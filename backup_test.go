@@ -138,4 +138,157 @@ func testBackup(t *testing.T, testRowCount int, usePerPageSteps bool) {
 	}
 	initialRemaining := backup.Remaining()
 	if initialRemaining <= 0 {
-		t.F
+		t.Fatalf("Unexpected initial remaining value: %v", initialRemaining)
+	}
+	if initialRemaining != initialPageCount {
+		t.Fatalf("Initial remaining value differs from the initial page count value; remaining: %v; page count: %v", initialRemaining, initialPageCount)
+	}
+
+	// Perform the backup.
+	if usePerPageSteps {
+		var startTime = time.Now().Unix()
+
+		// Test backing-up using a page-by-page approach.
+		var latestRemaining = initialRemaining
+		for {
+			// Perform the backup step.
+			isDone, err = backup.Step(1)
+			if err != nil {
+				t.Fatal("Failed to perform a backup step:", err)
+			}
+
+			// The page count should remain unchanged from its initial value.
+			currentPageCount := backup.PageCount()
+			if currentPageCount != initialPageCount {
+				t.Fatalf("Current page count differs from the initial page count; initial page count: %v; current page count: %v", initialPageCount, currentPageCount)
+			}
+
+			// There should now be one less page remaining.
+			currentRemaining := backup.Remaining()
+			expectedRemaining := latestRemaining - 1
+			if currentRemaining != expectedRemaining {
+				t.Fatalf("Unexpected remaining value; expected remaining value: %v; actual remaining value: %v", expectedRemaining, currentRemaining)
+			}
+			latestRemaining = currentRemaining
+
+			if isDone {
+				break
+			}
+
+			// Limit the runtime of the backup attempt.
+			if (time.Now().Unix() - startTime) > usePagePerStepsTimeoutSeconds {
+				t.Fatal("Backup is taking longer than expected.")
+			}
+		}
+	} else {
+		// Test the copying of all remaining pages.
+		isDone, err = backup.Step(-1)
+		if err != nil {
+			t.Fatal("Failed to perform a backup step:", err)
+		}
+		if !isDone {
+			t.Fatal("Backup is unexpectedly not done.")
+		}
+	}
+
+	// Check that the page count and remaining values are reasonable.
+	finalPageCount := backup.PageCount()
+	if finalPageCount != initialPageCount {
+		t.Fatalf("Final page count differs from the initial page count; initial page count: %v; final page count: %v", initialPageCount, finalPageCount)
+	}
+	finalRemaining := backup.Remaining()
+	if finalRemaining != 0 {
+		t.Fatalf("Unexpected remaining value: %v", finalRemaining)
+	}
+
+	// Finish the backup.
+	err = backup.Finish()
+	if err != nil {
+		t.Fatal("Failed to finish backup:", err)
+	}
+
+	// Confirm that the "test" table now exists in the destination database.
+	var doesTestTableExist bool
+	err = destDb.QueryRow("SELECT EXISTS (SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'test' LIMIT 1) AS test_table_exists").Scan(&doesTestTableExist)
+	if err != nil {
+		t.Fatal("Failed to check if the \"test\" table exists in the destination database:", err)
+	}
+	if !doesTestTableExist {
+		t.Fatal("The \"test\" table could not be found in the destination database.")
+	}
+
+	// Confirm that the number of rows in the destination database's "test" table matches that of the source table.
+	var actualTestTableRowCount int
+	err = destDb.QueryRow("SELECT COUNT(*) FROM test").Scan(&actualTestTableRowCount)
+	if err != nil {
+		t.Fatal("Failed to determine the rowcount of the \"test\" table in the destination database:", err)
+	}
+	if testRowCount != actualTestTableRowCount {
+		t.Fatalf("Unexpected destination \"test\" table row count; expected: %v; found: %v", testRowCount, actualTestTableRowCount)
+	}
+
+	// Check each of the rows in the destination database.
+	for id := 0; id < testRowCount; id++ {
+		var checkedValue string
+		err = destDb.QueryRow("SELECT value FROM test WHERE id = ?", id).Scan(&checkedValue)
+		if err != nil {
+			t.Fatal("Failed to query the \"test\" table in the destination database:", err)
+		}
+
+		var expectedValue = generateTestData(id)
+		if checkedValue != expectedValue {
+			t.Fatalf("Unexpected value in the \"test\" table in the destination database; expected value: %v; actual value: %v", expectedValue, checkedValue)
+		}
+	}
+}
+
+func TestBackupStepByStep(t *testing.T) {
+	testBackup(t, testRowCount, true)
+}
+
+func TestBackupAllRemainingPages(t *testing.T) {
+	testBackup(t, testRowCount, false)
+}
+
+// Test the error reporting when preparing to perform a backup.
+func TestBackupError(t *testing.T) {
+	const driverName = "sqlite3_TestBackupError"
+
+	// The driver's connection will be needed in order to perform the backup.
+	var dbDriverConn *SQLiteConn
+	sql.Register(driverName, &SQLiteDriver{
+		ConnectHook: func(conn *SQLiteConn) error {
+			dbDriverConn = conn
+			return nil
+		},
+	})
+
+	// Connect to the database.
+	dbTempFilename := TempFilename(t)
+	defer os.Remove(dbTempFilename)
+	db, err := sql.Open(driverName, dbTempFilename)
+	if err != nil {
+		t.Fatal("Failed to open the database:", err)
+	}
+	defer db.Close()
+	db.Ping()
+
+	// Need the driver connection in order to perform the backup.
+	if dbDriverConn == nil {
+		t.Fatal("Failed to get the driver connection.")
+	}
+
+	// Prepare to perform the backup.
+	// Intentionally using the same connection for both the source and destination databases, to trigger an error result.
+	backup, err := dbDriverConn.Backup("main", dbDriverConn, "main")
+	if err == nil {
+		t.Fatal("Failed to get the expected error result.")
+	}
+	const expectedError = "source and destination must be distinct"
+	if err.Error() != expectedError {
+		t.Fatalf("Unexpected error message; expected value: \"%v\"; actual value: \"%v\"", expectedError, err.Error())
+	}
+	if backup != nil {
+		t.Fatal("Failed to get the expected nil backup result.")
+	}
+}
