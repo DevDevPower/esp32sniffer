@@ -657,4 +657,137 @@ typedef sqlite_uint64 sqlite3_uint64;
 ** ^Calling sqlite3_close() or sqlite3_close_v2() with a NULL pointer
 ** argument is a harmless no-op.
 */
-SQLITE_API int sqli
+SQLITE_API int sqlite3_close(sqlite3*);
+SQLITE_API int sqlite3_close_v2(sqlite3*);
+
+/*
+** The type for a callback function.
+** This is legacy and deprecated.  It is included for historical
+** compatibility and is not documented.
+*/
+typedef int (*sqlite3_callback)(void*,int,char**, char**);
+
+/*
+** CAPI3REF: One-Step Query Execution Interface
+** METHOD: sqlite3
+**
+** The sqlite3_exec() interface is a convenience wrapper around
+** [sqlite3_prepare_v2()], [sqlite3_step()], and [sqlite3_finalize()],
+** that allows an application to run multiple statements of SQL
+** without having to use a lot of C code.
+**
+** ^The sqlite3_exec() interface runs zero or more UTF-8 encoded,
+** semicolon-separate SQL statements passed into its 2nd argument,
+** in the context of the [database connection] passed in as its 1st
+** argument.  ^If the callback function of the 3rd argument to
+** sqlite3_exec() is not NULL, then it is invoked for each result row
+** coming out of the evaluated SQL statements.  ^The 4th argument to
+** sqlite3_exec() is relayed through to the 1st argument of each
+** callback invocation.  ^If the callback pointer to sqlite3_exec()
+** is NULL, then no callback is ever invoked and result rows are
+** ignored.
+**
+** ^If an error occurs while evaluating the SQL statements passed into
+** sqlite3_exec(), then execution of the current statement stops and
+** subsequent statements are skipped.  ^If the 5th parameter to sqlite3_exec()
+** is not NULL then any error message is written into memory obtained
+** from [sqlite3_malloc()] and passed back through the 5th parameter.
+** To avoid memory leaks, the application should invoke [sqlite3_free()]
+** on error message strings returned through the 5th parameter of
+** sqlite3_exec() after the error message string is no longer needed.
+** ^If the 5th parameter to sqlite3_exec() is not NULL and no errors
+** occur, then sqlite3_exec() sets the pointer in its 5th parameter to
+** NULL before returning.
+**
+** ^If an sqlite3_exec() callback returns non-zero, the sqlite3_exec()
+** routine returns SQLITE_ABORT without invoking the callback again and
+** without running any subsequent SQL statements.
+**
+** ^The 2nd argument to the sqlite3_exec() callback function is the
+** number of columns in the result.  ^The 3rd argument to the sqlite3_exec()
+** callback is an array of pointers to strings obtained as if from
+** [sqlite3_column_text()], one for each column.  ^If an element of a
+** result row is NULL then the corresponding string pointer for the
+** sqlite3_exec() callback is a NULL pointer.  ^The 4th argument to the
+** sqlite3_exec() callback is an array of pointers to strings where each
+** entry represents the name of corresponding result column as obtained
+** from [sqlite3_column_name()].
+**
+** ^If the 2nd parameter to sqlite3_exec() is a NULL pointer, a pointer
+** to an empty string, or a pointer that contains only whitespace and/or
+** SQL comments, then no SQL statements are evaluated and the database
+** is not changed.
+**
+** Restrictions:
+**
+** <ul>
+** <li> The application must ensure that the 1st parameter to sqlite3_exec()
+**      is a valid and open [database connection].
+** <li> The application must not close the [database connection] specified by
+**      the 1st parameter to sqlite3_exec() while sqlite3_exec() is running.
+** <li> The application must not modify the SQL statement text passed into
+**      the 2nd parameter of sqlite3_exec() while sqlite3_exec() is running.
+** </ul>
+*/
+SQLITE_API int sqlite3_exec(
+  sqlite3*,                                  /* An open database */
+  const char *sql,                           /* SQL to be evaluated */
+  int (*callback)(void*,int,char**,char**),  /* Callback function */
+  void *,                                    /* 1st argument to callback */
+  char **errmsg                              /* Error msg written here */
+);
+
+/*
+** CAPI3REF: Result Codes
+** KEYWORDS: {result code definitions}
+**
+** Many SQLite functions return an integer result code from the set shown
+** here in order to indicate success or failure.
+**
+** New error codes may be added in future versions of SQLite.
+**
+** See also: [extended result code definitions]
+*/
+#define SQLITE_OK           0   /* Successful result */
+/* beginning-of-error-codes */
+#define SQLITE_ERROR        1   /* Generic error */
+#define SQLITE_INTERNAL     2   /* Internal logic error in SQLite */
+#define SQLITE_PERM         3   /* Access permission denied */
+#define SQLITE_ABORT        4   /* Callback routine requested an abort */
+#define SQLITE_BUSY         5   /* The database file is locked */
+#define SQLITE_LOCKED       6   /* A table in the database is locked */
+#define SQLITE_NOMEM        7   /* A malloc() failed */
+#define SQLITE_READONLY     8   /* Attempt to write a readonly database */
+#define SQLITE_INTERRUPT    9   /* Operation terminated by sqlite3_interrupt()*/
+#define SQLITE_IOERR       10   /* Some kind of disk I/O error occurred */
+#define SQLITE_CORRUPT     11   /* The database disk image is malformed */
+#define SQLITE_NOTFOUND    12   /* Unknown opcode in sqlite3_file_control() */
+#define SQLITE_FULL        13   /* Insertion failed because database is full */
+#define SQLITE_CANTOPEN    14   /* Unable to open the database file */
+#define SQLITE_PROTOCOL    15   /* Database lock protocol error */
+#define SQLITE_EMPTY       16   /* Internal use only */
+#define SQLITE_SCHEMA      17   /* The database schema changed */
+#define SQLITE_TOOBIG      18   /* String or BLOB exceeds size limit */
+#define SQLITE_CONSTRAINT  19   /* Abort due to constraint violation */
+#define SQLITE_MISMATCH    20   /* Data type mismatch */
+#define SQLITE_MISUSE      21   /* Library used incorrectly */
+#define SQLITE_NOLFS       22   /* Uses OS features not supported on host */
+#define SQLITE_AUTH        23   /* Authorization denied */
+#define SQLITE_FORMAT      24   /* Not used */
+#define SQLITE_RANGE       25   /* 2nd parameter to sqlite3_bind out of range */
+#define SQLITE_NOTADB      26   /* File opened that is not a database file */
+#define SQLITE_NOTICE      27   /* Notifications from sqlite3_log() */
+#define SQLITE_WARNING     28   /* Warnings from sqlite3_log() */
+#define SQLITE_ROW         100  /* sqlite3_step() has another row ready */
+#define SQLITE_DONE        101  /* sqlite3_step() has finished executing */
+/* end-of-error-codes */
+
+/*
+** CAPI3REF: Extended Result Codes
+** KEYWORDS: {extended result code definitions}
+**
+** In its default configuration, SQLite API routines return one of 30 integer
+** [result codes].  However, experience has shown that many of
+** these result codes are too coarse-grained.  They do not provide as
+** much information about problems as programmers might like.  In an effort to
+** address this, newer versions of SQLite (version 3.3.8 [dateof:
