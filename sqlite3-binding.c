@@ -1299,3 +1299,124 @@ struct sqlite3_io_methods {
 ** sqlite3_file_control(db,SQLITE_FCNTL_VFS_POINTER,X) must be
 ** of type "[sqlite3_vfs] **".  This opcodes will set *X
 ** to a pointer to the top-level VFS.)^
+** ^When there are multiple VFS shims in the stack, this opcode finds the
+** upper-most shim only.
+**
+** <li>[[SQLITE_FCNTL_PRAGMA]]
+** ^Whenever a [PRAGMA] statement is parsed, an [SQLITE_FCNTL_PRAGMA]
+** file control is sent to the open [sqlite3_file] object corresponding
+** to the database file to which the pragma statement refers. ^The argument
+** to the [SQLITE_FCNTL_PRAGMA] file control is an array of
+** pointers to strings (char**) in which the second element of the array
+** is the name of the pragma and the third element is the argument to the
+** pragma or NULL if the pragma has no argument.  ^The handler for an
+** [SQLITE_FCNTL_PRAGMA] file control can optionally make the first element
+** of the char** argument point to a string obtained from [sqlite3_mprintf()]
+** or the equivalent and that string will become the result of the pragma or
+** the error message if the pragma fails. ^If the
+** [SQLITE_FCNTL_PRAGMA] file control returns [SQLITE_NOTFOUND], then normal
+** [PRAGMA] processing continues.  ^If the [SQLITE_FCNTL_PRAGMA]
+** file control returns [SQLITE_OK], then the parser assumes that the
+** VFS has handled the PRAGMA itself and the parser generates a no-op
+** prepared statement if result string is NULL, or that returns a copy
+** of the result string if the string is non-NULL.
+** ^If the [SQLITE_FCNTL_PRAGMA] file control returns
+** any result code other than [SQLITE_OK] or [SQLITE_NOTFOUND], that means
+** that the VFS encountered an error while handling the [PRAGMA] and the
+** compilation of the PRAGMA fails with an error.  ^The [SQLITE_FCNTL_PRAGMA]
+** file control occurs at the beginning of pragma statement analysis and so
+** it is able to override built-in [PRAGMA] statements.
+**
+** <li>[[SQLITE_FCNTL_BUSYHANDLER]]
+** ^The [SQLITE_FCNTL_BUSYHANDLER]
+** file-control may be invoked by SQLite on the database file handle
+** shortly after it is opened in order to provide a custom VFS with access
+** to the connection's busy-handler callback. The argument is of type (void**)
+** - an array of two (void *) values. The first (void *) actually points
+** to a function of type (int (*)(void *)). In order to invoke the connection's
+** busy-handler, this function should be invoked with the second (void *) in
+** the array as the only argument. If it returns non-zero, then the operation
+** should be retried. If it returns zero, the custom VFS should abandon the
+** current operation.
+**
+** <li>[[SQLITE_FCNTL_TEMPFILENAME]]
+** ^Applications can invoke the [SQLITE_FCNTL_TEMPFILENAME] file-control
+** to have SQLite generate a
+** temporary filename using the same algorithm that is followed to generate
+** temporary filenames for TEMP tables and other internal uses.  The
+** argument should be a char** which will be filled with the filename
+** written into memory obtained from [sqlite3_malloc()].  The caller should
+** invoke [sqlite3_free()] on the result to avoid a memory leak.
+**
+** <li>[[SQLITE_FCNTL_MMAP_SIZE]]
+** The [SQLITE_FCNTL_MMAP_SIZE] file control is used to query or set the
+** maximum number of bytes that will be used for memory-mapped I/O.
+** The argument is a pointer to a value of type sqlite3_int64 that
+** is an advisory maximum number of bytes in the file to memory map.  The
+** pointer is overwritten with the old value.  The limit is not changed if
+** the value originally pointed to is negative, and so the current limit
+** can be queried by passing in a pointer to a negative number.  This
+** file-control is used internally to implement [PRAGMA mmap_size].
+**
+** <li>[[SQLITE_FCNTL_TRACE]]
+** The [SQLITE_FCNTL_TRACE] file control provides advisory information
+** to the VFS about what the higher layers of the SQLite stack are doing.
+** This file control is used by some VFS activity tracing [shims].
+** The argument is a zero-terminated string.  Higher layers in the
+** SQLite stack may generate instances of this file control if
+** the [SQLITE_USE_FCNTL_TRACE] compile-time option is enabled.
+**
+** <li>[[SQLITE_FCNTL_HAS_MOVED]]
+** The [SQLITE_FCNTL_HAS_MOVED] file control interprets its argument as a
+** pointer to an integer and it writes a boolean into that integer depending
+** on whether or not the file has been renamed, moved, or deleted since it
+** was first opened.
+**
+** <li>[[SQLITE_FCNTL_WIN32_GET_HANDLE]]
+** The [SQLITE_FCNTL_WIN32_GET_HANDLE] opcode can be used to obtain the
+** underlying native file handle associated with a file handle.  This file
+** control interprets its argument as a pointer to a native file handle and
+** writes the resulting value there.
+**
+** <li>[[SQLITE_FCNTL_WIN32_SET_HANDLE]]
+** The [SQLITE_FCNTL_WIN32_SET_HANDLE] opcode is used for debugging.  This
+** opcode causes the xFileControl method to swap the file handle with the one
+** pointed to by the pArg argument.  This capability is used during testing
+** and only needs to be supported when SQLITE_TEST is defined.
+**
+** <li>[[SQLITE_FCNTL_WAL_BLOCK]]
+** The [SQLITE_FCNTL_WAL_BLOCK] is a signal to the VFS layer that it might
+** be advantageous to block on the next WAL lock if the lock is not immediately
+** available.  The WAL subsystem issues this signal during rare
+** circumstances in order to fix a problem with priority inversion.
+** Applications should <em>not</em> use this file-control.
+**
+** <li>[[SQLITE_FCNTL_ZIPVFS]]
+** The [SQLITE_FCNTL_ZIPVFS] opcode is implemented by zipvfs only. All other
+** VFS should return SQLITE_NOTFOUND for this opcode.
+**
+** <li>[[SQLITE_FCNTL_RBU]]
+** The [SQLITE_FCNTL_RBU] opcode is implemented by the special VFS used by
+** the RBU extension only.  All other VFS should return SQLITE_NOTFOUND for
+** this opcode.
+**
+** <li>[[SQLITE_FCNTL_BEGIN_ATOMIC_WRITE]]
+** If the [SQLITE_FCNTL_BEGIN_ATOMIC_WRITE] opcode returns SQLITE_OK, then
+** the file descriptor is placed in "batch write mode", which
+** means all subsequent write operations will be deferred and done
+** atomically at the next [SQLITE_FCNTL_COMMIT_ATOMIC_WRITE].  Systems
+** that do not support batch atomic writes will return SQLITE_NOTFOUND.
+** ^Following a successful SQLITE_FCNTL_BEGIN_ATOMIC_WRITE and prior to
+** the closing [SQLITE_FCNTL_COMMIT_ATOMIC_WRITE] or
+** [SQLITE_FCNTL_ROLLBACK_ATOMIC_WRITE], SQLite will make
+** no VFS interface calls on the same [sqlite3_file] file descriptor
+** except for calls to the xWrite method and the xFileControl method
+** with [SQLITE_FCNTL_SIZE_HINT].
+**
+** <li>[[SQLITE_FCNTL_COMMIT_ATOMIC_WRITE]]
+** The [SQLITE_FCNTL_COMMIT_ATOMIC_WRITE] opcode causes all write
+** operations since the previous successful call to
+** [SQLITE_FCNTL_BEGIN_ATOMIC_WRITE] to be performed atomically.
+** This file control returns [SQLITE_OK] if and only if the writes were
+** all performed successfully and have been committed to persistent storage.
+** ^Regardless of whether or not it is s
