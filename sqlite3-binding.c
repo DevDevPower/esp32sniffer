@@ -790,4 +790,116 @@ SQLITE_API int sqlite3_exec(
 ** [result codes].  However, experience has shown that many of
 ** these result codes are too coarse-grained.  They do not provide as
 ** much information about problems as programmers might like.  In an effort to
-** address this, newer versions of SQLite (version 3.3.8 [dateof:
+** address this, newer versions of SQLite (version 3.3.8 [dateof:3.3.8]
+** and later) include
+** support for additional result codes that provide more detailed information
+** about errors. These [extended result codes] are enabled or disabled
+** on a per database connection basis using the
+** [sqlite3_extended_result_codes()] API.  Or, the extended code for
+** the most recent error can be obtained using
+** [sqlite3_extended_errcode()].
+*/
+#define SQLITE_ERROR_MISSING_COLLSEQ   (SQLITE_ERROR | (1<<8))
+#define SQLITE_ERROR_RETRY             (SQLITE_ERROR | (2<<8))
+#define SQLITE_ERROR_SNAPSHOT          (SQLITE_ERROR | (3<<8))
+#define SQLITE_IOERR_READ              (SQLITE_IOERR | (1<<8))
+#define SQLITE_IOERR_SHORT_READ        (SQLITE_IOERR | (2<<8))
+#define SQLITE_IOERR_WRITE             (SQLITE_IOERR | (3<<8))
+#define SQLITE_IOERR_FSYNC             (SQLITE_IOERR | (4<<8))
+#define SQLITE_IOERR_DIR_FSYNC         (SQLITE_IOERR | (5<<8))
+#define SQLITE_IOERR_TRUNCATE          (SQLITE_IOERR | (6<<8))
+#define SQLITE_IOERR_FSTAT             (SQLITE_IOERR | (7<<8))
+#define SQLITE_IOERR_UNLOCK            (SQLITE_IOERR | (8<<8))
+#define SQLITE_IOERR_RDLOCK            (SQLITE_IOERR | (9<<8))
+#define SQLITE_IOERR_DELETE            (SQLITE_IOERR | (10<<8))
+#define SQLITE_IOERR_BLOCKED           (SQLITE_IOERR | (11<<8))
+#define SQLITE_IOERR_NOMEM             (SQLITE_IOERR | (12<<8))
+#define SQLITE_IOERR_ACCESS            (SQLITE_IOERR | (13<<8))
+#define SQLITE_IOERR_CHECKRESERVEDLOCK (SQLITE_IOERR | (14<<8))
+#define SQLITE_IOERR_LOCK              (SQLITE_IOERR | (15<<8))
+#define SQLITE_IOERR_CLOSE             (SQLITE_IOERR | (16<<8))
+#define SQLITE_IOERR_DIR_CLOSE         (SQLITE_IOERR | (17<<8))
+#define SQLITE_IOERR_SHMOPEN           (SQLITE_IOERR | (18<<8))
+#define SQLITE_IOERR_SHMSIZE           (SQLITE_IOERR | (19<<8))
+#define SQLITE_IOERR_SHMLOCK           (SQLITE_IOERR | (20<<8))
+#define SQLITE_IOERR_SHMMAP            (SQLITE_IOERR | (21<<8))
+#define SQLITE_IOERR_SEEK              (SQLITE_IOERR | (22<<8))
+#define SQLITE_IOERR_DELETE_NOENT      (SQLITE_IOERR | (23<<8))
+#define SQLITE_IOERR_MMAP              (SQLITE_IOERR | (24<<8))
+#define SQLITE_IOERR_GETTEMPPATH       (SQLITE_IOERR | (25<<8))
+#define SQLITE_IOERR_CONVPATH          (SQLITE_IOERR | (26<<8))
+#define SQLITE_IOERR_VNODE             (SQLITE_IOERR | (27<<8))
+#define SQLITE_IOERR_AUTH              (SQLITE_IOERR | (28<<8))
+#define SQLITE_IOERR_BEGIN_ATOMIC      (SQLITE_IOERR | (29<<8))
+#define SQLITE_IOERR_COMMIT_ATOMIC     (SQLITE_IOERR | (30<<8))
+#define SQLITE_IOERR_ROLLBACK_ATOMIC   (SQLITE_IOERR | (31<<8))
+#define SQLITE_IOERR_DATA              (SQLITE_IOERR | (32<<8))
+#define SQLITE_IOERR_CORRUPTFS         (SQLITE_IOERR | (33<<8))
+#define SQLITE_LOCKED_SHAREDCACHE      (SQLITE_LOCKED |  (1<<8))
+#define SQLITE_LOCKED_VTAB             (SQLITE_LOCKED |  (2<<8))
+#define SQLITE_BUSY_RECOVERY           (SQLITE_BUSY   |  (1<<8))
+#define SQLITE_BUSY_SNAPSHOT           (SQLITE_BUSY   |  (2<<8))
+#define SQLITE_BUSY_TIMEOUT            (SQLITE_BUSY   |  (3<<8))
+#define SQLITE_CANTOPEN_NOTEMPDIR      (SQLITE_CANTOPEN | (1<<8))
+#define SQLITE_CANTOPEN_ISDIR          (SQLITE_CANTOPEN | (2<<8))
+#define SQLITE_CANTOPEN_FULLPATH       (SQLITE_CANTOPEN | (3<<8))
+#define SQLITE_CANTOPEN_CONVPATH       (SQLITE_CANTOPEN | (4<<8))
+#define SQLITE_CANTOPEN_DIRTYWAL       (SQLITE_CANTOPEN | (5<<8)) /* Not Used */
+#define SQLITE_CANTOPEN_SYMLINK        (SQLITE_CANTOPEN | (6<<8))
+#define SQLITE_CORRUPT_VTAB            (SQLITE_CORRUPT | (1<<8))
+#define SQLITE_CORRUPT_SEQUENCE        (SQLITE_CORRUPT | (2<<8))
+#define SQLITE_CORRUPT_INDEX           (SQLITE_CORRUPT | (3<<8))
+#define SQLITE_READONLY_RECOVERY       (SQLITE_READONLY | (1<<8))
+#define SQLITE_READONLY_CANTLOCK       (SQLITE_READONLY | (2<<8))
+#define SQLITE_READONLY_ROLLBACK       (SQLITE_READONLY | (3<<8))
+#define SQLITE_READONLY_DBMOVED        (SQLITE_READONLY | (4<<8))
+#define SQLITE_READONLY_CANTINIT       (SQLITE_READONLY | (5<<8))
+#define SQLITE_READONLY_DIRECTORY      (SQLITE_READONLY | (6<<8))
+#define SQLITE_ABORT_ROLLBACK          (SQLITE_ABORT | (2<<8))
+#define SQLITE_CONSTRAINT_CHECK        (SQLITE_CONSTRAINT | (1<<8))
+#define SQLITE_CONSTRAINT_COMMITHOOK   (SQLITE_CONSTRAINT | (2<<8))
+#define SQLITE_CONSTRAINT_FOREIGNKEY   (SQLITE_CONSTRAINT | (3<<8))
+#define SQLITE_CONSTRAINT_FUNCTION     (SQLITE_CONSTRAINT | (4<<8))
+#define SQLITE_CONSTRAINT_NOTNULL      (SQLITE_CONSTRAINT | (5<<8))
+#define SQLITE_CONSTRAINT_PRIMARYKEY   (SQLITE_CONSTRAINT | (6<<8))
+#define SQLITE_CONSTRAINT_TRIGGER      (SQLITE_CONSTRAINT | (7<<8))
+#define SQLITE_CONSTRAINT_UNIQUE       (SQLITE_CONSTRAINT | (8<<8))
+#define SQLITE_CONSTRAINT_VTAB         (SQLITE_CONSTRAINT | (9<<8))
+#define SQLITE_CONSTRAINT_ROWID        (SQLITE_CONSTRAINT |(10<<8))
+#define SQLITE_CONSTRAINT_PINNED       (SQLITE_CONSTRAINT |(11<<8))
+#define SQLITE_CONSTRAINT_DATATYPE     (SQLITE_CONSTRAINT |(12<<8))
+#define SQLITE_NOTICE_RECOVER_WAL      (SQLITE_NOTICE | (1<<8))
+#define SQLITE_NOTICE_RECOVER_ROLLBACK (SQLITE_NOTICE | (2<<8))
+#define SQLITE_WARNING_AUTOINDEX       (SQLITE_WARNING | (1<<8))
+#define SQLITE_AUTH_USER               (SQLITE_AUTH | (1<<8))
+#define SQLITE_OK_LOAD_PERMANENTLY     (SQLITE_OK | (1<<8))
+#define SQLITE_OK_SYMLINK              (SQLITE_OK | (2<<8)) /* internal use only */
+
+/*
+** CAPI3REF: Flags For File Open Operations
+**
+** These bit values are intended for use in the
+** 3rd parameter to the [sqlite3_open_v2()] interface and
+** in the 4th parameter to the [sqlite3_vfs.xOpen] method.
+**
+** Only those flags marked as "Ok for sqlite3_open_v2()" may be
+** used as the third argument to the [sqlite3_open_v2()] interface.
+** The other flags have historically been ignored by sqlite3_open_v2(),
+** though future versions of SQLite might change so that an error is
+** raised if any of the disallowed bits are passed into sqlite3_open_v2().
+** Applications should not depend on the historical behavior.
+**
+** Note in particular that passing the SQLITE_OPEN_EXCLUSIVE flag into
+** [sqlite3_open_v2()] does *not* cause the underlying database file
+** to be opened using O_EXCL.  Passing SQLITE_OPEN_EXCLUSIVE into
+** [sqlite3_open_v2()] has historically be a no-op and might become an
+** error in future versions of SQLite.
+*/
+#define SQLITE_OPEN_READONLY         0x00000001  /* Ok for sqlite3_open_v2() */
+#define SQLITE_OPEN_READWRITE        0x00000002  /* Ok for sqlite3_open_v2() */
+#define SQLITE_OPEN_CREATE           0x00000004  /* Ok for sqlite3_open_v2() */
+#define SQLITE_OPEN_DELETEONCLOSE    0x00000008  /* VFS only */
+#define SQLITE_OPEN_EXCLUSIVE        0x00000010  /* VFS only */
+#define SQLITE_OPEN_AUTOPROXY        0x00000020  /* VFS only */
+#define SQLITE_OPEN_URI              0x00000040  /* Ok for sqlite3_open_v2() */
+#define SQLITE_OPEN_MEMORY           0x00000080  /* Ok for sqlite3_o
