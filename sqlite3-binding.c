@@ -1184,4 +1184,118 @@ struct sqlite3_io_methods {
 ** of the in-memory database.  The argument is a pointer to a [sqlite3_int64].
 ** If the integer pointed to is negative, then it is filled in with the
 ** current limit.  Otherwise the limit is set to the larger of the value
-** of
+** of the integer pointed to and the current database size.  The integer
+** pointed to is set to the new limit.
+**
+** <li>[[SQLITE_FCNTL_CHUNK_SIZE]]
+** The [SQLITE_FCNTL_CHUNK_SIZE] opcode is used to request that the VFS
+** extends and truncates the database file in chunks of a size specified
+** by the user. The fourth argument to [sqlite3_file_control()] should
+** point to an integer (type int) containing the new chunk-size to use
+** for the nominated database. Allocating database file space in large
+** chunks (say 1MB at a time), may reduce file-system fragmentation and
+** improve performance on some systems.
+**
+** <li>[[SQLITE_FCNTL_FILE_POINTER]]
+** The [SQLITE_FCNTL_FILE_POINTER] opcode is used to obtain a pointer
+** to the [sqlite3_file] object associated with a particular database
+** connection.  See also [SQLITE_FCNTL_JOURNAL_POINTER].
+**
+** <li>[[SQLITE_FCNTL_JOURNAL_POINTER]]
+** The [SQLITE_FCNTL_JOURNAL_POINTER] opcode is used to obtain a pointer
+** to the [sqlite3_file] object associated with the journal file (either
+** the [rollback journal] or the [write-ahead log]) for a particular database
+** connection.  See also [SQLITE_FCNTL_FILE_POINTER].
+**
+** <li>[[SQLITE_FCNTL_SYNC_OMITTED]]
+** No longer in use.
+**
+** <li>[[SQLITE_FCNTL_SYNC]]
+** The [SQLITE_FCNTL_SYNC] opcode is generated internally by SQLite and
+** sent to the VFS immediately before the xSync method is invoked on a
+** database file descriptor. Or, if the xSync method is not invoked
+** because the user has configured SQLite with
+** [PRAGMA synchronous | PRAGMA synchronous=OFF] it is invoked in place
+** of the xSync method. In most cases, the pointer argument passed with
+** this file-control is NULL. However, if the database file is being synced
+** as part of a multi-database commit, the argument points to a nul-terminated
+** string containing the transactions super-journal file name. VFSes that
+** do not need this signal should silently ignore this opcode. Applications
+** should not call [sqlite3_file_control()] with this opcode as doing so may
+** disrupt the operation of the specialized VFSes that do require it.
+**
+** <li>[[SQLITE_FCNTL_COMMIT_PHASETWO]]
+** The [SQLITE_FCNTL_COMMIT_PHASETWO] opcode is generated internally by SQLite
+** and sent to the VFS after a transaction has been committed immediately
+** but before the database is unlocked. VFSes that do not need this signal
+** should silently ignore this opcode. Applications should not call
+** [sqlite3_file_control()] with this opcode as doing so may disrupt the
+** operation of the specialized VFSes that do require it.
+**
+** <li>[[SQLITE_FCNTL_WIN32_AV_RETRY]]
+** ^The [SQLITE_FCNTL_WIN32_AV_RETRY] opcode is used to configure automatic
+** retry counts and intervals for certain disk I/O operations for the
+** windows [VFS] in order to provide robustness in the presence of
+** anti-virus programs.  By default, the windows VFS will retry file read,
+** file write, and file delete operations up to 10 times, with a delay
+** of 25 milliseconds before the first retry and with the delay increasing
+** by an additional 25 milliseconds with each subsequent retry.  This
+** opcode allows these two values (10 retries and 25 milliseconds of delay)
+** to be adjusted.  The values are changed for all database connections
+** within the same process.  The argument is a pointer to an array of two
+** integers where the first integer is the new retry count and the second
+** integer is the delay.  If either integer is negative, then the setting
+** is not changed but instead the prior value of that setting is written
+** into the array entry, allowing the current retry settings to be
+** interrogated.  The zDbName parameter is ignored.
+**
+** <li>[[SQLITE_FCNTL_PERSIST_WAL]]
+** ^The [SQLITE_FCNTL_PERSIST_WAL] opcode is used to set or query the
+** persistent [WAL | Write Ahead Log] setting.  By default, the auxiliary
+** write ahead log ([WAL file]) and shared memory
+** files used for transaction control
+** are automatically deleted when the latest connection to the database
+** closes.  Setting persistent WAL mode causes those files to persist after
+** close.  Persisting the files is useful when other processes that do not
+** have write permission on the directory containing the database file want
+** to read the database file, as the WAL and shared memory files must exist
+** in order for the database to be readable.  The fourth parameter to
+** [sqlite3_file_control()] for this opcode should be a pointer to an integer.
+** That integer is 0 to disable persistent WAL mode or 1 to enable persistent
+** WAL mode.  If the integer is -1, then it is overwritten with the current
+** WAL persistence setting.
+**
+** <li>[[SQLITE_FCNTL_POWERSAFE_OVERWRITE]]
+** ^The [SQLITE_FCNTL_POWERSAFE_OVERWRITE] opcode is used to set or query the
+** persistent "powersafe-overwrite" or "PSOW" setting.  The PSOW setting
+** determines the [SQLITE_IOCAP_POWERSAFE_OVERWRITE] bit of the
+** xDeviceCharacteristics methods. The fourth parameter to
+** [sqlite3_file_control()] for this opcode should be a pointer to an integer.
+** That integer is 0 to disable zero-damage mode or 1 to enable zero-damage
+** mode.  If the integer is -1, then it is overwritten with the current
+** zero-damage mode setting.
+**
+** <li>[[SQLITE_FCNTL_OVERWRITE]]
+** ^The [SQLITE_FCNTL_OVERWRITE] opcode is invoked by SQLite after opening
+** a write transaction to indicate that, unless it is rolled back for some
+** reason, the entire database file will be overwritten by the current
+** transaction. This is used by VACUUM operations.
+**
+** <li>[[SQLITE_FCNTL_VFSNAME]]
+** ^The [SQLITE_FCNTL_VFSNAME] opcode can be used to obtain the names of
+** all [VFSes] in the VFS stack.  The names are of all VFS shims and the
+** final bottom-level VFS are written into memory obtained from
+** [sqlite3_malloc()] and the result is stored in the char* variable
+** that the fourth parameter of [sqlite3_file_control()] points to.
+** The caller is responsible for freeing the memory when done.  As with
+** all file-control actions, there is no guarantee that this will actually
+** do anything.  Callers should initialize the char* variable to a NULL
+** pointer in case this file-control is not implemented.  This file-control
+** is intended for diagnostic use only.
+**
+** <li>[[SQLITE_FCNTL_VFS_POINTER]]
+** ^The [SQLITE_FCNTL_VFS_POINTER] opcode finds a pointer to the top-level
+** [VFSes] currently in use.  ^(The argument X in
+** sqlite3_file_control(db,SQLITE_FCNTL_VFS_POINTER,X) must be
+** of type "[sqlite3_vfs] **".  This opcodes will set *X
+** to a pointer to the top-level VFS.)^
