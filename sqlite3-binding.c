@@ -1419,4 +1419,139 @@ struct sqlite3_io_methods {
 ** [SQLITE_FCNTL_BEGIN_ATOMIC_WRITE] to be performed atomically.
 ** This file control returns [SQLITE_OK] if and only if the writes were
 ** all performed successfully and have been committed to persistent storage.
-** ^Regardless of whether or not it is s
+** ^Regardless of whether or not it is successful, this file control takes
+** the file descriptor out of batch write mode so that all subsequent
+** write operations are independent.
+** ^SQLite will never invoke SQLITE_FCNTL_COMMIT_ATOMIC_WRITE without
+** a prior successful call to [SQLITE_FCNTL_BEGIN_ATOMIC_WRITE].
+**
+** <li>[[SQLITE_FCNTL_ROLLBACK_ATOMIC_WRITE]]
+** The [SQLITE_FCNTL_ROLLBACK_ATOMIC_WRITE] opcode causes all write
+** operations since the previous successful call to
+** [SQLITE_FCNTL_BEGIN_ATOMIC_WRITE] to be rolled back.
+** ^This file control takes the file descriptor out of batch write mode
+** so that all subsequent write operations are independent.
+** ^SQLite will never invoke SQLITE_FCNTL_ROLLBACK_ATOMIC_WRITE without
+** a prior successful call to [SQLITE_FCNTL_BEGIN_ATOMIC_WRITE].
+**
+** <li>[[SQLITE_FCNTL_LOCK_TIMEOUT]]
+** The [SQLITE_FCNTL_LOCK_TIMEOUT] opcode is used to configure a VFS
+** to block for up to M milliseconds before failing when attempting to
+** obtain a file lock using the xLock or xShmLock methods of the VFS.
+** The parameter is a pointer to a 32-bit signed integer that contains
+** the value that M is to be set to. Before returning, the 32-bit signed
+** integer is overwritten with the previous value of M.
+**
+** <li>[[SQLITE_FCNTL_DATA_VERSION]]
+** The [SQLITE_FCNTL_DATA_VERSION] opcode is used to detect changes to
+** a database file.  The argument is a pointer to a 32-bit unsigned integer.
+** The "data version" for the pager is written into the pointer.  The
+** "data version" changes whenever any change occurs to the corresponding
+** database file, either through SQL statements on the same database
+** connection or through transactions committed by separate database
+** connections possibly in other processes. The [sqlite3_total_changes()]
+** interface can be used to find if any database on the connection has changed,
+** but that interface responds to changes on TEMP as well as MAIN and does
+** not provide a mechanism to detect changes to MAIN only.  Also, the
+** [sqlite3_total_changes()] interface responds to internal changes only and
+** omits changes made by other database connections.  The
+** [PRAGMA data_version] command provides a mechanism to detect changes to
+** a single attached database that occur due to other database connections,
+** but omits changes implemented by the database connection on which it is
+** called.  This file control is the only mechanism to detect changes that
+** happen either internally or externally and that are associated with
+** a particular attached database.
+**
+** <li>[[SQLITE_FCNTL_CKPT_START]]
+** The [SQLITE_FCNTL_CKPT_START] opcode is invoked from within a checkpoint
+** in wal mode before the client starts to copy pages from the wal
+** file to the database file.
+**
+** <li>[[SQLITE_FCNTL_CKPT_DONE]]
+** The [SQLITE_FCNTL_CKPT_DONE] opcode is invoked from within a checkpoint
+** in wal mode after the client has finished copying pages from the wal
+** file to the database file, but before the *-shm file is updated to
+** record the fact that the pages have been checkpointed.
+** </ul>
+**
+** <li>[[SQLITE_FCNTL_EXTERNAL_READER]]
+** The EXPERIMENTAL [SQLITE_FCNTL_EXTERNAL_READER] opcode is used to detect
+** whether or not there is a database client in another process with a wal-mode
+** transaction open on the database or not. It is only available on unix.The
+** (void*) argument passed with this file-control should be a pointer to a
+** value of type (int). The integer value is set to 1 if the database is a wal
+** mode database and there exists at least one client in another process that
+** currently has an SQL transaction open on the database. It is set to 0 if
+** the database is not a wal-mode db, or if there is no such connection in any
+** other process. This opcode cannot be used to detect transactions opened
+** by clients within the current process, only within other processes.
+** </ul>
+**
+** <li>[[SQLITE_FCNTL_CKSM_FILE]]
+** Used by the cksmvfs VFS module only.
+** </ul>
+*/
+#define SQLITE_FCNTL_LOCKSTATE               1
+#define SQLITE_FCNTL_GET_LOCKPROXYFILE       2
+#define SQLITE_FCNTL_SET_LOCKPROXYFILE       3
+#define SQLITE_FCNTL_LAST_ERRNO              4
+#define SQLITE_FCNTL_SIZE_HINT               5
+#define SQLITE_FCNTL_CHUNK_SIZE              6
+#define SQLITE_FCNTL_FILE_POINTER            7
+#define SQLITE_FCNTL_SYNC_OMITTED            8
+#define SQLITE_FCNTL_WIN32_AV_RETRY          9
+#define SQLITE_FCNTL_PERSIST_WAL            10
+#define SQLITE_FCNTL_OVERWRITE              11
+#define SQLITE_FCNTL_VFSNAME                12
+#define SQLITE_FCNTL_POWERSAFE_OVERWRITE    13
+#define SQLITE_FCNTL_PRAGMA                 14
+#define SQLITE_FCNTL_BUSYHANDLER            15
+#define SQLITE_FCNTL_TEMPFILENAME           16
+#define SQLITE_FCNTL_MMAP_SIZE              18
+#define SQLITE_FCNTL_TRACE                  19
+#define SQLITE_FCNTL_HAS_MOVED              20
+#define SQLITE_FCNTL_SYNC                   21
+#define SQLITE_FCNTL_COMMIT_PHASETWO        22
+#define SQLITE_FCNTL_WIN32_SET_HANDLE       23
+#define SQLITE_FCNTL_WAL_BLOCK              24
+#define SQLITE_FCNTL_ZIPVFS                 25
+#define SQLITE_FCNTL_RBU                    26
+#define SQLITE_FCNTL_VFS_POINTER            27
+#define SQLITE_FCNTL_JOURNAL_POINTER        28
+#define SQLITE_FCNTL_WIN32_GET_HANDLE       29
+#define SQLITE_FCNTL_PDB                    30
+#define SQLITE_FCNTL_BEGIN_ATOMIC_WRITE     31
+#define SQLITE_FCNTL_COMMIT_ATOMIC_WRITE    32
+#define SQLITE_FCNTL_ROLLBACK_ATOMIC_WRITE  33
+#define SQLITE_FCNTL_LOCK_TIMEOUT           34
+#define SQLITE_FCNTL_DATA_VERSION           35
+#define SQLITE_FCNTL_SIZE_LIMIT             36
+#define SQLITE_FCNTL_CKPT_DONE              37
+#define SQLITE_FCNTL_RESERVE_BYTES          38
+#define SQLITE_FCNTL_CKPT_START             39
+#define SQLITE_FCNTL_EXTERNAL_READER        40
+#define SQLITE_FCNTL_CKSM_FILE              41
+
+/* deprecated names */
+#define SQLITE_GET_LOCKPROXYFILE      SQLITE_FCNTL_GET_LOCKPROXYFILE
+#define SQLITE_SET_LOCKPROXYFILE      SQLITE_FCNTL_SET_LOCKPROXYFILE
+#define SQLITE_LAST_ERRNO             SQLITE_FCNTL_LAST_ERRNO
+
+
+/*
+** CAPI3REF: Mutex Handle
+**
+** The mutex module within SQLite defines [sqlite3_mutex] to be an
+** abstract type for a mutex object.  The SQLite core never looks
+** at the internal representation of an [sqlite3_mutex].  It only
+** deals with pointers to the [sqlite3_mutex] object.
+**
+** Mutexes are created using [sqlite3_mutex_alloc()].
+*/
+typedef struct sqlite3_mutex sqlite3_mutex;
+
+/*
+** CAPI3REF: Loadable Extension Thunk
+**
+** A pointer to the opaque sqlite3_api_routines structure is passed as
+** the third parameter to entry points of [loadable ext
