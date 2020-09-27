@@ -1554,4 +1554,144 @@ typedef struct sqlite3_mutex sqlite3_mutex;
 ** CAPI3REF: Loadable Extension Thunk
 **
 ** A pointer to the opaque sqlite3_api_routines structure is passed as
-** the third parameter to entry points of [loadable ext
+** the third parameter to entry points of [loadable extensions].  This
+** structure must be typedefed in order to work around compiler warnings
+** on some platforms.
+*/
+typedef struct sqlite3_api_routines sqlite3_api_routines;
+
+/*
+** CAPI3REF: OS Interface Object
+**
+** An instance of the sqlite3_vfs object defines the interface between
+** the SQLite core and the underlying operating system.  The "vfs"
+** in the name of the object stands for "virtual file system".  See
+** the [VFS | VFS documentation] for further information.
+**
+** The VFS interface is sometimes extended by adding new methods onto
+** the end.  Each time such an extension occurs, the iVersion field
+** is incremented.  The iVersion value started out as 1 in
+** SQLite [version 3.5.0] on [dateof:3.5.0], then increased to 2
+** with SQLite [version 3.7.0] on [dateof:3.7.0], and then increased
+** to 3 with SQLite [version 3.7.6] on [dateof:3.7.6].  Additional fields
+** may be appended to the sqlite3_vfs object and the iVersion value
+** may increase again in future versions of SQLite.
+** Note that due to an oversight, the structure
+** of the sqlite3_vfs object changed in the transition from
+** SQLite [version 3.5.9] to [version 3.6.0] on [dateof:3.6.0]
+** and yet the iVersion field was not increased.
+**
+** The szOsFile field is the size of the subclassed [sqlite3_file]
+** structure used by this VFS.  mxPathname is the maximum length of
+** a pathname in this VFS.
+**
+** Registered sqlite3_vfs objects are kept on a linked list formed by
+** the pNext pointer.  The [sqlite3_vfs_register()]
+** and [sqlite3_vfs_unregister()] interfaces manage this list
+** in a thread-safe way.  The [sqlite3_vfs_find()] interface
+** searches the list.  Neither the application code nor the VFS
+** implementation should use the pNext pointer.
+**
+** The pNext field is the only field in the sqlite3_vfs
+** structure that SQLite will ever modify.  SQLite will only access
+** or modify this field while holding a particular static mutex.
+** The application should never modify anything within the sqlite3_vfs
+** object once the object has been registered.
+**
+** The zName field holds the name of the VFS module.  The name must
+** be unique across all VFS modules.
+**
+** [[sqlite3_vfs.xOpen]]
+** ^SQLite guarantees that the zFilename parameter to xOpen
+** is either a NULL pointer or string obtained
+** from xFullPathname() with an optional suffix added.
+** ^If a suffix is added to the zFilename parameter, it will
+** consist of a single "-" character followed by no more than
+** 11 alphanumeric and/or "-" characters.
+** ^SQLite further guarantees that
+** the string will be valid and unchanged until xClose() is
+** called. Because of the previous sentence,
+** the [sqlite3_file] can safely store a pointer to the
+** filename if it needs to remember the filename for some reason.
+** If the zFilename parameter to xOpen is a NULL pointer then xOpen
+** must invent its own temporary name for the file.  ^Whenever the
+** xFilename parameter is NULL it will also be the case that the
+** flags parameter will include [SQLITE_OPEN_DELETEONCLOSE].
+**
+** The flags argument to xOpen() includes all bits set in
+** the flags argument to [sqlite3_open_v2()].  Or if [sqlite3_open()]
+** or [sqlite3_open16()] is used, then flags includes at least
+** [SQLITE_OPEN_READWRITE] | [SQLITE_OPEN_CREATE].
+** If xOpen() opens a file read-only then it sets *pOutFlags to
+** include [SQLITE_OPEN_READONLY].  Other bits in *pOutFlags may be set.
+**
+** ^(SQLite will also add one of the following flags to the xOpen()
+** call, depending on the object being opened:
+**
+** <ul>
+** <li>  [SQLITE_OPEN_MAIN_DB]
+** <li>  [SQLITE_OPEN_MAIN_JOURNAL]
+** <li>  [SQLITE_OPEN_TEMP_DB]
+** <li>  [SQLITE_OPEN_TEMP_JOURNAL]
+** <li>  [SQLITE_OPEN_TRANSIENT_DB]
+** <li>  [SQLITE_OPEN_SUBJOURNAL]
+** <li>  [SQLITE_OPEN_SUPER_JOURNAL]
+** <li>  [SQLITE_OPEN_WAL]
+** </ul>)^
+**
+** The file I/O implementation can use the object type flags to
+** change the way it deals with files.  For example, an application
+** that does not care about crash recovery or rollback might make
+** the open of a journal file a no-op.  Writes to this journal would
+** also be no-ops, and any attempt to read the journal would return
+** SQLITE_IOERR.  Or the implementation might recognize that a database
+** file will be doing page-aligned sector reads and writes in a random
+** order and set up its I/O subsystem accordingly.
+**
+** SQLite might also add one of the following flags to the xOpen method:
+**
+** <ul>
+** <li> [SQLITE_OPEN_DELETEONCLOSE]
+** <li> [SQLITE_OPEN_EXCLUSIVE]
+** </ul>
+**
+** The [SQLITE_OPEN_DELETEONCLOSE] flag means the file should be
+** deleted when it is closed.  ^The [SQLITE_OPEN_DELETEONCLOSE]
+** will be set for TEMP databases and their journals, transient
+** databases, and subjournals.
+**
+** ^The [SQLITE_OPEN_EXCLUSIVE] flag is always used in conjunction
+** with the [SQLITE_OPEN_CREATE] flag, which are both directly
+** analogous to the O_EXCL and O_CREAT flags of the POSIX open()
+** API.  The SQLITE_OPEN_EXCLUSIVE flag, when paired with the
+** SQLITE_OPEN_CREATE, is used to indicate that file should always
+** be created, and that it is an error if it already exists.
+** It is <i>not</i> used to indicate the file should be opened
+** for exclusive access.
+**
+** ^At least szOsFile bytes of memory are allocated by SQLite
+** to hold the [sqlite3_file] structure passed as the third
+** argument to xOpen.  The xOpen method does not have to
+** allocate the structure; it should just fill it in.  Note that
+** the xOpen method must set the sqlite3_file.pMethods to either
+** a valid [sqlite3_io_methods] object or to NULL.  xOpen must do
+** this even if the open fails.  SQLite expects that the sqlite3_file.pMethods
+** element will be valid after xOpen returns regardless of the success
+** or failure of the xOpen call.
+**
+** [[sqlite3_vfs.xAccess]]
+** ^The flags argument to xAccess() may be [SQLITE_ACCESS_EXISTS]
+** to test for the existence of a file, or [SQLITE_ACCESS_READWRITE] to
+** test whether a file is readable and writable, or [SQLITE_ACCESS_READ]
+** to test whether a file is at least readable.  The SQLITE_ACCESS_READ
+** flag is never actually used and is not implemented in the built-in
+** VFSes of SQLite.  The file is named by the second argument and can be a
+** directory. The xAccess method returns [SQLITE_OK] on success or some
+** non-zero error code if there is an I/O error or if the name of
+** the file given in the second argument is illegal.  If SQLITE_OK
+** is returned, then non-zero or zero is written into *pResOut to indicate
+** whether or not the file is accessible.
+**
+** ^SQLite will always allocate at least mxPathname+1 bytes for the
+** output buffer xFullPathname.  The exact size of the output buffer
+** is also passed
