@@ -2819,4 +2819,143 @@ SQLITE_API void sqlite3_set_last_insert_rowid(sqlite3*,sqlite3_int64);
 ** type of SQL statement does not modify the value returned by these functions.
 **
 ** ^Only changes made directly by the INSERT, UPDATE or DELETE statement are
-** con
+** considered - auxiliary changes caused by [CREATE TRIGGER | triggers],
+** [foreign key actions] or [REPLACE] constraint resolution are not counted.
+**
+** Changes to a view that are intercepted by
+** [INSTEAD OF trigger | INSTEAD OF triggers] are not counted. ^The value
+** returned by sqlite3_changes() immediately after an INSERT, UPDATE or
+** DELETE statement run on a view is always zero. Only changes made to real
+** tables are counted.
+**
+** Things are more complicated if the sqlite3_changes() function is
+** executed while a trigger program is running. This may happen if the
+** program uses the [changes() SQL function], or if some other callback
+** function invokes sqlite3_changes() directly. Essentially:
+**
+** <ul>
+**   <li> ^(Before entering a trigger program the value returned by
+**        sqlite3_changes() function is saved. After the trigger program
+**        has finished, the original value is restored.)^
+**
+**   <li> ^(Within a trigger program each INSERT, UPDATE and DELETE
+**        statement sets the value returned by sqlite3_changes()
+**        upon completion as normal. Of course, this value will not include
+**        any changes performed by sub-triggers, as the sqlite3_changes()
+**        value will be saved and restored after each sub-trigger has run.)^
+** </ul>
+**
+** ^This means that if the changes() SQL function (or similar) is used
+** by the first INSERT, UPDATE or DELETE statement within a trigger, it
+** returns the value as set when the calling statement began executing.
+** ^If it is used by the second or subsequent such statement within a trigger
+** program, the value returned reflects the number of rows modified by the
+** previous INSERT, UPDATE or DELETE statement within the same trigger.
+**
+** If a separate thread makes changes on the same database connection
+** while [sqlite3_changes()] is running then the value returned
+** is unpredictable and not meaningful.
+**
+** See also:
+** <ul>
+** <li> the [sqlite3_total_changes()] interface
+** <li> the [count_changes pragma]
+** <li> the [changes() SQL function]
+** <li> the [data_version pragma]
+** </ul>
+*/
+SQLITE_API int sqlite3_changes(sqlite3*);
+SQLITE_API sqlite3_int64 sqlite3_changes64(sqlite3*);
+
+/*
+** CAPI3REF: Total Number Of Rows Modified
+** METHOD: sqlite3
+**
+** ^These functions return the total number of rows inserted, modified or
+** deleted by all [INSERT], [UPDATE] or [DELETE] statements completed
+** since the database connection was opened, including those executed as
+** part of trigger programs. The two functions are identical except for the
+** type of the return value and that if the number of rows modified by the
+** connection exceeds the maximum value supported by type "int", then
+** the return value of sqlite3_total_changes() is undefined. ^Executing
+** any other type of SQL statement does not affect the value returned by
+** sqlite3_total_changes().
+**
+** ^Changes made as part of [foreign key actions] are included in the
+** count, but those made as part of REPLACE constraint resolution are
+** not. ^Changes to a view that are intercepted by INSTEAD OF triggers
+** are not counted.
+**
+** The [sqlite3_total_changes(D)] interface only reports the number
+** of rows that changed due to SQL statement run against database
+** connection D.  Any changes by other database connections are ignored.
+** To detect changes against a database file from other database
+** connections use the [PRAGMA data_version] command or the
+** [SQLITE_FCNTL_DATA_VERSION] [file control].
+**
+** If a separate thread makes changes on the same database connection
+** while [sqlite3_total_changes()] is running then the value
+** returned is unpredictable and not meaningful.
+**
+** See also:
+** <ul>
+** <li> the [sqlite3_changes()] interface
+** <li> the [count_changes pragma]
+** <li> the [changes() SQL function]
+** <li> the [data_version pragma]
+** <li> the [SQLITE_FCNTL_DATA_VERSION] [file control]
+** </ul>
+*/
+SQLITE_API int sqlite3_total_changes(sqlite3*);
+SQLITE_API sqlite3_int64 sqlite3_total_changes64(sqlite3*);
+
+/*
+** CAPI3REF: Interrupt A Long-Running Query
+** METHOD: sqlite3
+**
+** ^This function causes any pending database operation to abort and
+** return at its earliest opportunity. This routine is typically
+** called in response to a user action such as pressing "Cancel"
+** or Ctrl-C where the user wants a long query operation to halt
+** immediately.
+**
+** ^It is safe to call this routine from a thread different from the
+** thread that is currently running the database operation.  But it
+** is not safe to call this routine with a [database connection] that
+** is closed or might close before sqlite3_interrupt() returns.
+**
+** ^If an SQL operation is very nearly finished at the time when
+** sqlite3_interrupt() is called, then it might not have an opportunity
+** to be interrupted and might continue to completion.
+**
+** ^An SQL operation that is interrupted will return [SQLITE_INTERRUPT].
+** ^If the interrupted SQL operation is an INSERT, UPDATE, or DELETE
+** that is inside an explicit transaction, then the entire transaction
+** will be rolled back automatically.
+**
+** ^The sqlite3_interrupt(D) call is in effect until all currently running
+** SQL statements on [database connection] D complete.  ^Any new SQL statements
+** that are started after the sqlite3_interrupt() call and before the
+** running statement count reaches zero are interrupted as if they had been
+** running prior to the sqlite3_interrupt() call.  ^New SQL statements
+** that are started after the running statement count reaches zero are
+** not effected by the sqlite3_interrupt().
+** ^A call to sqlite3_interrupt(D) that occurs when there are no running
+** SQL statements is a no-op and has no effect on SQL statements
+** that are started after the sqlite3_interrupt() call returns.
+*/
+SQLITE_API void sqlite3_interrupt(sqlite3*);
+
+/*
+** CAPI3REF: Determine If An SQL Statement Is Complete
+**
+** These routines are useful during command-line input to determine if the
+** currently entered text seems to form a complete SQL statement or
+** if additional input is needed before sending the text into
+** SQLite for parsing.  ^These routines return 1 if the input string
+** appears to be a complete SQL statement.  ^A statement is judged to be
+** complete if it ends with a semicolon token and is not a prefix of a
+** well-formed CREATE TRIGGER statement.  ^Semicolons that are embedded within
+** string literals or quoted identifier names or comments are not
+** independent tokens (they are part of the token in which they are
+** embedded) and thus do not count as a statement termi
