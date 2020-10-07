@@ -2687,4 +2687,136 @@ struct sqlite3_mem_methods {
 ** created database file to have a schema format version number (the 4-byte
 ** integer found at offset 44 into the database header) of 1.  This in turn
 ** means that the resulting database file will be readable and writable by
-** any SQ
+** any SQLite version back to 3.0.0 ([dateof:3.0.0]).  Without this setting,
+** newly created databases are generally not understandable by SQLite versions
+** prior to 3.3.0 ([dateof:3.3.0]).  As these words are written, there
+** is now scarcely any need to generated database files that are compatible
+** all the way back to version 3.0.0, and so this setting is of little
+** practical use, but is provided so that SQLite can continue to claim the
+** ability to generate new database files that are compatible with  version
+** 3.0.0.
+** <p>Note that when the SQLITE_DBCONFIG_LEGACY_FILE_FORMAT setting is on,
+** the [VACUUM] command will fail with an obscure error when attempting to
+** process a table with generated columns and a descending index.  This is
+** not considered a bug since SQLite versions 3.3.0 and earlier do not support
+** either generated columns or decending indexes.
+** </dd>
+** </dl>
+*/
+#define SQLITE_DBCONFIG_MAINDBNAME            1000 /* const char* */
+#define SQLITE_DBCONFIG_LOOKASIDE             1001 /* void* int int */
+#define SQLITE_DBCONFIG_ENABLE_FKEY           1002 /* int int* */
+#define SQLITE_DBCONFIG_ENABLE_TRIGGER        1003 /* int int* */
+#define SQLITE_DBCONFIG_ENABLE_FTS3_TOKENIZER 1004 /* int int* */
+#define SQLITE_DBCONFIG_ENABLE_LOAD_EXTENSION 1005 /* int int* */
+#define SQLITE_DBCONFIG_NO_CKPT_ON_CLOSE      1006 /* int int* */
+#define SQLITE_DBCONFIG_ENABLE_QPSG           1007 /* int int* */
+#define SQLITE_DBCONFIG_TRIGGER_EQP           1008 /* int int* */
+#define SQLITE_DBCONFIG_RESET_DATABASE        1009 /* int int* */
+#define SQLITE_DBCONFIG_DEFENSIVE             1010 /* int int* */
+#define SQLITE_DBCONFIG_WRITABLE_SCHEMA       1011 /* int int* */
+#define SQLITE_DBCONFIG_LEGACY_ALTER_TABLE    1012 /* int int* */
+#define SQLITE_DBCONFIG_DQS_DML               1013 /* int int* */
+#define SQLITE_DBCONFIG_DQS_DDL               1014 /* int int* */
+#define SQLITE_DBCONFIG_ENABLE_VIEW           1015 /* int int* */
+#define SQLITE_DBCONFIG_LEGACY_FILE_FORMAT    1016 /* int int* */
+#define SQLITE_DBCONFIG_TRUSTED_SCHEMA        1017 /* int int* */
+#define SQLITE_DBCONFIG_MAX                   1017 /* Largest DBCONFIG */
+
+/*
+** CAPI3REF: Enable Or Disable Extended Result Codes
+** METHOD: sqlite3
+**
+** ^The sqlite3_extended_result_codes() routine enables or disables the
+** [extended result codes] feature of SQLite. ^The extended result
+** codes are disabled by default for historical compatibility.
+*/
+SQLITE_API int sqlite3_extended_result_codes(sqlite3*, int onoff);
+
+/*
+** CAPI3REF: Last Insert Rowid
+** METHOD: sqlite3
+**
+** ^Each entry in most SQLite tables (except for [WITHOUT ROWID] tables)
+** has a unique 64-bit signed
+** integer key called the [ROWID | "rowid"]. ^The rowid is always available
+** as an undeclared column named ROWID, OID, or _ROWID_ as long as those
+** names are not also used by explicitly declared columns. ^If
+** the table has a column of type [INTEGER PRIMARY KEY] then that column
+** is another alias for the rowid.
+**
+** ^The sqlite3_last_insert_rowid(D) interface usually returns the [rowid] of
+** the most recent successful [INSERT] into a rowid table or [virtual table]
+** on database connection D. ^Inserts into [WITHOUT ROWID] tables are not
+** recorded. ^If no successful [INSERT]s into rowid tables have ever occurred
+** on the database connection D, then sqlite3_last_insert_rowid(D) returns
+** zero.
+**
+** As well as being set automatically as rows are inserted into database
+** tables, the value returned by this function may be set explicitly by
+** [sqlite3_set_last_insert_rowid()]
+**
+** Some virtual table implementations may INSERT rows into rowid tables as
+** part of committing a transaction (e.g. to flush data accumulated in memory
+** to disk). In this case subsequent calls to this function return the rowid
+** associated with these internal INSERT operations, which leads to
+** unintuitive results. Virtual table implementations that do write to rowid
+** tables in this way can avoid this problem by restoring the original
+** rowid value using [sqlite3_set_last_insert_rowid()] before returning
+** control to the user.
+**
+** ^(If an [INSERT] occurs within a trigger then this routine will
+** return the [rowid] of the inserted row as long as the trigger is
+** running. Once the trigger program ends, the value returned
+** by this routine reverts to what it was before the trigger was fired.)^
+**
+** ^An [INSERT] that fails due to a constraint violation is not a
+** successful [INSERT] and does not change the value returned by this
+** routine.  ^Thus INSERT OR FAIL, INSERT OR IGNORE, INSERT OR ROLLBACK,
+** and INSERT OR ABORT make no changes to the return value of this
+** routine when their insertion fails.  ^(When INSERT OR REPLACE
+** encounters a constraint violation, it does not fail.  The
+** INSERT continues to completion after deleting rows that caused
+** the constraint problem so INSERT OR REPLACE will always change
+** the return value of this interface.)^
+**
+** ^For the purposes of this routine, an [INSERT] is considered to
+** be successful even if it is subsequently rolled back.
+**
+** This function is accessible to SQL statements via the
+** [last_insert_rowid() SQL function].
+**
+** If a separate thread performs a new [INSERT] on the same
+** database connection while the [sqlite3_last_insert_rowid()]
+** function is running and thus changes the last insert [rowid],
+** then the value returned by [sqlite3_last_insert_rowid()] is
+** unpredictable and might not equal either the old or the new
+** last insert [rowid].
+*/
+SQLITE_API sqlite3_int64 sqlite3_last_insert_rowid(sqlite3*);
+
+/*
+** CAPI3REF: Set the Last Insert Rowid value.
+** METHOD: sqlite3
+**
+** The sqlite3_set_last_insert_rowid(D, R) method allows the application to
+** set the value returned by calling sqlite3_last_insert_rowid(D) to R
+** without inserting a row into the database.
+*/
+SQLITE_API void sqlite3_set_last_insert_rowid(sqlite3*,sqlite3_int64);
+
+/*
+** CAPI3REF: Count The Number Of Rows Modified
+** METHOD: sqlite3
+**
+** ^These functions return the number of rows modified, inserted or
+** deleted by the most recently completed INSERT, UPDATE or DELETE
+** statement on the database connection specified by the only parameter.
+** The two functions are identical except for the type of the return value
+** and that if the number of rows modified by the most recent INSERT, UPDATE
+** or DELETE is greater than the maximum value supported by type "int", then
+** the return value of sqlite3_changes() is undefined. ^Executing any other
+** type of SQL statement does not modify the value returned by these functions.
+**
+** ^Only changes made directly by the INSERT, UPDATE or DELETE statement are
+** con
