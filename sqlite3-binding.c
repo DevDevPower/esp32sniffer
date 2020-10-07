@@ -2326,4 +2326,122 @@ struct sqlite3_mem_methods {
 **
 ** [[SQLITE_CONFIG_WIN32_HEAPSIZE]]
 ** <dt>SQLITE_CONFIG_WIN32_HEAPSIZE
-*
+** <dd>^The SQLITE_CONFIG_WIN32_HEAPSIZE option is only available if SQLite is
+** compiled for Windows with the [SQLITE_WIN32_MALLOC] pre-processor macro
+** defined. ^SQLITE_CONFIG_WIN32_HEAPSIZE takes a 32-bit unsigned integer value
+** that specifies the maximum size of the created heap.
+**
+** [[SQLITE_CONFIG_PCACHE_HDRSZ]]
+** <dt>SQLITE_CONFIG_PCACHE_HDRSZ
+** <dd>^The SQLITE_CONFIG_PCACHE_HDRSZ option takes a single parameter which
+** is a pointer to an integer and writes into that integer the number of extra
+** bytes per page required for each page in [SQLITE_CONFIG_PAGECACHE].
+** The amount of extra space required can change depending on the compiler,
+** target platform, and SQLite version.
+**
+** [[SQLITE_CONFIG_PMASZ]]
+** <dt>SQLITE_CONFIG_PMASZ
+** <dd>^The SQLITE_CONFIG_PMASZ option takes a single parameter which
+** is an unsigned integer and sets the "Minimum PMA Size" for the multithreaded
+** sorter to that integer.  The default minimum PMA Size is set by the
+** [SQLITE_SORTER_PMASZ] compile-time option.  New threads are launched
+** to help with sort operations when multithreaded sorting
+** is enabled (using the [PRAGMA threads] command) and the amount of content
+** to be sorted exceeds the page size times the minimum of the
+** [PRAGMA cache_size] setting and this value.
+**
+** [[SQLITE_CONFIG_STMTJRNL_SPILL]]
+** <dt>SQLITE_CONFIG_STMTJRNL_SPILL
+** <dd>^The SQLITE_CONFIG_STMTJRNL_SPILL option takes a single parameter which
+** becomes the [statement journal] spill-to-disk threshold.
+** [Statement journals] are held in memory until their size (in bytes)
+** exceeds this threshold, at which point they are written to disk.
+** Or if the threshold is -1, statement journals are always held
+** exclusively in memory.
+** Since many statement journals never become large, setting the spill
+** threshold to a value such as 64KiB can greatly reduce the amount of
+** I/O required to support statement rollback.
+** The default value for this setting is controlled by the
+** [SQLITE_STMTJRNL_SPILL] compile-time option.
+**
+** [[SQLITE_CONFIG_SORTERREF_SIZE]]
+** <dt>SQLITE_CONFIG_SORTERREF_SIZE
+** <dd>The SQLITE_CONFIG_SORTERREF_SIZE option accepts a single parameter
+** of type (int) - the new value of the sorter-reference size threshold.
+** Usually, when SQLite uses an external sort to order records according
+** to an ORDER BY clause, all fields required by the caller are present in the
+** sorted records. However, if SQLite determines based on the declared type
+** of a table column that its values are likely to be very large - larger
+** than the configured sorter-reference size threshold - then a reference
+** is stored in each sorted record and the required column values loaded
+** from the database as records are returned in sorted order. The default
+** value for this option is to never use this optimization. Specifying a
+** negative value for this option restores the default behaviour.
+** This option is only available if SQLite is compiled with the
+** [SQLITE_ENABLE_SORTER_REFERENCES] compile-time option.
+**
+** [[SQLITE_CONFIG_MEMDB_MAXSIZE]]
+** <dt>SQLITE_CONFIG_MEMDB_MAXSIZE
+** <dd>The SQLITE_CONFIG_MEMDB_MAXSIZE option accepts a single parameter
+** [sqlite3_int64] parameter which is the default maximum size for an in-memory
+** database created using [sqlite3_deserialize()].  This default maximum
+** size can be adjusted up or down for individual databases using the
+** [SQLITE_FCNTL_SIZE_LIMIT] [sqlite3_file_control|file-control].  If this
+** configuration setting is never used, then the default maximum is determined
+** by the [SQLITE_MEMDB_DEFAULT_MAXSIZE] compile-time option.  If that
+** compile-time option is not set, then the default maximum is 1073741824.
+** </dl>
+*/
+#define SQLITE_CONFIG_SINGLETHREAD  1  /* nil */
+#define SQLITE_CONFIG_MULTITHREAD   2  /* nil */
+#define SQLITE_CONFIG_SERIALIZED    3  /* nil */
+#define SQLITE_CONFIG_MALLOC        4  /* sqlite3_mem_methods* */
+#define SQLITE_CONFIG_GETMALLOC     5  /* sqlite3_mem_methods* */
+#define SQLITE_CONFIG_SCRATCH       6  /* No longer used */
+#define SQLITE_CONFIG_PAGECACHE     7  /* void*, int sz, int N */
+#define SQLITE_CONFIG_HEAP          8  /* void*, int nByte, int min */
+#define SQLITE_CONFIG_MEMSTATUS     9  /* boolean */
+#define SQLITE_CONFIG_MUTEX        10  /* sqlite3_mutex_methods* */
+#define SQLITE_CONFIG_GETMUTEX     11  /* sqlite3_mutex_methods* */
+/* previously SQLITE_CONFIG_CHUNKALLOC 12 which is now unused. */
+#define SQLITE_CONFIG_LOOKASIDE    13  /* int int */
+#define SQLITE_CONFIG_PCACHE       14  /* no-op */
+#define SQLITE_CONFIG_GETPCACHE    15  /* no-op */
+#define SQLITE_CONFIG_LOG          16  /* xFunc, void* */
+#define SQLITE_CONFIG_URI          17  /* int */
+#define SQLITE_CONFIG_PCACHE2      18  /* sqlite3_pcache_methods2* */
+#define SQLITE_CONFIG_GETPCACHE2   19  /* sqlite3_pcache_methods2* */
+#define SQLITE_CONFIG_COVERING_INDEX_SCAN 20  /* int */
+#define SQLITE_CONFIG_SQLLOG       21  /* xSqllog, void* */
+#define SQLITE_CONFIG_MMAP_SIZE    22  /* sqlite3_int64, sqlite3_int64 */
+#define SQLITE_CONFIG_WIN32_HEAPSIZE      23  /* int nByte */
+#define SQLITE_CONFIG_PCACHE_HDRSZ        24  /* int *psz */
+#define SQLITE_CONFIG_PMASZ               25  /* unsigned int szPma */
+#define SQLITE_CONFIG_STMTJRNL_SPILL      26  /* int nByte */
+#define SQLITE_CONFIG_SMALL_MALLOC        27  /* boolean */
+#define SQLITE_CONFIG_SORTERREF_SIZE      28  /* int nByte */
+#define SQLITE_CONFIG_MEMDB_MAXSIZE       29  /* sqlite3_int64 */
+
+/*
+** CAPI3REF: Database Connection Configuration Options
+**
+** These constants are the available integer configuration options that
+** can be passed as the second argument to the [sqlite3_db_config()] interface.
+**
+** New configuration options may be added in future releases of SQLite.
+** Existing configuration options might be discontinued.  Applications
+** should check the return code from [sqlite3_db_config()] to make sure that
+** the call worked.  ^The [sqlite3_db_config()] interface will return a
+** non-zero [error code] if a discontinued or unsupported configuration option
+** is invoked.
+**
+** <dl>
+** [[SQLITE_DBCONFIG_LOOKASIDE]]
+** <dt>SQLITE_DBCONFIG_LOOKASIDE</dt>
+** <dd> ^This option takes three additional arguments that determine the
+** [lookaside memory allocator] configuration for the [database connection].
+** ^The first argument (the third parameter to [sqlite3_db_config()] is a
+** pointer to a memory buffer to use for lookaside memory.
+** ^The first argument after the SQLITE_DBCONFIG_LOOKASIDE verb
+** may be NULL in which case SQLite will allocate the
+** lookaside buffer itself using [sqlite3_malloc()]. ^The
