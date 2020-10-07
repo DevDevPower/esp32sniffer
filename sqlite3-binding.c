@@ -2958,4 +2958,157 @@ SQLITE_API void sqlite3_interrupt(sqlite3*);
 ** well-formed CREATE TRIGGER statement.  ^Semicolons that are embedded within
 ** string literals or quoted identifier names or comments are not
 ** independent tokens (they are part of the token in which they are
-** embedded) and thus do not count as a statement termi
+** embedded) and thus do not count as a statement terminator.  ^Whitespace
+** and comments that follow the final semicolon are ignored.
+**
+** ^These routines return 0 if the statement is incomplete.  ^If a
+** memory allocation fails, then SQLITE_NOMEM is returned.
+**
+** ^These routines do not parse the SQL statements thus
+** will not detect syntactically incorrect SQL.
+**
+** ^(If SQLite has not been initialized using [sqlite3_initialize()] prior
+** to invoking sqlite3_complete16() then sqlite3_initialize() is invoked
+** automatically by sqlite3_complete16().  If that initialization fails,
+** then the return value from sqlite3_complete16() will be non-zero
+** regardless of whether or not the input SQL is complete.)^
+**
+** The input to [sqlite3_complete()] must be a zero-terminated
+** UTF-8 string.
+**
+** The input to [sqlite3_complete16()] must be a zero-terminated
+** UTF-16 string in native byte order.
+*/
+SQLITE_API int sqlite3_complete(const char *sql);
+SQLITE_API int sqlite3_complete16(const void *sql);
+
+/*
+** CAPI3REF: Register A Callback To Handle SQLITE_BUSY Errors
+** KEYWORDS: {busy-handler callback} {busy handler}
+** METHOD: sqlite3
+**
+** ^The sqlite3_busy_handler(D,X,P) routine sets a callback function X
+** that might be invoked with argument P whenever
+** an attempt is made to access a database table associated with
+** [database connection] D when another thread
+** or process has the table locked.
+** The sqlite3_busy_handler() interface is used to implement
+** [sqlite3_busy_timeout()] and [PRAGMA busy_timeout].
+**
+** ^If the busy callback is NULL, then [SQLITE_BUSY]
+** is returned immediately upon encountering the lock.  ^If the busy callback
+** is not NULL, then the callback might be invoked with two arguments.
+**
+** ^The first argument to the busy handler is a copy of the void* pointer which
+** is the third argument to sqlite3_busy_handler().  ^The second argument to
+** the busy handler callback is the number of times that the busy handler has
+** been invoked previously for the same locking event.  ^If the
+** busy callback returns 0, then no additional attempts are made to
+** access the database and [SQLITE_BUSY] is returned
+** to the application.
+** ^If the callback returns non-zero, then another attempt
+** is made to access the database and the cycle repeats.
+**
+** The presence of a busy handler does not guarantee that it will be invoked
+** when there is lock contention. ^If SQLite determines that invoking the busy
+** handler could result in a deadlock, it will go ahead and return [SQLITE_BUSY]
+** to the application instead of invoking the
+** busy handler.
+** Consider a scenario where one process is holding a read lock that
+** it is trying to promote to a reserved lock and
+** a second process is holding a reserved lock that it is trying
+** to promote to an exclusive lock.  The first process cannot proceed
+** because it is blocked by the second and the second process cannot
+** proceed because it is blocked by the first.  If both processes
+** invoke the busy handlers, neither will make any progress.  Therefore,
+** SQLite returns [SQLITE_BUSY] for the first process, hoping that this
+** will induce the first process to release its read lock and allow
+** the second process to proceed.
+**
+** ^The default busy callback is NULL.
+**
+** ^(There can only be a single busy handler defined for each
+** [database connection].  Setting a new busy handler clears any
+** previously set handler.)^  ^Note that calling [sqlite3_busy_timeout()]
+** or evaluating [PRAGMA busy_timeout=N] will change the
+** busy handler and thus clear any previously set busy handler.
+**
+** The busy callback should not take any actions which modify the
+** database connection that invoked the busy handler.  In other words,
+** the busy handler is not reentrant.  Any such actions
+** result in undefined behavior.
+**
+** A busy handler must not close the database connection
+** or [prepared statement] that invoked the busy handler.
+*/
+SQLITE_API int sqlite3_busy_handler(sqlite3*,int(*)(void*,int),void*);
+
+/*
+** CAPI3REF: Set A Busy Timeout
+** METHOD: sqlite3
+**
+** ^This routine sets a [sqlite3_busy_handler | busy handler] that sleeps
+** for a specified amount of time when a table is locked.  ^The handler
+** will sleep multiple times until at least "ms" milliseconds of sleeping
+** have accumulated.  ^After at least "ms" milliseconds of sleeping,
+** the handler returns 0 which causes [sqlite3_step()] to return
+** [SQLITE_BUSY].
+**
+** ^Calling this routine with an argument less than or equal to zero
+** turns off all busy handlers.
+**
+** ^(There can only be a single busy handler for a particular
+** [database connection] at any given moment.  If another busy handler
+** was defined  (using [sqlite3_busy_handler()]) prior to calling
+** this routine, that other busy handler is cleared.)^
+**
+** See also:  [PRAGMA busy_timeout]
+*/
+SQLITE_API int sqlite3_busy_timeout(sqlite3*, int ms);
+
+/*
+** CAPI3REF: Convenience Routines For Running Queries
+** METHOD: sqlite3
+**
+** This is a legacy interface that is preserved for backwards compatibility.
+** Use of this interface is not recommended.
+**
+** Definition: A <b>result table</b> is memory data structure created by the
+** [sqlite3_get_table()] interface.  A result table records the
+** complete query results from one or more queries.
+**
+** The table conceptually has a number of rows and columns.  But
+** these numbers are not part of the result table itself.  These
+** numbers are obtained separately.  Let N be the number of rows
+** and M be the number of columns.
+**
+** A result table is an array of pointers to zero-terminated UTF-8 strings.
+** There are (N+1)*M elements in the array.  The first M pointers point
+** to zero-terminated strings that  contain the names of the columns.
+** The remaining entries all point to query results.  NULL values result
+** in NULL pointers.  All other values are in their UTF-8 zero-terminated
+** string representation as returned by [sqlite3_column_text()].
+**
+** A result table might consist of one or more memory allocations.
+** It is not safe to pass a result table directly to [sqlite3_free()].
+** A result table should be deallocated using [sqlite3_free_table()].
+**
+** ^(As an example of the result table format, suppose a query result
+** is as follows:
+**
+** <blockquote><pre>
+**        Name        | Age
+**        -----------------------
+**        Alice       | 43
+**        Bob         | 28
+**        Cindy       | 21
+** </pre></blockquote>
+**
+** There are two columns (M==2) and three rows (N==3).  Thus the
+** result table has 8 entries.  Suppose the result table is stored
+** in an array named azResult.  Then azResult holds this content:
+**
+** <blockquote><pre>
+**        azResult&#91;0] = "Name";
+**        azResult&#91;1] = "Age";
+**      
