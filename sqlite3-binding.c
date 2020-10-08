@@ -3381,4 +3381,124 @@ SQLITE_API void sqlite3_randomness(int N, void *P);
 ** SQL statements from an untrusted source, to ensure that the SQL statements
 ** do not try to access data they are not allowed to see, or that they do not
 ** try to execute malicious statements that damage the database.  For
-** example, an application may allow a user to 
+** example, an application may allow a user to enter arbitrary
+** SQL queries for evaluation by a database.  But the application does
+** not want the user to be able to make arbitrary changes to the
+** database.  An authorizer could then be put in place while the
+** user-entered SQL is being [sqlite3_prepare | prepared] that
+** disallows everything except [SELECT] statements.
+**
+** Applications that need to process SQL from untrusted sources
+** might also consider lowering resource limits using [sqlite3_limit()]
+** and limiting database size using the [max_page_count] [PRAGMA]
+** in addition to using an authorizer.
+**
+** ^(Only a single authorizer can be in place on a database connection
+** at a time.  Each call to sqlite3_set_authorizer overrides the
+** previous call.)^  ^Disable the authorizer by installing a NULL callback.
+** The authorizer is disabled by default.
+**
+** The authorizer callback must not do anything that will modify
+** the database connection that invoked the authorizer callback.
+** Note that [sqlite3_prepare_v2()] and [sqlite3_step()] both modify their
+** database connections for the meaning of "modify" in this paragraph.
+**
+** ^When [sqlite3_prepare_v2()] is used to prepare a statement, the
+** statement might be re-prepared during [sqlite3_step()] due to a
+** schema change.  Hence, the application should ensure that the
+** correct authorizer callback remains in place during the [sqlite3_step()].
+**
+** ^Note that the authorizer callback is invoked only during
+** [sqlite3_prepare()] or its variants.  Authorization is not
+** performed during statement evaluation in [sqlite3_step()], unless
+** as stated in the previous paragraph, sqlite3_step() invokes
+** sqlite3_prepare_v2() to reprepare a statement after a schema change.
+*/
+SQLITE_API int sqlite3_set_authorizer(
+  sqlite3*,
+  int (*xAuth)(void*,int,const char*,const char*,const char*,const char*),
+  void *pUserData
+);
+
+/*
+** CAPI3REF: Authorizer Return Codes
+**
+** The [sqlite3_set_authorizer | authorizer callback function] must
+** return either [SQLITE_OK] or one of these two constants in order
+** to signal SQLite whether or not the action is permitted.  See the
+** [sqlite3_set_authorizer | authorizer documentation] for additional
+** information.
+**
+** Note that SQLITE_IGNORE is also used as a [conflict resolution mode]
+** returned from the [sqlite3_vtab_on_conflict()] interface.
+*/
+#define SQLITE_DENY   1   /* Abort the SQL statement with an error */
+#define SQLITE_IGNORE 2   /* Don't allow access, but don't generate an error */
+
+/*
+** CAPI3REF: Authorizer Action Codes
+**
+** The [sqlite3_set_authorizer()] interface registers a callback function
+** that is invoked to authorize certain SQL statement actions.  The
+** second parameter to the callback is an integer code that specifies
+** what action is being authorized.  These are the integer action codes that
+** the authorizer callback may be passed.
+**
+** These action code values signify what kind of operation is to be
+** authorized.  The 3rd and 4th parameters to the authorization
+** callback function will be parameters or NULL depending on which of these
+** codes is used as the second parameter.  ^(The 5th parameter to the
+** authorizer callback is the name of the database ("main", "temp",
+** etc.) if applicable.)^  ^The 6th parameter to the authorizer callback
+** is the name of the inner-most trigger or view that is responsible for
+** the access attempt or NULL if this access attempt is directly from
+** top-level SQL code.
+*/
+/******************************************* 3rd ************ 4th ***********/
+#define SQLITE_CREATE_INDEX          1   /* Index Name      Table Name      */
+#define SQLITE_CREATE_TABLE          2   /* Table Name      NULL            */
+#define SQLITE_CREATE_TEMP_INDEX     3   /* Index Name      Table Name      */
+#define SQLITE_CREATE_TEMP_TABLE     4   /* Table Name      NULL            */
+#define SQLITE_CREATE_TEMP_TRIGGER   5   /* Trigger Name    Table Name      */
+#define SQLITE_CREATE_TEMP_VIEW      6   /* View Name       NULL            */
+#define SQLITE_CREATE_TRIGGER        7   /* Trigger Name    Table Name      */
+#define SQLITE_CREATE_VIEW           8   /* View Name       NULL            */
+#define SQLITE_DELETE                9   /* Table Name      NULL            */
+#define SQLITE_DROP_INDEX           10   /* Index Name      Table Name      */
+#define SQLITE_DROP_TABLE           11   /* Table Name      NULL            */
+#define SQLITE_DROP_TEMP_INDEX      12   /* Index Name      Table Name      */
+#define SQLITE_DROP_TEMP_TABLE      13   /* Table Name      NULL            */
+#define SQLITE_DROP_TEMP_TRIGGER    14   /* Trigger Name    Table Name      */
+#define SQLITE_DROP_TEMP_VIEW       15   /* View Name       NULL            */
+#define SQLITE_DROP_TRIGGER         16   /* Trigger Name    Table Name      */
+#define SQLITE_DROP_VIEW            17   /* View Name       NULL            */
+#define SQLITE_INSERT               18   /* Table Name      NULL            */
+#define SQLITE_PRAGMA               19   /* Pragma Name     1st arg or NULL */
+#define SQLITE_READ                 20   /* Table Name      Column Name     */
+#define SQLITE_SELECT               21   /* NULL            NULL            */
+#define SQLITE_TRANSACTION          22   /* Operation       NULL            */
+#define SQLITE_UPDATE               23   /* Table Name      Column Name     */
+#define SQLITE_ATTACH               24   /* Filename        NULL            */
+#define SQLITE_DETACH               25   /* Database Name   NULL            */
+#define SQLITE_ALTER_TABLE          26   /* Database Name   Table Name      */
+#define SQLITE_REINDEX              27   /* Index Name      NULL            */
+#define SQLITE_ANALYZE              28   /* Table Name      NULL            */
+#define SQLITE_CREATE_VTABLE        29   /* Table Name      Module Name     */
+#define SQLITE_DROP_VTABLE          30   /* Table Name      Module Name     */
+#define SQLITE_FUNCTION             31   /* NULL            Function Name   */
+#define SQLITE_SAVEPOINT            32   /* Operation       Savepoint Name  */
+#define SQLITE_COPY                  0   /* No longer used */
+#define SQLITE_RECURSIVE            33   /* NULL            NULL            */
+
+/*
+** CAPI3REF: Tracing And Profiling Functions
+** METHOD: sqlite3
+**
+** These routines are deprecated. Use the [sqlite3_trace_v2()] interface
+** instead of the routines described here.
+**
+** These routines register callback functions that can be used for
+** tracing and profiling the execution of SQL statements.
+**
+** ^The callback function registered by sqlite3_trace() is invoked at
+** various times when an SQL statement
