@@ -3111,4 +3111,140 @@ SQLITE_API int sqlite3_busy_timeout(sqlite3*, int ms);
 ** <blockquote><pre>
 **        azResult&#91;0] = "Name";
 **        azResult&#91;1] = "Age";
-**      
+**        azResult&#91;2] = "Alice";
+**        azResult&#91;3] = "43";
+**        azResult&#91;4] = "Bob";
+**        azResult&#91;5] = "28";
+**        azResult&#91;6] = "Cindy";
+**        azResult&#91;7] = "21";
+** </pre></blockquote>)^
+**
+** ^The sqlite3_get_table() function evaluates one or more
+** semicolon-separated SQL statements in the zero-terminated UTF-8
+** string of its 2nd parameter and returns a result table to the
+** pointer given in its 3rd parameter.
+**
+** After the application has finished with the result from sqlite3_get_table(),
+** it must pass the result table pointer to sqlite3_free_table() in order to
+** release the memory that was malloced.  Because of the way the
+** [sqlite3_malloc()] happens within sqlite3_get_table(), the calling
+** function must not try to call [sqlite3_free()] directly.  Only
+** [sqlite3_free_table()] is able to release the memory properly and safely.
+**
+** The sqlite3_get_table() interface is implemented as a wrapper around
+** [sqlite3_exec()].  The sqlite3_get_table() routine does not have access
+** to any internal data structures of SQLite.  It uses only the public
+** interface defined here.  As a consequence, errors that occur in the
+** wrapper layer outside of the internal [sqlite3_exec()] call are not
+** reflected in subsequent calls to [sqlite3_errcode()] or
+** [sqlite3_errmsg()].
+*/
+SQLITE_API int sqlite3_get_table(
+  sqlite3 *db,          /* An open database */
+  const char *zSql,     /* SQL to be evaluated */
+  char ***pazResult,    /* Results of the query */
+  int *pnRow,           /* Number of result rows written here */
+  int *pnColumn,        /* Number of result columns written here */
+  char **pzErrmsg       /* Error msg written here */
+);
+SQLITE_API void sqlite3_free_table(char **result);
+
+/*
+** CAPI3REF: Formatted String Printing Functions
+**
+** These routines are work-alikes of the "printf()" family of functions
+** from the standard C library.
+** These routines understand most of the common formatting options from
+** the standard library printf()
+** plus some additional non-standard formats ([%q], [%Q], [%w], and [%z]).
+** See the [built-in printf()] documentation for details.
+**
+** ^The sqlite3_mprintf() and sqlite3_vmprintf() routines write their
+** results into memory obtained from [sqlite3_malloc64()].
+** The strings returned by these two routines should be
+** released by [sqlite3_free()].  ^Both routines return a
+** NULL pointer if [sqlite3_malloc64()] is unable to allocate enough
+** memory to hold the resulting string.
+**
+** ^(The sqlite3_snprintf() routine is similar to "snprintf()" from
+** the standard C library.  The result is written into the
+** buffer supplied as the second parameter whose size is given by
+** the first parameter. Note that the order of the
+** first two parameters is reversed from snprintf().)^  This is an
+** historical accident that cannot be fixed without breaking
+** backwards compatibility.  ^(Note also that sqlite3_snprintf()
+** returns a pointer to its buffer instead of the number of
+** characters actually written into the buffer.)^  We admit that
+** the number of characters written would be a more useful return
+** value but we cannot change the implementation of sqlite3_snprintf()
+** now without breaking compatibility.
+**
+** ^As long as the buffer size is greater than zero, sqlite3_snprintf()
+** guarantees that the buffer is always zero-terminated.  ^The first
+** parameter "n" is the total size of the buffer, including space for
+** the zero terminator.  So the longest string that can be completely
+** written will be n-1 characters.
+**
+** ^The sqlite3_vsnprintf() routine is a varargs version of sqlite3_snprintf().
+**
+** See also:  [built-in printf()], [printf() SQL function]
+*/
+SQLITE_API char *sqlite3_mprintf(const char*,...);
+SQLITE_API char *sqlite3_vmprintf(const char*, va_list);
+SQLITE_API char *sqlite3_snprintf(int,char*,const char*, ...);
+SQLITE_API char *sqlite3_vsnprintf(int,char*,const char*, va_list);
+
+/*
+** CAPI3REF: Memory Allocation Subsystem
+**
+** The SQLite core uses these three routines for all of its own
+** internal memory allocation needs. "Core" in the previous sentence
+** does not include operating-system specific [VFS] implementation.  The
+** Windows VFS uses native malloc() and free() for some operations.
+**
+** ^The sqlite3_malloc() routine returns a pointer to a block
+** of memory at least N bytes in length, where N is the parameter.
+** ^If sqlite3_malloc() is unable to obtain sufficient free
+** memory, it returns a NULL pointer.  ^If the parameter N to
+** sqlite3_malloc() is zero or negative then sqlite3_malloc() returns
+** a NULL pointer.
+**
+** ^The sqlite3_malloc64(N) routine works just like
+** sqlite3_malloc(N) except that N is an unsigned 64-bit integer instead
+** of a signed 32-bit integer.
+**
+** ^Calling sqlite3_free() with a pointer previously returned
+** by sqlite3_malloc() or sqlite3_realloc() releases that memory so
+** that it might be reused.  ^The sqlite3_free() routine is
+** a no-op if is called with a NULL pointer.  Passing a NULL pointer
+** to sqlite3_free() is harmless.  After being freed, memory
+** should neither be read nor written.  Even reading previously freed
+** memory might result in a segmentation fault or other severe error.
+** Memory corruption, a segmentation fault, or other severe error
+** might result if sqlite3_free() is called with a non-NULL pointer that
+** was not obtained from sqlite3_malloc() or sqlite3_realloc().
+**
+** ^The sqlite3_realloc(X,N) interface attempts to resize a
+** prior memory allocation X to be at least N bytes.
+** ^If the X parameter to sqlite3_realloc(X,N)
+** is a NULL pointer then its behavior is identical to calling
+** sqlite3_malloc(N).
+** ^If the N parameter to sqlite3_realloc(X,N) is zero or
+** negative then the behavior is exactly the same as calling
+** sqlite3_free(X).
+** ^sqlite3_realloc(X,N) returns a pointer to a memory allocation
+** of at least N bytes in size or NULL if insufficient memory is available.
+** ^If M is the size of the prior allocation, then min(N,M) bytes
+** of the prior allocation are copied into the beginning of buffer returned
+** by sqlite3_realloc(X,N) and the prior allocation is freed.
+** ^If sqlite3_realloc(X,N) returns NULL and N is positive, then the
+** prior allocation is not freed.
+**
+** ^The sqlite3_realloc64(X,N) interfaces works the same as
+** sqlite3_realloc(X,N) except that N is a 64-bit unsigned integer instead
+** of a 32-bit signed integer.
+**
+** ^If X is a memory allocation previously obtained from sqlite3_malloc(),
+** sqlite3_malloc64(), sqlite3_realloc(), or sqlite3_realloc64(), then
+** sqlite3_msize(X) returns the size of that memory allocation in bytes.
+** ^The value returned by sqlite3_msize(X) might be larger than the
