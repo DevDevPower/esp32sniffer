@@ -3646,4 +3646,140 @@ SQLITE_API int sqlite3_trace_v2(
 ** interrupted.  This feature can be used to implement a
 ** "Cancel" button on a GUI progress dialog box.
 **
-** The progress handler callback must not do anythin
+** The progress handler callback must not do anything that will modify
+** the database connection that invoked the progress handler.
+** Note that [sqlite3_prepare_v2()] and [sqlite3_step()] both modify their
+** database connections for the meaning of "modify" in this paragraph.
+**
+*/
+SQLITE_API void sqlite3_progress_handler(sqlite3*, int, int(*)(void*), void*);
+
+/*
+** CAPI3REF: Opening A New Database Connection
+** CONSTRUCTOR: sqlite3
+**
+** ^These routines open an SQLite database file as specified by the
+** filename argument. ^The filename argument is interpreted as UTF-8 for
+** sqlite3_open() and sqlite3_open_v2() and as UTF-16 in the native byte
+** order for sqlite3_open16(). ^(A [database connection] handle is usually
+** returned in *ppDb, even if an error occurs.  The only exception is that
+** if SQLite is unable to allocate memory to hold the [sqlite3] object,
+** a NULL will be written into *ppDb instead of a pointer to the [sqlite3]
+** object.)^ ^(If the database is opened (and/or created) successfully, then
+** [SQLITE_OK] is returned.  Otherwise an [error code] is returned.)^ ^The
+** [sqlite3_errmsg()] or [sqlite3_errmsg16()] routines can be used to obtain
+** an English language description of the error following a failure of any
+** of the sqlite3_open() routines.
+**
+** ^The default encoding will be UTF-8 for databases created using
+** sqlite3_open() or sqlite3_open_v2().  ^The default encoding for databases
+** created using sqlite3_open16() will be UTF-16 in the native byte order.
+**
+** Whether or not an error occurs when it is opened, resources
+** associated with the [database connection] handle should be released by
+** passing it to [sqlite3_close()] when it is no longer required.
+**
+** The sqlite3_open_v2() interface works like sqlite3_open()
+** except that it accepts two additional parameters for additional control
+** over the new database connection.  ^(The flags parameter to
+** sqlite3_open_v2() must include, at a minimum, one of the following
+** three flag combinations:)^
+**
+** <dl>
+** ^(<dt>[SQLITE_OPEN_READONLY]</dt>
+** <dd>The database is opened in read-only mode.  If the database does not
+** already exist, an error is returned.</dd>)^
+**
+** ^(<dt>[SQLITE_OPEN_READWRITE]</dt>
+** <dd>The database is opened for reading and writing if possible, or reading
+** only if the file is write protected by the operating system.  In either
+** case the database must already exist, otherwise an error is returned.</dd>)^
+**
+** ^(<dt>[SQLITE_OPEN_READWRITE] | [SQLITE_OPEN_CREATE]</dt>
+** <dd>The database is opened for reading and writing, and is created if
+** it does not already exist. This is the behavior that is always used for
+** sqlite3_open() and sqlite3_open16().</dd>)^
+** </dl>
+**
+** In addition to the required flags, the following optional flags are
+** also supported:
+**
+** <dl>
+** ^(<dt>[SQLITE_OPEN_URI]</dt>
+** <dd>The filename can be interpreted as a URI if this flag is set.</dd>)^
+**
+** ^(<dt>[SQLITE_OPEN_MEMORY]</dt>
+** <dd>The database will be opened as an in-memory database.  The database
+** is named by the "filename" argument for the purposes of cache-sharing,
+** if shared cache mode is enabled, but the "filename" is otherwise ignored.
+** </dd>)^
+**
+** ^(<dt>[SQLITE_OPEN_NOMUTEX]</dt>
+** <dd>The new database connection will use the "multi-thread"
+** [threading mode].)^  This means that separate threads are allowed
+** to use SQLite at the same time, as long as each thread is using
+** a different [database connection].
+**
+** ^(<dt>[SQLITE_OPEN_FULLMUTEX]</dt>
+** <dd>The new database connection will use the "serialized"
+** [threading mode].)^  This means the multiple threads can safely
+** attempt to use the same database connection at the same time.
+** (Mutexes will block any actual concurrency, but in this mode
+** there is no harm in trying.)
+**
+** ^(<dt>[SQLITE_OPEN_SHAREDCACHE]</dt>
+** <dd>The database is opened [shared cache] enabled, overriding
+** the default shared cache setting provided by
+** [sqlite3_enable_shared_cache()].)^
+**
+** ^(<dt>[SQLITE_OPEN_PRIVATECACHE]</dt>
+** <dd>The database is opened [shared cache] disabled, overriding
+** the default shared cache setting provided by
+** [sqlite3_enable_shared_cache()].)^
+**
+** [[OPEN_EXRESCODE]] ^(<dt>[SQLITE_OPEN_EXRESCODE]</dt>
+** <dd>The database connection comes up in "extended result code mode".
+** In other words, the database behaves has if
+** [sqlite3_extended_result_codes(db,1)] where called on the database
+** connection as soon as the connection is created. In addition to setting
+** the extended result code mode, this flag also causes [sqlite3_open_v2()]
+** to return an extended result code.</dd>
+**
+** [[OPEN_NOFOLLOW]] ^(<dt>[SQLITE_OPEN_NOFOLLOW]</dt>
+** <dd>The database filename is not allowed to be a symbolic link</dd>
+** </dl>)^
+**
+** If the 3rd parameter to sqlite3_open_v2() is not one of the
+** required combinations shown above optionally combined with other
+** [SQLITE_OPEN_READONLY | SQLITE_OPEN_* bits]
+** then the behavior is undefined.  Historic versions of SQLite
+** have silently ignored surplus bits in the flags parameter to
+** sqlite3_open_v2(), however that behavior might not be carried through
+** into future versions of SQLite and so applications should not rely
+** upon it.  Note in particular that the SQLITE_OPEN_EXCLUSIVE flag is a no-op
+** for sqlite3_open_v2().  The SQLITE_OPEN_EXCLUSIVE does *not* cause
+** the open to fail if the database already exists.  The SQLITE_OPEN_EXCLUSIVE
+** flag is intended for use by the [sqlite3_vfs|VFS interface] only, and not
+** by sqlite3_open_v2().
+**
+** ^The fourth parameter to sqlite3_open_v2() is the name of the
+** [sqlite3_vfs] object that defines the operating system interface that
+** the new database connection should use.  ^If the fourth parameter is
+** a NULL pointer then the default [sqlite3_vfs] object is used.
+**
+** ^If the filename is ":memory:", then a private, temporary in-memory database
+** is created for the connection.  ^This in-memory database will vanish when
+** the database connection is closed.  Future versions of SQLite might
+** make use of additional special filenames that begin with the ":" character.
+** It is recommended that when a database filename actually does begin with
+** a ":" character you should prefix the filename with a pathname such as
+** "./" to avoid ambiguity.
+**
+** ^If the filename is an empty string, then a private, temporary
+** on-disk database will be created.  ^This private database will be
+** automatically deleted as soon as the database connection is closed.
+**
+** [[URI filenames in sqlite3_open()]] <h3>URI Filenames</h3>
+**
+** ^If [URI filename] interpretation is enabled, and the filename argument
+** begins with "file:", then the 
