@@ -4188,4 +4188,150 @@ SQLITE_API int sqlite3_error_offset(sqlite3 *db);
 ** An instance of this object represents a single SQL statement that
 ** has been compiled into binary form and is ready to be evaluated.
 **
-** Think of eac
+** Think of each SQL statement as a separate computer program.  The
+** original SQL text is source code.  A prepared statement object
+** is the compiled object code.  All SQL must be converted into a
+** prepared statement before it can be run.
+**
+** The life-cycle of a prepared statement object usually goes like this:
+**
+** <ol>
+** <li> Create the prepared statement object using [sqlite3_prepare_v2()].
+** <li> Bind values to [parameters] using the sqlite3_bind_*()
+**      interfaces.
+** <li> Run the SQL by calling [sqlite3_step()] one or more times.
+** <li> Reset the prepared statement using [sqlite3_reset()] then go back
+**      to step 2.  Do this zero or more times.
+** <li> Destroy the object using [sqlite3_finalize()].
+** </ol>
+*/
+typedef struct sqlite3_stmt sqlite3_stmt;
+
+/*
+** CAPI3REF: Run-time Limits
+** METHOD: sqlite3
+**
+** ^(This interface allows the size of various constructs to be limited
+** on a connection by connection basis.  The first parameter is the
+** [database connection] whose limit is to be set or queried.  The
+** second parameter is one of the [limit categories] that define a
+** class of constructs to be size limited.  The third parameter is the
+** new limit for that construct.)^
+**
+** ^If the new limit is a negative number, the limit is unchanged.
+** ^(For each limit category SQLITE_LIMIT_<i>NAME</i> there is a
+** [limits | hard upper bound]
+** set at compile-time by a C preprocessor macro called
+** [limits | SQLITE_MAX_<i>NAME</i>].
+** (The "_LIMIT_" in the name is changed to "_MAX_".))^
+** ^Attempts to increase a limit above its hard upper bound are
+** silently truncated to the hard upper bound.
+**
+** ^Regardless of whether or not the limit was changed, the
+** [sqlite3_limit()] interface returns the prior value of the limit.
+** ^Hence, to find the current value of a limit without changing it,
+** simply invoke this interface with the third parameter set to -1.
+**
+** Run-time limits are intended for use in applications that manage
+** both their own internal database and also databases that are controlled
+** by untrusted external sources.  An example application might be a
+** web browser that has its own databases for storing history and
+** separate databases controlled by JavaScript applications downloaded
+** off the Internet.  The internal databases can be given the
+** large, default limits.  Databases managed by external sources can
+** be given much smaller limits designed to prevent a denial of service
+** attack.  Developers might also want to use the [sqlite3_set_authorizer()]
+** interface to further control untrusted SQL.  The size of the database
+** created by an untrusted script can be contained using the
+** [max_page_count] [PRAGMA].
+**
+** New run-time limit categories may be added in future releases.
+*/
+SQLITE_API int sqlite3_limit(sqlite3*, int id, int newVal);
+
+/*
+** CAPI3REF: Run-Time Limit Categories
+** KEYWORDS: {limit category} {*limit categories}
+**
+** These constants define various performance limits
+** that can be lowered at run-time using [sqlite3_limit()].
+** The synopsis of the meanings of the various limits is shown below.
+** Additional information is available at [limits | Limits in SQLite].
+**
+** <dl>
+** [[SQLITE_LIMIT_LENGTH]] ^(<dt>SQLITE_LIMIT_LENGTH</dt>
+** <dd>The maximum size of any string or BLOB or table row, in bytes.<dd>)^
+**
+** [[SQLITE_LIMIT_SQL_LENGTH]] ^(<dt>SQLITE_LIMIT_SQL_LENGTH</dt>
+** <dd>The maximum length of an SQL statement, in bytes.</dd>)^
+**
+** [[SQLITE_LIMIT_COLUMN]] ^(<dt>SQLITE_LIMIT_COLUMN</dt>
+** <dd>The maximum number of columns in a table definition or in the
+** result set of a [SELECT] or the maximum number of columns in an index
+** or in an ORDER BY or GROUP BY clause.</dd>)^
+**
+** [[SQLITE_LIMIT_EXPR_DEPTH]] ^(<dt>SQLITE_LIMIT_EXPR_DEPTH</dt>
+** <dd>The maximum depth of the parse tree on any expression.</dd>)^
+**
+** [[SQLITE_LIMIT_COMPOUND_SELECT]] ^(<dt>SQLITE_LIMIT_COMPOUND_SELECT</dt>
+** <dd>The maximum number of terms in a compound SELECT statement.</dd>)^
+**
+** [[SQLITE_LIMIT_VDBE_OP]] ^(<dt>SQLITE_LIMIT_VDBE_OP</dt>
+** <dd>The maximum number of instructions in a virtual machine program
+** used to implement an SQL statement.  If [sqlite3_prepare_v2()] or
+** the equivalent tries to allocate space for more than this many opcodes
+** in a single prepared statement, an SQLITE_NOMEM error is returned.</dd>)^
+**
+** [[SQLITE_LIMIT_FUNCTION_ARG]] ^(<dt>SQLITE_LIMIT_FUNCTION_ARG</dt>
+** <dd>The maximum number of arguments on a function.</dd>)^
+**
+** [[SQLITE_LIMIT_ATTACHED]] ^(<dt>SQLITE_LIMIT_ATTACHED</dt>
+** <dd>The maximum number of [ATTACH | attached databases].)^</dd>
+**
+** [[SQLITE_LIMIT_LIKE_PATTERN_LENGTH]]
+** ^(<dt>SQLITE_LIMIT_LIKE_PATTERN_LENGTH</dt>
+** <dd>The maximum length of the pattern argument to the [LIKE] or
+** [GLOB] operators.</dd>)^
+**
+** [[SQLITE_LIMIT_VARIABLE_NUMBER]]
+** ^(<dt>SQLITE_LIMIT_VARIABLE_NUMBER</dt>
+** <dd>The maximum index number of any [parameter] in an SQL statement.)^
+**
+** [[SQLITE_LIMIT_TRIGGER_DEPTH]] ^(<dt>SQLITE_LIMIT_TRIGGER_DEPTH</dt>
+** <dd>The maximum depth of recursion for triggers.</dd>)^
+**
+** [[SQLITE_LIMIT_WORKER_THREADS]] ^(<dt>SQLITE_LIMIT_WORKER_THREADS</dt>
+** <dd>The maximum number of auxiliary worker threads that a single
+** [prepared statement] may start.</dd>)^
+** </dl>
+*/
+#define SQLITE_LIMIT_LENGTH                    0
+#define SQLITE_LIMIT_SQL_LENGTH                1
+#define SQLITE_LIMIT_COLUMN                    2
+#define SQLITE_LIMIT_EXPR_DEPTH                3
+#define SQLITE_LIMIT_COMPOUND_SELECT           4
+#define SQLITE_LIMIT_VDBE_OP                   5
+#define SQLITE_LIMIT_FUNCTION_ARG              6
+#define SQLITE_LIMIT_ATTACHED                  7
+#define SQLITE_LIMIT_LIKE_PATTERN_LENGTH       8
+#define SQLITE_LIMIT_VARIABLE_NUMBER           9
+#define SQLITE_LIMIT_TRIGGER_DEPTH            10
+#define SQLITE_LIMIT_WORKER_THREADS           11
+
+/*
+** CAPI3REF: Prepare Flags
+**
+** These constants define various flags that can be passed into
+** "prepFlags" parameter of the [sqlite3_prepare_v3()] and
+** [sqlite3_prepare16_v3()] interfaces.
+**
+** New flags may be added in future releases of SQLite.
+**
+** <dl>
+** [[SQLITE_PREPARE_PERSISTENT]] ^(<dt>SQLITE_PREPARE_PERSISTENT</dt>
+** <dd>The SQLITE_PREPARE_PERSISTENT flag is a hint to the query planner
+** that the prepared statement will be retained for a long time and
+** probably reused many times.)^ ^Without this flag, [sqlite3_prepare_v3()]
+** and [sqlite3_prepare16_v3()] assume that the prepared statement will
+** be used just once or at most a few times and then destroyed using
+** [sqlite3_finalize()] r
