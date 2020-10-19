@@ -5300,4 +5300,148 @@ SQLITE_API int sqlite3_data_count(sqlite3_stmt *pStmt);
 ** or [sqlite3_value_bytes()], the behavior is not threadsafe.
 ** Hence, the sqlite3_column_value() interface
 ** is normally only useful within the implementation of
-** [application-defined SQL functions] or [virt
+** [application-defined SQL functions] or [virtual tables], not within
+** top-level application code.
+**
+** These routines may attempt to convert the datatype of the result.
+** ^For example, if the internal representation is FLOAT and a text result
+** is requested, [sqlite3_snprintf()] is used internally to perform the
+** conversion automatically.  ^(The following table details the conversions
+** that are applied:
+**
+** <blockquote>
+** <table border="1">
+** <tr><th> Internal<br>Type <th> Requested<br>Type <th>  Conversion
+**
+** <tr><td>  NULL    <td> INTEGER   <td> Result is 0
+** <tr><td>  NULL    <td>  FLOAT    <td> Result is 0.0
+** <tr><td>  NULL    <td>   TEXT    <td> Result is a NULL pointer
+** <tr><td>  NULL    <td>   BLOB    <td> Result is a NULL pointer
+** <tr><td> INTEGER  <td>  FLOAT    <td> Convert from integer to float
+** <tr><td> INTEGER  <td>   TEXT    <td> ASCII rendering of the integer
+** <tr><td> INTEGER  <td>   BLOB    <td> Same as INTEGER->TEXT
+** <tr><td>  FLOAT   <td> INTEGER   <td> [CAST] to INTEGER
+** <tr><td>  FLOAT   <td>   TEXT    <td> ASCII rendering of the float
+** <tr><td>  FLOAT   <td>   BLOB    <td> [CAST] to BLOB
+** <tr><td>  TEXT    <td> INTEGER   <td> [CAST] to INTEGER
+** <tr><td>  TEXT    <td>  FLOAT    <td> [CAST] to REAL
+** <tr><td>  TEXT    <td>   BLOB    <td> No change
+** <tr><td>  BLOB    <td> INTEGER   <td> [CAST] to INTEGER
+** <tr><td>  BLOB    <td>  FLOAT    <td> [CAST] to REAL
+** <tr><td>  BLOB    <td>   TEXT    <td> [CAST] to TEXT, ensure zero terminator
+** </table>
+** </blockquote>)^
+**
+** Note that when type conversions occur, pointers returned by prior
+** calls to sqlite3_column_blob(), sqlite3_column_text(), and/or
+** sqlite3_column_text16() may be invalidated.
+** Type conversions and pointer invalidations might occur
+** in the following cases:
+**
+** <ul>
+** <li> The initial content is a BLOB and sqlite3_column_text() or
+**      sqlite3_column_text16() is called.  A zero-terminator might
+**      need to be added to the string.</li>
+** <li> The initial content is UTF-8 text and sqlite3_column_bytes16() or
+**      sqlite3_column_text16() is called.  The content must be converted
+**      to UTF-16.</li>
+** <li> The initial content is UTF-16 text and sqlite3_column_bytes() or
+**      sqlite3_column_text() is called.  The content must be converted
+**      to UTF-8.</li>
+** </ul>
+**
+** ^Conversions between UTF-16be and UTF-16le are always done in place and do
+** not invalidate a prior pointer, though of course the content of the buffer
+** that the prior pointer references will have been modified.  Other kinds
+** of conversion are done in place when it is possible, but sometimes they
+** are not possible and in those cases prior pointers are invalidated.
+**
+** The safest policy is to invoke these routines
+** in one of the following ways:
+**
+** <ul>
+**  <li>sqlite3_column_text() followed by sqlite3_column_bytes()</li>
+**  <li>sqlite3_column_blob() followed by sqlite3_column_bytes()</li>
+**  <li>sqlite3_column_text16() followed by sqlite3_column_bytes16()</li>
+** </ul>
+**
+** In other words, you should call sqlite3_column_text(),
+** sqlite3_column_blob(), or sqlite3_column_text16() first to force the result
+** into the desired format, then invoke sqlite3_column_bytes() or
+** sqlite3_column_bytes16() to find the size of the result.  Do not mix calls
+** to sqlite3_column_text() or sqlite3_column_blob() with calls to
+** sqlite3_column_bytes16(), and do not mix calls to sqlite3_column_text16()
+** with calls to sqlite3_column_bytes().
+**
+** ^The pointers returned are valid until a type conversion occurs as
+** described above, or until [sqlite3_step()] or [sqlite3_reset()] or
+** [sqlite3_finalize()] is called.  ^The memory space used to hold strings
+** and BLOBs is freed automatically.  Do not pass the pointers returned
+** from [sqlite3_column_blob()], [sqlite3_column_text()], etc. into
+** [sqlite3_free()].
+**
+** As long as the input parameters are correct, these routines will only
+** fail if an out-of-memory error occurs during a format conversion.
+** Only the following subset of interfaces are subject to out-of-memory
+** errors:
+**
+** <ul>
+** <li> sqlite3_column_blob()
+** <li> sqlite3_column_text()
+** <li> sqlite3_column_text16()
+** <li> sqlite3_column_bytes()
+** <li> sqlite3_column_bytes16()
+** </ul>
+**
+** If an out-of-memory error occurs, then the return value from these
+** routines is the same as if the column had contained an SQL NULL value.
+** Valid SQL NULL returns can be distinguished from out-of-memory errors
+** by invoking the [sqlite3_errcode()] immediately after the suspect
+** return value is obtained and before any
+** other SQLite interface is called on the same [database connection].
+*/
+SQLITE_API const void *sqlite3_column_blob(sqlite3_stmt*, int iCol);
+SQLITE_API double sqlite3_column_double(sqlite3_stmt*, int iCol);
+SQLITE_API int sqlite3_column_int(sqlite3_stmt*, int iCol);
+SQLITE_API sqlite3_int64 sqlite3_column_int64(sqlite3_stmt*, int iCol);
+SQLITE_API const unsigned char *sqlite3_column_text(sqlite3_stmt*, int iCol);
+SQLITE_API const void *sqlite3_column_text16(sqlite3_stmt*, int iCol);
+SQLITE_API sqlite3_value *sqlite3_column_value(sqlite3_stmt*, int iCol);
+SQLITE_API int sqlite3_column_bytes(sqlite3_stmt*, int iCol);
+SQLITE_API int sqlite3_column_bytes16(sqlite3_stmt*, int iCol);
+SQLITE_API int sqlite3_column_type(sqlite3_stmt*, int iCol);
+
+/*
+** CAPI3REF: Destroy A Prepared Statement Object
+** DESTRUCTOR: sqlite3_stmt
+**
+** ^The sqlite3_finalize() function is called to delete a [prepared statement].
+** ^If the most recent evaluation of the statement encountered no errors
+** or if the statement is never been evaluated, then sqlite3_finalize() returns
+** SQLITE_OK.  ^If the most recent evaluation of statement S failed, then
+** sqlite3_finalize(S) returns the appropriate [error code] or
+** [extended error code].
+**
+** ^The sqlite3_finalize(S) routine can be called at any point during
+** the life cycle of [prepared statement] S:
+** before statement S is ever evaluated, after
+** one or more calls to [sqlite3_reset()], or after any call
+** to [sqlite3_step()] regardless of whether or not the statement has
+** completed execution.
+**
+** ^Invoking sqlite3_finalize() on a NULL pointer is a harmless no-op.
+**
+** The application must finalize every [prepared statement] in order to avoid
+** resource leaks.  It is a grievous error for the application to try to use
+** a prepared statement after it has been finalized.  Any use of a prepared
+** statement after it has been finalized can result in undefined and
+** undesirable behavior such as segfaults and heap corruption.
+*/
+SQLITE_API int sqlite3_finalize(sqlite3_stmt *pStmt);
+
+/*
+** CAPI3REF: Reset A Prepared Statement Object
+** METHOD: sqlite3_stmt
+**
+** The sqlite3_reset() function is called to reset a [prepared statement]
+** object back to it
