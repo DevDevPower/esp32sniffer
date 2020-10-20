@@ -6129,4 +6129,113 @@ typedef void (*sqlite3_destructor_type)(void*);
 ** ^The sqlite3_result_text(), sqlite3_result_text16(),
 ** sqlite3_result_text16le(), and sqlite3_result_text16be() interfaces
 ** set the return value of the application-defined function to be
-** a text string which is repr
+** a text string which is represented as UTF-8, UTF-16 native byte order,
+** UTF-16 little endian, or UTF-16 big endian, respectively.
+** ^The sqlite3_result_text64() interface sets the return value of an
+** application-defined function to be a text string in an encoding
+** specified by the fifth (and last) parameter, which must be one
+** of [SQLITE_UTF8], [SQLITE_UTF16], [SQLITE_UTF16BE], or [SQLITE_UTF16LE].
+** ^SQLite takes the text result from the application from
+** the 2nd parameter of the sqlite3_result_text* interfaces.
+** ^If the 3rd parameter to the sqlite3_result_text* interfaces
+** is negative, then SQLite takes result text from the 2nd parameter
+** through the first zero character.
+** ^If the 3rd parameter to the sqlite3_result_text* interfaces
+** is non-negative, then as many bytes (not characters) of the text
+** pointed to by the 2nd parameter are taken as the application-defined
+** function result.  If the 3rd parameter is non-negative, then it
+** must be the byte offset into the string where the NUL terminator would
+** appear if the string where NUL terminated.  If any NUL characters occur
+** in the string at a byte offset that is less than the value of the 3rd
+** parameter, then the resulting string will contain embedded NULs and the
+** result of expressions operating on strings with embedded NULs is undefined.
+** ^If the 4th parameter to the sqlite3_result_text* interfaces
+** or sqlite3_result_blob is a non-NULL pointer, then SQLite calls that
+** function as the destructor on the text or BLOB result when it has
+** finished using that result.
+** ^If the 4th parameter to the sqlite3_result_text* interfaces or to
+** sqlite3_result_blob is the special constant SQLITE_STATIC, then SQLite
+** assumes that the text or BLOB result is in constant space and does not
+** copy the content of the parameter nor call a destructor on the content
+** when it has finished using that result.
+** ^If the 4th parameter to the sqlite3_result_text* interfaces
+** or sqlite3_result_blob is the special constant SQLITE_TRANSIENT
+** then SQLite makes a copy of the result into space obtained
+** from [sqlite3_malloc()] before it returns.
+**
+** ^For the sqlite3_result_text16(), sqlite3_result_text16le(), and
+** sqlite3_result_text16be() routines, and for sqlite3_result_text64()
+** when the encoding is not UTF8, if the input UTF16 begins with a
+** byte-order mark (BOM, U+FEFF) then the BOM is removed from the
+** string and the rest of the string is interpreted according to the
+** byte-order specified by the BOM.  ^The byte-order specified by
+** the BOM at the beginning of the text overrides the byte-order
+** specified by the interface procedure.  ^So, for example, if
+** sqlite3_result_text16le() is invoked with text that begins
+** with bytes 0xfe, 0xff (a big-endian byte-order mark) then the
+** first two bytes of input are skipped and the remaining input
+** is interpreted as UTF16BE text.
+**
+** ^For UTF16 input text to the sqlite3_result_text16(),
+** sqlite3_result_text16be(), sqlite3_result_text16le(), and
+** sqlite3_result_text64() routines, if the text contains invalid
+** UTF16 characters, the invalid characters might be converted
+** into the unicode replacement character, U+FFFD.
+**
+** ^The sqlite3_result_value() interface sets the result of
+** the application-defined function to be a copy of the
+** [unprotected sqlite3_value] object specified by the 2nd parameter.  ^The
+** sqlite3_result_value() interface makes a copy of the [sqlite3_value]
+** so that the [sqlite3_value] specified in the parameter may change or
+** be deallocated after sqlite3_result_value() returns without harm.
+** ^A [protected sqlite3_value] object may always be used where an
+** [unprotected sqlite3_value] object is required, so either
+** kind of [sqlite3_value] object can be used with this interface.
+**
+** ^The sqlite3_result_pointer(C,P,T,D) interface sets the result to an
+** SQL NULL value, just like [sqlite3_result_null(C)], except that it
+** also associates the host-language pointer P or type T with that
+** NULL value such that the pointer can be retrieved within an
+** [application-defined SQL function] using [sqlite3_value_pointer()].
+** ^If the D parameter is not NULL, then it is a pointer to a destructor
+** for the P parameter.  ^SQLite invokes D with P as its only argument
+** when SQLite is finished with P.  The T parameter should be a static
+** string and preferably a string literal. The sqlite3_result_pointer()
+** routine is part of the [pointer passing interface] added for SQLite 3.20.0.
+**
+** If these routines are called from within the different thread
+** than the one containing the application-defined function that received
+** the [sqlite3_context] pointer, the results are undefined.
+*/
+SQLITE_API void sqlite3_result_blob(sqlite3_context*, const void*, int, void(*)(void*));
+SQLITE_API void sqlite3_result_blob64(sqlite3_context*,const void*,
+                           sqlite3_uint64,void(*)(void*));
+SQLITE_API void sqlite3_result_double(sqlite3_context*, double);
+SQLITE_API void sqlite3_result_error(sqlite3_context*, const char*, int);
+SQLITE_API void sqlite3_result_error16(sqlite3_context*, const void*, int);
+SQLITE_API void sqlite3_result_error_toobig(sqlite3_context*);
+SQLITE_API void sqlite3_result_error_nomem(sqlite3_context*);
+SQLITE_API void sqlite3_result_error_code(sqlite3_context*, int);
+SQLITE_API void sqlite3_result_int(sqlite3_context*, int);
+SQLITE_API void sqlite3_result_int64(sqlite3_context*, sqlite3_int64);
+SQLITE_API void sqlite3_result_null(sqlite3_context*);
+SQLITE_API void sqlite3_result_text(sqlite3_context*, const char*, int, void(*)(void*));
+SQLITE_API void sqlite3_result_text64(sqlite3_context*, const char*,sqlite3_uint64,
+                           void(*)(void*), unsigned char encoding);
+SQLITE_API void sqlite3_result_text16(sqlite3_context*, const void*, int, void(*)(void*));
+SQLITE_API void sqlite3_result_text16le(sqlite3_context*, const void*, int,void(*)(void*));
+SQLITE_API void sqlite3_result_text16be(sqlite3_context*, const void*, int,void(*)(void*));
+SQLITE_API void sqlite3_result_value(sqlite3_context*, sqlite3_value*);
+SQLITE_API void sqlite3_result_pointer(sqlite3_context*, void*,const char*,void(*)(void*));
+SQLITE_API void sqlite3_result_zeroblob(sqlite3_context*, int n);
+SQLITE_API int sqlite3_result_zeroblob64(sqlite3_context*, sqlite3_uint64 n);
+
+
+/*
+** CAPI3REF: Setting The Subtype Of An SQL Function
+** METHOD: sqlite3_context
+**
+** The sqlite3_result_subtype(C,T) function causes the subtype of
+** the result from the [application-defined SQL function] with
+** [sqlite3_context] C to be the value T.  Only the lower 8 bits
+** of the subtype T are preserved in current ver
