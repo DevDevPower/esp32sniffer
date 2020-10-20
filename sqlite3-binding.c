@@ -5998,4 +5998,135 @@ SQLITE_API sqlite3 *sqlite3_context_db_handle(sqlite3_context*);
 ** invocations of the same function.
 **
 ** ^The sqlite3_get_auxdata(C,N) interface returns a pointer to the metadata
-** associated by the sqlite3_set_auxdata(C,N,P,X) function with the N
+** associated by the sqlite3_set_auxdata(C,N,P,X) function with the Nth argument
+** value to the application-defined function.  ^N is zero for the left-most
+** function argument.  ^If there is no metadata
+** associated with the function argument, the sqlite3_get_auxdata(C,N) interface
+** returns a NULL pointer.
+**
+** ^The sqlite3_set_auxdata(C,N,P,X) interface saves P as metadata for the N-th
+** argument of the application-defined function.  ^Subsequent
+** calls to sqlite3_get_auxdata(C,N) return P from the most recent
+** sqlite3_set_auxdata(C,N,P,X) call if the metadata is still valid or
+** NULL if the metadata has been discarded.
+** ^After each call to sqlite3_set_auxdata(C,N,P,X) where X is not NULL,
+** SQLite will invoke the destructor function X with parameter P exactly
+** once, when the metadata is discarded.
+** SQLite is free to discard the metadata at any time, including: <ul>
+** <li> ^(when the corresponding function parameter changes)^, or
+** <li> ^(when [sqlite3_reset()] or [sqlite3_finalize()] is called for the
+**      SQL statement)^, or
+** <li> ^(when sqlite3_set_auxdata() is invoked again on the same
+**       parameter)^, or
+** <li> ^(during the original sqlite3_set_auxdata() call when a memory
+**      allocation error occurs.)^ </ul>
+**
+** Note the last bullet in particular.  The destructor X in
+** sqlite3_set_auxdata(C,N,P,X) might be called immediately, before the
+** sqlite3_set_auxdata() interface even returns.  Hence sqlite3_set_auxdata()
+** should be called near the end of the function implementation and the
+** function implementation should not make any use of P after
+** sqlite3_set_auxdata() has been called.
+**
+** ^(In practice, metadata is preserved between function calls for
+** function parameters that are compile-time constants, including literal
+** values and [parameters] and expressions composed from the same.)^
+**
+** The value of the N parameter to these interfaces should be non-negative.
+** Future enhancements may make use of negative N values to define new
+** kinds of function caching behavior.
+**
+** These routines must be called from the same thread in which
+** the SQL function is running.
+*/
+SQLITE_API void *sqlite3_get_auxdata(sqlite3_context*, int N);
+SQLITE_API void sqlite3_set_auxdata(sqlite3_context*, int N, void*, void (*)(void*));
+
+
+/*
+** CAPI3REF: Constants Defining Special Destructor Behavior
+**
+** These are special values for the destructor that is passed in as the
+** final argument to routines like [sqlite3_result_blob()].  ^If the destructor
+** argument is SQLITE_STATIC, it means that the content pointer is constant
+** and will never change.  It does not need to be destroyed.  ^The
+** SQLITE_TRANSIENT value means that the content will likely change in
+** the near future and that SQLite should make its own private copy of
+** the content before returning.
+**
+** The typedef is necessary to work around problems in certain
+** C++ compilers.
+*/
+typedef void (*sqlite3_destructor_type)(void*);
+#define SQLITE_STATIC      ((sqlite3_destructor_type)0)
+#define SQLITE_TRANSIENT   ((sqlite3_destructor_type)-1)
+
+/*
+** CAPI3REF: Setting The Result Of An SQL Function
+** METHOD: sqlite3_context
+**
+** These routines are used by the xFunc or xFinal callbacks that
+** implement SQL functions and aggregates.  See
+** [sqlite3_create_function()] and [sqlite3_create_function16()]
+** for additional information.
+**
+** These functions work very much like the [parameter binding] family of
+** functions used to bind values to host parameters in prepared statements.
+** Refer to the [SQL parameter] documentation for additional information.
+**
+** ^The sqlite3_result_blob() interface sets the result from
+** an application-defined function to be the BLOB whose content is pointed
+** to by the second parameter and which is N bytes long where N is the
+** third parameter.
+**
+** ^The sqlite3_result_zeroblob(C,N) and sqlite3_result_zeroblob64(C,N)
+** interfaces set the result of the application-defined function to be
+** a BLOB containing all zero bytes and N bytes in size.
+**
+** ^The sqlite3_result_double() interface sets the result from
+** an application-defined function to be a floating point value specified
+** by its 2nd argument.
+**
+** ^The sqlite3_result_error() and sqlite3_result_error16() functions
+** cause the implemented SQL function to throw an exception.
+** ^SQLite uses the string pointed to by the
+** 2nd parameter of sqlite3_result_error() or sqlite3_result_error16()
+** as the text of an error message.  ^SQLite interprets the error
+** message string from sqlite3_result_error() as UTF-8. ^SQLite
+** interprets the string from sqlite3_result_error16() as UTF-16 using
+** the same [byte-order determination rules] as [sqlite3_bind_text16()].
+** ^If the third parameter to sqlite3_result_error()
+** or sqlite3_result_error16() is negative then SQLite takes as the error
+** message all text up through the first zero character.
+** ^If the third parameter to sqlite3_result_error() or
+** sqlite3_result_error16() is non-negative then SQLite takes that many
+** bytes (not characters) from the 2nd parameter as the error message.
+** ^The sqlite3_result_error() and sqlite3_result_error16()
+** routines make a private copy of the error message text before
+** they return.  Hence, the calling function can deallocate or
+** modify the text after they return without harm.
+** ^The sqlite3_result_error_code() function changes the error code
+** returned by SQLite as a result of an error in a function.  ^By default,
+** the error code is SQLITE_ERROR.  ^A subsequent call to sqlite3_result_error()
+** or sqlite3_result_error16() resets the error code to SQLITE_ERROR.
+**
+** ^The sqlite3_result_error_toobig() interface causes SQLite to throw an
+** error indicating that a string or BLOB is too long to represent.
+**
+** ^The sqlite3_result_error_nomem() interface causes SQLite to throw an
+** error indicating that a memory allocation failed.
+**
+** ^The sqlite3_result_int() interface sets the return value
+** of the application-defined function to be the 32-bit signed integer
+** value given in the 2nd argument.
+** ^The sqlite3_result_int64() interface sets the return value
+** of the application-defined function to be the 64-bit signed integer
+** value given in the 2nd argument.
+**
+** ^The sqlite3_result_null() interface sets the return value
+** of the application-defined function to be NULL.
+**
+** ^The sqlite3_result_text(), sqlite3_result_text16(),
+** sqlite3_result_text16le(), and sqlite3_result_text16be() interfaces
+** set the return value of the application-defined function to be
+** a text string which is repr
