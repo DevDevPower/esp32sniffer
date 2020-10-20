@@ -6238,4 +6238,170 @@ SQLITE_API int sqlite3_result_zeroblob64(sqlite3_context*, sqlite3_uint64 n);
 ** The sqlite3_result_subtype(C,T) function causes the subtype of
 ** the result from the [application-defined SQL function] with
 ** [sqlite3_context] C to be the value T.  Only the lower 8 bits
-** of the subtype T are preserved in current ver
+** of the subtype T are preserved in current versions of SQLite;
+** higher order bits are discarded.
+** The number of subtype bytes preserved by SQLite might increase
+** in future releases of SQLite.
+*/
+SQLITE_API void sqlite3_result_subtype(sqlite3_context*,unsigned int);
+
+/*
+** CAPI3REF: Define New Collating Sequences
+** METHOD: sqlite3
+**
+** ^These functions add, remove, or modify a [collation] associated
+** with the [database connection] specified as the first argument.
+**
+** ^The name of the collation is a UTF-8 string
+** for sqlite3_create_collation() and sqlite3_create_collation_v2()
+** and a UTF-16 string in native byte order for sqlite3_create_collation16().
+** ^Collation names that compare equal according to [sqlite3_strnicmp()] are
+** considered to be the same name.
+**
+** ^(The third argument (eTextRep) must be one of the constants:
+** <ul>
+** <li> [SQLITE_UTF8],
+** <li> [SQLITE_UTF16LE],
+** <li> [SQLITE_UTF16BE],
+** <li> [SQLITE_UTF16], or
+** <li> [SQLITE_UTF16_ALIGNED].
+** </ul>)^
+** ^The eTextRep argument determines the encoding of strings passed
+** to the collating function callback, xCompare.
+** ^The [SQLITE_UTF16] and [SQLITE_UTF16_ALIGNED] values for eTextRep
+** force strings to be UTF16 with native byte order.
+** ^The [SQLITE_UTF16_ALIGNED] value for eTextRep forces strings to begin
+** on an even byte address.
+**
+** ^The fourth argument, pArg, is an application data pointer that is passed
+** through as the first argument to the collating function callback.
+**
+** ^The fifth argument, xCompare, is a pointer to the collating function.
+** ^Multiple collating functions can be registered using the same name but
+** with different eTextRep parameters and SQLite will use whichever
+** function requires the least amount of data transformation.
+** ^If the xCompare argument is NULL then the collating function is
+** deleted.  ^When all collating functions having the same name are deleted,
+** that collation is no longer usable.
+**
+** ^The collating function callback is invoked with a copy of the pArg
+** application data pointer and with two strings in the encoding specified
+** by the eTextRep argument.  The two integer parameters to the collating
+** function callback are the length of the two strings, in bytes. The collating
+** function must return an integer that is negative, zero, or positive
+** if the first string is less than, equal to, or greater than the second,
+** respectively.  A collating function must always return the same answer
+** given the same inputs.  If two or more collating functions are registered
+** to the same collation name (using different eTextRep values) then all
+** must give an equivalent answer when invoked with equivalent strings.
+** The collating function must obey the following properties for all
+** strings A, B, and C:
+**
+** <ol>
+** <li> If A==B then B==A.
+** <li> If A==B and B==C then A==C.
+** <li> If A&lt;B THEN B&gt;A.
+** <li> If A&lt;B and B&lt;C then A&lt;C.
+** </ol>
+**
+** If a collating function fails any of the above constraints and that
+** collating function is registered and used, then the behavior of SQLite
+** is undefined.
+**
+** ^The sqlite3_create_collation_v2() works like sqlite3_create_collation()
+** with the addition that the xDestroy callback is invoked on pArg when
+** the collating function is deleted.
+** ^Collating functions are deleted when they are overridden by later
+** calls to the collation creation functions or when the
+** [database connection] is closed using [sqlite3_close()].
+**
+** ^The xDestroy callback is <u>not</u> called if the
+** sqlite3_create_collation_v2() function fails.  Applications that invoke
+** sqlite3_create_collation_v2() with a non-NULL xDestroy argument should
+** check the return code and dispose of the application data pointer
+** themselves rather than expecting SQLite to deal with it for them.
+** This is different from every other SQLite interface.  The inconsistency
+** is unfortunate but cannot be changed without breaking backwards
+** compatibility.
+**
+** See also:  [sqlite3_collation_needed()] and [sqlite3_collation_needed16()].
+*/
+SQLITE_API int sqlite3_create_collation(
+  sqlite3*,
+  const char *zName,
+  int eTextRep,
+  void *pArg,
+  int(*xCompare)(void*,int,const void*,int,const void*)
+);
+SQLITE_API int sqlite3_create_collation_v2(
+  sqlite3*,
+  const char *zName,
+  int eTextRep,
+  void *pArg,
+  int(*xCompare)(void*,int,const void*,int,const void*),
+  void(*xDestroy)(void*)
+);
+SQLITE_API int sqlite3_create_collation16(
+  sqlite3*,
+  const void *zName,
+  int eTextRep,
+  void *pArg,
+  int(*xCompare)(void*,int,const void*,int,const void*)
+);
+
+/*
+** CAPI3REF: Collation Needed Callbacks
+** METHOD: sqlite3
+**
+** ^To avoid having to register all collation sequences before a database
+** can be used, a single callback function may be registered with the
+** [database connection] to be invoked whenever an undefined collation
+** sequence is required.
+**
+** ^If the function is registered using the sqlite3_collation_needed() API,
+** then it is passed the names of undefined collation sequences as strings
+** encoded in UTF-8. ^If sqlite3_collation_needed16() is used,
+** the names are passed as UTF-16 in machine native byte order.
+** ^A call to either function replaces the existing collation-needed callback.
+**
+** ^(When the callback is invoked, the first argument passed is a copy
+** of the second argument to sqlite3_collation_needed() or
+** sqlite3_collation_needed16().  The second argument is the database
+** connection.  The third argument is one of [SQLITE_UTF8], [SQLITE_UTF16BE],
+** or [SQLITE_UTF16LE], indicating the most desirable form of the collation
+** sequence function required.  The fourth parameter is the name of the
+** required collation sequence.)^
+**
+** The callback function should register the desired collation using
+** [sqlite3_create_collation()], [sqlite3_create_collation16()], or
+** [sqlite3_create_collation_v2()].
+*/
+SQLITE_API int sqlite3_collation_needed(
+  sqlite3*,
+  void*,
+  void(*)(void*,sqlite3*,int eTextRep,const char*)
+);
+SQLITE_API int sqlite3_collation_needed16(
+  sqlite3*,
+  void*,
+  void(*)(void*,sqlite3*,int eTextRep,const void*)
+);
+
+#ifdef SQLITE_ENABLE_CEROD
+/*
+** Specify the activation key for a CEROD database.  Unless
+** activated, none of the CEROD routines will work.
+*/
+SQLITE_API void sqlite3_activate_cerod(
+  const char *zPassPhrase        /* Activation phrase */
+);
+#endif
+
+/*
+** CAPI3REF: Suspend Execution For A Short Time
+**
+** The sqlite3_sleep() function causes the current thread to suspend execution
+** for at least a number of milliseconds specified in its parameter.
+**
+** If the operating system does not support sleep requests with
+** milliseco
