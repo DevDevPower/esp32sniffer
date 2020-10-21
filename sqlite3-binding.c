@@ -6984,4 +6984,153 @@ SQLITE_API int sqlite3_db_release_memory(sqlite3*);
 ** error.  ^If the argument N is negative
 ** then no change is made to the heap limit.  Hence, the current
 ** size of heap limits can be determined by invoking
-** sqlite3_soft_heap
+** sqlite3_soft_heap_limit64(-1) or sqlite3_hard_heap_limit(-1).
+**
+** ^Setting the heap limits to zero disables the heap limiter mechanism.
+**
+** ^The soft heap limit may not be greater than the hard heap limit.
+** ^If the hard heap limit is enabled and if sqlite3_soft_heap_limit(N)
+** is invoked with a value of N that is greater than the hard heap limit,
+** the the soft heap limit is set to the value of the hard heap limit.
+** ^The soft heap limit is automatically enabled whenever the hard heap
+** limit is enabled. ^When sqlite3_hard_heap_limit64(N) is invoked and
+** the soft heap limit is outside the range of 1..N, then the soft heap
+** limit is set to N.  ^Invoking sqlite3_soft_heap_limit64(0) when the
+** hard heap limit is enabled makes the soft heap limit equal to the
+** hard heap limit.
+**
+** The memory allocation limits can also be adjusted using
+** [PRAGMA soft_heap_limit] and [PRAGMA hard_heap_limit].
+**
+** ^(The heap limits are not enforced in the current implementation
+** if one or more of following conditions are true:
+**
+** <ul>
+** <li> The limit value is set to zero.
+** <li> Memory accounting is disabled using a combination of the
+**      [sqlite3_config]([SQLITE_CONFIG_MEMSTATUS],...) start-time option and
+**      the [SQLITE_DEFAULT_MEMSTATUS] compile-time option.
+** <li> An alternative page cache implementation is specified using
+**      [sqlite3_config]([SQLITE_CONFIG_PCACHE2],...).
+** <li> The page cache allocates from its own memory pool supplied
+**      by [sqlite3_config]([SQLITE_CONFIG_PAGECACHE],...) rather than
+**      from the heap.
+** </ul>)^
+**
+** The circumstances under which SQLite will enforce the heap limits may
+** changes in future releases of SQLite.
+*/
+SQLITE_API sqlite3_int64 sqlite3_soft_heap_limit64(sqlite3_int64 N);
+SQLITE_API sqlite3_int64 sqlite3_hard_heap_limit64(sqlite3_int64 N);
+
+/*
+** CAPI3REF: Deprecated Soft Heap Limit Interface
+** DEPRECATED
+**
+** This is a deprecated version of the [sqlite3_soft_heap_limit64()]
+** interface.  This routine is provided for historical compatibility
+** only.  All new applications should use the
+** [sqlite3_soft_heap_limit64()] interface rather than this one.
+*/
+SQLITE_API SQLITE_DEPRECATED void sqlite3_soft_heap_limit(int N);
+
+
+/*
+** CAPI3REF: Extract Metadata About A Column Of A Table
+** METHOD: sqlite3
+**
+** ^(The sqlite3_table_column_metadata(X,D,T,C,....) routine returns
+** information about column C of table T in database D
+** on [database connection] X.)^  ^The sqlite3_table_column_metadata()
+** interface returns SQLITE_OK and fills in the non-NULL pointers in
+** the final five arguments with appropriate values if the specified
+** column exists.  ^The sqlite3_table_column_metadata() interface returns
+** SQLITE_ERROR if the specified column does not exist.
+** ^If the column-name parameter to sqlite3_table_column_metadata() is a
+** NULL pointer, then this routine simply checks for the existence of the
+** table and returns SQLITE_OK if the table exists and SQLITE_ERROR if it
+** does not.  If the table name parameter T in a call to
+** sqlite3_table_column_metadata(X,D,T,C,...) is NULL then the result is
+** undefined behavior.
+**
+** ^The column is identified by the second, third and fourth parameters to
+** this function. ^(The second parameter is either the name of the database
+** (i.e. "main", "temp", or an attached database) containing the specified
+** table or NULL.)^ ^If it is NULL, then all attached databases are searched
+** for the table using the same algorithm used by the database engine to
+** resolve unqualified table references.
+**
+** ^The third and fourth parameters to this function are the table and column
+** name of the desired column, respectively.
+**
+** ^Metadata is returned by writing to the memory locations passed as the 5th
+** and subsequent parameters to this function. ^Any of these arguments may be
+** NULL, in which case the corresponding element of metadata is omitted.
+**
+** ^(<blockquote>
+** <table border="1">
+** <tr><th> Parameter <th> Output<br>Type <th>  Description
+**
+** <tr><td> 5th <td> const char* <td> Data type
+** <tr><td> 6th <td> const char* <td> Name of default collation sequence
+** <tr><td> 7th <td> int         <td> True if column has a NOT NULL constraint
+** <tr><td> 8th <td> int         <td> True if column is part of the PRIMARY KEY
+** <tr><td> 9th <td> int         <td> True if column is [AUTOINCREMENT]
+** </table>
+** </blockquote>)^
+**
+** ^The memory pointed to by the character pointers returned for the
+** declaration type and collation sequence is valid until the next
+** call to any SQLite API function.
+**
+** ^If the specified table is actually a view, an [error code] is returned.
+**
+** ^If the specified column is "rowid", "oid" or "_rowid_" and the table
+** is not a [WITHOUT ROWID] table and an
+** [INTEGER PRIMARY KEY] column has been explicitly declared, then the output
+** parameters are set for the explicitly declared column. ^(If there is no
+** [INTEGER PRIMARY KEY] column, then the outputs
+** for the [rowid] are set as follows:
+**
+** <pre>
+**     data type: "INTEGER"
+**     collation sequence: "BINARY"
+**     not null: 0
+**     primary key: 1
+**     auto increment: 0
+** </pre>)^
+**
+** ^This function causes all database schemas to be read from disk and
+** parsed, if that has not already been done, and returns an error if
+** any errors are encountered while loading the schema.
+*/
+SQLITE_API int sqlite3_table_column_metadata(
+  sqlite3 *db,                /* Connection handle */
+  const char *zDbName,        /* Database name or NULL */
+  const char *zTableName,     /* Table name */
+  const char *zColumnName,    /* Column name */
+  char const **pzDataType,    /* OUTPUT: Declared data type */
+  char const **pzCollSeq,     /* OUTPUT: Collation sequence name */
+  int *pNotNull,              /* OUTPUT: True if NOT NULL constraint exists */
+  int *pPrimaryKey,           /* OUTPUT: True if column part of PK */
+  int *pAutoinc               /* OUTPUT: True if column is auto-increment */
+);
+
+/*
+** CAPI3REF: Load An Extension
+** METHOD: sqlite3
+**
+** ^This interface loads an SQLite extension library from the named file.
+**
+** ^The sqlite3_load_extension() interface attempts to load an
+** [SQLite extension] library contained in the file zFile.  If
+** the file cannot be loaded directly, attempts are made to load
+** with various operating-system specific extensions added.
+** So for example, if "samplelib" cannot be loaded, then names like
+** "samplelib.so" or "samplelib.dylib" or "samplelib.dll" might
+** be tried also.
+**
+** ^The entry point is zProc.
+** ^(zProc may be 0, in which case SQLite will try to come up with an
+** entry point name on its own.  It first tries "sqlite3_extension_init".
+** If that does not work, it constructs a name "sqlite3_X_init" where the
