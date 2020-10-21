@@ -6692,4 +6692,150 @@ SQLITE_API int sqlite3_txn_state(sqlite3*,const char *zSchema);
 ** <dd>The SQLITE_TXN_WRITE state means that the database is currently
 ** in a write transaction.  Content has been written to the database file
 ** but has not yet committed.  The transaction state will change to
-** to SQLITE_TXN_NONE at the next [
+** to SQLITE_TXN_NONE at the next [ROLLBACK] or [COMMIT].</dd>
+*/
+#define SQLITE_TXN_NONE  0
+#define SQLITE_TXN_READ  1
+#define SQLITE_TXN_WRITE 2
+
+/*
+** CAPI3REF: Find the next prepared statement
+** METHOD: sqlite3
+**
+** ^This interface returns a pointer to the next [prepared statement] after
+** pStmt associated with the [database connection] pDb.  ^If pStmt is NULL
+** then this interface returns a pointer to the first prepared statement
+** associated with the database connection pDb.  ^If no prepared statement
+** satisfies the conditions of this routine, it returns NULL.
+**
+** The [database connection] pointer D in a call to
+** [sqlite3_next_stmt(D,S)] must refer to an open database
+** connection and in particular must not be a NULL pointer.
+*/
+SQLITE_API sqlite3_stmt *sqlite3_next_stmt(sqlite3 *pDb, sqlite3_stmt *pStmt);
+
+/*
+** CAPI3REF: Commit And Rollback Notification Callbacks
+** METHOD: sqlite3
+**
+** ^The sqlite3_commit_hook() interface registers a callback
+** function to be invoked whenever a transaction is [COMMIT | committed].
+** ^Any callback set by a previous call to sqlite3_commit_hook()
+** for the same database connection is overridden.
+** ^The sqlite3_rollback_hook() interface registers a callback
+** function to be invoked whenever a transaction is [ROLLBACK | rolled back].
+** ^Any callback set by a previous call to sqlite3_rollback_hook()
+** for the same database connection is overridden.
+** ^The pArg argument is passed through to the callback.
+** ^If the callback on a commit hook function returns non-zero,
+** then the commit is converted into a rollback.
+**
+** ^The sqlite3_commit_hook(D,C,P) and sqlite3_rollback_hook(D,C,P) functions
+** return the P argument from the previous call of the same function
+** on the same [database connection] D, or NULL for
+** the first call for each function on D.
+**
+** The commit and rollback hook callbacks are not reentrant.
+** The callback implementation must not do anything that will modify
+** the database connection that invoked the callback.  Any actions
+** to modify the database connection must be deferred until after the
+** completion of the [sqlite3_step()] call that triggered the commit
+** or rollback hook in the first place.
+** Note that running any other SQL statements, including SELECT statements,
+** or merely calling [sqlite3_prepare_v2()] and [sqlite3_step()] will modify
+** the database connections for the meaning of "modify" in this paragraph.
+**
+** ^Registering a NULL function disables the callback.
+**
+** ^When the commit hook callback routine returns zero, the [COMMIT]
+** operation is allowed to continue normally.  ^If the commit hook
+** returns non-zero, then the [COMMIT] is converted into a [ROLLBACK].
+** ^The rollback hook is invoked on a rollback that results from a commit
+** hook returning non-zero, just as it would be with any other rollback.
+**
+** ^For the purposes of this API, a transaction is said to have been
+** rolled back if an explicit "ROLLBACK" statement is executed, or
+** an error or constraint causes an implicit rollback to occur.
+** ^The rollback callback is not invoked if a transaction is
+** automatically rolled back because the database connection is closed.
+**
+** See also the [sqlite3_update_hook()] interface.
+*/
+SQLITE_API void *sqlite3_commit_hook(sqlite3*, int(*)(void*), void*);
+SQLITE_API void *sqlite3_rollback_hook(sqlite3*, void(*)(void *), void*);
+
+/*
+** CAPI3REF: Autovacuum Compaction Amount Callback
+** METHOD: sqlite3
+**
+** ^The sqlite3_autovacuum_pages(D,C,P,X) interface registers a callback
+** function C that is invoked prior to each autovacuum of the database
+** file.  ^The callback is passed a copy of the generic data pointer (P),
+** the schema-name of the attached database that is being autovacuumed,
+** the the size of the database file in pages, the number of free pages,
+** and the number of bytes per page, respectively.  The callback should
+** return the number of free pages that should be removed by the
+** autovacuum.  ^If the callback returns zero, then no autovacuum happens.
+** ^If the value returned is greater than or equal to the number of
+** free pages, then a complete autovacuum happens.
+**
+** <p>^If there are multiple ATTACH-ed database files that are being
+** modified as part of a transaction commit, then the autovacuum pages
+** callback is invoked separately for each file.
+**
+** <p><b>The callback is not reentrant.</b> The callback function should
+** not attempt to invoke any other SQLite interface.  If it does, bad
+** things may happen, including segmentation faults and corrupt database
+** files.  The callback function should be a simple function that
+** does some arithmetic on its input parameters and returns a result.
+**
+** ^The X parameter to sqlite3_autovacuum_pages(D,C,P,X) is an optional
+** destructor for the P parameter.  ^If X is not NULL, then X(P) is
+** invoked whenever the database connection closes or when the callback
+** is overwritten by another invocation of sqlite3_autovacuum_pages().
+**
+** <p>^There is only one autovacuum pages callback per database connection.
+** ^Each call to the sqlite3_autovacuum_pages() interface overrides all
+** previous invocations for that database connection.  ^If the callback
+** argument (C) to sqlite3_autovacuum_pages(D,C,P,X) is a NULL pointer,
+** then the autovacuum steps callback is cancelled.  The return value
+** from sqlite3_autovacuum_pages() is normally SQLITE_OK, but might
+** be some other error code if something goes wrong.  The current
+** implementation will only return SQLITE_OK or SQLITE_MISUSE, but other
+** return codes might be added in future releases.
+**
+** <p>If no autovacuum pages callback is specified (the usual case) or
+** a NULL pointer is provided for the callback,
+** then the default behavior is to vacuum all free pages.  So, in other
+** words, the default behavior is the same as if the callback function
+** were something like this:
+**
+** <blockquote><pre>
+** &nbsp;   unsigned int demonstration_autovac_pages_callback(
+** &nbsp;     void *pClientData,
+** &nbsp;     const char *zSchema,
+** &nbsp;     unsigned int nDbPage,
+** &nbsp;     unsigned int nFreePage,
+** &nbsp;     unsigned int nBytePerPage
+** &nbsp;   ){
+** &nbsp;     return nFreePage;
+** &nbsp;   }
+** </pre></blockquote>
+*/
+SQLITE_API int sqlite3_autovacuum_pages(
+  sqlite3 *db,
+  unsigned int(*)(void*,const char*,unsigned int,unsigned int,unsigned int),
+  void*,
+  void(*)(void*)
+);
+
+
+/*
+** CAPI3REF: Data Change Notification Callbacks
+** METHOD: sqlite3
+**
+** ^The sqlite3_update_hook() interface registers a callback function
+** with the [database connection] identified by the first argument
+** to be invoked whenever a row is updated, inserted or deleted in
+** a [rowid table].
+** ^Any callback set by a pr
