@@ -6838,4 +6838,150 @@ SQLITE_API int sqlite3_autovacuum_pages(
 ** with the [database connection] identified by the first argument
 ** to be invoked whenever a row is updated, inserted or deleted in
 ** a [rowid table].
-** ^Any callback set by a pr
+** ^Any callback set by a previous call to this function
+** for the same database connection is overridden.
+**
+** ^The second argument is a pointer to the function to invoke when a
+** row is updated, inserted or deleted in a rowid table.
+** ^The first argument to the callback is a copy of the third argument
+** to sqlite3_update_hook().
+** ^The second callback argument is one of [SQLITE_INSERT], [SQLITE_DELETE],
+** or [SQLITE_UPDATE], depending on the operation that caused the callback
+** to be invoked.
+** ^The third and fourth arguments to the callback contain pointers to the
+** database and table name containing the affected row.
+** ^The final callback parameter is the [rowid] of the row.
+** ^In the case of an update, this is the [rowid] after the update takes place.
+**
+** ^(The update hook is not invoked when internal system tables are
+** modified (i.e. sqlite_sequence).)^
+** ^The update hook is not invoked when [WITHOUT ROWID] tables are modified.
+**
+** ^In the current implementation, the update hook
+** is not invoked when conflicting rows are deleted because of an
+** [ON CONFLICT | ON CONFLICT REPLACE] clause.  ^Nor is the update hook
+** invoked when rows are deleted using the [truncate optimization].
+** The exceptions defined in this paragraph might change in a future
+** release of SQLite.
+**
+** The update hook implementation must not do anything that will modify
+** the database connection that invoked the update hook.  Any actions
+** to modify the database connection must be deferred until after the
+** completion of the [sqlite3_step()] call that triggered the update hook.
+** Note that [sqlite3_prepare_v2()] and [sqlite3_step()] both modify their
+** database connections for the meaning of "modify" in this paragraph.
+**
+** ^The sqlite3_update_hook(D,C,P) function
+** returns the P argument from the previous call
+** on the same [database connection] D, or NULL for
+** the first call on D.
+**
+** See also the [sqlite3_commit_hook()], [sqlite3_rollback_hook()],
+** and [sqlite3_preupdate_hook()] interfaces.
+*/
+SQLITE_API void *sqlite3_update_hook(
+  sqlite3*,
+  void(*)(void *,int ,char const *,char const *,sqlite3_int64),
+  void*
+);
+
+/*
+** CAPI3REF: Enable Or Disable Shared Pager Cache
+**
+** ^(This routine enables or disables the sharing of the database cache
+** and schema data structures between [database connection | connections]
+** to the same database. Sharing is enabled if the argument is true
+** and disabled if the argument is false.)^
+**
+** ^Cache sharing is enabled and disabled for an entire process.
+** This is a change as of SQLite [version 3.5.0] ([dateof:3.5.0]).
+** In prior versions of SQLite,
+** sharing was enabled or disabled for each thread separately.
+**
+** ^(The cache sharing mode set by this interface effects all subsequent
+** calls to [sqlite3_open()], [sqlite3_open_v2()], and [sqlite3_open16()].
+** Existing database connections continue to use the sharing mode
+** that was in effect at the time they were opened.)^
+**
+** ^(This routine returns [SQLITE_OK] if shared cache was enabled or disabled
+** successfully.  An [error code] is returned otherwise.)^
+**
+** ^Shared cache is disabled by default. It is recommended that it stay
+** that way.  In other words, do not use this routine.  This interface
+** continues to be provided for historical compatibility, but its use is
+** discouraged.  Any use of shared cache is discouraged.  If shared cache
+** must be used, it is recommended that shared cache only be enabled for
+** individual database connections using the [sqlite3_open_v2()] interface
+** with the [SQLITE_OPEN_SHAREDCACHE] flag.
+**
+** Note: This method is disabled on MacOS X 10.7 and iOS version 5.0
+** and will always return SQLITE_MISUSE. On those systems,
+** shared cache mode should be enabled per-database connection via
+** [sqlite3_open_v2()] with [SQLITE_OPEN_SHAREDCACHE].
+**
+** This interface is threadsafe on processors where writing a
+** 32-bit integer is atomic.
+**
+** See Also:  [SQLite Shared-Cache Mode]
+*/
+SQLITE_API int sqlite3_enable_shared_cache(int);
+
+/*
+** CAPI3REF: Attempt To Free Heap Memory
+**
+** ^The sqlite3_release_memory() interface attempts to free N bytes
+** of heap memory by deallocating non-essential memory allocations
+** held by the database library.   Memory used to cache database
+** pages to improve performance is an example of non-essential memory.
+** ^sqlite3_release_memory() returns the number of bytes actually freed,
+** which might be more or less than the amount requested.
+** ^The sqlite3_release_memory() routine is a no-op returning zero
+** if SQLite is not compiled with [SQLITE_ENABLE_MEMORY_MANAGEMENT].
+**
+** See also: [sqlite3_db_release_memory()]
+*/
+SQLITE_API int sqlite3_release_memory(int);
+
+/*
+** CAPI3REF: Free Memory Used By A Database Connection
+** METHOD: sqlite3
+**
+** ^The sqlite3_db_release_memory(D) interface attempts to free as much heap
+** memory as possible from database connection D. Unlike the
+** [sqlite3_release_memory()] interface, this interface is in effect even
+** when the [SQLITE_ENABLE_MEMORY_MANAGEMENT] compile-time option is
+** omitted.
+**
+** See also: [sqlite3_release_memory()]
+*/
+SQLITE_API int sqlite3_db_release_memory(sqlite3*);
+
+/*
+** CAPI3REF: Impose A Limit On Heap Size
+**
+** These interfaces impose limits on the amount of heap memory that will be
+** by all database connections within a single process.
+**
+** ^The sqlite3_soft_heap_limit64() interface sets and/or queries the
+** soft limit on the amount of heap memory that may be allocated by SQLite.
+** ^SQLite strives to keep heap memory utilization below the soft heap
+** limit by reducing the number of pages held in the page cache
+** as heap memory usages approaches the limit.
+** ^The soft heap limit is "soft" because even though SQLite strives to stay
+** below the limit, it will exceed the limit rather than generate
+** an [SQLITE_NOMEM] error.  In other words, the soft heap limit
+** is advisory only.
+**
+** ^The sqlite3_hard_heap_limit64(N) interface sets a hard upper bound of
+** N bytes on the amount of memory that will be allocated.  ^The
+** sqlite3_hard_heap_limit64(N) interface is similar to
+** sqlite3_soft_heap_limit64(N) except that memory allocations will fail
+** when the hard heap limit is reached.
+**
+** ^The return value from both sqlite3_soft_heap_limit64() and
+** sqlite3_hard_heap_limit64() is the size of
+** the heap limit prior to the call, or negative in the case of an
+** error.  ^If the argument N is negative
+** then no change is made to the heap limit.  Hence, the current
+** size of heap limits can be determined by invoking
+** sqlite3_soft_heap
