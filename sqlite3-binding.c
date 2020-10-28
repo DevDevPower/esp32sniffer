@@ -7549,4 +7549,160 @@ struct sqlite3_index_info {
 ** destructor.
 **
 ** ^If the third parameter (the pointer to the sqlite3_module object) is
-** NULL then n
+** NULL then no new module is created and any existing modules with the
+** same name are dropped.
+**
+** See also: [sqlite3_drop_modules()]
+*/
+SQLITE_API int sqlite3_create_module(
+  sqlite3 *db,               /* SQLite connection to register module with */
+  const char *zName,         /* Name of the module */
+  const sqlite3_module *p,   /* Methods for the module */
+  void *pClientData          /* Client data for xCreate/xConnect */
+);
+SQLITE_API int sqlite3_create_module_v2(
+  sqlite3 *db,               /* SQLite connection to register module with */
+  const char *zName,         /* Name of the module */
+  const sqlite3_module *p,   /* Methods for the module */
+  void *pClientData,         /* Client data for xCreate/xConnect */
+  void(*xDestroy)(void*)     /* Module destructor function */
+);
+
+/*
+** CAPI3REF: Remove Unnecessary Virtual Table Implementations
+** METHOD: sqlite3
+**
+** ^The sqlite3_drop_modules(D,L) interface removes all virtual
+** table modules from database connection D except those named on list L.
+** The L parameter must be either NULL or a pointer to an array of pointers
+** to strings where the array is terminated by a single NULL pointer.
+** ^If the L parameter is NULL, then all virtual table modules are removed.
+**
+** See also: [sqlite3_create_module()]
+*/
+SQLITE_API int sqlite3_drop_modules(
+  sqlite3 *db,                /* Remove modules from this connection */
+  const char **azKeep         /* Except, do not remove the ones named here */
+);
+
+/*
+** CAPI3REF: Virtual Table Instance Object
+** KEYWORDS: sqlite3_vtab
+**
+** Every [virtual table module] implementation uses a subclass
+** of this object to describe a particular instance
+** of the [virtual table].  Each subclass will
+** be tailored to the specific needs of the module implementation.
+** The purpose of this superclass is to define certain fields that are
+** common to all module implementations.
+**
+** ^Virtual tables methods can set an error message by assigning a
+** string obtained from [sqlite3_mprintf()] to zErrMsg.  The method should
+** take care that any prior string is freed by a call to [sqlite3_free()]
+** prior to assigning a new string to zErrMsg.  ^After the error message
+** is delivered up to the client application, the string will be automatically
+** freed by sqlite3_free() and the zErrMsg field will be zeroed.
+*/
+struct sqlite3_vtab {
+  const sqlite3_module *pModule;  /* The module for this virtual table */
+  int nRef;                       /* Number of open cursors */
+  char *zErrMsg;                  /* Error message from sqlite3_mprintf() */
+  /* Virtual table implementations will typically add additional fields */
+};
+
+/*
+** CAPI3REF: Virtual Table Cursor Object
+** KEYWORDS: sqlite3_vtab_cursor {virtual table cursor}
+**
+** Every [virtual table module] implementation uses a subclass of the
+** following structure to describe cursors that point into the
+** [virtual table] and are used
+** to loop through the virtual table.  Cursors are created using the
+** [sqlite3_module.xOpen | xOpen] method of the module and are destroyed
+** by the [sqlite3_module.xClose | xClose] method.  Cursors are used
+** by the [xFilter], [xNext], [xEof], [xColumn], and [xRowid] methods
+** of the module.  Each module implementation will define
+** the content of a cursor structure to suit its own needs.
+**
+** This superclass exists in order to define fields of the cursor that
+** are common to all implementations.
+*/
+struct sqlite3_vtab_cursor {
+  sqlite3_vtab *pVtab;      /* Virtual table of this cursor */
+  /* Virtual table implementations will typically add additional fields */
+};
+
+/*
+** CAPI3REF: Declare The Schema Of A Virtual Table
+**
+** ^The [xCreate] and [xConnect] methods of a
+** [virtual table module] call this interface
+** to declare the format (the names and datatypes of the columns) of
+** the virtual tables they implement.
+*/
+SQLITE_API int sqlite3_declare_vtab(sqlite3*, const char *zSQL);
+
+/*
+** CAPI3REF: Overload A Function For A Virtual Table
+** METHOD: sqlite3
+**
+** ^(Virtual tables can provide alternative implementations of functions
+** using the [xFindFunction] method of the [virtual table module].
+** But global versions of those functions
+** must exist in order to be overloaded.)^
+**
+** ^(This API makes sure a global version of a function with a particular
+** name and number of parameters exists.  If no such function exists
+** before this API is called, a new function is created.)^  ^The implementation
+** of the new function always causes an exception to be thrown.  So
+** the new function is not good for anything by itself.  Its only
+** purpose is to be a placeholder function that can be overloaded
+** by a [virtual table].
+*/
+SQLITE_API int sqlite3_overload_function(sqlite3*, const char *zFuncName, int nArg);
+
+/*
+** The interface to the virtual-table mechanism defined above (back up
+** to a comment remarkably similar to this one) is currently considered
+** to be experimental.  The interface might change in incompatible ways.
+** If this is a problem for you, do not use the interface at this time.
+**
+** When the virtual-table mechanism stabilizes, we will declare the
+** interface fixed, support it indefinitely, and remove this comment.
+*/
+
+/*
+** CAPI3REF: A Handle To An Open BLOB
+** KEYWORDS: {BLOB handle} {BLOB handles}
+**
+** An instance of this object represents an open BLOB on which
+** [sqlite3_blob_open | incremental BLOB I/O] can be performed.
+** ^Objects of this type are created by [sqlite3_blob_open()]
+** and destroyed by [sqlite3_blob_close()].
+** ^The [sqlite3_blob_read()] and [sqlite3_blob_write()] interfaces
+** can be used to read or write small subsections of the BLOB.
+** ^The [sqlite3_blob_bytes()] interface returns the size of the BLOB in bytes.
+*/
+typedef struct sqlite3_blob sqlite3_blob;
+
+/*
+** CAPI3REF: Open A BLOB For Incremental I/O
+** METHOD: sqlite3
+** CONSTRUCTOR: sqlite3_blob
+**
+** ^(This interfaces opens a [BLOB handle | handle] to the BLOB located
+** in row iRow, column zColumn, table zTable in database zDb;
+** in other words, the same BLOB that would be selected by:
+**
+** <pre>
+**     SELECT zColumn FROM zDb.zTable WHERE [rowid] = iRow;
+** </pre>)^
+**
+** ^(Parameter zDb is not the filename that contains the database, but
+** rather the symbolic name of the database. For attached databases, this is
+** the name that appears after the AS keyword in the [ATTACH] statement.
+** For the main database file, the database name is "main". For TEMP
+** tables, the database name is "temp".)^
+**
+** ^If the flags parameter is non-zero, then the BLOB is opened for read
+** and write access. ^If the flags parame
