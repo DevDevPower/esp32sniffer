@@ -8131,4 +8131,151 @@ SQLITE_API void sqlite3_mutex_leave(sqlite3_mutex*);
 ** If xMutexInit fails in any way, it is expected to clean up after itself
 ** prior to returning.
 */
-typedef struct sqlite3_mutex
+typedef struct sqlite3_mutex_methods sqlite3_mutex_methods;
+struct sqlite3_mutex_methods {
+  int (*xMutexInit)(void);
+  int (*xMutexEnd)(void);
+  sqlite3_mutex *(*xMutexAlloc)(int);
+  void (*xMutexFree)(sqlite3_mutex *);
+  void (*xMutexEnter)(sqlite3_mutex *);
+  int (*xMutexTry)(sqlite3_mutex *);
+  void (*xMutexLeave)(sqlite3_mutex *);
+  int (*xMutexHeld)(sqlite3_mutex *);
+  int (*xMutexNotheld)(sqlite3_mutex *);
+};
+
+/*
+** CAPI3REF: Mutex Verification Routines
+**
+** The sqlite3_mutex_held() and sqlite3_mutex_notheld() routines
+** are intended for use inside assert() statements.  The SQLite core
+** never uses these routines except inside an assert() and applications
+** are advised to follow the lead of the core.  The SQLite core only
+** provides implementations for these routines when it is compiled
+** with the SQLITE_DEBUG flag.  External mutex implementations
+** are only required to provide these routines if SQLITE_DEBUG is
+** defined and if NDEBUG is not defined.
+**
+** These routines should return true if the mutex in their argument
+** is held or not held, respectively, by the calling thread.
+**
+** The implementation is not required to provide versions of these
+** routines that actually work. If the implementation does not provide working
+** versions of these routines, it should at least provide stubs that always
+** return true so that one does not get spurious assertion failures.
+**
+** If the argument to sqlite3_mutex_held() is a NULL pointer then
+** the routine should return 1.   This seems counter-intuitive since
+** clearly the mutex cannot be held if it does not exist.  But
+** the reason the mutex does not exist is because the build is not
+** using mutexes.  And we do not want the assert() containing the
+** call to sqlite3_mutex_held() to fail, so a non-zero return is
+** the appropriate thing to do.  The sqlite3_mutex_notheld()
+** interface should also return 1 when given a NULL pointer.
+*/
+#ifndef NDEBUG
+SQLITE_API int sqlite3_mutex_held(sqlite3_mutex*);
+SQLITE_API int sqlite3_mutex_notheld(sqlite3_mutex*);
+#endif
+
+/*
+** CAPI3REF: Mutex Types
+**
+** The [sqlite3_mutex_alloc()] interface takes a single argument
+** which is one of these integer constants.
+**
+** The set of static mutexes may change from one SQLite release to the
+** next.  Applications that override the built-in mutex logic must be
+** prepared to accommodate additional static mutexes.
+*/
+#define SQLITE_MUTEX_FAST             0
+#define SQLITE_MUTEX_RECURSIVE        1
+#define SQLITE_MUTEX_STATIC_MAIN      2
+#define SQLITE_MUTEX_STATIC_MEM       3  /* sqlite3_malloc() */
+#define SQLITE_MUTEX_STATIC_MEM2      4  /* NOT USED */
+#define SQLITE_MUTEX_STATIC_OPEN      4  /* sqlite3BtreeOpen() */
+#define SQLITE_MUTEX_STATIC_PRNG      5  /* sqlite3_randomness() */
+#define SQLITE_MUTEX_STATIC_LRU       6  /* lru page list */
+#define SQLITE_MUTEX_STATIC_LRU2      7  /* NOT USED */
+#define SQLITE_MUTEX_STATIC_PMEM      7  /* sqlite3PageMalloc() */
+#define SQLITE_MUTEX_STATIC_APP1      8  /* For use by application */
+#define SQLITE_MUTEX_STATIC_APP2      9  /* For use by application */
+#define SQLITE_MUTEX_STATIC_APP3     10  /* For use by application */
+#define SQLITE_MUTEX_STATIC_VFS1     11  /* For use by built-in VFS */
+#define SQLITE_MUTEX_STATIC_VFS2     12  /* For use by extension VFS */
+#define SQLITE_MUTEX_STATIC_VFS3     13  /* For use by application VFS */
+
+/* Legacy compatibility: */
+#define SQLITE_MUTEX_STATIC_MASTER    2
+
+
+/*
+** CAPI3REF: Retrieve the mutex for a database connection
+** METHOD: sqlite3
+**
+** ^This interface returns a pointer the [sqlite3_mutex] object that
+** serializes access to the [database connection] given in the argument
+** when the [threading mode] is Serialized.
+** ^If the [threading mode] is Single-thread or Multi-thread then this
+** routine returns a NULL pointer.
+*/
+SQLITE_API sqlite3_mutex *sqlite3_db_mutex(sqlite3*);
+
+/*
+** CAPI3REF: Low-Level Control Of Database Files
+** METHOD: sqlite3
+** KEYWORDS: {file control}
+**
+** ^The [sqlite3_file_control()] interface makes a direct call to the
+** xFileControl method for the [sqlite3_io_methods] object associated
+** with a particular database identified by the second argument. ^The
+** name of the database is "main" for the main database or "temp" for the
+** TEMP database, or the name that appears after the AS keyword for
+** databases that are added using the [ATTACH] SQL command.
+** ^A NULL pointer can be used in place of "main" to refer to the
+** main database file.
+** ^The third and fourth parameters to this routine
+** are passed directly through to the second and third parameters of
+** the xFileControl method.  ^The return value of the xFileControl
+** method becomes the return value of this routine.
+**
+** A few opcodes for [sqlite3_file_control()] are handled directly
+** by the SQLite core and never invoke the
+** sqlite3_io_methods.xFileControl method.
+** ^The [SQLITE_FCNTL_FILE_POINTER] value for the op parameter causes
+** a pointer to the underlying [sqlite3_file] object to be written into
+** the space pointed to by the 4th parameter.  The
+** [SQLITE_FCNTL_JOURNAL_POINTER] works similarly except that it returns
+** the [sqlite3_file] object associated with the journal file instead of
+** the main database.  The [SQLITE_FCNTL_VFS_POINTER] opcode returns
+** a pointer to the underlying [sqlite3_vfs] object for the file.
+** The [SQLITE_FCNTL_DATA_VERSION] returns the data version counter
+** from the pager.
+**
+** ^If the second parameter (zDbName) does not match the name of any
+** open database file, then SQLITE_ERROR is returned.  ^This error
+** code is not remembered and will not be recalled by [sqlite3_errcode()]
+** or [sqlite3_errmsg()].  The underlying xFileControl method might
+** also return SQLITE_ERROR.  There is no way to distinguish between
+** an incorrect zDbName and an SQLITE_ERROR return from the underlying
+** xFileControl method.
+**
+** See also: [file control opcodes]
+*/
+SQLITE_API int sqlite3_file_control(sqlite3*, const char *zDbName, int op, void*);
+
+/*
+** CAPI3REF: Testing Interface
+**
+** ^The sqlite3_test_control() interface is used to read out internal
+** state of SQLite and to inject faults into SQLite for testing
+** purposes.  ^The first parameter is an operation code that determines
+** the number, meaning, and operation of all subsequent parameters.
+**
+** This interface is not for use by applications.  It exists solely
+** for verifying the correct operation of the SQLite library.  Depending
+** on how the SQLite library is compiled, this interface might not exist.
+**
+** The details of the operation codes, their meanings, the parameters
+** they take, and what they do are all subject to change without notice.
+** Unlike most of the SQLite API, this
