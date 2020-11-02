@@ -8844,4 +8844,145 @@ SQLITE_API int sqlite3_stmt_status(sqlite3_stmt*, int op,int resetFlg);
 **
 ** [[SQLITE_STMTSTATUS_RUN]] <dt>SQLITE_STMTSTATUS_RUN</dt>
 ** <dd>^This is the number of times that the prepared statement has
-** been run.  A single "run" for the purposes of
+** been run.  A single "run" for the purposes of this counter is one
+** or more calls to [sqlite3_step()] followed by a call to [sqlite3_reset()].
+** The counter is incremented on the first [sqlite3_step()] call of each
+** cycle.
+**
+** [[SQLITE_STMTSTATUS_FILTER_MISS]]
+** [[SQLITE_STMTSTATUS_FILTER HIT]]
+** <dt>SQLITE_STMTSTATUS_FILTER_HIT<br>
+** SQLITE_STMTSTATUS_FILTER_MISS</dt>
+** <dd>^SQLITE_STMTSTATUS_FILTER_HIT is the number of times that a join
+** step was bypassed because a Bloom filter returned not-found.  The
+** corresponding SQLITE_STMTSTATUS_FILTER_MISS value is the number of
+** times that the Bloom filter returned a find, and thus the join step
+** had to be processed as normal.
+**
+** [[SQLITE_STMTSTATUS_MEMUSED]] <dt>SQLITE_STMTSTATUS_MEMUSED</dt>
+** <dd>^This is the approximate number of bytes of heap memory
+** used to store the prepared statement.  ^This value is not actually
+** a counter, and so the resetFlg parameter to sqlite3_stmt_status()
+** is ignored when the opcode is SQLITE_STMTSTATUS_MEMUSED.
+** </dd>
+** </dl>
+*/
+#define SQLITE_STMTSTATUS_FULLSCAN_STEP     1
+#define SQLITE_STMTSTATUS_SORT              2
+#define SQLITE_STMTSTATUS_AUTOINDEX         3
+#define SQLITE_STMTSTATUS_VM_STEP           4
+#define SQLITE_STMTSTATUS_REPREPARE         5
+#define SQLITE_STMTSTATUS_RUN               6
+#define SQLITE_STMTSTATUS_FILTER_MISS       7
+#define SQLITE_STMTSTATUS_FILTER_HIT        8
+#define SQLITE_STMTSTATUS_MEMUSED           99
+
+/*
+** CAPI3REF: Custom Page Cache Object
+**
+** The sqlite3_pcache type is opaque.  It is implemented by
+** the pluggable module.  The SQLite core has no knowledge of
+** its size or internal structure and never deals with the
+** sqlite3_pcache object except by holding and passing pointers
+** to the object.
+**
+** See [sqlite3_pcache_methods2] for additional information.
+*/
+typedef struct sqlite3_pcache sqlite3_pcache;
+
+/*
+** CAPI3REF: Custom Page Cache Object
+**
+** The sqlite3_pcache_page object represents a single page in the
+** page cache.  The page cache will allocate instances of this
+** object.  Various methods of the page cache use pointers to instances
+** of this object as parameters or as their return value.
+**
+** See [sqlite3_pcache_methods2] for additional information.
+*/
+typedef struct sqlite3_pcache_page sqlite3_pcache_page;
+struct sqlite3_pcache_page {
+  void *pBuf;        /* The content of the page */
+  void *pExtra;      /* Extra information associated with the page */
+};
+
+/*
+** CAPI3REF: Application Defined Page Cache.
+** KEYWORDS: {page cache}
+**
+** ^(The [sqlite3_config]([SQLITE_CONFIG_PCACHE2], ...) interface can
+** register an alternative page cache implementation by passing in an
+** instance of the sqlite3_pcache_methods2 structure.)^
+** In many applications, most of the heap memory allocated by
+** SQLite is used for the page cache.
+** By implementing a
+** custom page cache using this API, an application can better control
+** the amount of memory consumed by SQLite, the way in which
+** that memory is allocated and released, and the policies used to
+** determine exactly which parts of a database file are cached and for
+** how long.
+**
+** The alternative page cache mechanism is an
+** extreme measure that is only needed by the most demanding applications.
+** The built-in page cache is recommended for most uses.
+**
+** ^(The contents of the sqlite3_pcache_methods2 structure are copied to an
+** internal buffer by SQLite within the call to [sqlite3_config].  Hence
+** the application may discard the parameter after the call to
+** [sqlite3_config()] returns.)^
+**
+** [[the xInit() page cache method]]
+** ^(The xInit() method is called once for each effective
+** call to [sqlite3_initialize()])^
+** (usually only once during the lifetime of the process). ^(The xInit()
+** method is passed a copy of the sqlite3_pcache_methods2.pArg value.)^
+** The intent of the xInit() method is to set up global data structures
+** required by the custom page cache implementation.
+** ^(If the xInit() method is NULL, then the
+** built-in default page cache is used instead of the application defined
+** page cache.)^
+**
+** [[the xShutdown() page cache method]]
+** ^The xShutdown() method is called by [sqlite3_shutdown()].
+** It can be used to clean up
+** any outstanding resources before process shutdown, if required.
+** ^The xShutdown() method may be NULL.
+**
+** ^SQLite automatically serializes calls to the xInit method,
+** so the xInit method need not be threadsafe.  ^The
+** xShutdown method is only called from [sqlite3_shutdown()] so it does
+** not need to be threadsafe either.  All other methods must be threadsafe
+** in multithreaded applications.
+**
+** ^SQLite will never invoke xInit() more than once without an intervening
+** call to xShutdown().
+**
+** [[the xCreate() page cache methods]]
+** ^SQLite invokes the xCreate() method to construct a new cache instance.
+** SQLite will typically create one cache instance for each open database file,
+** though this is not guaranteed. ^The
+** first parameter, szPage, is the size in bytes of the pages that must
+** be allocated by the cache.  ^szPage will always a power of two.  ^The
+** second parameter szExtra is a number of bytes of extra storage
+** associated with each page cache entry.  ^The szExtra parameter will
+** a number less than 250.  SQLite will use the
+** extra szExtra bytes on each page to store metadata about the underlying
+** database page on disk.  The value passed into szExtra depends
+** on the SQLite version, the target platform, and how SQLite was compiled.
+** ^The third argument to xCreate(), bPurgeable, is true if the cache being
+** created will be used to cache database pages of a file stored on disk, or
+** false if it is used for an in-memory database. The cache implementation
+** does not have to do anything special based with the value of bPurgeable;
+** it is purely advisory.  ^On a cache where bPurgeable is false, SQLite will
+** never invoke xUnpin() except to deliberately delete a page.
+** ^In other words, calls to xUnpin() on a cache with bPurgeable set to
+** false will always have the "discard" flag set to true.
+** ^Hence, a cache created with bPurgeable false will
+** never contain any unpinned pages.
+**
+** [[the xCachesize() page cache method]]
+** ^(The xCachesize() method may be called at any time by SQLite to set the
+** suggested maximum cache-size (number of pages stored by) the cache
+** instance passed as the first argument. This is the value configured using
+** the SQLite "[PRAGMA cache_size]" command.)^  As with the bPurgeable
+** parameter, the implementation is not required to do anything 
