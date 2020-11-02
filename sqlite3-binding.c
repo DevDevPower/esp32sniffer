@@ -8278,4 +8278,154 @@ SQLITE_API int sqlite3_file_control(sqlite3*, const char *zDbName, int op, void*
 **
 ** The details of the operation codes, their meanings, the parameters
 ** they take, and what they do are all subject to change without notice.
-** Unlike most of the SQLite API, this
+** Unlike most of the SQLite API, this function is not guaranteed to
+** operate consistently from one release to the next.
+*/
+SQLITE_API int sqlite3_test_control(int op, ...);
+
+/*
+** CAPI3REF: Testing Interface Operation Codes
+**
+** These constants are the valid operation code parameters used
+** as the first argument to [sqlite3_test_control()].
+**
+** These parameters and their meanings are subject to change
+** without notice.  These values are for testing purposes only.
+** Applications should not use any of these parameters or the
+** [sqlite3_test_control()] interface.
+*/
+#define SQLITE_TESTCTRL_FIRST                    5
+#define SQLITE_TESTCTRL_PRNG_SAVE                5
+#define SQLITE_TESTCTRL_PRNG_RESTORE             6
+#define SQLITE_TESTCTRL_PRNG_RESET               7  /* NOT USED */
+#define SQLITE_TESTCTRL_BITVEC_TEST              8
+#define SQLITE_TESTCTRL_FAULT_INSTALL            9
+#define SQLITE_TESTCTRL_BENIGN_MALLOC_HOOKS     10
+#define SQLITE_TESTCTRL_PENDING_BYTE            11
+#define SQLITE_TESTCTRL_ASSERT                  12
+#define SQLITE_TESTCTRL_ALWAYS                  13
+#define SQLITE_TESTCTRL_RESERVE                 14  /* NOT USED */
+#define SQLITE_TESTCTRL_OPTIMIZATIONS           15
+#define SQLITE_TESTCTRL_ISKEYWORD               16  /* NOT USED */
+#define SQLITE_TESTCTRL_SCRATCHMALLOC           17  /* NOT USED */
+#define SQLITE_TESTCTRL_INTERNAL_FUNCTIONS      17
+#define SQLITE_TESTCTRL_LOCALTIME_FAULT         18
+#define SQLITE_TESTCTRL_EXPLAIN_STMT            19  /* NOT USED */
+#define SQLITE_TESTCTRL_ONCE_RESET_THRESHOLD    19
+#define SQLITE_TESTCTRL_NEVER_CORRUPT           20
+#define SQLITE_TESTCTRL_VDBE_COVERAGE           21
+#define SQLITE_TESTCTRL_BYTEORDER               22
+#define SQLITE_TESTCTRL_ISINIT                  23
+#define SQLITE_TESTCTRL_SORTER_MMAP             24
+#define SQLITE_TESTCTRL_IMPOSTER                25
+#define SQLITE_TESTCTRL_PARSER_COVERAGE         26
+#define SQLITE_TESTCTRL_RESULT_INTREAL          27
+#define SQLITE_TESTCTRL_PRNG_SEED               28
+#define SQLITE_TESTCTRL_EXTRA_SCHEMA_CHECKS     29
+#define SQLITE_TESTCTRL_SEEK_COUNT              30
+#define SQLITE_TESTCTRL_TRACEFLAGS              31
+#define SQLITE_TESTCTRL_TUNE                    32
+#define SQLITE_TESTCTRL_LOGEST                  33
+#define SQLITE_TESTCTRL_LAST                    33  /* Largest TESTCTRL */
+
+/*
+** CAPI3REF: SQL Keyword Checking
+**
+** These routines provide access to the set of SQL language keywords
+** recognized by SQLite.  Applications can uses these routines to determine
+** whether or not a specific identifier needs to be escaped (for example,
+** by enclosing in double-quotes) so as not to confuse the parser.
+**
+** The sqlite3_keyword_count() interface returns the number of distinct
+** keywords understood by SQLite.
+**
+** The sqlite3_keyword_name(N,Z,L) interface finds the N-th keyword and
+** makes *Z point to that keyword expressed as UTF8 and writes the number
+** of bytes in the keyword into *L.  The string that *Z points to is not
+** zero-terminated.  The sqlite3_keyword_name(N,Z,L) routine returns
+** SQLITE_OK if N is within bounds and SQLITE_ERROR if not. If either Z
+** or L are NULL or invalid pointers then calls to
+** sqlite3_keyword_name(N,Z,L) result in undefined behavior.
+**
+** The sqlite3_keyword_check(Z,L) interface checks to see whether or not
+** the L-byte UTF8 identifier that Z points to is a keyword, returning non-zero
+** if it is and zero if not.
+**
+** The parser used by SQLite is forgiving.  It is often possible to use
+** a keyword as an identifier as long as such use does not result in a
+** parsing ambiguity.  For example, the statement
+** "CREATE TABLE BEGIN(REPLACE,PRAGMA,END);" is accepted by SQLite, and
+** creates a new table named "BEGIN" with three columns named
+** "REPLACE", "PRAGMA", and "END".  Nevertheless, best practice is to avoid
+** using keywords as identifiers.  Common techniques used to avoid keyword
+** name collisions include:
+** <ul>
+** <li> Put all identifier names inside double-quotes.  This is the official
+**      SQL way to escape identifier names.
+** <li> Put identifier names inside &#91;...&#93;.  This is not standard SQL,
+**      but it is what SQL Server does and so lots of programmers use this
+**      technique.
+** <li> Begin every identifier with the letter "Z" as no SQL keywords start
+**      with "Z".
+** <li> Include a digit somewhere in every identifier name.
+** </ul>
+**
+** Note that the number of keywords understood by SQLite can depend on
+** compile-time options.  For example, "VACUUM" is not a keyword if
+** SQLite is compiled with the [-DSQLITE_OMIT_VACUUM] option.  Also,
+** new keywords may be added to future releases of SQLite.
+*/
+SQLITE_API int sqlite3_keyword_count(void);
+SQLITE_API int sqlite3_keyword_name(int,const char**,int*);
+SQLITE_API int sqlite3_keyword_check(const char*,int);
+
+/*
+** CAPI3REF: Dynamic String Object
+** KEYWORDS: {dynamic string}
+**
+** An instance of the sqlite3_str object contains a dynamically-sized
+** string under construction.
+**
+** The lifecycle of an sqlite3_str object is as follows:
+** <ol>
+** <li> ^The sqlite3_str object is created using [sqlite3_str_new()].
+** <li> ^Text is appended to the sqlite3_str object using various
+** methods, such as [sqlite3_str_appendf()].
+** <li> ^The sqlite3_str object is destroyed and the string it created
+** is returned using the [sqlite3_str_finish()] interface.
+** </ol>
+*/
+typedef struct sqlite3_str sqlite3_str;
+
+/*
+** CAPI3REF: Create A New Dynamic String Object
+** CONSTRUCTOR: sqlite3_str
+**
+** ^The [sqlite3_str_new(D)] interface allocates and initializes
+** a new [sqlite3_str] object.  To avoid memory leaks, the object returned by
+** [sqlite3_str_new()] must be freed by a subsequent call to
+** [sqlite3_str_finish(X)].
+**
+** ^The [sqlite3_str_new(D)] interface always returns a pointer to a
+** valid [sqlite3_str] object, though in the event of an out-of-memory
+** error the returned object might be a special singleton that will
+** silently reject new text, always return SQLITE_NOMEM from
+** [sqlite3_str_errcode()], always return 0 for
+** [sqlite3_str_length()], and always return NULL from
+** [sqlite3_str_finish(X)].  It is always safe to use the value
+** returned by [sqlite3_str_new(D)] as the sqlite3_str parameter
+** to any of the other [sqlite3_str] methods.
+**
+** The D parameter to [sqlite3_str_new(D)] may be NULL.  If the
+** D parameter in [sqlite3_str_new(D)] is not NULL, then the maximum
+** length of the string contained in the [sqlite3_str] object will be
+** the value set for [sqlite3_limit](D,[SQLITE_LIMIT_LENGTH]) instead
+** of [SQLITE_MAX_LENGTH].
+*/
+SQLITE_API sqlite3_str *sqlite3_str_new(sqlite3*);
+
+/*
+** CAPI3REF: Finalize A Dynamic String
+** DESTRUCTOR: sqlite3_str
+**
+** ^The [sqlite3_str_finish(
