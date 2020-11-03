@@ -9131,4 +9131,126 @@ typedef struct sqlite3_backup sqlite3_backup;
 ** it is not locked continuously for the entire backup operation.
 ** ^Thus, the backup may be performed on a live source database without
 ** preventing other database connections from
-** reading or writi
+** reading or writing to the source database while the backup is underway.
+**
+** ^(To perform a backup operation:
+**   <ol>
+**     <li><b>sqlite3_backup_init()</b> is called once to initialize the
+**         backup,
+**     <li><b>sqlite3_backup_step()</b> is called one or more times to transfer
+**         the data between the two databases, and finally
+**     <li><b>sqlite3_backup_finish()</b> is called to release all resources
+**         associated with the backup operation.
+**   </ol>)^
+** There should be exactly one call to sqlite3_backup_finish() for each
+** successful call to sqlite3_backup_init().
+**
+** [[sqlite3_backup_init()]] <b>sqlite3_backup_init()</b>
+**
+** ^The D and N arguments to sqlite3_backup_init(D,N,S,M) are the
+** [database connection] associated with the destination database
+** and the database name, respectively.
+** ^The database name is "main" for the main database, "temp" for the
+** temporary database, or the name specified after the AS keyword in
+** an [ATTACH] statement for an attached database.
+** ^The S and M arguments passed to
+** sqlite3_backup_init(D,N,S,M) identify the [database connection]
+** and database name of the source database, respectively.
+** ^The source and destination [database connections] (parameters S and D)
+** must be different or else sqlite3_backup_init(D,N,S,M) will fail with
+** an error.
+**
+** ^A call to sqlite3_backup_init() will fail, returning NULL, if
+** there is already a read or read-write transaction open on the
+** destination database.
+**
+** ^If an error occurs within sqlite3_backup_init(D,N,S,M), then NULL is
+** returned and an error code and error message are stored in the
+** destination [database connection] D.
+** ^The error code and message for the failed call to sqlite3_backup_init()
+** can be retrieved using the [sqlite3_errcode()], [sqlite3_errmsg()], and/or
+** [sqlite3_errmsg16()] functions.
+** ^A successful call to sqlite3_backup_init() returns a pointer to an
+** [sqlite3_backup] object.
+** ^The [sqlite3_backup] object may be used with the sqlite3_backup_step() and
+** sqlite3_backup_finish() functions to perform the specified backup
+** operation.
+**
+** [[sqlite3_backup_step()]] <b>sqlite3_backup_step()</b>
+**
+** ^Function sqlite3_backup_step(B,N) will copy up to N pages between
+** the source and destination databases specified by [sqlite3_backup] object B.
+** ^If N is negative, all remaining source pages are copied.
+** ^If sqlite3_backup_step(B,N) successfully copies N pages and there
+** are still more pages to be copied, then the function returns [SQLITE_OK].
+** ^If sqlite3_backup_step(B,N) successfully finishes copying all pages
+** from source to destination, then it returns [SQLITE_DONE].
+** ^If an error occurs while running sqlite3_backup_step(B,N),
+** then an [error code] is returned. ^As well as [SQLITE_OK] and
+** [SQLITE_DONE], a call to sqlite3_backup_step() may return [SQLITE_READONLY],
+** [SQLITE_NOMEM], [SQLITE_BUSY], [SQLITE_LOCKED], or an
+** [SQLITE_IOERR_ACCESS | SQLITE_IOERR_XXX] extended error code.
+**
+** ^(The sqlite3_backup_step() might return [SQLITE_READONLY] if
+** <ol>
+** <li> the destination database was opened read-only, or
+** <li> the destination database is using write-ahead-log journaling
+** and the destination and source page sizes differ, or
+** <li> the destination database is an in-memory database and the
+** destination and source page sizes differ.
+** </ol>)^
+**
+** ^If sqlite3_backup_step() cannot obtain a required file-system lock, then
+** the [sqlite3_busy_handler | busy-handler function]
+** is invoked (if one is specified). ^If the
+** busy-handler returns non-zero before the lock is available, then
+** [SQLITE_BUSY] is returned to the caller. ^In this case the call to
+** sqlite3_backup_step() can be retried later. ^If the source
+** [database connection]
+** is being used to write to the source database when sqlite3_backup_step()
+** is called, then [SQLITE_LOCKED] is returned immediately. ^Again, in this
+** case the call to sqlite3_backup_step() can be retried later on. ^(If
+** [SQLITE_IOERR_ACCESS | SQLITE_IOERR_XXX], [SQLITE_NOMEM], or
+** [SQLITE_READONLY] is returned, then
+** there is no point in retrying the call to sqlite3_backup_step(). These
+** errors are considered fatal.)^  The application must accept
+** that the backup operation has failed and pass the backup operation handle
+** to the sqlite3_backup_finish() to release associated resources.
+**
+** ^The first call to sqlite3_backup_step() obtains an exclusive lock
+** on the destination file. ^The exclusive lock is not released until either
+** sqlite3_backup_finish() is called or the backup operation is complete
+** and sqlite3_backup_step() returns [SQLITE_DONE].  ^Every call to
+** sqlite3_backup_step() obtains a [shared lock] on the source database that
+** lasts for the duration of the sqlite3_backup_step() call.
+** ^Because the source database is not locked between calls to
+** sqlite3_backup_step(), the source database may be modified mid-way
+** through the backup process.  ^If the source database is modified by an
+** external process or via a database connection other than the one being
+** used by the backup operation, then the backup will be automatically
+** restarted by the next call to sqlite3_backup_step(). ^If the source
+** database is modified by the using the same database connection as is used
+** by the backup operation, then the backup database is automatically
+** updated at the same time.
+**
+** [[sqlite3_backup_finish()]] <b>sqlite3_backup_finish()</b>
+**
+** When sqlite3_backup_step() has returned [SQLITE_DONE], or when the
+** application wishes to abandon the backup operation, the application
+** should destroy the [sqlite3_backup] by passing it to sqlite3_backup_finish().
+** ^The sqlite3_backup_finish() interfaces releases all
+** resources associated with the [sqlite3_backup] object.
+** ^If sqlite3_backup_step() has not yet returned [SQLITE_DONE], then any
+** active write-transaction on the destination database is rolled back.
+** The [sqlite3_backup] object is invalid
+** and may not be used following a call to sqlite3_backup_finish().
+**
+** ^The value returned by sqlite3_backup_finish is [SQLITE_OK] if no
+** sqlite3_backup_step() errors occurred, regardless or whether or not
+** sqlite3_backup_step() completed.
+** ^If an out-of-memory condition or IO error occurred during any prior
+** sqlite3_backup_step() call on the same [sqlite3_backup] object, then
+** sqlite3_backup_finish() returns the corresponding [error code].
+**
+** ^A return of [SQLITE_BUSY] or [SQLITE_LOCKED] from sqlite3_backup_step()
+** is not a permanent error and does not affect the return va
