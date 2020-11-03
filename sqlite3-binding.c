@@ -9253,4 +9253,127 @@ typedef struct sqlite3_backup sqlite3_backup;
 ** sqlite3_backup_finish() returns the corresponding [error code].
 **
 ** ^A return of [SQLITE_BUSY] or [SQLITE_LOCKED] from sqlite3_backup_step()
-** is not a permanent error and does not affect the return va
+** is not a permanent error and does not affect the return value of
+** sqlite3_backup_finish().
+**
+** [[sqlite3_backup_remaining()]] [[sqlite3_backup_pagecount()]]
+** <b>sqlite3_backup_remaining() and sqlite3_backup_pagecount()</b>
+**
+** ^The sqlite3_backup_remaining() routine returns the number of pages still
+** to be backed up at the conclusion of the most recent sqlite3_backup_step().
+** ^The sqlite3_backup_pagecount() routine returns the total number of pages
+** in the source database at the conclusion of the most recent
+** sqlite3_backup_step().
+** ^(The values returned by these functions are only updated by
+** sqlite3_backup_step(). If the source database is modified in a way that
+** changes the size of the source database or the number of pages remaining,
+** those changes are not reflected in the output of sqlite3_backup_pagecount()
+** and sqlite3_backup_remaining() until after the next
+** sqlite3_backup_step().)^
+**
+** <b>Concurrent Usage of Database Handles</b>
+**
+** ^The source [database connection] may be used by the application for other
+** purposes while a backup operation is underway or being initialized.
+** ^If SQLite is compiled and configured to support threadsafe database
+** connections, then the source database connection may be used concurrently
+** from within other threads.
+**
+** However, the application must guarantee that the destination
+** [database connection] is not passed to any other API (by any thread) after
+** sqlite3_backup_init() is called and before the corresponding call to
+** sqlite3_backup_finish().  SQLite does not currently check to see
+** if the application incorrectly accesses the destination [database connection]
+** and so no error code is reported, but the operations may malfunction
+** nevertheless.  Use of the destination database connection while a
+** backup is in progress might also also cause a mutex deadlock.
+**
+** If running in [shared cache mode], the application must
+** guarantee that the shared cache used by the destination database
+** is not accessed while the backup is running. In practice this means
+** that the application must guarantee that the disk file being
+** backed up to is not accessed by any connection within the process,
+** not just the specific connection that was passed to sqlite3_backup_init().
+**
+** The [sqlite3_backup] object itself is partially threadsafe. Multiple
+** threads may safely make multiple concurrent calls to sqlite3_backup_step().
+** However, the sqlite3_backup_remaining() and sqlite3_backup_pagecount()
+** APIs are not strictly speaking threadsafe. If they are invoked at the
+** same time as another thread is invoking sqlite3_backup_step() it is
+** possible that they return invalid values.
+*/
+SQLITE_API sqlite3_backup *sqlite3_backup_init(
+  sqlite3 *pDest,                        /* Destination database handle */
+  const char *zDestName,                 /* Destination database name */
+  sqlite3 *pSource,                      /* Source database handle */
+  const char *zSourceName                /* Source database name */
+);
+SQLITE_API int sqlite3_backup_step(sqlite3_backup *p, int nPage);
+SQLITE_API int sqlite3_backup_finish(sqlite3_backup *p);
+SQLITE_API int sqlite3_backup_remaining(sqlite3_backup *p);
+SQLITE_API int sqlite3_backup_pagecount(sqlite3_backup *p);
+
+/*
+** CAPI3REF: Unlock Notification
+** METHOD: sqlite3
+**
+** ^When running in shared-cache mode, a database operation may fail with
+** an [SQLITE_LOCKED] error if the required locks on the shared-cache or
+** individual tables within the shared-cache cannot be obtained. See
+** [SQLite Shared-Cache Mode] for a description of shared-cache locking.
+** ^This API may be used to register a callback that SQLite will invoke
+** when the connection currently holding the required lock relinquishes it.
+** ^This API is only available if the library was compiled with the
+** [SQLITE_ENABLE_UNLOCK_NOTIFY] C-preprocessor symbol defined.
+**
+** See Also: [Using the SQLite Unlock Notification Feature].
+**
+** ^Shared-cache locks are released when a database connection concludes
+** its current transaction, either by committing it or rolling it back.
+**
+** ^When a connection (known as the blocked connection) fails to obtain a
+** shared-cache lock and SQLITE_LOCKED is returned to the caller, the
+** identity of the database connection (the blocking connection) that
+** has locked the required resource is stored internally. ^After an
+** application receives an SQLITE_LOCKED error, it may call the
+** sqlite3_unlock_notify() method with the blocked connection handle as
+** the first argument to register for a callback that will be invoked
+** when the blocking connections current transaction is concluded. ^The
+** callback is invoked from within the [sqlite3_step] or [sqlite3_close]
+** call that concludes the blocking connection's transaction.
+**
+** ^(If sqlite3_unlock_notify() is called in a multi-threaded application,
+** there is a chance that the blocking connection will have already
+** concluded its transaction by the time sqlite3_unlock_notify() is invoked.
+** If this happens, then the specified callback is invoked immediately,
+** from within the call to sqlite3_unlock_notify().)^
+**
+** ^If the blocked connection is attempting to obtain a write-lock on a
+** shared-cache table, and more than one other connection currently holds
+** a read-lock on the same table, then SQLite arbitrarily selects one of
+** the other connections to use as the blocking connection.
+**
+** ^(There may be at most one unlock-notify callback registered by a
+** blocked connection. If sqlite3_unlock_notify() is called when the
+** blocked connection already has a registered unlock-notify callback,
+** then the new callback replaces the old.)^ ^If sqlite3_unlock_notify() is
+** called with a NULL pointer as its second argument, then any existing
+** unlock-notify callback is canceled. ^The blocked connections
+** unlock-notify callback may also be canceled by closing the blocked
+** connection using [sqlite3_close()].
+**
+** The unlock-notify callback is not reentrant. If an application invokes
+** any sqlite3_xxx API functions from within an unlock-notify callback, a
+** crash or deadlock may be the result.
+**
+** ^Unless deadlock is detected (see below), sqlite3_unlock_notify() always
+** returns SQLITE_OK.
+**
+** <b>Callback Invocation Details</b>
+**
+** When an unlock-notify callback is registered, the application provides a
+** single void* pointer that is passed to the callback when it is invoked.
+** However, the signature of the callback function allows SQLite to pass
+** it an array of void* context pointers. The first argument passed to
+** an unlock-notify callback is a pointer to an array of void* pointers,
+** and the second is
