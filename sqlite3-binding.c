@@ -8985,4 +8985,150 @@ struct sqlite3_pcache_page {
 ** suggested maximum cache-size (number of pages stored by) the cache
 ** instance passed as the first argument. This is the value configured using
 ** the SQLite "[PRAGMA cache_size]" command.)^  As with the bPurgeable
-** parameter, the implementation is not required to do anything 
+** parameter, the implementation is not required to do anything with this
+** value; it is advisory only.
+**
+** [[the xPagecount() page cache methods]]
+** The xPagecount() method must return the number of pages currently
+** stored in the cache, both pinned and unpinned.
+**
+** [[the xFetch() page cache methods]]
+** The xFetch() method locates a page in the cache and returns a pointer to
+** an sqlite3_pcache_page object associated with that page, or a NULL pointer.
+** The pBuf element of the returned sqlite3_pcache_page object will be a
+** pointer to a buffer of szPage bytes used to store the content of a
+** single database page.  The pExtra element of sqlite3_pcache_page will be
+** a pointer to the szExtra bytes of extra storage that SQLite has requested
+** for each entry in the page cache.
+**
+** The page to be fetched is determined by the key. ^The minimum key value
+** is 1.  After it has been retrieved using xFetch, the page is considered
+** to be "pinned".
+**
+** If the requested page is already in the page cache, then the page cache
+** implementation must return a pointer to the page buffer with its content
+** intact.  If the requested page is not already in the cache, then the
+** cache implementation should use the value of the createFlag
+** parameter to help it determined what action to take:
+**
+** <table border=1 width=85% align=center>
+** <tr><th> createFlag <th> Behavior when page is not already in cache
+** <tr><td> 0 <td> Do not allocate a new page.  Return NULL.
+** <tr><td> 1 <td> Allocate a new page if it easy and convenient to do so.
+**                 Otherwise return NULL.
+** <tr><td> 2 <td> Make every effort to allocate a new page.  Only return
+**                 NULL if allocating a new page is effectively impossible.
+** </table>
+**
+** ^(SQLite will normally invoke xFetch() with a createFlag of 0 or 1.  SQLite
+** will only use a createFlag of 2 after a prior call with a createFlag of 1
+** failed.)^  In between the xFetch() calls, SQLite may
+** attempt to unpin one or more cache pages by spilling the content of
+** pinned pages to disk and synching the operating system disk cache.
+**
+** [[the xUnpin() page cache method]]
+** ^xUnpin() is called by SQLite with a pointer to a currently pinned page
+** as its second argument.  If the third parameter, discard, is non-zero,
+** then the page must be evicted from the cache.
+** ^If the discard parameter is
+** zero, then the page may be discarded or retained at the discretion of
+** page cache implementation. ^The page cache implementation
+** may choose to evict unpinned pages at any time.
+**
+** The cache must not perform any reference counting. A single
+** call to xUnpin() unpins the page regardless of the number of prior calls
+** to xFetch().
+**
+** [[the xRekey() page cache methods]]
+** The xRekey() method is used to change the key value associated with the
+** page passed as the second argument. If the cache
+** previously contains an entry associated with newKey, it must be
+** discarded. ^Any prior cache entry associated with newKey is guaranteed not
+** to be pinned.
+**
+** When SQLite calls the xTruncate() method, the cache must discard all
+** existing cache entries with page numbers (keys) greater than or equal
+** to the value of the iLimit parameter passed to xTruncate(). If any
+** of these pages are pinned, they are implicitly unpinned, meaning that
+** they can be safely discarded.
+**
+** [[the xDestroy() page cache method]]
+** ^The xDestroy() method is used to delete a cache allocated by xCreate().
+** All resources associated with the specified cache should be freed. ^After
+** calling the xDestroy() method, SQLite considers the [sqlite3_pcache*]
+** handle invalid, and will not use it with any other sqlite3_pcache_methods2
+** functions.
+**
+** [[the xShrink() page cache method]]
+** ^SQLite invokes the xShrink() method when it wants the page cache to
+** free up as much of heap memory as possible.  The page cache implementation
+** is not obligated to free any memory, but well-behaved implementations should
+** do their best.
+*/
+typedef struct sqlite3_pcache_methods2 sqlite3_pcache_methods2;
+struct sqlite3_pcache_methods2 {
+  int iVersion;
+  void *pArg;
+  int (*xInit)(void*);
+  void (*xShutdown)(void*);
+  sqlite3_pcache *(*xCreate)(int szPage, int szExtra, int bPurgeable);
+  void (*xCachesize)(sqlite3_pcache*, int nCachesize);
+  int (*xPagecount)(sqlite3_pcache*);
+  sqlite3_pcache_page *(*xFetch)(sqlite3_pcache*, unsigned key, int createFlag);
+  void (*xUnpin)(sqlite3_pcache*, sqlite3_pcache_page*, int discard);
+  void (*xRekey)(sqlite3_pcache*, sqlite3_pcache_page*,
+      unsigned oldKey, unsigned newKey);
+  void (*xTruncate)(sqlite3_pcache*, unsigned iLimit);
+  void (*xDestroy)(sqlite3_pcache*);
+  void (*xShrink)(sqlite3_pcache*);
+};
+
+/*
+** This is the obsolete pcache_methods object that has now been replaced
+** by sqlite3_pcache_methods2.  This object is not used by SQLite.  It is
+** retained in the header file for backwards compatibility only.
+*/
+typedef struct sqlite3_pcache_methods sqlite3_pcache_methods;
+struct sqlite3_pcache_methods {
+  void *pArg;
+  int (*xInit)(void*);
+  void (*xShutdown)(void*);
+  sqlite3_pcache *(*xCreate)(int szPage, int bPurgeable);
+  void (*xCachesize)(sqlite3_pcache*, int nCachesize);
+  int (*xPagecount)(sqlite3_pcache*);
+  void *(*xFetch)(sqlite3_pcache*, unsigned key, int createFlag);
+  void (*xUnpin)(sqlite3_pcache*, void*, int discard);
+  void (*xRekey)(sqlite3_pcache*, void*, unsigned oldKey, unsigned newKey);
+  void (*xTruncate)(sqlite3_pcache*, unsigned iLimit);
+  void (*xDestroy)(sqlite3_pcache*);
+};
+
+
+/*
+** CAPI3REF: Online Backup Object
+**
+** The sqlite3_backup object records state information about an ongoing
+** online backup operation.  ^The sqlite3_backup object is created by
+** a call to [sqlite3_backup_init()] and is destroyed by a call to
+** [sqlite3_backup_finish()].
+**
+** See Also: [Using the SQLite Online Backup API]
+*/
+typedef struct sqlite3_backup sqlite3_backup;
+
+/*
+** CAPI3REF: Online Backup API.
+**
+** The backup API copies the content of one database into another.
+** It is useful either for creating backups of databases or
+** for copying in-memory databases to or from persistent files.
+**
+** See Also: [Using the SQLite Online Backup API]
+**
+** ^SQLite holds a write transaction open on the destination database file
+** for the duration of the backup operation.
+** ^The source database is read-locked only while it is being read;
+** it is not locked continuously for the entire backup operation.
+** ^Thus, the backup may be performed on a live source database without
+** preventing other database connections from
+** reading or writi
