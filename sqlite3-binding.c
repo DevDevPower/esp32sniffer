@@ -10058,4 +10058,144 @@ SQLITE_API int sqlite3_vtab_in(sqlite3_index_info*, int iCons, int bHandle);
 ** ^On success, the sqlite3_vtab_in_first(X,P) and sqlite3_vtab_in_next(X,P)
 ** routines return SQLITE_OK and set *P to point to the first or next value
 ** on the RHS of the IN constraint.  ^If there are no more values on the
-** right hand side o
+** right hand side of the IN constraint, then *P is set to NULL and these
+** routines return [SQLITE_DONE].  ^The return value might be
+** some other value, such as SQLITE_NOMEM, in the event of a malfunction.
+**
+** The *ppOut values returned by these routines are only valid until the
+** next call to either of these routines or until the end of the xFilter
+** method from which these routines were called.  If the virtual table
+** implementation needs to retain the *ppOut values for longer, it must make
+** copies.  The *ppOut values are [protected sqlite3_value|protected].
+*/
+SQLITE_API int sqlite3_vtab_in_first(sqlite3_value *pVal, sqlite3_value **ppOut);
+SQLITE_API int sqlite3_vtab_in_next(sqlite3_value *pVal, sqlite3_value **ppOut);
+
+/*
+** CAPI3REF: Constraint values in xBestIndex()
+** METHOD: sqlite3_index_info
+**
+** This API may only be used from within the [xBestIndex|xBestIndex method]
+** of a [virtual table] implementation. The result of calling this interface
+** from outside of an xBestIndex method are undefined and probably harmful.
+**
+** ^When the sqlite3_vtab_rhs_value(P,J,V) interface is invoked from within
+** the [xBestIndex] method of a [virtual table] implementation, with P being
+** a copy of the [sqlite3_index_info] object pointer passed into xBestIndex and
+** J being a 0-based index into P->aConstraint[], then this routine
+** attempts to set *V to the value of the right-hand operand of
+** that constraint if the right-hand operand is known.  ^If the
+** right-hand operand is not known, then *V is set to a NULL pointer.
+** ^The sqlite3_vtab_rhs_value(P,J,V) interface returns SQLITE_OK if
+** and only if *V is set to a value.  ^The sqlite3_vtab_rhs_value(P,J,V)
+** inteface returns SQLITE_NOTFOUND if the right-hand side of the J-th
+** constraint is not available.  ^The sqlite3_vtab_rhs_value() interface
+** can return an result code other than SQLITE_OK or SQLITE_NOTFOUND if
+** something goes wrong.
+**
+** The sqlite3_vtab_rhs_value() interface is usually only successful if
+** the right-hand operand of a constraint is a literal value in the original
+** SQL statement.  If the right-hand operand is an expression or a reference
+** to some other column or a [host parameter], then sqlite3_vtab_rhs_value()
+** will probably return [SQLITE_NOTFOUND].
+**
+** ^(Some constraints, such as [SQLITE_INDEX_CONSTRAINT_ISNULL] and
+** [SQLITE_INDEX_CONSTRAINT_ISNOTNULL], have no right-hand operand.  For such
+** constraints, sqlite3_vtab_rhs_value() always returns SQLITE_NOTFOUND.)^
+**
+** ^The [sqlite3_value] object returned in *V is a protected sqlite3_value
+** and remains valid for the duration of the xBestIndex method call.
+** ^When xBestIndex returns, the sqlite3_value object returned by
+** sqlite3_vtab_rhs_value() is automatically deallocated.
+**
+** The "_rhs_" in the name of this routine is an abbreviation for
+** "Right-Hand Side".
+*/
+SQLITE_API int sqlite3_vtab_rhs_value(sqlite3_index_info*, int, sqlite3_value **ppVal);
+
+/*
+** CAPI3REF: Conflict resolution modes
+** KEYWORDS: {conflict resolution mode}
+**
+** These constants are returned by [sqlite3_vtab_on_conflict()] to
+** inform a [virtual table] implementation what the [ON CONFLICT] mode
+** is for the SQL statement being evaluated.
+**
+** Note that the [SQLITE_IGNORE] constant is also used as a potential
+** return value from the [sqlite3_set_authorizer()] callback and that
+** [SQLITE_ABORT] is also a [result code].
+*/
+#define SQLITE_ROLLBACK 1
+/* #define SQLITE_IGNORE 2 // Also used by sqlite3_authorizer() callback */
+#define SQLITE_FAIL     3
+/* #define SQLITE_ABORT 4  // Also an error code */
+#define SQLITE_REPLACE  5
+
+/*
+** CAPI3REF: Prepared Statement Scan Status Opcodes
+** KEYWORDS: {scanstatus options}
+**
+** The following constants can be used for the T parameter to the
+** [sqlite3_stmt_scanstatus(S,X,T,V)] interface.  Each constant designates a
+** different metric for sqlite3_stmt_scanstatus() to return.
+**
+** When the value returned to V is a string, space to hold that string is
+** managed by the prepared statement S and will be automatically freed when
+** S is finalized.
+**
+** <dl>
+** [[SQLITE_SCANSTAT_NLOOP]] <dt>SQLITE_SCANSTAT_NLOOP</dt>
+** <dd>^The [sqlite3_int64] variable pointed to by the V parameter will be
+** set to the total number of times that the X-th loop has run.</dd>
+**
+** [[SQLITE_SCANSTAT_NVISIT]] <dt>SQLITE_SCANSTAT_NVISIT</dt>
+** <dd>^The [sqlite3_int64] variable pointed to by the V parameter will be set
+** to the total number of rows examined by all iterations of the X-th loop.</dd>
+**
+** [[SQLITE_SCANSTAT_EST]] <dt>SQLITE_SCANSTAT_EST</dt>
+** <dd>^The "double" variable pointed to by the V parameter will be set to the
+** query planner's estimate for the average number of rows output from each
+** iteration of the X-th loop.  If the query planner's estimates was accurate,
+** then this value will approximate the quotient NVISIT/NLOOP and the
+** product of this value for all prior loops with the same SELECTID will
+** be the NLOOP value for the current loop.
+**
+** [[SQLITE_SCANSTAT_NAME]] <dt>SQLITE_SCANSTAT_NAME</dt>
+** <dd>^The "const char *" variable pointed to by the V parameter will be set
+** to a zero-terminated UTF-8 string containing the name of the index or table
+** used for the X-th loop.
+**
+** [[SQLITE_SCANSTAT_EXPLAIN]] <dt>SQLITE_SCANSTAT_EXPLAIN</dt>
+** <dd>^The "const char *" variable pointed to by the V parameter will be set
+** to a zero-terminated UTF-8 string containing the [EXPLAIN QUERY PLAN]
+** description for the X-th loop.
+**
+** [[SQLITE_SCANSTAT_SELECTID]] <dt>SQLITE_SCANSTAT_SELECT</dt>
+** <dd>^The "int" variable pointed to by the V parameter will be set to the
+** "select-id" for the X-th loop.  The select-id identifies which query or
+** subquery the loop is part of.  The main query has a select-id of zero.
+** The select-id is the same value as is output in the first column
+** of an [EXPLAIN QUERY PLAN] query.
+** </dl>
+*/
+#define SQLITE_SCANSTAT_NLOOP    0
+#define SQLITE_SCANSTAT_NVISIT   1
+#define SQLITE_SCANSTAT_EST      2
+#define SQLITE_SCANSTAT_NAME     3
+#define SQLITE_SCANSTAT_EXPLAIN  4
+#define SQLITE_SCANSTAT_SELECTID 5
+
+/*
+** CAPI3REF: Prepared Statement Scan Status
+** METHOD: sqlite3_stmt
+**
+** This interface returns information about the predicted and measured
+** performance for pStmt.  Advanced applications can use this
+** interface to compare the predicted and the measured performance and
+** issue warnings and/or rerun [ANALYZE] if discrepancies are found.
+**
+** Since this interface is expected to be rarely used, it is only
+** available if SQLite is compiled using the [SQLITE_ENABLE_STMT_SCANSTATUS]
+** compile-time option.
+**
+** The "iScanStatusOp" parameter determines which status information to r
