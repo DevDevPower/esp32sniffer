@@ -9787,4 +9787,133 @@ SQLITE_API int sqlite3_vtab_config(sqlite3*, int op, ...);
 ** views.
 ** </dd>
 **
-** [[SQLITE_VTAB_INNOCUOUS
+** [[SQLITE_VTAB_INNOCUOUS]]<dt>SQLITE_VTAB_INNOCUOUS</dt>
+** <dd>Calls of the form
+** [sqlite3_vtab_config](db,SQLITE_VTAB_INNOCUOUS) from within the
+** the [xConnect] or [xCreate] methods of a [virtual table] implmentation
+** identify that virtual table as being safe to use from within triggers
+** and views.  Conceptually, the SQLITE_VTAB_INNOCUOUS tag means that the
+** virtual table can do no serious harm even if it is controlled by a
+** malicious hacker.  Developers should avoid setting the SQLITE_VTAB_INNOCUOUS
+** flag unless absolutely necessary.
+** </dd>
+** </dl>
+*/
+#define SQLITE_VTAB_CONSTRAINT_SUPPORT 1
+#define SQLITE_VTAB_INNOCUOUS          2
+#define SQLITE_VTAB_DIRECTONLY         3
+
+/*
+** CAPI3REF: Determine The Virtual Table Conflict Policy
+**
+** This function may only be called from within a call to the [xUpdate] method
+** of a [virtual table] implementation for an INSERT or UPDATE operation. ^The
+** value returned is one of [SQLITE_ROLLBACK], [SQLITE_IGNORE], [SQLITE_FAIL],
+** [SQLITE_ABORT], or [SQLITE_REPLACE], according to the [ON CONFLICT] mode
+** of the SQL statement that triggered the call to the [xUpdate] method of the
+** [virtual table].
+*/
+SQLITE_API int sqlite3_vtab_on_conflict(sqlite3 *);
+
+/*
+** CAPI3REF: Determine If Virtual Table Column Access Is For UPDATE
+**
+** If the sqlite3_vtab_nochange(X) routine is called within the [xColumn]
+** method of a [virtual table], then it might return true if the
+** column is being fetched as part of an UPDATE operation during which the
+** column value will not change.  The virtual table implementation can use
+** this hint as permission to substitute a return value that is less
+** expensive to compute and that the corresponding
+** [xUpdate] method understands as a "no-change" value.
+**
+** If the [xColumn] method calls sqlite3_vtab_nochange() and finds that
+** the column is not changed by the UPDATE statement, then the xColumn
+** method can optionally return without setting a result, without calling
+** any of the [sqlite3_result_int|sqlite3_result_xxxxx() interfaces].
+** In that case, [sqlite3_value_nochange(X)] will return true for the
+** same column in the [xUpdate] method.
+**
+** The sqlite3_vtab_nochange() routine is an optimization.  Virtual table
+** implementations should continue to give a correct answer even if the
+** sqlite3_vtab_nochange() interface were to always return false.  In the
+** current implementation, the sqlite3_vtab_nochange() interface does always
+** returns false for the enhanced [UPDATE FROM] statement.
+*/
+SQLITE_API int sqlite3_vtab_nochange(sqlite3_context*);
+
+/*
+** CAPI3REF: Determine The Collation For a Virtual Table Constraint
+** METHOD: sqlite3_index_info
+**
+** This function may only be called from within a call to the [xBestIndex]
+** method of a [virtual table].  This function returns a pointer to a string
+** that is the name of the appropriate collation sequence to use for text
+** comparisons on the constraint identified by its arguments.
+**
+** The first argument must be the pointer to the [sqlite3_index_info] object
+** that is the first parameter to the xBestIndex() method. The second argument
+** must be an index into the aConstraint[] array belonging to the
+** sqlite3_index_info structure passed to xBestIndex.
+**
+** Important:
+** The first parameter must be the same pointer that is passed into the
+** xBestMethod() method.  The first parameter may not be a pointer to a
+** different [sqlite3_index_info] object, even an exact copy.
+**
+** The return value is computed as follows:
+**
+** <ol>
+** <li><p> If the constraint comes from a WHERE clause expression that contains
+**         a [COLLATE operator], then the name of the collation specified by
+**         that COLLATE operator is returned.
+** <li><p> If there is no COLLATE operator, but the column that is the subject
+**         of the constraint specifies an alternative collating sequence via
+**         a [COLLATE clause] on the column definition within the CREATE TABLE
+**         statement that was passed into [sqlite3_declare_vtab()], then the
+**         name of that alternative collating sequence is returned.
+** <li><p> Otherwise, "BINARY" is returned.
+** </ol>
+*/
+SQLITE_API SQLITE_EXPERIMENTAL const char *sqlite3_vtab_collation(sqlite3_index_info*,int);
+
+/*
+** CAPI3REF: Determine if a virtual table query is DISTINCT
+** METHOD: sqlite3_index_info
+**
+** This API may only be used from within an [xBestIndex|xBestIndex method]
+** of a [virtual table] implementation. The result of calling this
+** interface from outside of xBestIndex() is undefined and probably harmful.
+**
+** ^The sqlite3_vtab_distinct() interface returns an integer between 0 and
+** 3.  The integer returned by sqlite3_vtab_distinct()
+** gives the virtual table additional information about how the query
+** planner wants the output to be ordered. As long as the virtual table
+** can meet the ordering requirements of the query planner, it may set
+** the "orderByConsumed" flag.
+**
+** <ol><li value="0"><p>
+** ^If the sqlite3_vtab_distinct() interface returns 0, that means
+** that the query planner needs the virtual table to return all rows in the
+** sort order defined by the "nOrderBy" and "aOrderBy" fields of the
+** [sqlite3_index_info] object.  This is the default expectation.  If the
+** virtual table outputs all rows in sorted order, then it is always safe for
+** the xBestIndex method to set the "orderByConsumed" flag, regardless of
+** the return value from sqlite3_vtab_distinct().
+** <li value="1"><p>
+** ^(If the sqlite3_vtab_distinct() interface returns 1, that means
+** that the query planner does not need the rows to be returned in sorted order
+** as long as all rows with the same values in all columns identified by the
+** "aOrderBy" field are adjacent.)^  This mode is used when the query planner
+** is doing a GROUP BY.
+** <li value="2"><p>
+** ^(If the sqlite3_vtab_distinct() interface returns 2, that means
+** that the query planner does not need the rows returned in any particular
+** order, as long as rows with the same values in all "aOrderBy" columns
+** are adjacent.)^  ^(Furthermore, only a single row for each particular
+** combination of values in the columns identified by the "aOrderBy" field
+** needs to be returned.)^  ^It is always ok for two or more rows with the same
+** values in all "aOrderBy" columns to be returned, as long as all such rows
+** are adjacent.  ^The virtual table may, if it chooses, omit extra rows
+** that have the same value for all columns identified by "aOrderBy".
+** ^However omitting the extra rows is optional.
+** This mode is used for a D
