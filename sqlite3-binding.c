@@ -10331,4 +10331,151 @@ SQLITE_API int sqlite3_db_cacheflush(sqlite3*);
 ** undefined. This must only be used within SQLITE_UPDATE and SQLITE_DELETE
 ** preupdate callbacks; if it is used by an SQLITE_INSERT callback then the
 ** behavior is undefined.  The [sqlite3_value] that P points to
-** will be
+** will be destroyed when the preupdate callback returns.
+**
+** ^The [sqlite3_preupdate_new(D,N,P)] interface writes into P a pointer to
+** a [protected sqlite3_value] that contains the value of the Nth column of
+** the table row after it is updated.  The N parameter must be between 0
+** and one less than the number of columns or the behavior will be
+** undefined. This must only be used within SQLITE_INSERT and SQLITE_UPDATE
+** preupdate callbacks; if it is used by an SQLITE_DELETE callback then the
+** behavior is undefined.  The [sqlite3_value] that P points to
+** will be destroyed when the preupdate callback returns.
+**
+** ^The [sqlite3_preupdate_depth(D)] interface returns 0 if the preupdate
+** callback was invoked as a result of a direct insert, update, or delete
+** operation; or 1 for inserts, updates, or deletes invoked by top-level
+** triggers; or 2 for changes resulting from triggers called by top-level
+** triggers; and so forth.
+**
+** When the [sqlite3_blob_write()] API is used to update a blob column,
+** the pre-update hook is invoked with SQLITE_DELETE. This is because the
+** in this case the new values are not available. In this case, when a
+** callback made with op==SQLITE_DELETE is actuall a write using the
+** sqlite3_blob_write() API, the [sqlite3_preupdate_blobwrite()] returns
+** the index of the column being written. In other cases, where the
+** pre-update hook is being invoked for some other reason, including a
+** regular DELETE, sqlite3_preupdate_blobwrite() returns -1.
+**
+** See also:  [sqlite3_update_hook()]
+*/
+#if defined(SQLITE_ENABLE_PREUPDATE_HOOK)
+SQLITE_API void *sqlite3_preupdate_hook(
+  sqlite3 *db,
+  void(*xPreUpdate)(
+    void *pCtx,                   /* Copy of third arg to preupdate_hook() */
+    sqlite3 *db,                  /* Database handle */
+    int op,                       /* SQLITE_UPDATE, DELETE or INSERT */
+    char const *zDb,              /* Database name */
+    char const *zName,            /* Table name */
+    sqlite3_int64 iKey1,          /* Rowid of row about to be deleted/updated */
+    sqlite3_int64 iKey2           /* New rowid value (for a rowid UPDATE) */
+  ),
+  void*
+);
+SQLITE_API int sqlite3_preupdate_old(sqlite3 *, int, sqlite3_value **);
+SQLITE_API int sqlite3_preupdate_count(sqlite3 *);
+SQLITE_API int sqlite3_preupdate_depth(sqlite3 *);
+SQLITE_API int sqlite3_preupdate_new(sqlite3 *, int, sqlite3_value **);
+SQLITE_API int sqlite3_preupdate_blobwrite(sqlite3 *);
+#endif
+
+/*
+** CAPI3REF: Low-level system error code
+** METHOD: sqlite3
+**
+** ^Attempt to return the underlying operating system error code or error
+** number that caused the most recent I/O error or failure to open a file.
+** The return value is OS-dependent.  For example, on unix systems, after
+** [sqlite3_open_v2()] returns [SQLITE_CANTOPEN], this interface could be
+** called to get back the underlying "errno" that caused the problem, such
+** as ENOSPC, EAUTH, EISDIR, and so forth.
+*/
+SQLITE_API int sqlite3_system_errno(sqlite3*);
+
+/*
+** CAPI3REF: Database Snapshot
+** KEYWORDS: {snapshot} {sqlite3_snapshot}
+**
+** An instance of the snapshot object records the state of a [WAL mode]
+** database for some specific point in history.
+**
+** In [WAL mode], multiple [database connections] that are open on the
+** same database file can each be reading a different historical version
+** of the database file.  When a [database connection] begins a read
+** transaction, that connection sees an unchanging copy of the database
+** as it existed for the point in time when the transaction first started.
+** Subsequent changes to the database from other connections are not seen
+** by the reader until a new read transaction is started.
+**
+** The sqlite3_snapshot object records state information about an historical
+** version of the database file so that it is possible to later open a new read
+** transaction that sees that historical version of the database rather than
+** the most recent version.
+*/
+typedef struct sqlite3_snapshot {
+  unsigned char hidden[48];
+} sqlite3_snapshot;
+
+/*
+** CAPI3REF: Record A Database Snapshot
+** CONSTRUCTOR: sqlite3_snapshot
+**
+** ^The [sqlite3_snapshot_get(D,S,P)] interface attempts to make a
+** new [sqlite3_snapshot] object that records the current state of
+** schema S in database connection D.  ^On success, the
+** [sqlite3_snapshot_get(D,S,P)] interface writes a pointer to the newly
+** created [sqlite3_snapshot] object into *P and returns SQLITE_OK.
+** If there is not already a read-transaction open on schema S when
+** this function is called, one is opened automatically.
+**
+** The following must be true for this function to succeed. If any of
+** the following statements are false when sqlite3_snapshot_get() is
+** called, SQLITE_ERROR is returned. The final value of *P is undefined
+** in this case.
+**
+** <ul>
+**   <li> The database handle must not be in [autocommit mode].
+**
+**   <li> Schema S of [database connection] D must be a [WAL mode] database.
+**
+**   <li> There must not be a write transaction open on schema S of database
+**        connection D.
+**
+**   <li> One or more transactions must have been written to the current wal
+**        file since it was created on disk (by any connection). This means
+**        that a snapshot cannot be taken on a wal mode database with no wal
+**        file immediately after it is first opened. At least one transaction
+**        must be written to it first.
+** </ul>
+**
+** This function may also return SQLITE_NOMEM.  If it is called with the
+** database handle in autocommit mode but fails for some other reason,
+** whether or not a read transaction is opened on schema S is undefined.
+**
+** The [sqlite3_snapshot] object returned from a successful call to
+** [sqlite3_snapshot_get()] must be freed using [sqlite3_snapshot_free()]
+** to avoid a memory leak.
+**
+** The [sqlite3_snapshot_get()] interface is only available when the
+** [SQLITE_ENABLE_SNAPSHOT] compile-time option is used.
+*/
+SQLITE_API SQLITE_EXPERIMENTAL int sqlite3_snapshot_get(
+  sqlite3 *db,
+  const char *zSchema,
+  sqlite3_snapshot **ppSnapshot
+);
+
+/*
+** CAPI3REF: Start a read transaction on an historical snapshot
+** METHOD: sqlite3_snapshot
+**
+** ^The [sqlite3_snapshot_open(D,S,P)] interface either starts a new read
+** transaction or upgrades an existing one for schema S of
+** [database connection] D such that the read transaction refers to
+** historical [snapshot] P, rather than the most recent change to the
+** database. ^The [sqlite3_snapshot_open()] interface returns SQLITE_OK
+** on success or an appropriate [error code] if it fails.
+**
+** ^In order to succeed, the database connection must not be in
+** [auto
