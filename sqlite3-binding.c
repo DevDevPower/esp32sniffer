@@ -10968,4 +10968,145 @@ SQLITE_API int sqlite3session_object_config(sqlite3_session*, int op, void *pArg
 **
 ** Passing zero to this function disables the session. Passing a value
 ** greater than zero enables it. Passing a value less than zero is a
-** no-op, and may be used to query the current state 
+** no-op, and may be used to query the current state of the session.
+**
+** The return value indicates the final state of the session object: 0 if
+** the session is disabled, or 1 if it is enabled.
+*/
+SQLITE_API int sqlite3session_enable(sqlite3_session *pSession, int bEnable);
+
+/*
+** CAPI3REF: Set Or Clear the Indirect Change Flag
+** METHOD: sqlite3_session
+**
+** Each change recorded by a session object is marked as either direct or
+** indirect. A change is marked as indirect if either:
+**
+** <ul>
+**   <li> The session object "indirect" flag is set when the change is
+**        made, or
+**   <li> The change is made by an SQL trigger or foreign key action
+**        instead of directly as a result of a users SQL statement.
+** </ul>
+**
+** If a single row is affected by more than one operation within a session,
+** then the change is considered indirect if all operations meet the criteria
+** for an indirect change above, or direct otherwise.
+**
+** This function is used to set, clear or query the session object indirect
+** flag.  If the second argument passed to this function is zero, then the
+** indirect flag is cleared. If it is greater than zero, the indirect flag
+** is set. Passing a value less than zero does not modify the current value
+** of the indirect flag, and may be used to query the current state of the
+** indirect flag for the specified session object.
+**
+** The return value indicates the final state of the indirect flag: 0 if
+** it is clear, or 1 if it is set.
+*/
+SQLITE_API int sqlite3session_indirect(sqlite3_session *pSession, int bIndirect);
+
+/*
+** CAPI3REF: Attach A Table To A Session Object
+** METHOD: sqlite3_session
+**
+** If argument zTab is not NULL, then it is the name of a table to attach
+** to the session object passed as the first argument. All subsequent changes
+** made to the table while the session object is enabled will be recorded. See
+** documentation for [sqlite3session_changeset()] for further details.
+**
+** Or, if argument zTab is NULL, then changes are recorded for all tables
+** in the database. If additional tables are added to the database (by
+** executing "CREATE TABLE" statements) after this call is made, changes for
+** the new tables are also recorded.
+**
+** Changes can only be recorded for tables that have a PRIMARY KEY explicitly
+** defined as part of their CREATE TABLE statement. It does not matter if the
+** PRIMARY KEY is an "INTEGER PRIMARY KEY" (rowid alias) or not. The PRIMARY
+** KEY may consist of a single column, or may be a composite key.
+**
+** It is not an error if the named table does not exist in the database. Nor
+** is it an error if the named table does not have a PRIMARY KEY. However,
+** no changes will be recorded in either of these scenarios.
+**
+** Changes are not recorded for individual rows that have NULL values stored
+** in one or more of their PRIMARY KEY columns.
+**
+** SQLITE_OK is returned if the call completes without error. Or, if an error
+** occurs, an SQLite error code (e.g. SQLITE_NOMEM) is returned.
+**
+** <h3>Special sqlite_stat1 Handling</h3>
+**
+** As of SQLite version 3.22.0, the "sqlite_stat1" table is an exception to
+** some of the rules above. In SQLite, the schema of sqlite_stat1 is:
+**  <pre>
+**  &nbsp;     CREATE TABLE sqlite_stat1(tbl,idx,stat)
+**  </pre>
+**
+** Even though sqlite_stat1 does not have a PRIMARY KEY, changes are
+** recorded for it as if the PRIMARY KEY is (tbl,idx). Additionally, changes
+** are recorded for rows for which (idx IS NULL) is true. However, for such
+** rows a zero-length blob (SQL value X'') is stored in the changeset or
+** patchset instead of a NULL value. This allows such changesets to be
+** manipulated by legacy implementations of sqlite3changeset_invert(),
+** concat() and similar.
+**
+** The sqlite3changeset_apply() function automatically converts the
+** zero-length blob back to a NULL value when updating the sqlite_stat1
+** table. However, if the application calls sqlite3changeset_new(),
+** sqlite3changeset_old() or sqlite3changeset_conflict on a changeset
+** iterator directly (including on a changeset iterator passed to a
+** conflict-handler callback) then the X'' value is returned. The application
+** must translate X'' to NULL itself if required.
+**
+** Legacy (older than 3.22.0) versions of the sessions module cannot capture
+** changes made to the sqlite_stat1 table. Legacy versions of the
+** sqlite3changeset_apply() function silently ignore any modifications to the
+** sqlite_stat1 table that are part of a changeset or patchset.
+*/
+SQLITE_API int sqlite3session_attach(
+  sqlite3_session *pSession,      /* Session object */
+  const char *zTab                /* Table name */
+);
+
+/*
+** CAPI3REF: Set a table filter on a Session Object.
+** METHOD: sqlite3_session
+**
+** The second argument (xFilter) is the "filter callback". For changes to rows
+** in tables that are not attached to the Session object, the filter is called
+** to determine whether changes to the table's rows should be tracked or not.
+** If xFilter returns 0, changes are not tracked. Note that once a table is
+** attached, xFilter will not be called again.
+*/
+SQLITE_API void sqlite3session_table_filter(
+  sqlite3_session *pSession,      /* Session object */
+  int(*xFilter)(
+    void *pCtx,                   /* Copy of third arg to _filter_table() */
+    const char *zTab              /* Table name */
+  ),
+  void *pCtx                      /* First argument passed to xFilter */
+);
+
+/*
+** CAPI3REF: Generate A Changeset From A Session Object
+** METHOD: sqlite3_session
+**
+** Obtain a changeset containing changes to the tables attached to the
+** session object passed as the first argument. If successful,
+** set *ppChangeset to point to a buffer containing the changeset
+** and *pnChangeset to the size of the changeset in bytes before returning
+** SQLITE_OK. If an error occurs, set both *ppChangeset and *pnChangeset to
+** zero and return an SQLite error code.
+**
+** A changeset consists of zero or more INSERT, UPDATE and/or DELETE changes,
+** each representing a change to a single row of an attached table. An INSERT
+** change contains the values of each field of a new database row. A DELETE
+** contains the original values of each field of a deleted database row. An
+** UPDATE change contains the original values of each field of an updated
+** database row along with the updated values for each updated non-primary-key
+** column. It is not possible for an UPDATE change to represent a change that
+** modifies the values of primary key columns. If such a change is made, it
+** is represented in a changeset as a DELETE followed by an INSERT.
+**
+** Changes are not recorded for rows that have NULL values stored in one or
+** more of their PRIMARY KEY columns. If su
