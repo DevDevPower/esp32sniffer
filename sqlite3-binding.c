@@ -11539,4 +11539,167 @@ SQLITE_API int sqlite3changeset_old(
 ** METHOD: sqlite3_changeset_iter
 **
 ** The pIter argument passed to this function may either be an iterator
-** pa
+** passed to a conflict-handler by [sqlite3changeset_apply()], or an iterator
+** created by [sqlite3changeset_start()]. In the latter case, the most recent
+** call to [sqlite3changeset_next()] must have returned SQLITE_ROW.
+** Furthermore, it may only be called if the type of change that the iterator
+** currently points to is either [SQLITE_UPDATE] or [SQLITE_INSERT]. Otherwise,
+** this function returns [SQLITE_MISUSE] and sets *ppValue to NULL.
+**
+** Argument iVal must be greater than or equal to 0, and less than the number
+** of columns in the table affected by the current change. Otherwise,
+** [SQLITE_RANGE] is returned and *ppValue is set to NULL.
+**
+** If successful, this function sets *ppValue to point to a protected
+** sqlite3_value object containing the iVal'th value from the vector of
+** new row values stored as part of the UPDATE or INSERT change and
+** returns SQLITE_OK. If the change is an UPDATE and does not include
+** a new value for the requested column, *ppValue is set to NULL and
+** SQLITE_OK returned. The name of the function comes from the fact that
+** this is similar to the "new.*" columns available to update or delete
+** triggers.
+**
+** If some other error occurs (e.g. an OOM condition), an SQLite error code
+** is returned and *ppValue is set to NULL.
+*/
+SQLITE_API int sqlite3changeset_new(
+  sqlite3_changeset_iter *pIter,  /* Changeset iterator */
+  int iVal,                       /* Column number */
+  sqlite3_value **ppValue         /* OUT: New value (or NULL pointer) */
+);
+
+/*
+** CAPI3REF: Obtain Conflicting Row Values From A Changeset Iterator
+** METHOD: sqlite3_changeset_iter
+**
+** This function should only be used with iterator objects passed to a
+** conflict-handler callback by [sqlite3changeset_apply()] with either
+** [SQLITE_CHANGESET_DATA] or [SQLITE_CHANGESET_CONFLICT]. If this function
+** is called on any other iterator, [SQLITE_MISUSE] is returned and *ppValue
+** is set to NULL.
+**
+** Argument iVal must be greater than or equal to 0, and less than the number
+** of columns in the table affected by the current change. Otherwise,
+** [SQLITE_RANGE] is returned and *ppValue is set to NULL.
+**
+** If successful, this function sets *ppValue to point to a protected
+** sqlite3_value object containing the iVal'th value from the
+** "conflicting row" associated with the current conflict-handler callback
+** and returns SQLITE_OK.
+**
+** If some other error occurs (e.g. an OOM condition), an SQLite error code
+** is returned and *ppValue is set to NULL.
+*/
+SQLITE_API int sqlite3changeset_conflict(
+  sqlite3_changeset_iter *pIter,  /* Changeset iterator */
+  int iVal,                       /* Column number */
+  sqlite3_value **ppValue         /* OUT: Value from conflicting row */
+);
+
+/*
+** CAPI3REF: Determine The Number Of Foreign Key Constraint Violations
+** METHOD: sqlite3_changeset_iter
+**
+** This function may only be called with an iterator passed to an
+** SQLITE_CHANGESET_FOREIGN_KEY conflict handler callback. In this case
+** it sets the output variable to the total number of known foreign key
+** violations in the destination database and returns SQLITE_OK.
+**
+** In all other cases this function returns SQLITE_MISUSE.
+*/
+SQLITE_API int sqlite3changeset_fk_conflicts(
+  sqlite3_changeset_iter *pIter,  /* Changeset iterator */
+  int *pnOut                      /* OUT: Number of FK violations */
+);
+
+
+/*
+** CAPI3REF: Finalize A Changeset Iterator
+** METHOD: sqlite3_changeset_iter
+**
+** This function is used to finalize an iterator allocated with
+** [sqlite3changeset_start()].
+**
+** This function should only be called on iterators created using the
+** [sqlite3changeset_start()] function. If an application calls this
+** function with an iterator passed to a conflict-handler by
+** [sqlite3changeset_apply()], [SQLITE_MISUSE] is immediately returned and the
+** call has no effect.
+**
+** If an error was encountered within a call to an sqlite3changeset_xxx()
+** function (for example an [SQLITE_CORRUPT] in [sqlite3changeset_next()] or an
+** [SQLITE_NOMEM] in [sqlite3changeset_new()]) then an error code corresponding
+** to that error is returned by this function. Otherwise, SQLITE_OK is
+** returned. This is to allow the following pattern (pseudo-code):
+**
+** <pre>
+**   sqlite3changeset_start();
+**   while( SQLITE_ROW==sqlite3changeset_next() ){
+**     // Do something with change.
+**   }
+**   rc = sqlite3changeset_finalize();
+**   if( rc!=SQLITE_OK ){
+**     // An error has occurred
+**   }
+** </pre>
+*/
+SQLITE_API int sqlite3changeset_finalize(sqlite3_changeset_iter *pIter);
+
+/*
+** CAPI3REF: Invert A Changeset
+**
+** This function is used to "invert" a changeset object. Applying an inverted
+** changeset to a database reverses the effects of applying the uninverted
+** changeset. Specifically:
+**
+** <ul>
+**   <li> Each DELETE change is changed to an INSERT, and
+**   <li> Each INSERT change is changed to a DELETE, and
+**   <li> For each UPDATE change, the old.* and new.* values are exchanged.
+** </ul>
+**
+** This function does not change the order in which changes appear within
+** the changeset. It merely reverses the sense of each individual change.
+**
+** If successful, a pointer to a buffer containing the inverted changeset
+** is stored in *ppOut, the size of the same buffer is stored in *pnOut, and
+** SQLITE_OK is returned. If an error occurs, both *pnOut and *ppOut are
+** zeroed and an SQLite error code returned.
+**
+** It is the responsibility of the caller to eventually call sqlite3_free()
+** on the *ppOut pointer to free the buffer allocation following a successful
+** call to this function.
+**
+** WARNING/TODO: This function currently assumes that the input is a valid
+** changeset. If it is not, the results are undefined.
+*/
+SQLITE_API int sqlite3changeset_invert(
+  int nIn, const void *pIn,       /* Input changeset */
+  int *pnOut, void **ppOut        /* OUT: Inverse of input */
+);
+
+/*
+** CAPI3REF: Concatenate Two Changeset Objects
+**
+** This function is used to concatenate two changesets, A and B, into a
+** single changeset. The result is a changeset equivalent to applying
+** changeset A followed by changeset B.
+**
+** This function combines the two input changesets using an
+** sqlite3_changegroup object. Calling it produces similar results as the
+** following code fragment:
+**
+** <pre>
+**   sqlite3_changegroup *pGrp;
+**   rc = sqlite3_changegroup_new(&pGrp);
+**   if( rc==SQLITE_OK ) rc = sqlite3changegroup_add(pGrp, nA, pA);
+**   if( rc==SQLITE_OK ) rc = sqlite3changegroup_add(pGrp, nB, pB);
+**   if( rc==SQLITE_OK ){
+**     rc = sqlite3changegroup_output(pGrp, pnOut, ppOut);
+**   }else{
+**     *ppOut = 0;
+**     *pnOut = 0;
+**   }
+** </pre>
+**
+** Refer to the sqlite3_changegroup documentation below for d
