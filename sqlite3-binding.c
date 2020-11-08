@@ -11844,4 +11844,134 @@ SQLITE_API int sqlite3changegroup_add(sqlite3_changegroup*, int nData, void *pDa
 **
 ** Obtain a buffer containing a changeset (or patchset) representing the
 ** current contents of the changegroup. If the inputs to the changegroup
-** were themselves changesets, the 
+** were themselves changesets, the output is a changeset. Or, if the
+** inputs were patchsets, the output is also a patchset.
+**
+** As with the output of the sqlite3session_changeset() and
+** sqlite3session_patchset() functions, all changes related to a single
+** table are grouped together in the output of this function. Tables appear
+** in the same order as for the very first changeset added to the changegroup.
+** If the second or subsequent changesets added to the changegroup contain
+** changes for tables that do not appear in the first changeset, they are
+** appended onto the end of the output changeset, again in the order in
+** which they are first encountered.
+**
+** If an error occurs, an SQLite error code is returned and the output
+** variables (*pnData) and (*ppData) are set to 0. Otherwise, SQLITE_OK
+** is returned and the output variables are set to the size of and a
+** pointer to the output buffer, respectively. In this case it is the
+** responsibility of the caller to eventually free the buffer using a
+** call to sqlite3_free().
+*/
+SQLITE_API int sqlite3changegroup_output(
+  sqlite3_changegroup*,
+  int *pnData,                    /* OUT: Size of output buffer in bytes */
+  void **ppData                   /* OUT: Pointer to output buffer */
+);
+
+/*
+** CAPI3REF: Delete A Changegroup Object
+** DESTRUCTOR: sqlite3_changegroup
+*/
+SQLITE_API void sqlite3changegroup_delete(sqlite3_changegroup*);
+
+/*
+** CAPI3REF: Apply A Changeset To A Database
+**
+** Apply a changeset or patchset to a database. These functions attempt to
+** update the "main" database attached to handle db with the changes found in
+** the changeset passed via the second and third arguments.
+**
+** The fourth argument (xFilter) passed to these functions is the "filter
+** callback". If it is not NULL, then for each table affected by at least one
+** change in the changeset, the filter callback is invoked with
+** the table name as the second argument, and a copy of the context pointer
+** passed as the sixth argument as the first. If the "filter callback"
+** returns zero, then no attempt is made to apply any changes to the table.
+** Otherwise, if the return value is non-zero or the xFilter argument to
+** is NULL, all changes related to the table are attempted.
+**
+** For each table that is not excluded by the filter callback, this function
+** tests that the target database contains a compatible table. A table is
+** considered compatible if all of the following are true:
+**
+** <ul>
+**   <li> The table has the same name as the name recorded in the
+**        changeset, and
+**   <li> The table has at least as many columns as recorded in the
+**        changeset, and
+**   <li> The table has primary key columns in the same position as
+**        recorded in the changeset.
+** </ul>
+**
+** If there is no compatible table, it is not an error, but none of the
+** changes associated with the table are applied. A warning message is issued
+** via the sqlite3_log() mechanism with the error code SQLITE_SCHEMA. At most
+** one such warning is issued for each table in the changeset.
+**
+** For each change for which there is a compatible table, an attempt is made
+** to modify the table contents according to the UPDATE, INSERT or DELETE
+** change. If a change cannot be applied cleanly, the conflict handler
+** function passed as the fifth argument to sqlite3changeset_apply() may be
+** invoked. A description of exactly when the conflict handler is invoked for
+** each type of change is below.
+**
+** Unlike the xFilter argument, xConflict may not be passed NULL. The results
+** of passing anything other than a valid function pointer as the xConflict
+** argument are undefined.
+**
+** Each time the conflict handler function is invoked, it must return one
+** of [SQLITE_CHANGESET_OMIT], [SQLITE_CHANGESET_ABORT] or
+** [SQLITE_CHANGESET_REPLACE]. SQLITE_CHANGESET_REPLACE may only be returned
+** if the second argument passed to the conflict handler is either
+** SQLITE_CHANGESET_DATA or SQLITE_CHANGESET_CONFLICT. If the conflict-handler
+** returns an illegal value, any changes already made are rolled back and
+** the call to sqlite3changeset_apply() returns SQLITE_MISUSE. Different
+** actions are taken by sqlite3changeset_apply() depending on the value
+** returned by each invocation of the conflict-handler function. Refer to
+** the documentation for the three
+** [SQLITE_CHANGESET_OMIT|available return values] for details.
+**
+** <dl>
+** <dt>DELETE Changes<dd>
+**   For each DELETE change, the function checks if the target database
+**   contains a row with the same primary key value (or values) as the
+**   original row values stored in the changeset. If it does, and the values
+**   stored in all non-primary key columns also match the values stored in
+**   the changeset the row is deleted from the target database.
+**
+**   If a row with matching primary key values is found, but one or more of
+**   the non-primary key fields contains a value different from the original
+**   row value stored in the changeset, the conflict-handler function is
+**   invoked with [SQLITE_CHANGESET_DATA] as the second argument. If the
+**   database table has more columns than are recorded in the changeset,
+**   only the values of those non-primary key fields are compared against
+**   the current database contents - any trailing database table columns
+**   are ignored.
+**
+**   If no row with matching primary key values is found in the database,
+**   the conflict-handler function is invoked with [SQLITE_CHANGESET_NOTFOUND]
+**   passed as the second argument.
+**
+**   If the DELETE operation is attempted, but SQLite returns SQLITE_CONSTRAINT
+**   (which can only happen if a foreign key constraint is violated), the
+**   conflict-handler function is invoked with [SQLITE_CHANGESET_CONSTRAINT]
+**   passed as the second argument. This includes the case where the DELETE
+**   operation is attempted because an earlier call to the conflict handler
+**   function returned [SQLITE_CHANGESET_REPLACE].
+**
+** <dt>INSERT Changes<dd>
+**   For each INSERT change, an attempt is made to insert the new row into
+**   the database. If the changeset row contains fewer fields than the
+**   database table, the trailing fields are populated with their default
+**   values.
+**
+**   If the attempt to insert the row fails because the database already
+**   contains a row with the same primary key values, the conflict handler
+**   function is invoked with the second argument set to
+**   [SQLITE_CHANGESET_CONFLICT].
+**
+**   If the attempt to insert the row fails because of some other constraint
+**   violation (e.g. NOT NULL or UNIQUE), the conflict handler function is
+**   invoked with the second argument set to [SQLITE_CHANGESET_CONSTRAINT].
+**   This includes the case where the INSERT operation is re-attempted be
