@@ -11702,4 +11702,146 @@ SQLITE_API int sqlite3changeset_invert(
 **   }
 ** </pre>
 **
-** Refer to the sqlite3_changegroup documentation below for d
+** Refer to the sqlite3_changegroup documentation below for details.
+*/
+SQLITE_API int sqlite3changeset_concat(
+  int nA,                         /* Number of bytes in buffer pA */
+  void *pA,                       /* Pointer to buffer containing changeset A */
+  int nB,                         /* Number of bytes in buffer pB */
+  void *pB,                       /* Pointer to buffer containing changeset B */
+  int *pnOut,                     /* OUT: Number of bytes in output changeset */
+  void **ppOut                    /* OUT: Buffer containing output changeset */
+);
+
+
+/*
+** CAPI3REF: Changegroup Handle
+**
+** A changegroup is an object used to combine two or more
+** [changesets] or [patchsets]
+*/
+typedef struct sqlite3_changegroup sqlite3_changegroup;
+
+/*
+** CAPI3REF: Create A New Changegroup Object
+** CONSTRUCTOR: sqlite3_changegroup
+**
+** An sqlite3_changegroup object is used to combine two or more changesets
+** (or patchsets) into a single changeset (or patchset). A single changegroup
+** object may combine changesets or patchsets, but not both. The output is
+** always in the same format as the input.
+**
+** If successful, this function returns SQLITE_OK and populates (*pp) with
+** a pointer to a new sqlite3_changegroup object before returning. The caller
+** should eventually free the returned object using a call to
+** sqlite3changegroup_delete(). If an error occurs, an SQLite error code
+** (i.e. SQLITE_NOMEM) is returned and *pp is set to NULL.
+**
+** The usual usage pattern for an sqlite3_changegroup object is as follows:
+**
+** <ul>
+**   <li> It is created using a call to sqlite3changegroup_new().
+**
+**   <li> Zero or more changesets (or patchsets) are added to the object
+**        by calling sqlite3changegroup_add().
+**
+**   <li> The result of combining all input changesets together is obtained
+**        by the application via a call to sqlite3changegroup_output().
+**
+**   <li> The object is deleted using a call to sqlite3changegroup_delete().
+** </ul>
+**
+** Any number of calls to add() and output() may be made between the calls to
+** new() and delete(), and in any order.
+**
+** As well as the regular sqlite3changegroup_add() and
+** sqlite3changegroup_output() functions, also available are the streaming
+** versions sqlite3changegroup_add_strm() and sqlite3changegroup_output_strm().
+*/
+SQLITE_API int sqlite3changegroup_new(sqlite3_changegroup **pp);
+
+/*
+** CAPI3REF: Add A Changeset To A Changegroup
+** METHOD: sqlite3_changegroup
+**
+** Add all changes within the changeset (or patchset) in buffer pData (size
+** nData bytes) to the changegroup.
+**
+** If the buffer contains a patchset, then all prior calls to this function
+** on the same changegroup object must also have specified patchsets. Or, if
+** the buffer contains a changeset, so must have the earlier calls to this
+** function. Otherwise, SQLITE_ERROR is returned and no changes are added
+** to the changegroup.
+**
+** Rows within the changeset and changegroup are identified by the values in
+** their PRIMARY KEY columns. A change in the changeset is considered to
+** apply to the same row as a change already present in the changegroup if
+** the two rows have the same primary key.
+**
+** Changes to rows that do not already appear in the changegroup are
+** simply copied into it. Or, if both the new changeset and the changegroup
+** contain changes that apply to a single row, the final contents of the
+** changegroup depends on the type of each change, as follows:
+**
+** <table border=1 style="margin-left:8ex;margin-right:8ex">
+**   <tr><th style="white-space:pre">Existing Change  </th>
+**       <th style="white-space:pre">New Change       </th>
+**       <th>Output Change
+**   <tr><td>INSERT <td>INSERT <td>
+**       The new change is ignored. This case does not occur if the new
+**       changeset was recorded immediately after the changesets already
+**       added to the changegroup.
+**   <tr><td>INSERT <td>UPDATE <td>
+**       The INSERT change remains in the changegroup. The values in the
+**       INSERT change are modified as if the row was inserted by the
+**       existing change and then updated according to the new change.
+**   <tr><td>INSERT <td>DELETE <td>
+**       The existing INSERT is removed from the changegroup. The DELETE is
+**       not added.
+**   <tr><td>UPDATE <td>INSERT <td>
+**       The new change is ignored. This case does not occur if the new
+**       changeset was recorded immediately after the changesets already
+**       added to the changegroup.
+**   <tr><td>UPDATE <td>UPDATE <td>
+**       The existing UPDATE remains within the changegroup. It is amended
+**       so that the accompanying values are as if the row was updated once
+**       by the existing change and then again by the new change.
+**   <tr><td>UPDATE <td>DELETE <td>
+**       The existing UPDATE is replaced by the new DELETE within the
+**       changegroup.
+**   <tr><td>DELETE <td>INSERT <td>
+**       If one or more of the column values in the row inserted by the
+**       new change differ from those in the row deleted by the existing
+**       change, the existing DELETE is replaced by an UPDATE within the
+**       changegroup. Otherwise, if the inserted row is exactly the same
+**       as the deleted row, the existing DELETE is simply discarded.
+**   <tr><td>DELETE <td>UPDATE <td>
+**       The new change is ignored. This case does not occur if the new
+**       changeset was recorded immediately after the changesets already
+**       added to the changegroup.
+**   <tr><td>DELETE <td>DELETE <td>
+**       The new change is ignored. This case does not occur if the new
+**       changeset was recorded immediately after the changesets already
+**       added to the changegroup.
+** </table>
+**
+** If the new changeset contains changes to a table that is already present
+** in the changegroup, then the number of columns and the position of the
+** primary key columns for the table must be consistent. If this is not the
+** case, this function fails with SQLITE_SCHEMA. If the input changeset
+** appears to be corrupt and the corruption is detected, SQLITE_CORRUPT is
+** returned. Or, if an out-of-memory condition occurs during processing, this
+** function returns SQLITE_NOMEM. In all cases, if an error occurs the state
+** of the final contents of the changegroup is undefined.
+**
+** If no error occurs, SQLITE_OK is returned.
+*/
+SQLITE_API int sqlite3changegroup_add(sqlite3_changegroup*, int nData, void *pData);
+
+/*
+** CAPI3REF: Obtain A Composite Changeset From A Changegroup
+** METHOD: sqlite3_changegroup
+**
+** Obtain a buffer containing a changeset (or patchset) representing the
+** current contents of the changegroup. If the inputs to the changegroup
+** were themselves changesets, the 
