@@ -12418,4 +12418,187 @@ SQLITE_API void sqlite3rebaser_delete(sqlite3_rebaser *p);
 **  </pre>
 **
 ** The xOutput callback is invoked zero or more times to return data to
-** the application. The first parameter passed to each call 
+** the application. The first parameter passed to each call is a copy of the
+** pOut pointer supplied by the application. The second parameter, pData,
+** points to a buffer nData bytes in size containing the chunk of output
+** data being returned. If the xOutput callback successfully processes the
+** supplied data, it should return SQLITE_OK to indicate success. Otherwise,
+** it should return some other SQLite error code. In this case processing
+** is immediately abandoned and the streaming API function returns a copy
+** of the xOutput error code to the application.
+**
+** The sessions module never invokes an xOutput callback with the third
+** parameter set to a value less than or equal to zero. Other than this,
+** no guarantees are made as to the size of the chunks of data returned.
+*/
+SQLITE_API int sqlite3changeset_apply_strm(
+  sqlite3 *db,                    /* Apply change to "main" db of this handle */
+  int (*xInput)(void *pIn, void *pData, int *pnData), /* Input function */
+  void *pIn,                                          /* First arg for xInput */
+  int(*xFilter)(
+    void *pCtx,                   /* Copy of sixth arg to _apply() */
+    const char *zTab              /* Table name */
+  ),
+  int(*xConflict)(
+    void *pCtx,                   /* Copy of sixth arg to _apply() */
+    int eConflict,                /* DATA, MISSING, CONFLICT, CONSTRAINT */
+    sqlite3_changeset_iter *p     /* Handle describing change and conflict */
+  ),
+  void *pCtx                      /* First argument passed to xConflict */
+);
+SQLITE_API int sqlite3changeset_apply_v2_strm(
+  sqlite3 *db,                    /* Apply change to "main" db of this handle */
+  int (*xInput)(void *pIn, void *pData, int *pnData), /* Input function */
+  void *pIn,                                          /* First arg for xInput */
+  int(*xFilter)(
+    void *pCtx,                   /* Copy of sixth arg to _apply() */
+    const char *zTab              /* Table name */
+  ),
+  int(*xConflict)(
+    void *pCtx,                   /* Copy of sixth arg to _apply() */
+    int eConflict,                /* DATA, MISSING, CONFLICT, CONSTRAINT */
+    sqlite3_changeset_iter *p     /* Handle describing change and conflict */
+  ),
+  void *pCtx,                     /* First argument passed to xConflict */
+  void **ppRebase, int *pnRebase,
+  int flags
+);
+SQLITE_API int sqlite3changeset_concat_strm(
+  int (*xInputA)(void *pIn, void *pData, int *pnData),
+  void *pInA,
+  int (*xInputB)(void *pIn, void *pData, int *pnData),
+  void *pInB,
+  int (*xOutput)(void *pOut, const void *pData, int nData),
+  void *pOut
+);
+SQLITE_API int sqlite3changeset_invert_strm(
+  int (*xInput)(void *pIn, void *pData, int *pnData),
+  void *pIn,
+  int (*xOutput)(void *pOut, const void *pData, int nData),
+  void *pOut
+);
+SQLITE_API int sqlite3changeset_start_strm(
+  sqlite3_changeset_iter **pp,
+  int (*xInput)(void *pIn, void *pData, int *pnData),
+  void *pIn
+);
+SQLITE_API int sqlite3changeset_start_v2_strm(
+  sqlite3_changeset_iter **pp,
+  int (*xInput)(void *pIn, void *pData, int *pnData),
+  void *pIn,
+  int flags
+);
+SQLITE_API int sqlite3session_changeset_strm(
+  sqlite3_session *pSession,
+  int (*xOutput)(void *pOut, const void *pData, int nData),
+  void *pOut
+);
+SQLITE_API int sqlite3session_patchset_strm(
+  sqlite3_session *pSession,
+  int (*xOutput)(void *pOut, const void *pData, int nData),
+  void *pOut
+);
+SQLITE_API int sqlite3changegroup_add_strm(sqlite3_changegroup*,
+    int (*xInput)(void *pIn, void *pData, int *pnData),
+    void *pIn
+);
+SQLITE_API int sqlite3changegroup_output_strm(sqlite3_changegroup*,
+    int (*xOutput)(void *pOut, const void *pData, int nData),
+    void *pOut
+);
+SQLITE_API int sqlite3rebaser_rebase_strm(
+  sqlite3_rebaser *pRebaser,
+  int (*xInput)(void *pIn, void *pData, int *pnData),
+  void *pIn,
+  int (*xOutput)(void *pOut, const void *pData, int nData),
+  void *pOut
+);
+
+/*
+** CAPI3REF: Configure global parameters
+**
+** The sqlite3session_config() interface is used to make global configuration
+** changes to the sessions module in order to tune it to the specific needs
+** of the application.
+**
+** The sqlite3session_config() interface is not threadsafe. If it is invoked
+** while any other thread is inside any other sessions method then the
+** results are undefined. Furthermore, if it is invoked after any sessions
+** related objects have been created, the results are also undefined.
+**
+** The first argument to the sqlite3session_config() function must be one
+** of the SQLITE_SESSION_CONFIG_XXX constants defined below. The
+** interpretation of the (void*) value passed as the second parameter and
+** the effect of calling this function depends on the value of the first
+** parameter.
+**
+** <dl>
+** <dt>SQLITE_SESSION_CONFIG_STRMSIZE<dd>
+**    By default, the sessions module streaming interfaces attempt to input
+**    and output data in approximately 1 KiB chunks. This operand may be used
+**    to set and query the value of this configuration setting. The pointer
+**    passed as the second argument must point to a value of type (int).
+**    If this value is greater than 0, it is used as the new streaming data
+**    chunk size for both input and output. Before returning, the (int) value
+**    pointed to by pArg is set to the final value of the streaming interface
+**    chunk size.
+** </dl>
+**
+** This function returns SQLITE_OK if successful, or an SQLite error code
+** otherwise.
+*/
+SQLITE_API int sqlite3session_config(int op, void *pArg);
+
+/*
+** CAPI3REF: Values for sqlite3session_config().
+*/
+#define SQLITE_SESSION_CONFIG_STRMSIZE 1
+
+/*
+** Make sure we can call this stuff from C++.
+*/
+#if 0
+}
+#endif
+
+#endif  /* !defined(__SQLITESESSION_H_) && defined(SQLITE_ENABLE_SESSION) */
+
+/******** End of sqlite3session.h *********/
+/******** Begin file fts5.h *********/
+/*
+** 2014 May 31
+**
+** The author disclaims copyright to this source code.  In place of
+** a legal notice, here is a blessing:
+**
+**    May you do good and not evil.
+**    May you find forgiveness for yourself and forgive others.
+**    May you share freely, never taking more than you give.
+**
+******************************************************************************
+**
+** Interfaces to extend FTS5. Using the interfaces defined in this file,
+** FTS5 may be extended with:
+**
+**     * custom tokenizers, and
+**     * custom auxiliary functions.
+*/
+
+
+#ifndef _FTS5_H
+#define _FTS5_H
+
+
+#if 0
+extern "C" {
+#endif
+
+/*************************************************************************
+** CUSTOM AUXILIARY FUNCTIONS
+**
+** Virtual table implementations may overload SQL functions by implementing
+** the sqlite3_module.xFindFunction() method.
+*/
+
+typedef struct Fts5ExtensionApi Fts5ExtensionApi;
+typedef struct F
