@@ -12256,4 +12256,166 @@ SQLITE_API int sqlite3changeset_apply_v2(
 **         key, it is rebased according to a REPLACE.
 **
 **    <li> If there have been no REPLACE resolutions on a key, then
-**         the local changeset is rebased according to the most
+**         the local changeset is rebased according to the most recent
+**         of the OMIT resolutions.
+** </ul>
+**
+** Note that conflict resolutions from multiple remote changesets are
+** combined on a per-field basis, not per-row. This means that in the
+** case of multiple remote UPDATE operations, some fields of a single
+** local change may be rebased for REPLACE while others are rebased for
+** OMIT.
+**
+** In order to rebase a local changeset, the remote changeset must first
+** be applied to the local database using sqlite3changeset_apply_v2() and
+** the buffer of rebase information captured. Then:
+**
+** <ol>
+**   <li> An sqlite3_rebaser object is created by calling
+**        sqlite3rebaser_create().
+**   <li> The new object is configured with the rebase buffer obtained from
+**        sqlite3changeset_apply_v2() by calling sqlite3rebaser_configure().
+**        If the local changeset is to be rebased against multiple remote
+**        changesets, then sqlite3rebaser_configure() should be called
+**        multiple times, in the same order that the multiple
+**        sqlite3changeset_apply_v2() calls were made.
+**   <li> Each local changeset is rebased by calling sqlite3rebaser_rebase().
+**   <li> The sqlite3_rebaser object is deleted by calling
+**        sqlite3rebaser_delete().
+** </ol>
+*/
+typedef struct sqlite3_rebaser sqlite3_rebaser;
+
+/*
+** CAPI3REF: Create a changeset rebaser object.
+** EXPERIMENTAL
+**
+** Allocate a new changeset rebaser object. If successful, set (*ppNew) to
+** point to the new object and return SQLITE_OK. Otherwise, if an error
+** occurs, return an SQLite error code (e.g. SQLITE_NOMEM) and set (*ppNew)
+** to NULL.
+*/
+SQLITE_API int sqlite3rebaser_create(sqlite3_rebaser **ppNew);
+
+/*
+** CAPI3REF: Configure a changeset rebaser object.
+** EXPERIMENTAL
+**
+** Configure the changeset rebaser object to rebase changesets according
+** to the conflict resolutions described by buffer pRebase (size nRebase
+** bytes), which must have been obtained from a previous call to
+** sqlite3changeset_apply_v2().
+*/
+SQLITE_API int sqlite3rebaser_configure(
+  sqlite3_rebaser*,
+  int nRebase, const void *pRebase
+);
+
+/*
+** CAPI3REF: Rebase a changeset
+** EXPERIMENTAL
+**
+** Argument pIn must point to a buffer containing a changeset nIn bytes
+** in size. This function allocates and populates a buffer with a copy
+** of the changeset rebased according to the configuration of the
+** rebaser object passed as the first argument. If successful, (*ppOut)
+** is set to point to the new buffer containing the rebased changeset and
+** (*pnOut) to its size in bytes and SQLITE_OK returned. It is the
+** responsibility of the caller to eventually free the new buffer using
+** sqlite3_free(). Otherwise, if an error occurs, (*ppOut) and (*pnOut)
+** are set to zero and an SQLite error code returned.
+*/
+SQLITE_API int sqlite3rebaser_rebase(
+  sqlite3_rebaser*,
+  int nIn, const void *pIn,
+  int *pnOut, void **ppOut
+);
+
+/*
+** CAPI3REF: Delete a changeset rebaser object.
+** EXPERIMENTAL
+**
+** Delete the changeset rebaser object and all associated resources. There
+** should be one call to this function for each successful invocation
+** of sqlite3rebaser_create().
+*/
+SQLITE_API void sqlite3rebaser_delete(sqlite3_rebaser *p);
+
+/*
+** CAPI3REF: Streaming Versions of API functions.
+**
+** The six streaming API xxx_strm() functions serve similar purposes to the
+** corresponding non-streaming API functions:
+**
+** <table border=1 style="margin-left:8ex;margin-right:8ex">
+**   <tr><th>Streaming function<th>Non-streaming equivalent</th>
+**   <tr><td>sqlite3changeset_apply_strm<td>[sqlite3changeset_apply]
+**   <tr><td>sqlite3changeset_apply_strm_v2<td>[sqlite3changeset_apply_v2]
+**   <tr><td>sqlite3changeset_concat_strm<td>[sqlite3changeset_concat]
+**   <tr><td>sqlite3changeset_invert_strm<td>[sqlite3changeset_invert]
+**   <tr><td>sqlite3changeset_start_strm<td>[sqlite3changeset_start]
+**   <tr><td>sqlite3session_changeset_strm<td>[sqlite3session_changeset]
+**   <tr><td>sqlite3session_patchset_strm<td>[sqlite3session_patchset]
+** </table>
+**
+** Non-streaming functions that accept changesets (or patchsets) as input
+** require that the entire changeset be stored in a single buffer in memory.
+** Similarly, those that return a changeset or patchset do so by returning
+** a pointer to a single large buffer allocated using sqlite3_malloc().
+** Normally this is convenient. However, if an application running in a
+** low-memory environment is required to handle very large changesets, the
+** large contiguous memory allocations required can become onerous.
+**
+** In order to avoid this problem, instead of a single large buffer, input
+** is passed to a streaming API functions by way of a callback function that
+** the sessions module invokes to incrementally request input data as it is
+** required. In all cases, a pair of API function parameters such as
+**
+**  <pre>
+**  &nbsp;     int nChangeset,
+**  &nbsp;     void *pChangeset,
+**  </pre>
+**
+** Is replaced by:
+**
+**  <pre>
+**  &nbsp;     int (*xInput)(void *pIn, void *pData, int *pnData),
+**  &nbsp;     void *pIn,
+**  </pre>
+**
+** Each time the xInput callback is invoked by the sessions module, the first
+** argument passed is a copy of the supplied pIn context pointer. The second
+** argument, pData, points to a buffer (*pnData) bytes in size. Assuming no
+** error occurs the xInput method should copy up to (*pnData) bytes of data
+** into the buffer and set (*pnData) to the actual number of bytes copied
+** before returning SQLITE_OK. If the input is completely exhausted, (*pnData)
+** should be set to zero to indicate this. Or, if an error occurs, an SQLite
+** error code should be returned. In all cases, if an xInput callback returns
+** an error, all processing is abandoned and the streaming API function
+** returns a copy of the error code to the caller.
+**
+** In the case of sqlite3changeset_start_strm(), the xInput callback may be
+** invoked by the sessions module at any point during the lifetime of the
+** iterator. If such an xInput callback returns an error, the iterator enters
+** an error state, whereby all subsequent calls to iterator functions
+** immediately fail with the same error code as returned by xInput.
+**
+** Similarly, streaming API functions that return changesets (or patchsets)
+** return them in chunks by way of a callback function instead of via a
+** pointer to a single large buffer. In this case, a pair of parameters such
+** as:
+**
+**  <pre>
+**  &nbsp;     int *pnChangeset,
+**  &nbsp;     void **ppChangeset,
+**  </pre>
+**
+** Is replaced by:
+**
+**  <pre>
+**  &nbsp;     int (*xOutput)(void *pOut, const void *pData, int nData),
+**  &nbsp;     void *pOut
+**  </pre>
+**
+** The xOutput callback is invoked zero or more times to return data to
+** the application. The first parameter passed to each call 
