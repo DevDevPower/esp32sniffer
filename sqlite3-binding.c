@@ -12601,4 +12601,154 @@ extern "C" {
 */
 
 typedef struct Fts5ExtensionApi Fts5ExtensionApi;
-typedef struct F
+typedef struct Fts5Context Fts5Context;
+typedef struct Fts5PhraseIter Fts5PhraseIter;
+
+typedef void (*fts5_extension_function)(
+  const Fts5ExtensionApi *pApi,   /* API offered by current FTS version */
+  Fts5Context *pFts,              /* First arg to pass to pApi functions */
+  sqlite3_context *pCtx,          /* Context for returning result/error */
+  int nVal,                       /* Number of values in apVal[] array */
+  sqlite3_value **apVal           /* Array of trailing arguments */
+);
+
+struct Fts5PhraseIter {
+  const unsigned char *a;
+  const unsigned char *b;
+};
+
+/*
+** EXTENSION API FUNCTIONS
+**
+** xUserData(pFts):
+**   Return a copy of the context pointer the extension function was
+**   registered with.
+**
+** xColumnTotalSize(pFts, iCol, pnToken):
+**   If parameter iCol is less than zero, set output variable *pnToken
+**   to the total number of tokens in the FTS5 table. Or, if iCol is
+**   non-negative but less than the number of columns in the table, return
+**   the total number of tokens in column iCol, considering all rows in
+**   the FTS5 table.
+**
+**   If parameter iCol is greater than or equal to the number of columns
+**   in the table, SQLITE_RANGE is returned. Or, if an error occurs (e.g.
+**   an OOM condition or IO error), an appropriate SQLite error code is
+**   returned.
+**
+** xColumnCount(pFts):
+**   Return the number of columns in the table.
+**
+** xColumnSize(pFts, iCol, pnToken):
+**   If parameter iCol is less than zero, set output variable *pnToken
+**   to the total number of tokens in the current row. Or, if iCol is
+**   non-negative but less than the number of columns in the table, set
+**   *pnToken to the number of tokens in column iCol of the current row.
+**
+**   If parameter iCol is greater than or equal to the number of columns
+**   in the table, SQLITE_RANGE is returned. Or, if an error occurs (e.g.
+**   an OOM condition or IO error), an appropriate SQLite error code is
+**   returned.
+**
+**   This function may be quite inefficient if used with an FTS5 table
+**   created with the "columnsize=0" option.
+**
+** xColumnText:
+**   This function attempts to retrieve the text of column iCol of the
+**   current document. If successful, (*pz) is set to point to a buffer
+**   containing the text in utf-8 encoding, (*pn) is set to the size in bytes
+**   (not characters) of the buffer and SQLITE_OK is returned. Otherwise,
+**   if an error occurs, an SQLite error code is returned and the final values
+**   of (*pz) and (*pn) are undefined.
+**
+** xPhraseCount:
+**   Returns the number of phrases in the current query expression.
+**
+** xPhraseSize:
+**   Returns the number of tokens in phrase iPhrase of the query. Phrases
+**   are numbered starting from zero.
+**
+** xInstCount:
+**   Set *pnInst to the total number of occurrences of all phrases within
+**   the query within the current row. Return SQLITE_OK if successful, or
+**   an error code (i.e. SQLITE_NOMEM) if an error occurs.
+**
+**   This API can be quite slow if used with an FTS5 table created with the
+**   "detail=none" or "detail=column" option. If the FTS5 table is created
+**   with either "detail=none" or "detail=column" and "content=" option
+**   (i.e. if it is a contentless table), then this API always returns 0.
+**
+** xInst:
+**   Query for the details of phrase match iIdx within the current row.
+**   Phrase matches are numbered starting from zero, so the iIdx argument
+**   should be greater than or equal to zero and smaller than the value
+**   output by xInstCount().
+**
+**   Usually, output parameter *piPhrase is set to the phrase number, *piCol
+**   to the column in which it occurs and *piOff the token offset of the
+**   first token of the phrase. Returns SQLITE_OK if successful, or an error
+**   code (i.e. SQLITE_NOMEM) if an error occurs.
+**
+**   This API can be quite slow if used with an FTS5 table created with the
+**   "detail=none" or "detail=column" option.
+**
+** xRowid:
+**   Returns the rowid of the current row.
+**
+** xTokenize:
+**   Tokenize text using the tokenizer belonging to the FTS5 table.
+**
+** xQueryPhrase(pFts5, iPhrase, pUserData, xCallback):
+**   This API function is used to query the FTS table for phrase iPhrase
+**   of the current query. Specifically, a query equivalent to:
+**
+**       ... FROM ftstable WHERE ftstable MATCH $p ORDER BY rowid
+**
+**   with $p set to a phrase equivalent to the phrase iPhrase of the
+**   current query is executed. Any column filter that applies to
+**   phrase iPhrase of the current query is included in $p. For each
+**   row visited, the callback function passed as the fourth argument
+**   is invoked. The context and API objects passed to the callback
+**   function may be used to access the properties of each matched row.
+**   Invoking Api.xUserData() returns a copy of the pointer passed as
+**   the third argument to pUserData.
+**
+**   If the callback function returns any value other than SQLITE_OK, the
+**   query is abandoned and the xQueryPhrase function returns immediately.
+**   If the returned value is SQLITE_DONE, xQueryPhrase returns SQLITE_OK.
+**   Otherwise, the error code is propagated upwards.
+**
+**   If the query runs to completion without incident, SQLITE_OK is returned.
+**   Or, if some error occurs before the query completes or is aborted by
+**   the callback, an SQLite error code is returned.
+**
+**
+** xSetAuxdata(pFts5, pAux, xDelete)
+**
+**   Save the pointer passed as the second argument as the extension function's
+**   "auxiliary data". The pointer may then be retrieved by the current or any
+**   future invocation of the same fts5 extension function made as part of
+**   the same MATCH query using the xGetAuxdata() API.
+**
+**   Each extension function is allocated a single auxiliary data slot for
+**   each FTS query (MATCH expression). If the extension function is invoked
+**   more than once for a single FTS query, then all invocations share a
+**   single auxiliary data context.
+**
+**   If there is already an auxiliary data pointer when this function is
+**   invoked, then it is replaced by the new pointer. If an xDelete callback
+**   was specified along with the original pointer, it is invoked at this
+**   point.
+**
+**   The xDelete callback, if one is specified, is also invoked on the
+**   auxiliary data pointer after the FTS5 query has finished.
+**
+**   If an error (e.g. an OOM condition) occurs within this function,
+**   the auxiliary data is set to NULL and an error code returned. If the
+**   xDelete parameter was not NULL, it is invoked on the auxiliary data
+**   pointer before returning.
+**
+**
+** xGetAuxdata(pFts5, bClear)
+**
+**   Returns the current auxili
