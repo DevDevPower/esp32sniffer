@@ -13030,4 +13030,197 @@ struct Fts5ExtensionApi {
 **   There is no limit to the number of synonyms that may be provided for a
 **   single token.
 **
-**   In man
+**   In many cases, method (1) above is the best approach. It does not add
+**   extra data to the FTS index or require FTS5 to query for multiple terms,
+**   so it is efficient in terms of disk space and query speed. However, it
+**   does not support prefix queries very well. If, as suggested above, the
+**   token "first" is substituted for "1st" by the tokenizer, then the query:
+**
+**   <codeblock>
+**     ... MATCH '1s*'</codeblock>
+**
+**   will not match documents that contain the token "1st" (as the tokenizer
+**   will probably not map "1s" to any prefix of "first").
+**
+**   For full prefix support, method (3) may be preferred. In this case,
+**   because the index contains entries for both "first" and "1st", prefix
+**   queries such as 'fi*' or '1s*' will match correctly. However, because
+**   extra entries are added to the FTS index, this method uses more space
+**   within the database.
+**
+**   Method (2) offers a midpoint between (1) and (3). Using this method,
+**   a query such as '1s*' will match documents that contain the literal
+**   token "1st", but not "first" (assuming the tokenizer is not able to
+**   provide synonyms for prefixes). However, a non-prefix query like '1st'
+**   will match against "1st" and "first". This method does not require
+**   extra disk space, as no extra entries are added to the FTS index.
+**   On the other hand, it may require more CPU cycles to run MATCH queries,
+**   as separate queries of the FTS index are required for each synonym.
+**
+**   When using methods (2) or (3), it is important that the tokenizer only
+**   provide synonyms when tokenizing document text (method (2)) or query
+**   text (method (3)), not both. Doing so will not cause any errors, but is
+**   inefficient.
+*/
+typedef struct Fts5Tokenizer Fts5Tokenizer;
+typedef struct fts5_tokenizer fts5_tokenizer;
+struct fts5_tokenizer {
+  int (*xCreate)(void*, const char **azArg, int nArg, Fts5Tokenizer **ppOut);
+  void (*xDelete)(Fts5Tokenizer*);
+  int (*xTokenize)(Fts5Tokenizer*,
+      void *pCtx,
+      int flags,            /* Mask of FTS5_TOKENIZE_* flags */
+      const char *pText, int nText,
+      int (*xToken)(
+        void *pCtx,         /* Copy of 2nd argument to xTokenize() */
+        int tflags,         /* Mask of FTS5_TOKEN_* flags */
+        const char *pToken, /* Pointer to buffer containing token */
+        int nToken,         /* Size of token in bytes */
+        int iStart,         /* Byte offset of token within input text */
+        int iEnd            /* Byte offset of end of token within input text */
+      )
+  );
+};
+
+/* Flags that may be passed as the third argument to xTokenize() */
+#define FTS5_TOKENIZE_QUERY     0x0001
+#define FTS5_TOKENIZE_PREFIX    0x0002
+#define FTS5_TOKENIZE_DOCUMENT  0x0004
+#define FTS5_TOKENIZE_AUX       0x0008
+
+/* Flags that may be passed by the tokenizer implementation back to FTS5
+** as the third argument to the supplied xToken callback. */
+#define FTS5_TOKEN_COLOCATED    0x0001      /* Same position as prev. token */
+
+/*
+** END OF CUSTOM TOKENIZERS
+*************************************************************************/
+
+/*************************************************************************
+** FTS5 EXTENSION REGISTRATION API
+*/
+typedef struct fts5_api fts5_api;
+struct fts5_api {
+  int iVersion;                   /* Currently always set to 2 */
+
+  /* Create a new tokenizer */
+  int (*xCreateTokenizer)(
+    fts5_api *pApi,
+    const char *zName,
+    void *pContext,
+    fts5_tokenizer *pTokenizer,
+    void (*xDestroy)(void*)
+  );
+
+  /* Find an existing tokenizer */
+  int (*xFindTokenizer)(
+    fts5_api *pApi,
+    const char *zName,
+    void **ppContext,
+    fts5_tokenizer *pTokenizer
+  );
+
+  /* Create a new auxiliary function */
+  int (*xCreateFunction)(
+    fts5_api *pApi,
+    const char *zName,
+    void *pContext,
+    fts5_extension_function xFunction,
+    void (*xDestroy)(void*)
+  );
+};
+
+/*
+** END OF REGISTRATION API
+*************************************************************************/
+
+#if 0
+}  /* end of the 'extern "C"' block */
+#endif
+
+#endif /* _FTS5_H */
+
+/******** End of fts5.h *********/
+
+/************** End of sqlite3.h *********************************************/
+/************** Continuing where we left off in sqliteInt.h ******************/
+
+/*
+** Reuse the STATIC_LRU for mutex access to sqlite3_temp_directory.
+*/
+#define SQLITE_MUTEX_STATIC_TEMPDIR SQLITE_MUTEX_STATIC_VFS1
+
+/*
+** Include the configuration header output by 'configure' if we're using the
+** autoconf-based build
+*/
+#if defined(_HAVE_SQLITE_CONFIG_H) && !defined(SQLITECONFIG_H)
+#include "config.h"
+#define SQLITECONFIG_H 1
+#endif
+
+/************** Include sqliteLimit.h in the middle of sqliteInt.h ***********/
+/************** Begin file sqliteLimit.h *************************************/
+/*
+** 2007 May 7
+**
+** The author disclaims copyright to this source code.  In place of
+** a legal notice, here is a blessing:
+**
+**    May you do good and not evil.
+**    May you find forgiveness for yourself and forgive others.
+**    May you share freely, never taking more than you give.
+**
+*************************************************************************
+**
+** This file defines various limits of what SQLite can process.
+*/
+
+/*
+** The maximum length of a TEXT or BLOB in bytes.   This also
+** limits the size of a row in a table or index.
+**
+** The hard limit is the ability of a 32-bit signed integer
+** to count the size: 2^31-1 or 2147483647.
+*/
+#ifndef SQLITE_MAX_LENGTH
+# define SQLITE_MAX_LENGTH 1000000000
+#endif
+
+/*
+** This is the maximum number of
+**
+**    * Columns in a table
+**    * Columns in an index
+**    * Columns in a view
+**    * Terms in the SET clause of an UPDATE statement
+**    * Terms in the result set of a SELECT statement
+**    * Terms in the GROUP BY or ORDER BY clauses of a SELECT statement.
+**    * Terms in the VALUES clause of an INSERT statement
+**
+** The hard upper limit here is 32676.  Most database people will
+** tell you that in a well-normalized database, you usually should
+** not have more than a dozen or so columns in any table.  And if
+** that is the case, there is no point in having more than a few
+** dozen values in any of the other situations described above.
+*/
+#ifndef SQLITE_MAX_COLUMN
+# define SQLITE_MAX_COLUMN 2000
+#endif
+
+/*
+** The maximum length of a single SQL statement in bytes.
+**
+** It used to be the case that setting this value to zero would
+** turn the limit off.  That is no longer true.  It is not possible
+** to turn this limit off.
+*/
+#ifndef SQLITE_MAX_SQL_LENGTH
+# define SQLITE_MAX_SQL_LENGTH 1000000000
+#endif
+
+/*
+** The maximum depth of an expression tree. This is limited to
+** some extent by SQLITE_MAX_SQL_LENGTH. But sometime you might
+** want to place more severe limits on the complexity of an
+** expression. A 
