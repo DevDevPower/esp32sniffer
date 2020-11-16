@@ -13605,4 +13605,197 @@ struct fts5_api {
 #if defined(SQLITE_COVERAGE_TEST) || defined(SQLITE_DEBUG)
 # ifndef SQLITE_AMALGAMATION
     extern unsigned int sqlite3CoverageCounter;
-# en
+# endif
+# define testcase(X)  if( X ){ sqlite3CoverageCounter += (unsigned)__LINE__; }
+#else
+# define testcase(X)
+#endif
+
+/*
+** The TESTONLY macro is used to enclose variable declarations or
+** other bits of code that are needed to support the arguments
+** within testcase() and assert() macros.
+*/
+#if !defined(NDEBUG) || defined(SQLITE_COVERAGE_TEST)
+# define TESTONLY(X)  X
+#else
+# define TESTONLY(X)
+#endif
+
+/*
+** Sometimes we need a small amount of code such as a variable initialization
+** to setup for a later assert() statement.  We do not want this code to
+** appear when assert() is disabled.  The following macro is therefore
+** used to contain that setup code.  The "VVA" acronym stands for
+** "Verification, Validation, and Accreditation".  In other words, the
+** code within VVA_ONLY() will only run during verification processes.
+*/
+#ifndef NDEBUG
+# define VVA_ONLY(X)  X
+#else
+# define VVA_ONLY(X)
+#endif
+
+/*
+** Disable ALWAYS() and NEVER() (make them pass-throughs) for coverage
+** and mutation testing
+*/
+#if defined(SQLITE_COVERAGE_TEST) || defined(SQLITE_MUTATION_TEST)
+# define SQLITE_OMIT_AUXILIARY_SAFETY_CHECKS  1
+#endif
+
+/*
+** The ALWAYS and NEVER macros surround boolean expressions which
+** are intended to always be true or false, respectively.  Such
+** expressions could be omitted from the code completely.  But they
+** are included in a few cases in order to enhance the resilience
+** of SQLite to unexpected behavior - to make the code "self-healing"
+** or "ductile" rather than being "brittle" and crashing at the first
+** hint of unplanned behavior.
+**
+** In other words, ALWAYS and NEVER are added for defensive code.
+**
+** When doing coverage testing ALWAYS and NEVER are hard-coded to
+** be true and false so that the unreachable code they specify will
+** not be counted as untested code.
+*/
+#if defined(SQLITE_OMIT_AUXILIARY_SAFETY_CHECKS)
+# define ALWAYS(X)      (1)
+# define NEVER(X)       (0)
+#elif !defined(NDEBUG)
+# define ALWAYS(X)      ((X)?1:(assert(0),0))
+# define NEVER(X)       ((X)?(assert(0),1):0)
+#else
+# define ALWAYS(X)      (X)
+# define NEVER(X)       (X)
+#endif
+
+/*
+** Some conditionals are optimizations only.  In other words, if the
+** conditionals are replaced with a constant 1 (true) or 0 (false) then
+** the correct answer is still obtained, though perhaps not as quickly.
+**
+** The following macros mark these optimizations conditionals.
+*/
+#if defined(SQLITE_MUTATION_TEST)
+# define OK_IF_ALWAYS_TRUE(X)  (1)
+# define OK_IF_ALWAYS_FALSE(X) (0)
+#else
+# define OK_IF_ALWAYS_TRUE(X)  (X)
+# define OK_IF_ALWAYS_FALSE(X) (X)
+#endif
+
+/*
+** Some malloc failures are only possible if SQLITE_TEST_REALLOC_STRESS is
+** defined.  We need to defend against those failures when testing with
+** SQLITE_TEST_REALLOC_STRESS, but we don't want the unreachable branches
+** during a normal build.  The following macro can be used to disable tests
+** that are always false except when SQLITE_TEST_REALLOC_STRESS is set.
+*/
+#if defined(SQLITE_TEST_REALLOC_STRESS)
+# define ONLY_IF_REALLOC_STRESS(X)  (X)
+#elif !defined(NDEBUG)
+# define ONLY_IF_REALLOC_STRESS(X)  ((X)?(assert(0),1):0)
+#else
+# define ONLY_IF_REALLOC_STRESS(X)  (0)
+#endif
+
+/*
+** Declarations used for tracing the operating system interfaces.
+*/
+#if defined(SQLITE_FORCE_OS_TRACE) || defined(SQLITE_TEST) || \
+    (defined(SQLITE_DEBUG) && SQLITE_OS_WIN)
+  extern int sqlite3OSTrace;
+# define OSTRACE(X)          if( sqlite3OSTrace ) sqlite3DebugPrintf X
+# define SQLITE_HAVE_OS_TRACE
+#else
+# define OSTRACE(X)
+# undef  SQLITE_HAVE_OS_TRACE
+#endif
+
+/*
+** Is the sqlite3ErrName() function needed in the build?  Currently,
+** it is needed by "mutex_w32.c" (when debugging), "os_win.c" (when
+** OSTRACE is enabled), and by several "test*.c" files (which are
+** compiled using SQLITE_TEST).
+*/
+#if defined(SQLITE_HAVE_OS_TRACE) || defined(SQLITE_TEST) || \
+    (defined(SQLITE_DEBUG) && SQLITE_OS_WIN)
+# define SQLITE_NEED_ERR_NAME
+#else
+# undef  SQLITE_NEED_ERR_NAME
+#endif
+
+/*
+** SQLITE_ENABLE_EXPLAIN_COMMENTS is incompatible with SQLITE_OMIT_EXPLAIN
+*/
+#ifdef SQLITE_OMIT_EXPLAIN
+# undef SQLITE_ENABLE_EXPLAIN_COMMENTS
+#endif
+
+/*
+** SQLITE_OMIT_VIRTUALTABLE implies SQLITE_OMIT_ALTERTABLE
+*/
+#if defined(SQLITE_OMIT_VIRTUALTABLE) && !defined(SQLITE_OMIT_ALTERTABLE)
+# define SQLITE_OMIT_ALTERTABLE
+#endif
+
+/*
+** Return true (non-zero) if the input is an integer that is too large
+** to fit in 32-bits.  This macro is used inside of various testcase()
+** macros to verify that we have tested SQLite for large-file support.
+*/
+#define IS_BIG_INT(X)  (((X)&~(i64)0xffffffff)!=0)
+
+/*
+** The macro unlikely() is a hint that surrounds a boolean
+** expression that is usually false.  Macro likely() surrounds
+** a boolean expression that is usually true.  These hints could,
+** in theory, be used by the compiler to generate better code, but
+** currently they are just comments for human readers.
+*/
+#define likely(X)    (X)
+#define unlikely(X)  (X)
+
+/************** Include hash.h in the middle of sqliteInt.h ******************/
+/************** Begin file hash.h ********************************************/
+/*
+** 2001 September 22
+**
+** The author disclaims copyright to this source code.  In place of
+** a legal notice, here is a blessing:
+**
+**    May you do good and not evil.
+**    May you find forgiveness for yourself and forgive others.
+**    May you share freely, never taking more than you give.
+**
+*************************************************************************
+** This is the header file for the generic hash-table implementation
+** used in SQLite.
+*/
+#ifndef SQLITE_HASH_H
+#define SQLITE_HASH_H
+
+/* Forward declarations of structures. */
+typedef struct Hash Hash;
+typedef struct HashElem HashElem;
+
+/* A complete hash table is an instance of the following structure.
+** The internals of this structure are intended to be opaque -- client
+** code should not attempt to access or modify the fields of this structure
+** directly.  Change this structure only by using the routines below.
+** However, some of the "procedures" and "functions" for modifying and
+** accessing this structure are really macros, so we can't really make
+** this structure opaque.
+**
+** All elements of the hash table are on a single doubly-linked list.
+** Hash.first points to the head of this list.
+**
+** There are Hash.htsize buckets.  Each bucket points to a spot in
+** the global doubly-linked list.  The contents of the bucket are the
+** element pointed to plus the next _ht.count-1 elements in the list.
+**
+** Hash.htsize and Hash.ht may be zero.  In that case lookup is done
+** by a linear search of the global list.  For small tables, the
+** Hash.ht table is never allocated because if there are few elements
+** in the table, it is faster 
