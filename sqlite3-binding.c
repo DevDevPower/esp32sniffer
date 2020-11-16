@@ -13223,4 +13223,204 @@ struct fts5_api {
 ** The maximum depth of an expression tree. This is limited to
 ** some extent by SQLITE_MAX_SQL_LENGTH. But sometime you might
 ** want to place more severe limits on the complexity of an
-** expression. A 
+** expression. A value of 0 means that there is no limit.
+*/
+#ifndef SQLITE_MAX_EXPR_DEPTH
+# define SQLITE_MAX_EXPR_DEPTH 1000
+#endif
+
+/*
+** The maximum number of terms in a compound SELECT statement.
+** The code generator for compound SELECT statements does one
+** level of recursion for each term.  A stack overflow can result
+** if the number of terms is too large.  In practice, most SQL
+** never has more than 3 or 4 terms.  Use a value of 0 to disable
+** any limit on the number of terms in a compount SELECT.
+*/
+#ifndef SQLITE_MAX_COMPOUND_SELECT
+# define SQLITE_MAX_COMPOUND_SELECT 500
+#endif
+
+/*
+** The maximum number of opcodes in a VDBE program.
+** Not currently enforced.
+*/
+#ifndef SQLITE_MAX_VDBE_OP
+# define SQLITE_MAX_VDBE_OP 250000000
+#endif
+
+/*
+** The maximum number of arguments to an SQL function.
+*/
+#ifndef SQLITE_MAX_FUNCTION_ARG
+# define SQLITE_MAX_FUNCTION_ARG 127
+#endif
+
+/*
+** The suggested maximum number of in-memory pages to use for
+** the main database table and for temporary tables.
+**
+** IMPLEMENTATION-OF: R-30185-15359 The default suggested cache size is -2000,
+** which means the cache size is limited to 2048000 bytes of memory.
+** IMPLEMENTATION-OF: R-48205-43578 The default suggested cache size can be
+** altered using the SQLITE_DEFAULT_CACHE_SIZE compile-time options.
+*/
+#ifndef SQLITE_DEFAULT_CACHE_SIZE
+# define SQLITE_DEFAULT_CACHE_SIZE  -2000
+#endif
+
+/*
+** The default number of frames to accumulate in the log file before
+** checkpointing the database in WAL mode.
+*/
+#ifndef SQLITE_DEFAULT_WAL_AUTOCHECKPOINT
+# define SQLITE_DEFAULT_WAL_AUTOCHECKPOINT  1000
+#endif
+
+/*
+** The maximum number of attached databases.  This must be between 0
+** and 125.  The upper bound of 125 is because the attached databases are
+** counted using a signed 8-bit integer which has a maximum value of 127
+** and we have to allow 2 extra counts for the "main" and "temp" databases.
+*/
+#ifndef SQLITE_MAX_ATTACHED
+# define SQLITE_MAX_ATTACHED 10
+#endif
+
+
+/*
+** The maximum value of a ?nnn wildcard that the parser will accept.
+** If the value exceeds 32767 then extra space is required for the Expr
+** structure.  But otherwise, we believe that the number can be as large
+** as a signed 32-bit integer can hold.
+*/
+#ifndef SQLITE_MAX_VARIABLE_NUMBER
+# define SQLITE_MAX_VARIABLE_NUMBER 32766
+#endif
+
+/* Maximum page size.  The upper bound on this value is 65536.  This a limit
+** imposed by the use of 16-bit offsets within each page.
+**
+** Earlier versions of SQLite allowed the user to change this value at
+** compile time. This is no longer permitted, on the grounds that it creates
+** a library that is technically incompatible with an SQLite library
+** compiled with a different limit. If a process operating on a database
+** with a page-size of 65536 bytes crashes, then an instance of SQLite
+** compiled with the default page-size limit will not be able to rollback
+** the aborted transaction. This could lead to database corruption.
+*/
+#ifdef SQLITE_MAX_PAGE_SIZE
+# undef SQLITE_MAX_PAGE_SIZE
+#endif
+#define SQLITE_MAX_PAGE_SIZE 65536
+
+
+/*
+** The default size of a database page.
+*/
+#ifndef SQLITE_DEFAULT_PAGE_SIZE
+# define SQLITE_DEFAULT_PAGE_SIZE 4096
+#endif
+#if SQLITE_DEFAULT_PAGE_SIZE>SQLITE_MAX_PAGE_SIZE
+# undef SQLITE_DEFAULT_PAGE_SIZE
+# define SQLITE_DEFAULT_PAGE_SIZE SQLITE_MAX_PAGE_SIZE
+#endif
+
+/*
+** Ordinarily, if no value is explicitly provided, SQLite creates databases
+** with page size SQLITE_DEFAULT_PAGE_SIZE. However, based on certain
+** device characteristics (sector-size and atomic write() support),
+** SQLite may choose a larger value. This constant is the maximum value
+** SQLite will choose on its own.
+*/
+#ifndef SQLITE_MAX_DEFAULT_PAGE_SIZE
+# define SQLITE_MAX_DEFAULT_PAGE_SIZE 8192
+#endif
+#if SQLITE_MAX_DEFAULT_PAGE_SIZE>SQLITE_MAX_PAGE_SIZE
+# undef SQLITE_MAX_DEFAULT_PAGE_SIZE
+# define SQLITE_MAX_DEFAULT_PAGE_SIZE SQLITE_MAX_PAGE_SIZE
+#endif
+
+
+/*
+** Maximum number of pages in one database file.
+**
+** This is really just the default value for the max_page_count pragma.
+** This value can be lowered (or raised) at run-time using that the
+** max_page_count macro.
+*/
+#ifndef SQLITE_MAX_PAGE_COUNT
+# define SQLITE_MAX_PAGE_COUNT 1073741823
+#endif
+
+/*
+** Maximum length (in bytes) of the pattern in a LIKE or GLOB
+** operator.
+*/
+#ifndef SQLITE_MAX_LIKE_PATTERN_LENGTH
+# define SQLITE_MAX_LIKE_PATTERN_LENGTH 50000
+#endif
+
+/*
+** Maximum depth of recursion for triggers.
+**
+** A value of 1 means that a trigger program will not be able to itself
+** fire any triggers. A value of 0 means that no trigger programs at all
+** may be executed.
+*/
+#ifndef SQLITE_MAX_TRIGGER_DEPTH
+# define SQLITE_MAX_TRIGGER_DEPTH 1000
+#endif
+
+/************** End of sqliteLimit.h *****************************************/
+/************** Continuing where we left off in sqliteInt.h ******************/
+
+/* Disable nuisance warnings on Borland compilers */
+#if defined(__BORLANDC__)
+#pragma warn -rch /* unreachable code */
+#pragma warn -ccc /* Condition is always true or false */
+#pragma warn -aus /* Assigned value is never used */
+#pragma warn -csu /* Comparing signed and unsigned */
+#pragma warn -spa /* Suspicious pointer arithmetic */
+#endif
+
+/*
+** WAL mode depends on atomic aligned 32-bit loads and stores in a few
+** places.  The following macros try to make this explicit.
+*/
+#ifndef __has_extension
+# define __has_extension(x) 0     /* compatibility with non-clang compilers */
+#endif
+#if GCC_VERSION>=4007000 || __has_extension(c_atomic)
+# define SQLITE_ATOMIC_INTRINSICS 1
+# define AtomicLoad(PTR)       __atomic_load_n((PTR),__ATOMIC_RELAXED)
+# define AtomicStore(PTR,VAL)  __atomic_store_n((PTR),(VAL),__ATOMIC_RELAXED)
+#else
+# define SQLITE_ATOMIC_INTRINSICS 0
+# define AtomicLoad(PTR)       (*(PTR))
+# define AtomicStore(PTR,VAL)  (*(PTR) = (VAL))
+#endif
+
+/*
+** Include standard header files as necessary
+*/
+#ifdef HAVE_STDINT_H
+#include <stdint.h>
+#endif
+#ifdef HAVE_INTTYPES_H
+#include <inttypes.h>
+#endif
+
+/*
+** The following macros are used to cast pointers to integers and
+** integers to pointers.  The way you do this varies from one compiler
+** to the next, so we have developed the following set of #if statements
+** to generate appropriate macros for a wide range of compilers.
+**
+** The correct "ANSI" way to do this is to use the intptr_t type.
+** Unfortunately, that typedef is not available on all compilers, or
+** if it is available, it requires an #include of specific headers
+** that vary from one machine to the next.
+**
+** Ticket #3860:  The llvm-gcc-4.2 compiler from Apple chokes on
+** the ((void*)&((char*)0)[X]) construct.  But MSV
