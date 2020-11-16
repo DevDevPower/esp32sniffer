@@ -13423,4 +13423,186 @@ struct fts5_api {
 ** that vary from one machine to the next.
 **
 ** Ticket #3860:  The llvm-gcc-4.2 compiler from Apple chokes on
-** the ((void*)&((char*)0)[X]) construct.  But MSV
+** the ((void*)&((char*)0)[X]) construct.  But MSVC chokes on ((void*)(X)).
+** So we have to define the macros in different ways depending on the
+** compiler.
+*/
+#if defined(HAVE_STDINT_H)   /* Use this case if we have ANSI headers */
+# define SQLITE_INT_TO_PTR(X)  ((void*)(intptr_t)(X))
+# define SQLITE_PTR_TO_INT(X)  ((int)(intptr_t)(X))
+#elif defined(__PTRDIFF_TYPE__)  /* This case should work for GCC */
+# define SQLITE_INT_TO_PTR(X)  ((void*)(__PTRDIFF_TYPE__)(X))
+# define SQLITE_PTR_TO_INT(X)  ((int)(__PTRDIFF_TYPE__)(X))
+#elif !defined(__GNUC__)       /* Works for compilers other than LLVM */
+# define SQLITE_INT_TO_PTR(X)  ((void*)&((char*)0)[X])
+# define SQLITE_PTR_TO_INT(X)  ((int)(((char*)X)-(char*)0))
+#else                          /* Generates a warning - but it always works */
+# define SQLITE_INT_TO_PTR(X)  ((void*)(X))
+# define SQLITE_PTR_TO_INT(X)  ((int)(X))
+#endif
+
+/*
+** A macro to hint to the compiler that a function should not be
+** inlined.
+*/
+#if defined(__GNUC__)
+#  define SQLITE_NOINLINE  __attribute__((noinline))
+#elif defined(_MSC_VER) && _MSC_VER>=1310
+#  define SQLITE_NOINLINE  __declspec(noinline)
+#else
+#  define SQLITE_NOINLINE
+#endif
+
+/*
+** Make sure that the compiler intrinsics we desire are enabled when
+** compiling with an appropriate version of MSVC unless prevented by
+** the SQLITE_DISABLE_INTRINSIC define.
+*/
+#if !defined(SQLITE_DISABLE_INTRINSIC)
+#  if defined(_MSC_VER) && _MSC_VER>=1400
+#    if !defined(_WIN32_WCE)
+#      include <intrin.h>
+#      pragma intrinsic(_byteswap_ushort)
+#      pragma intrinsic(_byteswap_ulong)
+#      pragma intrinsic(_byteswap_uint64)
+#      pragma intrinsic(_ReadWriteBarrier)
+#    else
+#      include <cmnintrin.h>
+#    endif
+#  endif
+#endif
+
+/*
+** The SQLITE_THREADSAFE macro must be defined as 0, 1, or 2.
+** 0 means mutexes are permanently disable and the library is never
+** threadsafe.  1 means the library is serialized which is the highest
+** level of threadsafety.  2 means the library is multithreaded - multiple
+** threads can use SQLite as long as no two threads try to use the same
+** database connection at the same time.
+**
+** Older versions of SQLite used an optional THREADSAFE macro.
+** We support that for legacy.
+**
+** To ensure that the correct value of "THREADSAFE" is reported when querying
+** for compile-time options at runtime (e.g. "PRAGMA compile_options"), this
+** logic is partially replicated in ctime.c. If it is updated here, it should
+** also be updated there.
+*/
+#if !defined(SQLITE_THREADSAFE)
+# if defined(THREADSAFE)
+#   define SQLITE_THREADSAFE THREADSAFE
+# else
+#   define SQLITE_THREADSAFE 1 /* IMP: R-07272-22309 */
+# endif
+#endif
+
+/*
+** Powersafe overwrite is on by default.  But can be turned off using
+** the -DSQLITE_POWERSAFE_OVERWRITE=0 command-line option.
+*/
+#ifndef SQLITE_POWERSAFE_OVERWRITE
+# define SQLITE_POWERSAFE_OVERWRITE 1
+#endif
+
+/*
+** EVIDENCE-OF: R-25715-37072 Memory allocation statistics are enabled by
+** default unless SQLite is compiled with SQLITE_DEFAULT_MEMSTATUS=0 in
+** which case memory allocation statistics are disabled by default.
+*/
+#if !defined(SQLITE_DEFAULT_MEMSTATUS)
+# define SQLITE_DEFAULT_MEMSTATUS 1
+#endif
+
+/*
+** Exactly one of the following macros must be defined in order to
+** specify which memory allocation subsystem to use.
+**
+**     SQLITE_SYSTEM_MALLOC          // Use normal system malloc()
+**     SQLITE_WIN32_MALLOC           // Use Win32 native heap API
+**     SQLITE_ZERO_MALLOC            // Use a stub allocator that always fails
+**     SQLITE_MEMDEBUG               // Debugging version of system malloc()
+**
+** On Windows, if the SQLITE_WIN32_MALLOC_VALIDATE macro is defined and the
+** assert() macro is enabled, each call into the Win32 native heap subsystem
+** will cause HeapValidate to be called.  If heap validation should fail, an
+** assertion will be triggered.
+**
+** If none of the above are defined, then set SQLITE_SYSTEM_MALLOC as
+** the default.
+*/
+#if defined(SQLITE_SYSTEM_MALLOC) \
+  + defined(SQLITE_WIN32_MALLOC) \
+  + defined(SQLITE_ZERO_MALLOC) \
+  + defined(SQLITE_MEMDEBUG)>1
+# error "Two or more of the following compile-time configuration options\
+ are defined but at most one is allowed:\
+ SQLITE_SYSTEM_MALLOC, SQLITE_WIN32_MALLOC, SQLITE_MEMDEBUG,\
+ SQLITE_ZERO_MALLOC"
+#endif
+#if defined(SQLITE_SYSTEM_MALLOC) \
+  + defined(SQLITE_WIN32_MALLOC) \
+  + defined(SQLITE_ZERO_MALLOC) \
+  + defined(SQLITE_MEMDEBUG)==0
+# define SQLITE_SYSTEM_MALLOC 1
+#endif
+
+/*
+** If SQLITE_MALLOC_SOFT_LIMIT is not zero, then try to keep the
+** sizes of memory allocations below this value where possible.
+*/
+#if !defined(SQLITE_MALLOC_SOFT_LIMIT)
+# define SQLITE_MALLOC_SOFT_LIMIT 1024
+#endif
+
+/*
+** We need to define _XOPEN_SOURCE as follows in order to enable
+** recursive mutexes on most Unix systems and fchmod() on OpenBSD.
+** But _XOPEN_SOURCE define causes problems for Mac OS X, so omit
+** it.
+*/
+#if !defined(_XOPEN_SOURCE) && !defined(__DARWIN__) && !defined(__APPLE__)
+#  define _XOPEN_SOURCE 600
+#endif
+
+/*
+** NDEBUG and SQLITE_DEBUG are opposites.  It should always be true that
+** defined(NDEBUG)==!defined(SQLITE_DEBUG).  If this is not currently true,
+** make it true by defining or undefining NDEBUG.
+**
+** Setting NDEBUG makes the code smaller and faster by disabling the
+** assert() statements in the code.  So we want the default action
+** to be for NDEBUG to be set and NDEBUG to be undefined only if SQLITE_DEBUG
+** is set.  Thus NDEBUG becomes an opt-in rather than an opt-out
+** feature.
+*/
+#if !defined(NDEBUG) && !defined(SQLITE_DEBUG)
+# define NDEBUG 1
+#endif
+#if defined(NDEBUG) && defined(SQLITE_DEBUG)
+# undef NDEBUG
+#endif
+
+/*
+** Enable SQLITE_ENABLE_EXPLAIN_COMMENTS if SQLITE_DEBUG is turned on.
+*/
+#if !defined(SQLITE_ENABLE_EXPLAIN_COMMENTS) && defined(SQLITE_DEBUG)
+# define SQLITE_ENABLE_EXPLAIN_COMMENTS 1
+#endif
+
+/*
+** The testcase() macro is used to aid in coverage testing.  When
+** doing coverage testing, the condition inside the argument to
+** testcase() must be evaluated both true and false in order to
+** get full branch coverage.  The testcase() macro is inserted
+** to help ensure adequate test coverage in places where simple
+** condition/decision coverage is inadequate.  For example, testcase()
+** can be used to make sure boundary values are tested.  For
+** bitmask tests, testcase() can be used to make sure each bit
+** is significant and used at least once.  On switch statements
+** where multiple cases go to the same block of code, testcase()
+** can insure that all cases are evaluated.
+*/
+#if defined(SQLITE_COVERAGE_TEST) || defined(SQLITE_DEBUG)
+# ifndef SQLITE_AMALGAMATION
+    extern unsigned int sqlite3CoverageCounter;
+# en
