@@ -14901,4 +14901,170 @@ SQLITE_PRIVATE   int sqlite3PagerCloseWal(Pager *pPager, sqlite3*);
 # ifdef SQLITE_ENABLE_SNAPSHOT
 SQLITE_PRIVATE   int sqlite3PagerSnapshotGet(Pager*, sqlite3_snapshot **ppSnapshot);
 SQLITE_PRIVATE   int sqlite3PagerSnapshotOpen(Pager*, sqlite3_snapshot *pSnapshot);
-SQLITE_PRIVATE
+SQLITE_PRIVATE   int sqlite3PagerSnapshotRecover(Pager *pPager);
+SQLITE_PRIVATE   int sqlite3PagerSnapshotCheck(Pager *pPager, sqlite3_snapshot *pSnapshot);
+SQLITE_PRIVATE   void sqlite3PagerSnapshotUnlock(Pager *pPager);
+# endif
+#endif
+
+#if !defined(SQLITE_OMIT_WAL) && defined(SQLITE_ENABLE_SETLK_TIMEOUT)
+SQLITE_PRIVATE   int sqlite3PagerWalWriteLock(Pager*, int);
+SQLITE_PRIVATE   void sqlite3PagerWalDb(Pager*, sqlite3*);
+#else
+# define sqlite3PagerWalWriteLock(y,z) SQLITE_OK
+# define sqlite3PagerWalDb(x,y)
+#endif
+
+#ifdef SQLITE_DIRECT_OVERFLOW_READ
+SQLITE_PRIVATE   int sqlite3PagerDirectReadOk(Pager *pPager, Pgno pgno);
+#endif
+
+#ifdef SQLITE_ENABLE_ZIPVFS
+SQLITE_PRIVATE   int sqlite3PagerWalFramesize(Pager *pPager);
+#endif
+
+/* Functions used to query pager state and configuration. */
+SQLITE_PRIVATE u8 sqlite3PagerIsreadonly(Pager*);
+SQLITE_PRIVATE u32 sqlite3PagerDataVersion(Pager*);
+#ifdef SQLITE_DEBUG
+SQLITE_PRIVATE   int sqlite3PagerRefcount(Pager*);
+#endif
+SQLITE_PRIVATE int sqlite3PagerMemUsed(Pager*);
+SQLITE_PRIVATE const char *sqlite3PagerFilename(const Pager*, int);
+SQLITE_PRIVATE sqlite3_vfs *sqlite3PagerVfs(Pager*);
+SQLITE_PRIVATE sqlite3_file *sqlite3PagerFile(Pager*);
+SQLITE_PRIVATE sqlite3_file *sqlite3PagerJrnlFile(Pager*);
+SQLITE_PRIVATE const char *sqlite3PagerJournalname(Pager*);
+SQLITE_PRIVATE void *sqlite3PagerTempSpace(Pager*);
+SQLITE_PRIVATE int sqlite3PagerIsMemdb(Pager*);
+SQLITE_PRIVATE void sqlite3PagerCacheStat(Pager *, int, int, int *);
+SQLITE_PRIVATE void sqlite3PagerClearCache(Pager*);
+SQLITE_PRIVATE int sqlite3SectorSize(sqlite3_file *);
+
+/* Functions used to truncate the database file. */
+SQLITE_PRIVATE void sqlite3PagerTruncateImage(Pager*,Pgno);
+
+SQLITE_PRIVATE void sqlite3PagerRekey(DbPage*, Pgno, u16);
+
+/* Functions to support testing and debugging. */
+#if !defined(NDEBUG) || defined(SQLITE_TEST)
+SQLITE_PRIVATE   Pgno sqlite3PagerPagenumber(DbPage*);
+SQLITE_PRIVATE   int sqlite3PagerIswriteable(DbPage*);
+#endif
+#ifdef SQLITE_TEST
+SQLITE_PRIVATE   int *sqlite3PagerStats(Pager*);
+SQLITE_PRIVATE   void sqlite3PagerRefdump(Pager*);
+  void disable_simulated_io_errors(void);
+  void enable_simulated_io_errors(void);
+#else
+# define disable_simulated_io_errors()
+# define enable_simulated_io_errors()
+#endif
+
+#endif /* SQLITE_PAGER_H */
+
+/************** End of pager.h ***********************************************/
+/************** Continuing where we left off in sqliteInt.h ******************/
+/************** Include btree.h in the middle of sqliteInt.h *****************/
+/************** Begin file btree.h *******************************************/
+/*
+** 2001 September 15
+**
+** The author disclaims copyright to this source code.  In place of
+** a legal notice, here is a blessing:
+**
+**    May you do good and not evil.
+**    May you find forgiveness for yourself and forgive others.
+**    May you share freely, never taking more than you give.
+**
+*************************************************************************
+** This header file defines the interface that the sqlite B-Tree file
+** subsystem.  See comments in the source code for a detailed description
+** of what each interface routine does.
+*/
+#ifndef SQLITE_BTREE_H
+#define SQLITE_BTREE_H
+
+/* TODO: This definition is just included so other modules compile. It
+** needs to be revisited.
+*/
+#define SQLITE_N_BTREE_META 16
+
+/*
+** If defined as non-zero, auto-vacuum is enabled by default. Otherwise
+** it must be turned on for each database using "PRAGMA auto_vacuum = 1".
+*/
+#ifndef SQLITE_DEFAULT_AUTOVACUUM
+  #define SQLITE_DEFAULT_AUTOVACUUM 0
+#endif
+
+#define BTREE_AUTOVACUUM_NONE 0        /* Do not do auto-vacuum */
+#define BTREE_AUTOVACUUM_FULL 1        /* Do full auto-vacuum */
+#define BTREE_AUTOVACUUM_INCR 2        /* Incremental vacuum */
+
+/*
+** Forward declarations of structure
+*/
+typedef struct Btree Btree;
+typedef struct BtCursor BtCursor;
+typedef struct BtShared BtShared;
+typedef struct BtreePayload BtreePayload;
+
+
+SQLITE_PRIVATE int sqlite3BtreeOpen(
+  sqlite3_vfs *pVfs,       /* VFS to use with this b-tree */
+  const char *zFilename,   /* Name of database file to open */
+  sqlite3 *db,             /* Associated database connection */
+  Btree **ppBtree,         /* Return open Btree* here */
+  int flags,               /* Flags */
+  int vfsFlags             /* Flags passed through to VFS open */
+);
+
+/* The flags parameter to sqlite3BtreeOpen can be the bitwise or of the
+** following values.
+**
+** NOTE:  These values must match the corresponding PAGER_ values in
+** pager.h.
+*/
+#define BTREE_OMIT_JOURNAL  1  /* Do not create or use a rollback journal */
+#define BTREE_MEMORY        2  /* This is an in-memory DB */
+#define BTREE_SINGLE        4  /* The file contains at most 1 b-tree */
+#define BTREE_UNORDERED     8  /* Use of a hash implementation is OK */
+
+SQLITE_PRIVATE int sqlite3BtreeClose(Btree*);
+SQLITE_PRIVATE int sqlite3BtreeSetCacheSize(Btree*,int);
+SQLITE_PRIVATE int sqlite3BtreeSetSpillSize(Btree*,int);
+#if SQLITE_MAX_MMAP_SIZE>0
+SQLITE_PRIVATE   int sqlite3BtreeSetMmapLimit(Btree*,sqlite3_int64);
+#endif
+SQLITE_PRIVATE int sqlite3BtreeSetPagerFlags(Btree*,unsigned);
+SQLITE_PRIVATE int sqlite3BtreeSetPageSize(Btree *p, int nPagesize, int nReserve, int eFix);
+SQLITE_PRIVATE int sqlite3BtreeGetPageSize(Btree*);
+SQLITE_PRIVATE Pgno sqlite3BtreeMaxPageCount(Btree*,Pgno);
+SQLITE_PRIVATE Pgno sqlite3BtreeLastPage(Btree*);
+SQLITE_PRIVATE int sqlite3BtreeSecureDelete(Btree*,int);
+SQLITE_PRIVATE int sqlite3BtreeGetRequestedReserve(Btree*);
+SQLITE_PRIVATE int sqlite3BtreeGetReserveNoMutex(Btree *p);
+SQLITE_PRIVATE int sqlite3BtreeSetAutoVacuum(Btree *, int);
+SQLITE_PRIVATE int sqlite3BtreeGetAutoVacuum(Btree *);
+SQLITE_PRIVATE int sqlite3BtreeBeginTrans(Btree*,int,int*);
+SQLITE_PRIVATE int sqlite3BtreeCommitPhaseOne(Btree*, const char*);
+SQLITE_PRIVATE int sqlite3BtreeCommitPhaseTwo(Btree*, int);
+SQLITE_PRIVATE int sqlite3BtreeCommit(Btree*);
+SQLITE_PRIVATE int sqlite3BtreeRollback(Btree*,int,int);
+SQLITE_PRIVATE int sqlite3BtreeBeginStmt(Btree*,int);
+SQLITE_PRIVATE int sqlite3BtreeCreateTable(Btree*, Pgno*, int flags);
+SQLITE_PRIVATE int sqlite3BtreeTxnState(Btree*);
+SQLITE_PRIVATE int sqlite3BtreeIsInBackup(Btree*);
+
+SQLITE_PRIVATE void *sqlite3BtreeSchema(Btree *, int, void(*)(void *));
+SQLITE_PRIVATE int sqlite3BtreeSchemaLocked(Btree *pBtree);
+#ifndef SQLITE_OMIT_SHARED_CACHE
+SQLITE_PRIVATE int sqlite3BtreeLockTable(Btree *pBtree, int iTab, u8 isWriteLock);
+#endif
+
+/* Savepoints are named, nestable SQL transactions mostly implemented */
+/* in vdbe.c and pager.c See https://sqlite.org/lang_savepoint.html */
+SQLITE_PRIVATE int sqlite3BtreeSavepoint(Btree *, int, int);
+
+/* "Checkpoint" only refers to WAL. See https://sq
