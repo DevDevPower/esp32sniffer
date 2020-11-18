@@ -14135,4 +14135,221 @@ SQLITE_PRIVATE void sqlite3HashClear(Hash*);
 #ifndef SQLITE_MAX_WORKER_THREADS
 # define SQLITE_MAX_WORKER_THREADS 8
 #endif
-#ifndef SQLITE_DEFAULT_WORKE
+#ifndef SQLITE_DEFAULT_WORKER_THREADS
+# define SQLITE_DEFAULT_WORKER_THREADS 0
+#endif
+#if SQLITE_DEFAULT_WORKER_THREADS>SQLITE_MAX_WORKER_THREADS
+# undef SQLITE_MAX_WORKER_THREADS
+# define SQLITE_MAX_WORKER_THREADS SQLITE_DEFAULT_WORKER_THREADS
+#endif
+
+/*
+** The default initial allocation for the pagecache when using separate
+** pagecaches for each database connection.  A positive number is the
+** number of pages.  A negative number N translations means that a buffer
+** of -1024*N bytes is allocated and used for as many pages as it will hold.
+**
+** The default value of "20" was chosen to minimize the run-time of the
+** speedtest1 test program with options: --shrink-memory --reprepare
+*/
+#ifndef SQLITE_DEFAULT_PCACHE_INITSZ
+# define SQLITE_DEFAULT_PCACHE_INITSZ 20
+#endif
+
+/*
+** Default value for the SQLITE_CONFIG_SORTERREF_SIZE option.
+*/
+#ifndef SQLITE_DEFAULT_SORTERREF_SIZE
+# define SQLITE_DEFAULT_SORTERREF_SIZE 0x7fffffff
+#endif
+
+/*
+** The compile-time options SQLITE_MMAP_READWRITE and
+** SQLITE_ENABLE_BATCH_ATOMIC_WRITE are not compatible with one another.
+** You must choose one or the other (or neither) but not both.
+*/
+#if defined(SQLITE_MMAP_READWRITE) && defined(SQLITE_ENABLE_BATCH_ATOMIC_WRITE)
+#error Cannot use both SQLITE_MMAP_READWRITE and SQLITE_ENABLE_BATCH_ATOMIC_WRITE
+#endif
+
+/*
+** GCC does not define the offsetof() macro so we'll have to do it
+** ourselves.
+*/
+#ifndef offsetof
+#define offsetof(STRUCTURE,FIELD) ((int)((char*)&((STRUCTURE*)0)->FIELD))
+#endif
+
+/*
+** Macros to compute minimum and maximum of two numbers.
+*/
+#ifndef MIN
+# define MIN(A,B) ((A)<(B)?(A):(B))
+#endif
+#ifndef MAX
+# define MAX(A,B) ((A)>(B)?(A):(B))
+#endif
+
+/*
+** Swap two objects of type TYPE.
+*/
+#define SWAP(TYPE,A,B) {TYPE t=A; A=B; B=t;}
+
+/*
+** Check to see if this machine uses EBCDIC.  (Yes, believe it or
+** not, there are still machines out there that use EBCDIC.)
+*/
+#if 'A' == '\301'
+# define SQLITE_EBCDIC 1
+#else
+# define SQLITE_ASCII 1
+#endif
+
+/*
+** Integers of known sizes.  These typedefs might change for architectures
+** where the sizes very.  Preprocessor macros are available so that the
+** types can be conveniently redefined at compile-type.  Like this:
+**
+**         cc '-DUINTPTR_TYPE=long long int' ...
+*/
+#ifndef UINT32_TYPE
+# ifdef HAVE_UINT32_T
+#  define UINT32_TYPE uint32_t
+# else
+#  define UINT32_TYPE unsigned int
+# endif
+#endif
+#ifndef UINT16_TYPE
+# ifdef HAVE_UINT16_T
+#  define UINT16_TYPE uint16_t
+# else
+#  define UINT16_TYPE unsigned short int
+# endif
+#endif
+#ifndef INT16_TYPE
+# ifdef HAVE_INT16_T
+#  define INT16_TYPE int16_t
+# else
+#  define INT16_TYPE short int
+# endif
+#endif
+#ifndef UINT8_TYPE
+# ifdef HAVE_UINT8_T
+#  define UINT8_TYPE uint8_t
+# else
+#  define UINT8_TYPE unsigned char
+# endif
+#endif
+#ifndef INT8_TYPE
+# ifdef HAVE_INT8_T
+#  define INT8_TYPE int8_t
+# else
+#  define INT8_TYPE signed char
+# endif
+#endif
+#ifndef LONGDOUBLE_TYPE
+# define LONGDOUBLE_TYPE long double
+#endif
+typedef sqlite_int64 i64;          /* 8-byte signed integer */
+typedef sqlite_uint64 u64;         /* 8-byte unsigned integer */
+typedef UINT32_TYPE u32;           /* 4-byte unsigned integer */
+typedef UINT16_TYPE u16;           /* 2-byte unsigned integer */
+typedef INT16_TYPE i16;            /* 2-byte signed integer */
+typedef UINT8_TYPE u8;             /* 1-byte unsigned integer */
+typedef INT8_TYPE i8;              /* 1-byte signed integer */
+
+/*
+** SQLITE_MAX_U32 is a u64 constant that is the maximum u64 value
+** that can be stored in a u32 without loss of data.  The value
+** is 0x00000000ffffffff.  But because of quirks of some compilers, we
+** have to specify the value in the less intuitive manner shown:
+*/
+#define SQLITE_MAX_U32  ((((u64)1)<<32)-1)
+
+/*
+** The datatype used to store estimates of the number of rows in a
+** table or index.  This is an unsigned integer type.  For 99.9% of
+** the world, a 32-bit integer is sufficient.  But a 64-bit integer
+** can be used at compile-time if desired.
+*/
+#ifdef SQLITE_64BIT_STATS
+ typedef u64 tRowcnt;    /* 64-bit only if requested at compile-time */
+#else
+ typedef u32 tRowcnt;    /* 32-bit is the default */
+#endif
+
+/*
+** Estimated quantities used for query planning are stored as 16-bit
+** logarithms.  For quantity X, the value stored is 10*log2(X).  This
+** gives a possible range of values of approximately 1.0e986 to 1e-986.
+** But the allowed values are "grainy".  Not every value is representable.
+** For example, quantities 16 and 17 are both represented by a LogEst
+** of 40.  However, since LogEst quantities are suppose to be estimates,
+** not exact values, this imprecision is not a problem.
+**
+** "LogEst" is short for "Logarithmic Estimate".
+**
+** Examples:
+**      1 -> 0              20 -> 43          10000 -> 132
+**      2 -> 10             25 -> 46          25000 -> 146
+**      3 -> 16            100 -> 66        1000000 -> 199
+**      4 -> 20           1000 -> 99        1048576 -> 200
+**     10 -> 33           1024 -> 100    4294967296 -> 320
+**
+** The LogEst can be negative to indicate fractional values.
+** Examples:
+**
+**    0.5 -> -10           0.1 -> -33        0.0625 -> -40
+*/
+typedef INT16_TYPE LogEst;
+
+/*
+** Set the SQLITE_PTRSIZE macro to the number of bytes in a pointer
+*/
+#ifndef SQLITE_PTRSIZE
+# if defined(__SIZEOF_POINTER__)
+#   define SQLITE_PTRSIZE __SIZEOF_POINTER__
+# elif defined(i386)     || defined(__i386__)   || defined(_M_IX86) ||    \
+       defined(_M_ARM)   || defined(__arm__)    || defined(__x86)   ||    \
+      (defined(__APPLE__) && defined(__POWERPC__)) ||                     \
+      (defined(__TOS_AIX__) && !defined(__64BIT__))
+#   define SQLITE_PTRSIZE 4
+# else
+#   define SQLITE_PTRSIZE 8
+# endif
+#endif
+
+/* The uptr type is an unsigned integer large enough to hold a pointer
+*/
+#if defined(HAVE_STDINT_H)
+  typedef uintptr_t uptr;
+#elif SQLITE_PTRSIZE==4
+  typedef u32 uptr;
+#else
+  typedef u64 uptr;
+#endif
+
+/*
+** The SQLITE_WITHIN(P,S,E) macro checks to see if pointer P points to
+** something between S (inclusive) and E (exclusive).
+**
+** In other words, S is a buffer and E is a pointer to the first byte after
+** the end of buffer S.  This macro returns true if P points to something
+** contained within the buffer S.
+*/
+#define SQLITE_WITHIN(P,S,E) (((uptr)(P)>=(uptr)(S))&&((uptr)(P)<(uptr)(E)))
+
+
+/*
+** Macros to determine whether the machine is big or little endian,
+** and whether or not that determination is run-time or compile-time.
+**
+** For best performance, an attempt is made to guess at the byte-order
+** using C-preprocessor macros.  If that is unsuccessful, or if
+** -DSQLITE_BYTEORDER=0 is set, then byte-order is determined
+** at run-time.
+*/
+#ifndef SQLITE_BYTEORDER
+# if defined(i386)      || defined(__i386__)      || defined(_M_IX86) ||    \
+     defined(__x86_64)  || defined(__x86_64__)    || defined(_M_X64)  ||    \
+     
