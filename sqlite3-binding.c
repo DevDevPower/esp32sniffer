@@ -14566,4 +14566,186 @@ struct BusyHandler {
 ** The sqlite3DbFree() routine requires two parameters instead of the
 ** one parameter that destructors normally want.  So we have to introduce
 ** this magic value that the code knows to handle differently.  Any
-** pointer will work here as long
+** pointer will work here as long as it is distinct from SQLITE_STATIC
+** and SQLITE_TRANSIENT.
+*/
+#define SQLITE_DYNAMIC   ((sqlite3_destructor_type)sqlite3OomClear)
+
+/*
+** When SQLITE_OMIT_WSD is defined, it means that the target platform does
+** not support Writable Static Data (WSD) such as global and static variables.
+** All variables must either be on the stack or dynamically allocated from
+** the heap.  When WSD is unsupported, the variable declarations scattered
+** throughout the SQLite code must become constants instead.  The SQLITE_WSD
+** macro is used for this purpose.  And instead of referencing the variable
+** directly, we use its constant as a key to lookup the run-time allocated
+** buffer that holds real variable.  The constant is also the initializer
+** for the run-time allocated buffer.
+**
+** In the usual case where WSD is supported, the SQLITE_WSD and GLOBAL
+** macros become no-ops and have zero performance impact.
+*/
+#ifdef SQLITE_OMIT_WSD
+  #define SQLITE_WSD const
+  #define GLOBAL(t,v) (*(t*)sqlite3_wsd_find((void*)&(v), sizeof(v)))
+  #define sqlite3GlobalConfig GLOBAL(struct Sqlite3Config, sqlite3Config)
+SQLITE_API int sqlite3_wsd_init(int N, int J);
+SQLITE_API void *sqlite3_wsd_find(void *K, int L);
+#else
+  #define SQLITE_WSD
+  #define GLOBAL(t,v) v
+  #define sqlite3GlobalConfig sqlite3Config
+#endif
+
+/*
+** The following macros are used to suppress compiler warnings and to
+** make it clear to human readers when a function parameter is deliberately
+** left unused within the body of a function. This usually happens when
+** a function is called via a function pointer. For example the
+** implementation of an SQL aggregate step callback may not use the
+** parameter indicating the number of arguments passed to the aggregate,
+** if it knows that this is enforced elsewhere.
+**
+** When a function parameter is not used at all within the body of a function,
+** it is generally named "NotUsed" or "NotUsed2" to make things even clearer.
+** However, these macros may also be used to suppress warnings related to
+** parameters that may or may not be used depending on compilation options.
+** For example those parameters only used in assert() statements. In these
+** cases the parameters are named as per the usual conventions.
+*/
+#define UNUSED_PARAMETER(x) (void)(x)
+#define UNUSED_PARAMETER2(x,y) UNUSED_PARAMETER(x),UNUSED_PARAMETER(y)
+
+/*
+** Forward references to structures
+*/
+typedef struct AggInfo AggInfo;
+typedef struct AuthContext AuthContext;
+typedef struct AutoincInfo AutoincInfo;
+typedef struct Bitvec Bitvec;
+typedef struct CollSeq CollSeq;
+typedef struct Column Column;
+typedef struct Cte Cte;
+typedef struct CteUse CteUse;
+typedef struct Db Db;
+typedef struct DbFixer DbFixer;
+typedef struct Schema Schema;
+typedef struct Expr Expr;
+typedef struct ExprList ExprList;
+typedef struct FKey FKey;
+typedef struct FuncDestructor FuncDestructor;
+typedef struct FuncDef FuncDef;
+typedef struct FuncDefHash FuncDefHash;
+typedef struct IdList IdList;
+typedef struct Index Index;
+typedef struct IndexSample IndexSample;
+typedef struct KeyClass KeyClass;
+typedef struct KeyInfo KeyInfo;
+typedef struct Lookaside Lookaside;
+typedef struct LookasideSlot LookasideSlot;
+typedef struct Module Module;
+typedef struct NameContext NameContext;
+typedef struct OnOrUsing OnOrUsing;
+typedef struct Parse Parse;
+typedef struct ParseCleanup ParseCleanup;
+typedef struct PreUpdate PreUpdate;
+typedef struct PrintfArguments PrintfArguments;
+typedef struct RenameToken RenameToken;
+typedef struct Returning Returning;
+typedef struct RowSet RowSet;
+typedef struct Savepoint Savepoint;
+typedef struct Select Select;
+typedef struct SQLiteThread SQLiteThread;
+typedef struct SelectDest SelectDest;
+typedef struct SrcItem SrcItem;
+typedef struct SrcList SrcList;
+typedef struct sqlite3_str StrAccum; /* Internal alias for sqlite3_str */
+typedef struct Table Table;
+typedef struct TableLock TableLock;
+typedef struct Token Token;
+typedef struct TreeView TreeView;
+typedef struct Trigger Trigger;
+typedef struct TriggerPrg TriggerPrg;
+typedef struct TriggerStep TriggerStep;
+typedef struct UnpackedRecord UnpackedRecord;
+typedef struct Upsert Upsert;
+typedef struct VTable VTable;
+typedef struct VtabCtx VtabCtx;
+typedef struct Walker Walker;
+typedef struct WhereInfo WhereInfo;
+typedef struct Window Window;
+typedef struct With With;
+
+
+/*
+** The bitmask datatype defined below is used for various optimizations.
+**
+** Changing this from a 64-bit to a 32-bit type limits the number of
+** tables in a join to 32 instead of 64.  But it also reduces the size
+** of the library by 738 bytes on ix86.
+*/
+#ifdef SQLITE_BITMASK_TYPE
+  typedef SQLITE_BITMASK_TYPE Bitmask;
+#else
+  typedef u64 Bitmask;
+#endif
+
+/*
+** The number of bits in a Bitmask.  "BMS" means "BitMask Size".
+*/
+#define BMS  ((int)(sizeof(Bitmask)*8))
+
+/*
+** A bit in a Bitmask
+*/
+#define MASKBIT(n)    (((Bitmask)1)<<(n))
+#define MASKBIT64(n)  (((u64)1)<<(n))
+#define MASKBIT32(n)  (((unsigned int)1)<<(n))
+#define SMASKBIT32(n) ((n)<=31?((unsigned int)1)<<(n):0)
+#define ALLBITS       ((Bitmask)-1)
+
+/* A VList object records a mapping between parameters/variables/wildcards
+** in the SQL statement (such as $abc, @pqr, or :xyz) and the integer
+** variable number associated with that parameter.  See the format description
+** on the sqlite3VListAdd() routine for more information.  A VList is really
+** just an array of integers.
+*/
+typedef int VList;
+
+/*
+** Defer sourcing vdbe.h and btree.h until after the "u8" and
+** "BusyHandler" typedefs. vdbe.h also requires a few of the opaque
+** pointer types (i.e. FuncDef) defined above.
+*/
+/************** Include pager.h in the middle of sqliteInt.h *****************/
+/************** Begin file pager.h *******************************************/
+/*
+** 2001 September 15
+**
+** The author disclaims copyright to this source code.  In place of
+** a legal notice, here is a blessing:
+**
+**    May you do good and not evil.
+**    May you find forgiveness for yourself and forgive others.
+**    May you share freely, never taking more than you give.
+**
+*************************************************************************
+** This header file defines the interface that the sqlite page cache
+** subsystem.  The page cache subsystem reads and writes a file a page
+** at a time and provides a journal for rollback.
+*/
+
+#ifndef SQLITE_PAGER_H
+#define SQLITE_PAGER_H
+
+/*
+** Default maximum size for persistent journal files. A negative
+** value means no limit. This value may be overridden using the
+** sqlite3PagerJournalSizeLimit() API. See also "PRAGMA journal_size_limit".
+*/
+#ifndef SQLITE_DEFAULT_JOURNAL_SIZE_LIMIT
+  #define SQLITE_DEFAULT_JOURNAL_SIZE_LIMIT -1
+#endif
+
+/*
+** The type used to represent a page number.  The first page i
