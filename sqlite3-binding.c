@@ -14352,4 +14352,218 @@ typedef INT16_TYPE LogEst;
 #ifndef SQLITE_BYTEORDER
 # if defined(i386)      || defined(__i386__)      || defined(_M_IX86) ||    \
      defined(__x86_64)  || defined(__x86_64__)    || defined(_M_X64)  ||    \
-     
+     defined(_M_AMD64)  || defined(_M_ARM)        || defined(__x86)   ||    \
+     defined(__ARMEL__) || defined(__AARCH64EL__) || defined(_M_ARM64)
+#   define SQLITE_BYTEORDER    1234
+# elif defined(sparc)     || defined(__ppc__) || \
+       defined(__ARMEB__) || defined(__AARCH64EB__)
+#   define SQLITE_BYTEORDER    4321
+# else
+#   define SQLITE_BYTEORDER 0
+# endif
+#endif
+#if SQLITE_BYTEORDER==4321
+# define SQLITE_BIGENDIAN    1
+# define SQLITE_LITTLEENDIAN 0
+# define SQLITE_UTF16NATIVE  SQLITE_UTF16BE
+#elif SQLITE_BYTEORDER==1234
+# define SQLITE_BIGENDIAN    0
+# define SQLITE_LITTLEENDIAN 1
+# define SQLITE_UTF16NATIVE  SQLITE_UTF16LE
+#else
+# ifdef SQLITE_AMALGAMATION
+  const int sqlite3one = 1;
+# else
+  extern const int sqlite3one;
+# endif
+# define SQLITE_BIGENDIAN    (*(char *)(&sqlite3one)==0)
+# define SQLITE_LITTLEENDIAN (*(char *)(&sqlite3one)==1)
+# define SQLITE_UTF16NATIVE  (SQLITE_BIGENDIAN?SQLITE_UTF16BE:SQLITE_UTF16LE)
+#endif
+
+/*
+** Constants for the largest and smallest possible 64-bit signed integers.
+** These macros are designed to work correctly on both 32-bit and 64-bit
+** compilers.
+*/
+#define LARGEST_INT64  (0xffffffff|(((i64)0x7fffffff)<<32))
+#define LARGEST_UINT64 (0xffffffff|(((u64)0xffffffff)<<32))
+#define SMALLEST_INT64 (((i64)-1) - LARGEST_INT64)
+
+/*
+** Round up a number to the next larger multiple of 8.  This is used
+** to force 8-byte alignment on 64-bit architectures.
+**
+** ROUND8() always does the rounding, for any argument.
+**
+** ROUND8P() assumes that the argument is already an integer number of
+** pointers in size, and so it is a no-op on systems where the pointer
+** size is 8.
+*/
+#define ROUND8(x)     (((x)+7)&~7)
+#if SQLITE_PTRSIZE==8
+# define ROUND8P(x)   (x)
+#else
+# define ROUND8P(x)   (((x)+7)&~7)
+#endif
+
+/*
+** Round down to the nearest multiple of 8
+*/
+#define ROUNDDOWN8(x) ((x)&~7)
+
+/*
+** Assert that the pointer X is aligned to an 8-byte boundary.  This
+** macro is used only within assert() to verify that the code gets
+** all alignment restrictions correct.
+**
+** Except, if SQLITE_4_BYTE_ALIGNED_MALLOC is defined, then the
+** underlying malloc() implementation might return us 4-byte aligned
+** pointers.  In that case, only verify 4-byte alignment.
+*/
+#ifdef SQLITE_4_BYTE_ALIGNED_MALLOC
+# define EIGHT_BYTE_ALIGNMENT(X)   ((((char*)(X) - (char*)0)&3)==0)
+#else
+# define EIGHT_BYTE_ALIGNMENT(X)   ((((char*)(X) - (char*)0)&7)==0)
+#endif
+
+/*
+** Disable MMAP on platforms where it is known to not work
+*/
+#if defined(__OpenBSD__) || defined(__QNXNTO__)
+# undef SQLITE_MAX_MMAP_SIZE
+# define SQLITE_MAX_MMAP_SIZE 0
+#endif
+
+/*
+** Default maximum size of memory used by memory-mapped I/O in the VFS
+*/
+#ifdef __APPLE__
+# include <TargetConditionals.h>
+#endif
+#ifndef SQLITE_MAX_MMAP_SIZE
+# if defined(__linux__) \
+  || defined(_WIN32) \
+  || (defined(__APPLE__) && defined(__MACH__)) \
+  || defined(__sun) \
+  || defined(__FreeBSD__) \
+  || defined(__DragonFly__)
+#   define SQLITE_MAX_MMAP_SIZE 0x7fff0000  /* 2147418112 */
+# else
+#   define SQLITE_MAX_MMAP_SIZE 0
+# endif
+#endif
+
+/*
+** The default MMAP_SIZE is zero on all platforms.  Or, even if a larger
+** default MMAP_SIZE is specified at compile-time, make sure that it does
+** not exceed the maximum mmap size.
+*/
+#ifndef SQLITE_DEFAULT_MMAP_SIZE
+# define SQLITE_DEFAULT_MMAP_SIZE 0
+#endif
+#if SQLITE_DEFAULT_MMAP_SIZE>SQLITE_MAX_MMAP_SIZE
+# undef SQLITE_DEFAULT_MMAP_SIZE
+# define SQLITE_DEFAULT_MMAP_SIZE SQLITE_MAX_MMAP_SIZE
+#endif
+
+/*
+** TREETRACE_ENABLED will be either 1 or 0 depending on whether or not
+** the Abstract Syntax Tree tracing logic is turned on.
+*/
+#if !defined(SQLITE_AMALGAMATION)
+SQLITE_PRIVATE u32 sqlite3TreeTrace;
+#endif
+#if defined(SQLITE_DEBUG) \
+    && (defined(SQLITE_TEST) || defined(SQLITE_ENABLE_SELECTTRACE) \
+                             || defined(SQLITE_ENABLE_TREETRACE))
+# define TREETRACE_ENABLED 1
+# define SELECTTRACE(K,P,S,X)  \
+  if(sqlite3TreeTrace&(K))   \
+    sqlite3DebugPrintf("%u/%d/%p: ",(S)->selId,(P)->addrExplain,(S)),\
+    sqlite3DebugPrintf X
+#else
+# define SELECTTRACE(K,P,S,X)
+# define TREETRACE_ENABLED 0
+#endif
+
+/*
+** Macros for "wheretrace"
+*/
+SQLITE_PRIVATE u32 sqlite3WhereTrace;
+#if defined(SQLITE_DEBUG) \
+    && (defined(SQLITE_TEST) || defined(SQLITE_ENABLE_WHERETRACE))
+# define WHERETRACE(K,X)  if(sqlite3WhereTrace&(K)) sqlite3DebugPrintf X
+# define WHERETRACE_ENABLED 1
+#else
+# define WHERETRACE(K,X)
+#endif
+
+
+/*
+** An instance of the following structure is used to store the busy-handler
+** callback for a given sqlite handle.
+**
+** The sqlite.busyHandler member of the sqlite struct contains the busy
+** callback for the database handle. Each pager opened via the sqlite
+** handle is passed a pointer to sqlite.busyHandler. The busy-handler
+** callback is currently invoked only from within pager.c.
+*/
+typedef struct BusyHandler BusyHandler;
+struct BusyHandler {
+  int (*xBusyHandler)(void *,int);  /* The busy callback */
+  void *pBusyArg;                   /* First arg to busy callback */
+  int nBusy;                        /* Incremented with each busy call */
+};
+
+/*
+** Name of table that holds the database schema.
+**
+** The PREFERRED names are used whereever possible.  But LEGACY is also
+** used for backwards compatibility.
+**
+**  1.  Queries can use either the PREFERRED or the LEGACY names
+**  2.  The sqlite3_set_authorizer() callback uses the LEGACY name
+**  3.  The PRAGMA table_list statement uses the PREFERRED name
+**
+** The LEGACY names are stored in the internal symbol hash table
+** in support of (2).  Names are translated using sqlite3PreferredTableName()
+** for (3).  The sqlite3FindTable() function takes care of translating
+** names for (1).
+**
+** Note that "sqlite_temp_schema" can also be called "temp.sqlite_schema".
+*/
+#define LEGACY_SCHEMA_TABLE          "sqlite_master"
+#define LEGACY_TEMP_SCHEMA_TABLE     "sqlite_temp_master"
+#define PREFERRED_SCHEMA_TABLE       "sqlite_schema"
+#define PREFERRED_TEMP_SCHEMA_TABLE  "sqlite_temp_schema"
+
+
+/*
+** The root-page of the schema table.
+*/
+#define SCHEMA_ROOT    1
+
+/*
+** The name of the schema table.  The name is different for TEMP.
+*/
+#define SCHEMA_TABLE(x) \
+    ((!OMIT_TEMPDB)&&(x==1)?LEGACY_TEMP_SCHEMA_TABLE:LEGACY_SCHEMA_TABLE)
+
+/*
+** A convenience macro that returns the number of elements in
+** an array.
+*/
+#define ArraySize(X)    ((int)(sizeof(X)/sizeof(X[0])))
+
+/*
+** Determine if the argument is a power of two
+*/
+#define IsPowerOfTwo(X) (((X)&((X)-1))==0)
+
+/*
+** The following value as a destructor means to use sqlite3DbFree().
+** The sqlite3DbFree() routine requires two parameters instead of the
+** one parameter that destructors normally want.  So we have to introduce
+** this magic value that the code knows to handle differently.  Any
+** pointer will work here as long
