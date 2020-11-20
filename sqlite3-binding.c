@@ -15067,4 +15067,150 @@ SQLITE_PRIVATE int sqlite3BtreeLockTable(Btree *pBtree, int iTab, u8 isWriteLock
 /* in vdbe.c and pager.c See https://sqlite.org/lang_savepoint.html */
 SQLITE_PRIVATE int sqlite3BtreeSavepoint(Btree *, int, int);
 
-/* "Checkpoint" only refers to WAL. See https://sq
+/* "Checkpoint" only refers to WAL. See https://sqlite.org/wal.html#ckpt */
+#ifndef SQLITE_OMIT_WAL
+SQLITE_PRIVATE   int sqlite3BtreeCheckpoint(Btree*, int, int *, int *);
+#endif
+
+SQLITE_PRIVATE const char *sqlite3BtreeGetFilename(Btree *);
+SQLITE_PRIVATE const char *sqlite3BtreeGetJournalname(Btree *);
+SQLITE_PRIVATE int sqlite3BtreeCopyFile(Btree *, Btree *);
+
+SQLITE_PRIVATE int sqlite3BtreeIncrVacuum(Btree *);
+
+/* The flags parameter to sqlite3BtreeCreateTable can be the bitwise OR
+** of the flags shown below.
+**
+** Every SQLite table must have either BTREE_INTKEY or BTREE_BLOBKEY set.
+** With BTREE_INTKEY, the table key is a 64-bit integer and arbitrary data
+** is stored in the leaves.  (BTREE_INTKEY is used for SQL tables.)  With
+** BTREE_BLOBKEY, the key is an arbitrary BLOB and no content is stored
+** anywhere - the key is the content.  (BTREE_BLOBKEY is used for SQL
+** indices.)
+*/
+#define BTREE_INTKEY     1    /* Table has only 64-bit signed integer keys */
+#define BTREE_BLOBKEY    2    /* Table has keys only - no data */
+
+SQLITE_PRIVATE int sqlite3BtreeDropTable(Btree*, int, int*);
+SQLITE_PRIVATE int sqlite3BtreeClearTable(Btree*, int, i64*);
+SQLITE_PRIVATE int sqlite3BtreeClearTableOfCursor(BtCursor*);
+SQLITE_PRIVATE int sqlite3BtreeTripAllCursors(Btree*, int, int);
+
+SQLITE_PRIVATE void sqlite3BtreeGetMeta(Btree *pBtree, int idx, u32 *pValue);
+SQLITE_PRIVATE int sqlite3BtreeUpdateMeta(Btree*, int idx, u32 value);
+
+SQLITE_PRIVATE int sqlite3BtreeNewDb(Btree *p);
+
+/*
+** The second parameter to sqlite3BtreeGetMeta or sqlite3BtreeUpdateMeta
+** should be one of the following values. The integer values are assigned
+** to constants so that the offset of the corresponding field in an
+** SQLite database header may be found using the following formula:
+**
+**   offset = 36 + (idx * 4)
+**
+** For example, the free-page-count field is located at byte offset 36 of
+** the database file header. The incr-vacuum-flag field is located at
+** byte offset 64 (== 36+4*7).
+**
+** The BTREE_DATA_VERSION value is not really a value stored in the header.
+** It is a read-only number computed by the pager.  But we merge it with
+** the header value access routines since its access pattern is the same.
+** Call it a "virtual meta value".
+*/
+#define BTREE_FREE_PAGE_COUNT     0
+#define BTREE_SCHEMA_VERSION      1
+#define BTREE_FILE_FORMAT         2
+#define BTREE_DEFAULT_CACHE_SIZE  3
+#define BTREE_LARGEST_ROOT_PAGE   4
+#define BTREE_TEXT_ENCODING       5
+#define BTREE_USER_VERSION        6
+#define BTREE_INCR_VACUUM         7
+#define BTREE_APPLICATION_ID      8
+#define BTREE_DATA_VERSION        15  /* A virtual meta-value */
+
+/*
+** Kinds of hints that can be passed into the sqlite3BtreeCursorHint()
+** interface.
+**
+** BTREE_HINT_RANGE  (arguments: Expr*, Mem*)
+**
+**     The first argument is an Expr* (which is guaranteed to be constant for
+**     the lifetime of the cursor) that defines constraints on which rows
+**     might be fetched with this cursor.  The Expr* tree may contain
+**     TK_REGISTER nodes that refer to values stored in the array of registers
+**     passed as the second parameter.  In other words, if Expr.op==TK_REGISTER
+**     then the value of the node is the value in Mem[pExpr.iTable].  Any
+**     TK_COLUMN node in the expression tree refers to the Expr.iColumn-th
+**     column of the b-tree of the cursor.  The Expr tree will not contain
+**     any function calls nor subqueries nor references to b-trees other than
+**     the cursor being hinted.
+**
+**     The design of the _RANGE hint is aid b-tree implementations that try
+**     to prefetch content from remote machines - to provide those
+**     implementations with limits on what needs to be prefetched and thereby
+**     reduce network bandwidth.
+**
+** Note that BTREE_HINT_FLAGS with BTREE_BULKLOAD is the only hint used by
+** standard SQLite.  The other hints are provided for extentions that use
+** the SQLite parser and code generator but substitute their own storage
+** engine.
+*/
+#define BTREE_HINT_RANGE 0       /* Range constraints on queries */
+
+/*
+** Values that may be OR'd together to form the argument to the
+** BTREE_HINT_FLAGS hint for sqlite3BtreeCursorHint():
+**
+** The BTREE_BULKLOAD flag is set on index cursors when the index is going
+** to be filled with content that is already in sorted order.
+**
+** The BTREE_SEEK_EQ flag is set on cursors that will get OP_SeekGE or
+** OP_SeekLE opcodes for a range search, but where the range of entries
+** selected will all have the same key.  In other words, the cursor will
+** be used only for equality key searches.
+**
+*/
+#define BTREE_BULKLOAD 0x00000001  /* Used to full index in sorted order */
+#define BTREE_SEEK_EQ  0x00000002  /* EQ seeks only - no range seeks */
+
+/*
+** Flags passed as the third argument to sqlite3BtreeCursor().
+**
+** For read-only cursors the wrFlag argument is always zero. For read-write
+** cursors it may be set to either (BTREE_WRCSR|BTREE_FORDELETE) or just
+** (BTREE_WRCSR). If the BTREE_FORDELETE bit is set, then the cursor will
+** only be used by SQLite for the following:
+**
+**   * to seek to and then delete specific entries, and/or
+**
+**   * to read values that will be used to create keys that other
+**     BTREE_FORDELETE cursors will seek to and delete.
+**
+** The BTREE_FORDELETE flag is an optimization hint.  It is not used by
+** by this, the native b-tree engine of SQLite, but it is available to
+** alternative storage engines that might be substituted in place of this
+** b-tree system.  For alternative storage engines in which a delete of
+** the main table row automatically deletes corresponding index rows,
+** the FORDELETE flag hint allows those alternative storage engines to
+** skip a lot of work.  Namely:  FORDELETE cursors may treat all SEEK
+** and DELETE operations as no-ops, and any READ operation against a
+** FORDELETE cursor may return a null row: 0x01 0x00.
+*/
+#define BTREE_WRCSR     0x00000004     /* read-write cursor */
+#define BTREE_FORDELETE 0x00000008     /* Cursor is for seek/delete only */
+
+SQLITE_PRIVATE int sqlite3BtreeCursor(
+  Btree*,                              /* BTree containing table to open */
+  Pgno iTable,                         /* Index of root page */
+  int wrFlag,                          /* 1 for writing.  0 for read-only */
+  struct KeyInfo*,                     /* First argument to compare function */
+  BtCursor *pCursor                    /* Space to write cursor structure */
+);
+SQLITE_PRIVATE BtCursor *sqlite3BtreeFakeValidCursor(void);
+SQLITE_PRIVATE int sqlite3BtreeCursorSize(void);
+SQLITE_PRIVATE void sqlite3BtreeCursorZero(BtCursor*);
+SQLITE_PRIVATE void sqlite3BtreeCursorHintFlags(BtCursor*, unsigned);
+#ifdef SQLITE_ENABLE_CURSOR_HINTS
+SQLITE_PRIVATE void sqlite3BtreeCursorHint(BtCursor*, int, ...);
+#
