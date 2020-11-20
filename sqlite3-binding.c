@@ -15213,4 +15213,163 @@ SQLITE_PRIVATE void sqlite3BtreeCursorZero(BtCursor*);
 SQLITE_PRIVATE void sqlite3BtreeCursorHintFlags(BtCursor*, unsigned);
 #ifdef SQLITE_ENABLE_CURSOR_HINTS
 SQLITE_PRIVATE void sqlite3BtreeCursorHint(BtCursor*, int, ...);
+#endif
+
+SQLITE_PRIVATE int sqlite3BtreeCloseCursor(BtCursor*);
+SQLITE_PRIVATE int sqlite3BtreeTableMoveto(
+  BtCursor*,
+  i64 intKey,
+  int bias,
+  int *pRes
+);
+SQLITE_PRIVATE int sqlite3BtreeIndexMoveto(
+  BtCursor*,
+  UnpackedRecord *pUnKey,
+  int *pRes
+);
+SQLITE_PRIVATE int sqlite3BtreeCursorHasMoved(BtCursor*);
+SQLITE_PRIVATE int sqlite3BtreeCursorRestore(BtCursor*, int*);
+SQLITE_PRIVATE int sqlite3BtreeDelete(BtCursor*, u8 flags);
+
+/* Allowed flags for sqlite3BtreeDelete() and sqlite3BtreeInsert() */
+#define BTREE_SAVEPOSITION 0x02  /* Leave cursor pointing at NEXT or PREV */
+#define BTREE_AUXDELETE    0x04  /* not the primary delete operation */
+#define BTREE_APPEND       0x08  /* Insert is likely an append */
+#define BTREE_PREFORMAT    0x80  /* Inserted data is a preformated cell */
+
+/* An instance of the BtreePayload object describes the content of a single
+** entry in either an index or table btree.
+**
+** Index btrees (used for indexes and also WITHOUT ROWID tables) contain
+** an arbitrary key and no data.  These btrees have pKey,nKey set to the
+** key and the pData,nData,nZero fields are uninitialized.  The aMem,nMem
+** fields give an array of Mem objects that are a decomposition of the key.
+** The nMem field might be zero, indicating that no decomposition is available.
+**
+** Table btrees (used for rowid tables) contain an integer rowid used as
+** the key and passed in the nKey field.  The pKey field is zero.
+** pData,nData hold the content of the new entry.  nZero extra zero bytes
+** are appended to the end of the content when constructing the entry.
+** The aMem,nMem fields are uninitialized for table btrees.
+**
+** Field usage summary:
+**
+**               Table BTrees                   Index Btrees
+**
+**   pKey        always NULL                    encoded key
+**   nKey        the ROWID                      length of pKey
+**   pData       data                           not used
+**   aMem        not used                       decomposed key value
+**   nMem        not used                       entries in aMem
+**   nData       length of pData                not used
+**   nZero       extra zeros after pData        not used
+**
+** This object is used to pass information into sqlite3BtreeInsert().  The
+** same information used to be passed as five separate parameters.  But placing
+** the information into this object helps to keep the interface more
+** organized and understandable, and it also helps the resulting code to
+** run a little faster by using fewer registers for parameter passing.
+*/
+struct BtreePayload {
+  const void *pKey;       /* Key content for indexes.  NULL for tables */
+  sqlite3_int64 nKey;     /* Size of pKey for indexes.  PRIMARY KEY for tabs */
+  const void *pData;      /* Data for tables. */
+  sqlite3_value *aMem;    /* First of nMem value in the unpacked pKey */
+  u16 nMem;               /* Number of aMem[] value.  Might be zero */
+  int nData;              /* Size of pData.  0 if none. */
+  int nZero;              /* Extra zero data appended after pData,nData */
+};
+
+SQLITE_PRIVATE int sqlite3BtreeInsert(BtCursor*, const BtreePayload *pPayload,
+                       int flags, int seekResult);
+SQLITE_PRIVATE int sqlite3BtreeFirst(BtCursor*, int *pRes);
+SQLITE_PRIVATE int sqlite3BtreeLast(BtCursor*, int *pRes);
+SQLITE_PRIVATE int sqlite3BtreeNext(BtCursor*, int flags);
+SQLITE_PRIVATE int sqlite3BtreeEof(BtCursor*);
+SQLITE_PRIVATE int sqlite3BtreePrevious(BtCursor*, int flags);
+SQLITE_PRIVATE i64 sqlite3BtreeIntegerKey(BtCursor*);
+SQLITE_PRIVATE void sqlite3BtreeCursorPin(BtCursor*);
+SQLITE_PRIVATE void sqlite3BtreeCursorUnpin(BtCursor*);
+#ifdef SQLITE_ENABLE_OFFSET_SQL_FUNC
+SQLITE_PRIVATE i64 sqlite3BtreeOffset(BtCursor*);
+#endif
+SQLITE_PRIVATE int sqlite3BtreePayload(BtCursor*, u32 offset, u32 amt, void*);
+SQLITE_PRIVATE const void *sqlite3BtreePayloadFetch(BtCursor*, u32 *pAmt);
+SQLITE_PRIVATE u32 sqlite3BtreePayloadSize(BtCursor*);
+SQLITE_PRIVATE sqlite3_int64 sqlite3BtreeMaxRecordSize(BtCursor*);
+
+SQLITE_PRIVATE char *sqlite3BtreeIntegrityCheck(sqlite3*,Btree*,Pgno*aRoot,int nRoot,int,int*);
+SQLITE_PRIVATE struct Pager *sqlite3BtreePager(Btree*);
+SQLITE_PRIVATE i64 sqlite3BtreeRowCountEst(BtCursor*);
+
+#ifndef SQLITE_OMIT_INCRBLOB
+SQLITE_PRIVATE int sqlite3BtreePayloadChecked(BtCursor*, u32 offset, u32 amt, void*);
+SQLITE_PRIVATE int sqlite3BtreePutData(BtCursor*, u32 offset, u32 amt, void*);
+SQLITE_PRIVATE void sqlite3BtreeIncrblobCursor(BtCursor *);
+#endif
+SQLITE_PRIVATE void sqlite3BtreeClearCursor(BtCursor *);
+SQLITE_PRIVATE int sqlite3BtreeSetVersion(Btree *pBt, int iVersion);
+SQLITE_PRIVATE int sqlite3BtreeCursorHasHint(BtCursor*, unsigned int mask);
+SQLITE_PRIVATE int sqlite3BtreeIsReadonly(Btree *pBt);
+SQLITE_PRIVATE int sqlite3HeaderSizeBtree(void);
+
+#ifdef SQLITE_DEBUG
+SQLITE_PRIVATE sqlite3_uint64 sqlite3BtreeSeekCount(Btree*);
+#else
+# define sqlite3BtreeSeekCount(X) 0
+#endif
+
+#ifndef NDEBUG
+SQLITE_PRIVATE int sqlite3BtreeCursorIsValid(BtCursor*);
+#endif
+SQLITE_PRIVATE int sqlite3BtreeCursorIsValidNN(BtCursor*);
+
+SQLITE_PRIVATE int sqlite3BtreeCount(sqlite3*, BtCursor*, i64*);
+
+#ifdef SQLITE_TEST
+SQLITE_PRIVATE int sqlite3BtreeCursorInfo(BtCursor*, int*, int);
+SQLITE_PRIVATE void sqlite3BtreeCursorList(Btree*);
+#endif
+
+#ifndef SQLITE_OMIT_WAL
+SQLITE_PRIVATE   int sqlite3BtreeCheckpoint(Btree*, int, int *, int *);
+#endif
+
+SQLITE_PRIVATE int sqlite3BtreeTransferRow(BtCursor*, BtCursor*, i64);
+
+/*
+** If we are not using shared cache, then there is no need to
+** use mutexes to access the BtShared structures.  So make the
+** Enter and Leave procedures no-ops.
+*/
+#ifndef SQLITE_OMIT_SHARED_CACHE
+SQLITE_PRIVATE   void sqlite3BtreeEnter(Btree*);
+SQLITE_PRIVATE   void sqlite3BtreeEnterAll(sqlite3*);
+SQLITE_PRIVATE   int sqlite3BtreeSharable(Btree*);
+SQLITE_PRIVATE   void sqlite3BtreeEnterCursor(BtCursor*);
+SQLITE_PRIVATE   int sqlite3BtreeConnectionCount(Btree*);
+#else
+# define sqlite3BtreeEnter(X)
+# define sqlite3BtreeEnterAll(X)
+# define sqlite3BtreeSharable(X) 0
+# define sqlite3BtreeEnterCursor(X)
+# define sqlite3BtreeConnectionCount(X) 1
+#endif
+
+#if !defined(SQLITE_OMIT_SHARED_CACHE) && SQLITE_THREADSAFE
+SQLITE_PRIVATE   void sqlite3BtreeLeave(Btree*);
+SQLITE_PRIVATE   void sqlite3BtreeLeaveCursor(BtCursor*);
+SQLITE_PRIVATE   void sqlite3BtreeLeaveAll(sqlite3*);
+#ifndef NDEBUG
+  /* These routines are used inside assert() statements only. */
+SQLITE_PRIVATE   int sqlite3BtreeHoldsMutex(Btree*);
+SQLITE_PRIVATE   int sqlite3BtreeHoldsAllMutexes(sqlite3*);
+SQLITE_PRIVATE   int sqlite3SchemaMutexHeld(sqlite3*,int,Schema*);
+#endif
+#else
+
+# define sqlite3BtreeLeave(X)
+# define sqlite3BtreeLeaveCursor(X)
+# define sqlite3BtreeLeaveAll(X)
+
 #
