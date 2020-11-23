@@ -15539,4 +15539,100 @@ typedef struct VdbeOpList VdbeOpList;
 #endif
 
 /*
-** The following macro converts a label returned by sqlite3VdbeMak
+** The following macro converts a label returned by sqlite3VdbeMakeLabel()
+** into an index into the Parse.aLabel[] array that contains the resolved
+** address of that label.
+*/
+#define ADDR(X)  (~(X))
+
+/*
+** The makefile scans the vdbe.c source file and creates the "opcodes.h"
+** header file that defines a number for each opcode used by the VDBE.
+*/
+/************** Include opcodes.h in the middle of vdbe.h ********************/
+/************** Begin file opcodes.h *****************************************/
+/* Automatically generated.  Do not edit */
+/* See the tool/mkopcodeh.tcl script for details */
+#define OP_Savepoint       0
+#define OP_AutoCommit      1
+#define OP_Transaction     2
+#define OP_Checkpoint      3
+#define OP_JournalMode     4
+#define OP_Vacuum          5
+#define OP_VFilter         6 /* jump, synopsis: iplan=r[P3] zplan='P4'     */
+#define OP_VUpdate         7 /* synopsis: data=r[P3@P2]                    */
+#define OP_Goto            8 /* jump                                       */
+#define OP_Gosub           9 /* jump                                       */
+#define OP_InitCoroutine  10 /* jump                                       */
+#define OP_Yield          11 /* jump                                       */
+#define OP_MustBeInt      12 /* jump                                       */
+#define OP_Jump           13 /* jump                                       */
+#define OP_Once           14 /* jump                                       */
+#define OP_If             15 /* jump                                       */
+#define OP_IfNot          16 /* jump                                       */
+#define OP_IsNullOrType   17 /* jump, synopsis: if typeof(r[P1]) IN (P3,5) goto P2 */
+#define OP_IfNullRow      18 /* jump, synopsis: if P1.nullRow then r[P3]=NULL, goto P2 */
+#define OP_Not            19 /* same as TK_NOT, synopsis: r[P2]= !r[P1]    */
+#define OP_SeekLT         20 /* jump, synopsis: key=r[P3@P4]               */
+#define OP_SeekLE         21 /* jump, synopsis: key=r[P3@P4]               */
+#define OP_SeekGE         22 /* jump, synopsis: key=r[P3@P4]               */
+#define OP_SeekGT         23 /* jump, synopsis: key=r[P3@P4]               */
+#define OP_IfNotOpen      24 /* jump, synopsis: if( !csr[P1] ) goto P2     */
+#define OP_IfNoHope       25 /* jump, synopsis: key=r[P3@P4]               */
+#define OP_NoConflict     26 /* jump, synopsis: key=r[P3@P4]               */
+#define OP_NotFound       27 /* jump, synopsis: key=r[P3@P4]               */
+#define OP_Found          28 /* jump, synopsis: key=r[P3@P4]               */
+#define OP_SeekRowid      29 /* jump, synopsis: intkey=r[P3]               */
+#define OP_NotExists      30 /* jump, synopsis: intkey=r[P3]               */
+#define OP_Last           31 /* jump                                       */
+#define OP_IfSmaller      32 /* jump                                       */
+#define OP_SorterSort     33 /* jump                                       */
+#define OP_Sort           34 /* jump                                       */
+#define OP_Rewind         35 /* jump                                       */
+#define OP_SorterNext     36 /* jump                                       */
+#define OP_Prev           37 /* jump                                       */
+#define OP_Next           38 /* jump                                       */
+#define OP_IdxLE          39 /* jump, synopsis: key=r[P3@P4]               */
+#define OP_IdxGT          40 /* jump, synopsis: key=r[P3@P4]               */
+#define OP_IdxLT          41 /* jump, synopsis: key=r[P3@P4]               */
+#define OP_IdxGE          42 /* jump, synopsis: key=r[P3@P4]               */
+#define OP_Or             43 /* same as TK_OR, synopsis: r[P3]=(r[P1] || r[P2]) */
+#define OP_And            44 /* same as TK_AND, synopsis: r[P3]=(r[P1] && r[P2]) */
+#define OP_RowSetRead     45 /* jump, synopsis: r[P3]=rowset(P1)           */
+#define OP_RowSetTest     46 /* jump, synopsis: if r[P3] in rowset(P1) goto P2 */
+#define OP_Program        47 /* jump                                       */
+#define OP_FkIfZero       48 /* jump, synopsis: if fkctr[P1]==0 goto P2    */
+#define OP_IfPos          49 /* jump, synopsis: if r[P1]>0 then r[P1]-=P3, goto P2 */
+#define OP_IsNull         50 /* jump, same as TK_ISNULL, synopsis: if r[P1]==NULL goto P2 */
+#define OP_NotNull        51 /* jump, same as TK_NOTNULL, synopsis: if r[P1]!=NULL goto P2 */
+#define OP_Ne             52 /* jump, same as TK_NE, synopsis: IF r[P3]!=r[P1] */
+#define OP_Eq             53 /* jump, same as TK_EQ, synopsis: IF r[P3]==r[P1] */
+#define OP_Gt             54 /* jump, same as TK_GT, synopsis: IF r[P3]>r[P1] */
+#define OP_Le             55 /* jump, same as TK_LE, synopsis: IF r[P3]<=r[P1] */
+#define OP_Lt             56 /* jump, same as TK_LT, synopsis: IF r[P3]<r[P1] */
+#define OP_Ge             57 /* jump, same as TK_GE, synopsis: IF r[P3]>=r[P1] */
+#define OP_ElseEq         58 /* jump, same as TK_ESCAPE                    */
+#define OP_IfNotZero      59 /* jump, synopsis: if r[P1]!=0 then r[P1]--, goto P2 */
+#define OP_DecrJumpZero   60 /* jump, synopsis: if (--r[P1])==0 goto P2    */
+#define OP_IncrVacuum     61 /* jump                                       */
+#define OP_VNext          62 /* jump                                       */
+#define OP_Filter         63 /* jump, synopsis: if key(P3@P4) not in filter(P1) goto P2 */
+#define OP_Init           64 /* jump, synopsis: Start at P2                */
+#define OP_PureFunc       65 /* synopsis: r[P3]=func(r[P2@NP])             */
+#define OP_Function       66 /* synopsis: r[P3]=func(r[P2@NP])             */
+#define OP_Return         67
+#define OP_EndCoroutine   68
+#define OP_HaltIfNull     69 /* synopsis: if r[P3]=null halt               */
+#define OP_Halt           70
+#define OP_Integer        71 /* synopsis: r[P2]=P1                         */
+#define OP_Int64          72 /* synopsis: r[P2]=P4                         */
+#define OP_String         73 /* synopsis: r[P2]='P4' (len=P1)              */
+#define OP_BeginSubrtn    74 /* synopsis: r[P2]=NULL                       */
+#define OP_Null           75 /* synopsis: r[P2..P3]=NULL                   */
+#define OP_SoftNull       76 /* synopsis: r[P1]=NULL                       */
+#define OP_Blob           77 /* synopsis: r[P2]=P4 (len=P1)                */
+#define OP_Variable       78 /* synopsis: r[P2]=parameter(P1,P4)           */
+#define OP_Move           79 /* synopsis: r[P2@P3]=r[P1@P3]                */
+#define OP_Copy           80 /* synopsis: r[P2@P3+1]=r[P1@P3+1]            */
+#define OP_SCopy          81 /* synopsis: r[P2]=r[P1]                      */
+#define OP
