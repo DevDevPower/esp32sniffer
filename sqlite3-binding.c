@@ -15881,4 +15881,168 @@ SQLITE_PRIVATE void sqlite3VdbeRewind(Vdbe*);
 SQLITE_PRIVATE int sqlite3VdbeReset(Vdbe*);
 SQLITE_PRIVATE void sqlite3VdbeSetNumCols(Vdbe*,int);
 SQLITE_PRIVATE int sqlite3VdbeSetColName(Vdbe*, int, int, const char *, void(*)(void*));
-SQLITE_PRIVATE void sqlite3VdbeCou
+SQLITE_PRIVATE void sqlite3VdbeCountChanges(Vdbe*);
+SQLITE_PRIVATE sqlite3 *sqlite3VdbeDb(Vdbe*);
+SQLITE_PRIVATE u8 sqlite3VdbePrepareFlags(Vdbe*);
+SQLITE_PRIVATE void sqlite3VdbeSetSql(Vdbe*, const char *z, int n, u8);
+#ifdef SQLITE_ENABLE_NORMALIZE
+SQLITE_PRIVATE void sqlite3VdbeAddDblquoteStr(sqlite3*,Vdbe*,const char*);
+SQLITE_PRIVATE int sqlite3VdbeUsesDoubleQuotedString(Vdbe*,const char*);
+#endif
+SQLITE_PRIVATE void sqlite3VdbeSwap(Vdbe*,Vdbe*);
+SQLITE_PRIVATE VdbeOp *sqlite3VdbeTakeOpArray(Vdbe*, int*, int*);
+SQLITE_PRIVATE sqlite3_value *sqlite3VdbeGetBoundValue(Vdbe*, int, u8);
+SQLITE_PRIVATE void sqlite3VdbeSetVarmask(Vdbe*, int);
+#ifndef SQLITE_OMIT_TRACE
+SQLITE_PRIVATE   char *sqlite3VdbeExpandSql(Vdbe*, const char*);
+#endif
+SQLITE_PRIVATE int sqlite3MemCompare(const Mem*, const Mem*, const CollSeq*);
+SQLITE_PRIVATE int sqlite3BlobCompare(const Mem*, const Mem*);
+
+SQLITE_PRIVATE void sqlite3VdbeRecordUnpack(KeyInfo*,int,const void*,UnpackedRecord*);
+SQLITE_PRIVATE int sqlite3VdbeRecordCompare(int,const void*,UnpackedRecord*);
+SQLITE_PRIVATE int sqlite3VdbeRecordCompareWithSkip(int, const void *, UnpackedRecord *, int);
+SQLITE_PRIVATE UnpackedRecord *sqlite3VdbeAllocUnpackedRecord(KeyInfo*);
+
+typedef int (*RecordCompare)(int,const void*,UnpackedRecord*);
+SQLITE_PRIVATE RecordCompare sqlite3VdbeFindCompare(UnpackedRecord*);
+
+SQLITE_PRIVATE void sqlite3VdbeLinkSubProgram(Vdbe *, SubProgram *);
+SQLITE_PRIVATE int sqlite3VdbeHasSubProgram(Vdbe*);
+
+SQLITE_PRIVATE int sqlite3NotPureFunc(sqlite3_context*);
+#ifdef SQLITE_ENABLE_BYTECODE_VTAB
+SQLITE_PRIVATE int sqlite3VdbeBytecodeVtabInit(sqlite3*);
+#endif
+
+/* Use SQLITE_ENABLE_COMMENTS to enable generation of extra comments on
+** each VDBE opcode.
+**
+** Use the SQLITE_ENABLE_MODULE_COMMENTS macro to see some extra no-op
+** comments in VDBE programs that show key decision points in the code
+** generator.
+*/
+#ifdef SQLITE_ENABLE_EXPLAIN_COMMENTS
+SQLITE_PRIVATE   void sqlite3VdbeComment(Vdbe*, const char*, ...);
+# define VdbeComment(X)  sqlite3VdbeComment X
+SQLITE_PRIVATE   void sqlite3VdbeNoopComment(Vdbe*, const char*, ...);
+# define VdbeNoopComment(X)  sqlite3VdbeNoopComment X
+# ifdef SQLITE_ENABLE_MODULE_COMMENTS
+#   define VdbeModuleComment(X)  sqlite3VdbeNoopComment X
+# else
+#   define VdbeModuleComment(X)
+# endif
+#else
+# define VdbeComment(X)
+# define VdbeNoopComment(X)
+# define VdbeModuleComment(X)
+#endif
+
+/*
+** The VdbeCoverage macros are used to set a coverage testing point
+** for VDBE branch instructions.  The coverage testing points are line
+** numbers in the sqlite3.c source file.  VDBE branch coverage testing
+** only works with an amalagmation build.  That's ok since a VDBE branch
+** coverage build designed for testing the test suite only.  No application
+** should ever ship with VDBE branch coverage measuring turned on.
+**
+**    VdbeCoverage(v)                  // Mark the previously coded instruction
+**                                     // as a branch
+**
+**    VdbeCoverageIf(v, conditional)   // Mark previous if conditional true
+**
+**    VdbeCoverageAlwaysTaken(v)       // Previous branch is always taken
+**
+**    VdbeCoverageNeverTaken(v)        // Previous branch is never taken
+**
+**    VdbeCoverageNeverNull(v)         // Previous three-way branch is only
+**                                     // taken on the first two ways.  The
+**                                     // NULL option is not possible
+**
+**    VdbeCoverageEqNe(v)              // Previous OP_Jump is only interested
+**                                     // in distingishing equal and not-equal.
+**
+** Every VDBE branch operation must be tagged with one of the macros above.
+** If not, then when "make test" is run with -DSQLITE_VDBE_COVERAGE and
+** -DSQLITE_DEBUG then an ALWAYS() will fail in the vdbeTakeBranch()
+** routine in vdbe.c, alerting the developer to the missed tag.
+**
+** During testing, the test application will invoke
+** sqlite3_test_control(SQLITE_TESTCTRL_VDBE_COVERAGE,...) to set a callback
+** routine that is invoked as each bytecode branch is taken.  The callback
+** contains the sqlite3.c source line number ov the VdbeCoverage macro and
+** flags to indicate whether or not the branch was taken.  The test application
+** is responsible for keeping track of this and reporting byte-code branches
+** that are never taken.
+**
+** See the VdbeBranchTaken() macro and vdbeTakeBranch() function in the
+** vdbe.c source file for additional information.
+*/
+#ifdef SQLITE_VDBE_COVERAGE
+SQLITE_PRIVATE   void sqlite3VdbeSetLineNumber(Vdbe*,int);
+# define VdbeCoverage(v) sqlite3VdbeSetLineNumber(v,__LINE__)
+# define VdbeCoverageIf(v,x) if(x)sqlite3VdbeSetLineNumber(v,__LINE__)
+# define VdbeCoverageAlwaysTaken(v) \
+         sqlite3VdbeSetLineNumber(v,__LINE__|0x5000000);
+# define VdbeCoverageNeverTaken(v) \
+         sqlite3VdbeSetLineNumber(v,__LINE__|0x6000000);
+# define VdbeCoverageNeverNull(v) \
+         sqlite3VdbeSetLineNumber(v,__LINE__|0x4000000);
+# define VdbeCoverageNeverNullIf(v,x) \
+         if(x)sqlite3VdbeSetLineNumber(v,__LINE__|0x4000000);
+# define VdbeCoverageEqNe(v) \
+         sqlite3VdbeSetLineNumber(v,__LINE__|0x8000000);
+# define VDBE_OFFSET_LINENO(x) (__LINE__+x)
+#else
+# define VdbeCoverage(v)
+# define VdbeCoverageIf(v,x)
+# define VdbeCoverageAlwaysTaken(v)
+# define VdbeCoverageNeverTaken(v)
+# define VdbeCoverageNeverNull(v)
+# define VdbeCoverageNeverNullIf(v,x)
+# define VdbeCoverageEqNe(v)
+# define VDBE_OFFSET_LINENO(x) 0
+#endif
+
+#ifdef SQLITE_ENABLE_STMT_SCANSTATUS
+SQLITE_PRIVATE void sqlite3VdbeScanStatus(Vdbe*, int, int, int, LogEst, const char*);
+#else
+# define sqlite3VdbeScanStatus(a,b,c,d,e)
+#endif
+
+#if defined(SQLITE_DEBUG) || defined(VDBE_PROFILE)
+SQLITE_PRIVATE void sqlite3VdbePrintOp(FILE*, int, VdbeOp*);
+#endif
+
+#endif /* SQLITE_VDBE_H */
+
+/************** End of vdbe.h ************************************************/
+/************** Continuing where we left off in sqliteInt.h ******************/
+/************** Include pcache.h in the middle of sqliteInt.h ****************/
+/************** Begin file pcache.h ******************************************/
+/*
+** 2008 August 05
+**
+** The author disclaims copyright to this source code.  In place of
+** a legal notice, here is a blessing:
+**
+**    May you do good and not evil.
+**    May you find forgiveness for yourself and forgive others.
+**    May you share freely, never taking more than you give.
+**
+*************************************************************************
+** This header file defines the interface that the sqlite page cache
+** subsystem.
+*/
+
+#ifndef _PCACHE_H_
+
+typedef struct PgHdr PgHdr;
+typedef struct PCache PCache;
+
+/*
+** Every page in the cache is controlled by an instance of the following
+** structure.
+*/
+struct PgHdr {
+  sqlite3
