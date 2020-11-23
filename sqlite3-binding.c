@@ -15747,4 +15747,138 @@ typedef struct VdbeOpList VdbeOpList;
 */
 #define OPFLG_JUMP        0x01  /* jump:  P2 holds jmp target */
 #define OPFLG_IN1         0x02  /* in1:   P1 is an input */
-#define OPFLG_IN2         0x04  /* in2:   P2 is an input
+#define OPFLG_IN2         0x04  /* in2:   P2 is an input */
+#define OPFLG_IN3         0x08  /* in3:   P3 is an input */
+#define OPFLG_OUT2        0x10  /* out2:  P2 is an output */
+#define OPFLG_OUT3        0x20  /* out3:  P3 is an output */
+#define OPFLG_INITIALIZER {\
+/*   0 */ 0x00, 0x00, 0x00, 0x00, 0x10, 0x00, 0x01, 0x00,\
+/*   8 */ 0x01, 0x01, 0x01, 0x03, 0x03, 0x01, 0x01, 0x03,\
+/*  16 */ 0x03, 0x03, 0x01, 0x12, 0x09, 0x09, 0x09, 0x09,\
+/*  24 */ 0x01, 0x09, 0x09, 0x09, 0x09, 0x09, 0x09, 0x01,\
+/*  32 */ 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01,\
+/*  40 */ 0x01, 0x01, 0x01, 0x26, 0x26, 0x23, 0x0b, 0x01,\
+/*  48 */ 0x01, 0x03, 0x03, 0x03, 0x0b, 0x0b, 0x0b, 0x0b,\
+/*  56 */ 0x0b, 0x0b, 0x01, 0x03, 0x03, 0x01, 0x01, 0x01,\
+/*  64 */ 0x01, 0x00, 0x00, 0x02, 0x02, 0x08, 0x00, 0x10,\
+/*  72 */ 0x10, 0x10, 0x00, 0x10, 0x00, 0x10, 0x10, 0x00,\
+/*  80 */ 0x00, 0x10, 0x10, 0x00, 0x00, 0x00, 0x02, 0x02,\
+/*  88 */ 0x02, 0x00, 0x00, 0x12, 0x1e, 0x20, 0x00, 0x00,\
+/*  96 */ 0x00, 0x00, 0x10, 0x10, 0x00, 0x00, 0x26, 0x26,\
+/* 104 */ 0x26, 0x26, 0x26, 0x26, 0x26, 0x26, 0x26, 0x26,\
+/* 112 */ 0x00, 0x00, 0x12, 0x00, 0x00, 0x10, 0x00, 0x00,\
+/* 120 */ 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x10, 0x10,\
+/* 128 */ 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x10,\
+/* 136 */ 0x00, 0x00, 0x04, 0x04, 0x00, 0x00, 0x10, 0x00,\
+/* 144 */ 0x10, 0x00, 0x00, 0x10, 0x00, 0x00, 0x00, 0x00,\
+/* 152 */ 0x00, 0x10, 0x00, 0x00, 0x06, 0x10, 0x00, 0x04,\
+/* 160 */ 0x1a, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,\
+/* 168 */ 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x10, 0x00,\
+/* 176 */ 0x00, 0x10, 0x10, 0x02, 0x00, 0x00, 0x00, 0x00,\
+/* 184 */ 0x00, 0x00, 0x00,}
+
+/* The resolve3P2Values() routine is able to run faster if it knows
+** the value of the largest JUMP opcode.  The smaller the maximum
+** JUMP opcode the better, so the mkopcodeh.tcl script that
+** generated this include file strives to group all JUMP opcodes
+** together near the beginning of the list.
+*/
+#define SQLITE_MX_JUMP_OPCODE  64  /* Maximum JUMP opcode */
+
+/************** End of opcodes.h *********************************************/
+/************** Continuing where we left off in vdbe.h ***********************/
+
+/*
+** Additional non-public SQLITE_PREPARE_* flags
+*/
+#define SQLITE_PREPARE_SAVESQL  0x80  /* Preserve SQL text */
+#define SQLITE_PREPARE_MASK     0x0f  /* Mask of public flags */
+
+/*
+** Prototypes for the VDBE interface.  See comments on the implementation
+** for a description of what each of these routines does.
+*/
+SQLITE_PRIVATE Vdbe *sqlite3VdbeCreate(Parse*);
+SQLITE_PRIVATE Parse *sqlite3VdbeParser(Vdbe*);
+SQLITE_PRIVATE int sqlite3VdbeAddOp0(Vdbe*,int);
+SQLITE_PRIVATE int sqlite3VdbeAddOp1(Vdbe*,int,int);
+SQLITE_PRIVATE int sqlite3VdbeAddOp2(Vdbe*,int,int,int);
+SQLITE_PRIVATE int sqlite3VdbeGoto(Vdbe*,int);
+SQLITE_PRIVATE int sqlite3VdbeLoadString(Vdbe*,int,const char*);
+SQLITE_PRIVATE void sqlite3VdbeMultiLoad(Vdbe*,int,const char*,...);
+SQLITE_PRIVATE int sqlite3VdbeAddOp3(Vdbe*,int,int,int,int);
+SQLITE_PRIVATE int sqlite3VdbeAddOp4(Vdbe*,int,int,int,int,const char *zP4,int);
+SQLITE_PRIVATE int sqlite3VdbeAddOp4Dup8(Vdbe*,int,int,int,int,const u8*,int);
+SQLITE_PRIVATE int sqlite3VdbeAddOp4Int(Vdbe*,int,int,int,int,int);
+SQLITE_PRIVATE int sqlite3VdbeAddFunctionCall(Parse*,int,int,int,int,const FuncDef*,int);
+SQLITE_PRIVATE void sqlite3VdbeEndCoroutine(Vdbe*,int);
+#if defined(SQLITE_DEBUG) && !defined(SQLITE_TEST_REALLOC_STRESS)
+SQLITE_PRIVATE   void sqlite3VdbeVerifyNoMallocRequired(Vdbe *p, int N);
+SQLITE_PRIVATE   void sqlite3VdbeVerifyNoResultRow(Vdbe *p);
+#else
+# define sqlite3VdbeVerifyNoMallocRequired(A,B)
+# define sqlite3VdbeVerifyNoResultRow(A)
+#endif
+#if defined(SQLITE_DEBUG)
+SQLITE_PRIVATE   void sqlite3VdbeVerifyAbortable(Vdbe *p, int);
+SQLITE_PRIVATE   void sqlite3VdbeNoJumpsOutsideSubrtn(Vdbe*,int,int,int);
+#else
+# define sqlite3VdbeVerifyAbortable(A,B)
+# define sqlite3VdbeNoJumpsOutsideSubrtn(A,B,C,D)
+#endif
+SQLITE_PRIVATE VdbeOp *sqlite3VdbeAddOpList(Vdbe*, int nOp, VdbeOpList const *aOp,int iLineno);
+#ifndef SQLITE_OMIT_EXPLAIN
+SQLITE_PRIVATE   void sqlite3VdbeExplain(Parse*,u8,const char*,...);
+SQLITE_PRIVATE   void sqlite3VdbeExplainPop(Parse*);
+SQLITE_PRIVATE   int sqlite3VdbeExplainParent(Parse*);
+# define ExplainQueryPlan(P)        sqlite3VdbeExplain P
+# define ExplainQueryPlanPop(P)     sqlite3VdbeExplainPop(P)
+# define ExplainQueryPlanParent(P)  sqlite3VdbeExplainParent(P)
+#else
+# define ExplainQueryPlan(P)
+# define ExplainQueryPlanPop(P)
+# define ExplainQueryPlanParent(P) 0
+# define sqlite3ExplainBreakpoint(A,B) /*no-op*/
+#endif
+#if defined(SQLITE_DEBUG) && !defined(SQLITE_OMIT_EXPLAIN)
+SQLITE_PRIVATE   void sqlite3ExplainBreakpoint(const char*,const char*);
+#else
+# define sqlite3ExplainBreakpoint(A,B) /*no-op*/
+#endif
+SQLITE_PRIVATE void sqlite3VdbeAddParseSchemaOp(Vdbe*, int, char*, u16);
+SQLITE_PRIVATE void sqlite3VdbeChangeOpcode(Vdbe*, int addr, u8);
+SQLITE_PRIVATE void sqlite3VdbeChangeP1(Vdbe*, int addr, int P1);
+SQLITE_PRIVATE void sqlite3VdbeChangeP2(Vdbe*, int addr, int P2);
+SQLITE_PRIVATE void sqlite3VdbeChangeP3(Vdbe*, int addr, int P3);
+SQLITE_PRIVATE void sqlite3VdbeChangeP5(Vdbe*, u16 P5);
+SQLITE_PRIVATE void sqlite3VdbeJumpHere(Vdbe*, int addr);
+SQLITE_PRIVATE void sqlite3VdbeJumpHereOrPopInst(Vdbe*, int addr);
+SQLITE_PRIVATE int sqlite3VdbeChangeToNoop(Vdbe*, int addr);
+SQLITE_PRIVATE int sqlite3VdbeDeletePriorOpcode(Vdbe*, u8 op);
+#ifdef SQLITE_DEBUG
+SQLITE_PRIVATE   void sqlite3VdbeReleaseRegisters(Parse*,int addr, int n, u32 mask, int);
+#else
+# define sqlite3VdbeReleaseRegisters(P,A,N,M,F)
+#endif
+SQLITE_PRIVATE void sqlite3VdbeChangeP4(Vdbe*, int addr, const char *zP4, int N);
+SQLITE_PRIVATE void sqlite3VdbeAppendP4(Vdbe*, void *pP4, int p4type);
+SQLITE_PRIVATE void sqlite3VdbeSetP4KeyInfo(Parse*, Index*);
+SQLITE_PRIVATE void sqlite3VdbeUsesBtree(Vdbe*, int);
+SQLITE_PRIVATE VdbeOp *sqlite3VdbeGetOp(Vdbe*, int);
+SQLITE_PRIVATE int sqlite3VdbeMakeLabel(Parse*);
+SQLITE_PRIVATE void sqlite3VdbeRunOnlyOnce(Vdbe*);
+SQLITE_PRIVATE void sqlite3VdbeReusable(Vdbe*);
+SQLITE_PRIVATE void sqlite3VdbeDelete(Vdbe*);
+SQLITE_PRIVATE void sqlite3VdbeMakeReady(Vdbe*,Parse*);
+SQLITE_PRIVATE int sqlite3VdbeFinalize(Vdbe*);
+SQLITE_PRIVATE void sqlite3VdbeResolveLabel(Vdbe*, int);
+SQLITE_PRIVATE int sqlite3VdbeCurrentAddr(Vdbe*);
+#ifdef SQLITE_DEBUG
+SQLITE_PRIVATE   int sqlite3VdbeAssertMayAbort(Vdbe *, int);
+#endif
+SQLITE_PRIVATE void sqlite3VdbeResetStepResult(Vdbe*);
+SQLITE_PRIVATE void sqlite3VdbeRewind(Vdbe*);
+SQLITE_PRIVATE int sqlite3VdbeReset(Vdbe*);
+SQLITE_PRIVATE void sqlite3VdbeSetNumCols(Vdbe*,int);
+SQLITE_PRIVATE int sqlite3VdbeSetColName(Vdbe*, int, int, const char *, void(*)(void*));
+SQLITE_PRIVATE void sqlite3VdbeCou
