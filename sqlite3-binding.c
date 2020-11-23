@@ -15635,4 +15635,116 @@ typedef struct VdbeOpList VdbeOpList;
 #define OP_Move           79 /* synopsis: r[P2@P3]=r[P1@P3]                */
 #define OP_Copy           80 /* synopsis: r[P2@P3+1]=r[P1@P3+1]            */
 #define OP_SCopy          81 /* synopsis: r[P2]=r[P1]                      */
-#define OP
+#define OP_IntCopy        82 /* synopsis: r[P2]=r[P1]                      */
+#define OP_FkCheck        83
+#define OP_ResultRow      84 /* synopsis: output=r[P1@P2]                  */
+#define OP_CollSeq        85
+#define OP_AddImm         86 /* synopsis: r[P1]=r[P1]+P2                   */
+#define OP_RealAffinity   87
+#define OP_Cast           88 /* synopsis: affinity(r[P1])                  */
+#define OP_Permutation    89
+#define OP_Compare        90 /* synopsis: r[P1@P3] <-> r[P2@P3]            */
+#define OP_IsTrue         91 /* synopsis: r[P2] = coalesce(r[P1]==TRUE,P3) ^ P4 */
+#define OP_ZeroOrNull     92 /* synopsis: r[P2] = 0 OR NULL                */
+#define OP_Offset         93 /* synopsis: r[P3] = sqlite_offset(P1)        */
+#define OP_Column         94 /* synopsis: r[P3]=PX cursor P1 column P2     */
+#define OP_TypeCheck      95 /* synopsis: typecheck(r[P1@P2])              */
+#define OP_Affinity       96 /* synopsis: affinity(r[P1@P2])               */
+#define OP_MakeRecord     97 /* synopsis: r[P3]=mkrec(r[P1@P2])            */
+#define OP_Count          98 /* synopsis: r[P2]=count()                    */
+#define OP_ReadCookie     99
+#define OP_SetCookie     100
+#define OP_ReopenIdx     101 /* synopsis: root=P2 iDb=P3                   */
+#define OP_BitAnd        102 /* same as TK_BITAND, synopsis: r[P3]=r[P1]&r[P2] */
+#define OP_BitOr         103 /* same as TK_BITOR, synopsis: r[P3]=r[P1]|r[P2] */
+#define OP_ShiftLeft     104 /* same as TK_LSHIFT, synopsis: r[P3]=r[P2]<<r[P1] */
+#define OP_ShiftRight    105 /* same as TK_RSHIFT, synopsis: r[P3]=r[P2]>>r[P1] */
+#define OP_Add           106 /* same as TK_PLUS, synopsis: r[P3]=r[P1]+r[P2] */
+#define OP_Subtract      107 /* same as TK_MINUS, synopsis: r[P3]=r[P2]-r[P1] */
+#define OP_Multiply      108 /* same as TK_STAR, synopsis: r[P3]=r[P1]*r[P2] */
+#define OP_Divide        109 /* same as TK_SLASH, synopsis: r[P3]=r[P2]/r[P1] */
+#define OP_Remainder     110 /* same as TK_REM, synopsis: r[P3]=r[P2]%r[P1] */
+#define OP_Concat        111 /* same as TK_CONCAT, synopsis: r[P3]=r[P2]+r[P1] */
+#define OP_OpenRead      112 /* synopsis: root=P2 iDb=P3                   */
+#define OP_OpenWrite     113 /* synopsis: root=P2 iDb=P3                   */
+#define OP_BitNot        114 /* same as TK_BITNOT, synopsis: r[P2]= ~r[P1] */
+#define OP_OpenDup       115
+#define OP_OpenAutoindex 116 /* synopsis: nColumn=P2                       */
+#define OP_String8       117 /* same as TK_STRING, synopsis: r[P2]='P4'    */
+#define OP_OpenEphemeral 118 /* synopsis: nColumn=P2                       */
+#define OP_SorterOpen    119
+#define OP_SequenceTest  120 /* synopsis: if( cursor[P1].ctr++ ) pc = P2   */
+#define OP_OpenPseudo    121 /* synopsis: P3 columns in r[P2]              */
+#define OP_Close         122
+#define OP_ColumnsUsed   123
+#define OP_SeekScan      124 /* synopsis: Scan-ahead up to P1 rows         */
+#define OP_SeekHit       125 /* synopsis: set P2<=seekHit<=P3              */
+#define OP_Sequence      126 /* synopsis: r[P2]=cursor[P1].ctr++           */
+#define OP_NewRowid      127 /* synopsis: r[P2]=rowid                      */
+#define OP_Insert        128 /* synopsis: intkey=r[P3] data=r[P2]          */
+#define OP_RowCell       129
+#define OP_Delete        130
+#define OP_ResetCount    131
+#define OP_SorterCompare 132 /* synopsis: if key(P1)!=trim(r[P3],P4) goto P2 */
+#define OP_SorterData    133 /* synopsis: r[P2]=data                       */
+#define OP_RowData       134 /* synopsis: r[P2]=data                       */
+#define OP_Rowid         135 /* synopsis: r[P2]=PX rowid of P1             */
+#define OP_NullRow       136
+#define OP_SeekEnd       137
+#define OP_IdxInsert     138 /* synopsis: key=r[P2]                        */
+#define OP_SorterInsert  139 /* synopsis: key=r[P2]                        */
+#define OP_IdxDelete     140 /* synopsis: key=r[P2@P3]                     */
+#define OP_DeferredSeek  141 /* synopsis: Move P3 to P1.rowid if needed    */
+#define OP_IdxRowid      142 /* synopsis: r[P2]=rowid                      */
+#define OP_FinishSeek    143
+#define OP_Destroy       144
+#define OP_Clear         145
+#define OP_ResetSorter   146
+#define OP_CreateBtree   147 /* synopsis: r[P2]=root iDb=P1 flags=P3       */
+#define OP_SqlExec       148
+#define OP_ParseSchema   149
+#define OP_LoadAnalysis  150
+#define OP_DropTable     151
+#define OP_DropIndex     152
+#define OP_Real          153 /* same as TK_FLOAT, synopsis: r[P2]=P4       */
+#define OP_DropTrigger   154
+#define OP_IntegrityCk   155
+#define OP_RowSetAdd     156 /* synopsis: rowset(P1)=r[P2]                 */
+#define OP_Param         157
+#define OP_FkCounter     158 /* synopsis: fkctr[P1]+=P2                    */
+#define OP_MemMax        159 /* synopsis: r[P1]=max(r[P1],r[P2])           */
+#define OP_OffsetLimit   160 /* synopsis: if r[P1]>0 then r[P2]=r[P1]+max(0,r[P3]) else r[P2]=(-1) */
+#define OP_AggInverse    161 /* synopsis: accum=r[P3] inverse(r[P2@P5])    */
+#define OP_AggStep       162 /* synopsis: accum=r[P3] step(r[P2@P5])       */
+#define OP_AggStep1      163 /* synopsis: accum=r[P3] step(r[P2@P5])       */
+#define OP_AggValue      164 /* synopsis: r[P3]=value N=P2                 */
+#define OP_AggFinal      165 /* synopsis: accum=r[P1] N=P2                 */
+#define OP_Expire        166
+#define OP_CursorLock    167
+#define OP_CursorUnlock  168
+#define OP_TableLock     169 /* synopsis: iDb=P1 root=P2 write=P3          */
+#define OP_VBegin        170
+#define OP_VCreate       171
+#define OP_VDestroy      172
+#define OP_VOpen         173
+#define OP_VInitIn       174 /* synopsis: r[P2]=ValueList(P1,P3)           */
+#define OP_VColumn       175 /* synopsis: r[P3]=vcolumn(P2)                */
+#define OP_VRename       176
+#define OP_Pagecount     177
+#define OP_MaxPgcnt      178
+#define OP_ClrSubtype    179 /* synopsis: r[P1].subtype = 0                */
+#define OP_FilterAdd     180 /* synopsis: filter(P1) += key(P3@P4)         */
+#define OP_Trace         181
+#define OP_CursorHint    182
+#define OP_ReleaseReg    183 /* synopsis: release r[P1@P2] mask P3         */
+#define OP_Noop          184
+#define OP_Explain       185
+#define OP_Abortable     186
+
+/* Properties such as "out2" or "jump" that are specified in
+** comments following the "case" for each opcode in the vdbe.c
+** are encoded into bitvectors as follows:
+*/
+#define OPFLG_JUMP        0x01  /* jump:  P2 holds jmp target */
+#define OPFLG_IN1         0x02  /* in1:   P1 is an input */
+#define OPFLG_IN2         0x04  /* in2:   P2 is an input
