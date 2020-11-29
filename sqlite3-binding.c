@@ -16391,4 +16391,146 @@ SQLITE_PRIVATE int sqlite3PCacheIsDirty(PCache *pCache);
 ** byte out of a specific range of bytes. The lock byte is obtained at
 ** random so two separate readers can probably access the file at the
 ** same time, unless they are unlucky and choose the same lock byte.
-** An EXCLUSIVE_LOCK is obtai
+** An EXCLUSIVE_LOCK is obtained by locking all bytes in the range.
+** There can only be one writer.  A RESERVED_LOCK is obtained by locking
+** a single byte of the file that is designated as the reserved lock byte.
+** A PENDING_LOCK is obtained by locking a designated byte different from
+** the RESERVED_LOCK byte.
+**
+** On WinNT/2K/XP systems, LockFileEx() and UnlockFileEx() are available,
+** which means we can use reader/writer locks.  When reader/writer locks
+** are used, the lock is placed on the same range of bytes that is used
+** for probabilistic locking in Win95/98/ME.  Hence, the locking scheme
+** will support two or more Win95 readers or two or more WinNT readers.
+** But a single Win95 reader will lock out all WinNT readers and a single
+** WinNT reader will lock out all other Win95 readers.
+**
+** The following #defines specify the range of bytes used for locking.
+** SHARED_SIZE is the number of bytes available in the pool from which
+** a random byte is selected for a shared lock.  The pool of bytes for
+** shared locks begins at SHARED_FIRST.
+**
+** The same locking strategy and
+** byte ranges are used for Unix.  This leaves open the possibility of having
+** clients on win95, winNT, and unix all talking to the same shared file
+** and all locking correctly.  To do so would require that samba (or whatever
+** tool is being used for file sharing) implements locks correctly between
+** windows and unix.  I'm guessing that isn't likely to happen, but by
+** using the same locking range we are at least open to the possibility.
+**
+** Locking in windows is manditory.  For this reason, we cannot store
+** actual data in the bytes used for locking.  The pager never allocates
+** the pages involved in locking therefore.  SHARED_SIZE is selected so
+** that all locks will fit on a single page even at the minimum page size.
+** PENDING_BYTE defines the beginning of the locks.  By default PENDING_BYTE
+** is set high so that we don't have to allocate an unused page except
+** for very large databases.  But one should test the page skipping logic
+** by setting PENDING_BYTE low and running the entire regression suite.
+**
+** Changing the value of PENDING_BYTE results in a subtly incompatible
+** file format.  Depending on how it is changed, you might not notice
+** the incompatibility right away, even running a full regression test.
+** The default location of PENDING_BYTE is the first byte past the
+** 1GB boundary.
+**
+*/
+#ifdef SQLITE_OMIT_WSD
+# define PENDING_BYTE     (0x40000000)
+#else
+# define PENDING_BYTE      sqlite3PendingByte
+#endif
+#define RESERVED_BYTE     (PENDING_BYTE+1)
+#define SHARED_FIRST      (PENDING_BYTE+2)
+#define SHARED_SIZE       510
+
+/*
+** Wrapper around OS specific sqlite3_os_init() function.
+*/
+SQLITE_PRIVATE int sqlite3OsInit(void);
+
+/*
+** Functions for accessing sqlite3_file methods
+*/
+SQLITE_PRIVATE void sqlite3OsClose(sqlite3_file*);
+SQLITE_PRIVATE int sqlite3OsRead(sqlite3_file*, void*, int amt, i64 offset);
+SQLITE_PRIVATE int sqlite3OsWrite(sqlite3_file*, const void*, int amt, i64 offset);
+SQLITE_PRIVATE int sqlite3OsTruncate(sqlite3_file*, i64 size);
+SQLITE_PRIVATE int sqlite3OsSync(sqlite3_file*, int);
+SQLITE_PRIVATE int sqlite3OsFileSize(sqlite3_file*, i64 *pSize);
+SQLITE_PRIVATE int sqlite3OsLock(sqlite3_file*, int);
+SQLITE_PRIVATE int sqlite3OsUnlock(sqlite3_file*, int);
+SQLITE_PRIVATE int sqlite3OsCheckReservedLock(sqlite3_file *id, int *pResOut);
+SQLITE_PRIVATE int sqlite3OsFileControl(sqlite3_file*,int,void*);
+SQLITE_PRIVATE void sqlite3OsFileControlHint(sqlite3_file*,int,void*);
+#define SQLITE_FCNTL_DB_UNCHANGED 0xca093fa0
+SQLITE_PRIVATE int sqlite3OsSectorSize(sqlite3_file *id);
+SQLITE_PRIVATE int sqlite3OsDeviceCharacteristics(sqlite3_file *id);
+#ifndef SQLITE_OMIT_WAL
+SQLITE_PRIVATE int sqlite3OsShmMap(sqlite3_file *,int,int,int,void volatile **);
+SQLITE_PRIVATE int sqlite3OsShmLock(sqlite3_file *id, int, int, int);
+SQLITE_PRIVATE void sqlite3OsShmBarrier(sqlite3_file *id);
+SQLITE_PRIVATE int sqlite3OsShmUnmap(sqlite3_file *id, int);
+#endif /* SQLITE_OMIT_WAL */
+SQLITE_PRIVATE int sqlite3OsFetch(sqlite3_file *id, i64, int, void **);
+SQLITE_PRIVATE int sqlite3OsUnfetch(sqlite3_file *, i64, void *);
+
+
+/*
+** Functions for accessing sqlite3_vfs methods
+*/
+SQLITE_PRIVATE int sqlite3OsOpen(sqlite3_vfs *, const char *, sqlite3_file*, int, int *);
+SQLITE_PRIVATE int sqlite3OsDelete(sqlite3_vfs *, const char *, int);
+SQLITE_PRIVATE int sqlite3OsAccess(sqlite3_vfs *, const char *, int, int *pResOut);
+SQLITE_PRIVATE int sqlite3OsFullPathname(sqlite3_vfs *, const char *, int, char *);
+#ifndef SQLITE_OMIT_LOAD_EXTENSION
+SQLITE_PRIVATE void *sqlite3OsDlOpen(sqlite3_vfs *, const char *);
+SQLITE_PRIVATE void sqlite3OsDlError(sqlite3_vfs *, int, char *);
+SQLITE_PRIVATE void (*sqlite3OsDlSym(sqlite3_vfs *, void *, const char *))(void);
+SQLITE_PRIVATE void sqlite3OsDlClose(sqlite3_vfs *, void *);
+#endif /* SQLITE_OMIT_LOAD_EXTENSION */
+SQLITE_PRIVATE int sqlite3OsRandomness(sqlite3_vfs *, int, char *);
+SQLITE_PRIVATE int sqlite3OsSleep(sqlite3_vfs *, int);
+SQLITE_PRIVATE int sqlite3OsGetLastError(sqlite3_vfs*);
+SQLITE_PRIVATE int sqlite3OsCurrentTimeInt64(sqlite3_vfs *, sqlite3_int64*);
+
+/*
+** Convenience functions for opening and closing files using
+** sqlite3_malloc() to obtain space for the file-handle structure.
+*/
+SQLITE_PRIVATE int sqlite3OsOpenMalloc(sqlite3_vfs *, const char *, sqlite3_file **, int,int*);
+SQLITE_PRIVATE void sqlite3OsCloseFree(sqlite3_file *);
+
+#endif /* _SQLITE_OS_H_ */
+
+/************** End of os.h **************************************************/
+/************** Continuing where we left off in sqliteInt.h ******************/
+/************** Include mutex.h in the middle of sqliteInt.h *****************/
+/************** Begin file mutex.h *******************************************/
+/*
+** 2007 August 28
+**
+** The author disclaims copyright to this source code.  In place of
+** a legal notice, here is a blessing:
+**
+**    May you do good and not evil.
+**    May you find forgiveness for yourself and forgive others.
+**    May you share freely, never taking more than you give.
+**
+*************************************************************************
+**
+** This file contains the common header for all mutex implementations.
+** The sqliteInt.h header #includes this file so that it is available
+** to all source files.  We break it out in an effort to keep the code
+** better organized.
+**
+** NOTE:  source files should *not* #include this header file directly.
+** Source files should #include the sqliteInt.h file and let that file
+** include this one indirectly.
+*/
+
+
+/*
+** Figure out what version of the code to use.  The choices are
+**
+**   SQLITE_MUTEX_OMIT         No mutex logic.  Not even stubs.  The
+**                             mutexes implementation cannot be over
