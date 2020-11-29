@@ -16533,4 +16533,168 @@ SQLITE_PRIVATE void sqlite3OsCloseFree(sqlite3_file *);
 ** Figure out what version of the code to use.  The choices are
 **
 **   SQLITE_MUTEX_OMIT         No mutex logic.  Not even stubs.  The
-**                             mutexes implementation cannot be over
+**                             mutexes implementation cannot be overridden
+**                             at start-time.
+**
+**   SQLITE_MUTEX_NOOP         For single-threaded applications.  No
+**                             mutual exclusion is provided.  But this
+**                             implementation can be overridden at
+**                             start-time.
+**
+**   SQLITE_MUTEX_PTHREADS     For multi-threaded applications on Unix.
+**
+**   SQLITE_MUTEX_W32          For multi-threaded applications on Win32.
+*/
+#if !SQLITE_THREADSAFE
+# define SQLITE_MUTEX_OMIT
+#endif
+#if SQLITE_THREADSAFE && !defined(SQLITE_MUTEX_NOOP)
+#  if SQLITE_OS_UNIX
+#    define SQLITE_MUTEX_PTHREADS
+#  elif SQLITE_OS_WIN
+#    define SQLITE_MUTEX_W32
+#  else
+#    define SQLITE_MUTEX_NOOP
+#  endif
+#endif
+
+#ifdef SQLITE_MUTEX_OMIT
+/*
+** If this is a no-op implementation, implement everything as macros.
+*/
+#define sqlite3_mutex_alloc(X)    ((sqlite3_mutex*)8)
+#define sqlite3_mutex_free(X)
+#define sqlite3_mutex_enter(X)
+#define sqlite3_mutex_try(X)      SQLITE_OK
+#define sqlite3_mutex_leave(X)
+#define sqlite3_mutex_held(X)     ((void)(X),1)
+#define sqlite3_mutex_notheld(X)  ((void)(X),1)
+#define sqlite3MutexAlloc(X)      ((sqlite3_mutex*)8)
+#define sqlite3MutexInit()        SQLITE_OK
+#define sqlite3MutexEnd()
+#define MUTEX_LOGIC(X)
+#else
+#define MUTEX_LOGIC(X)            X
+SQLITE_API int sqlite3_mutex_held(sqlite3_mutex*);
+#endif /* defined(SQLITE_MUTEX_OMIT) */
+
+/************** End of mutex.h ***********************************************/
+/************** Continuing where we left off in sqliteInt.h ******************/
+
+/* The SQLITE_EXTRA_DURABLE compile-time option used to set the default
+** synchronous setting to EXTRA.  It is no longer supported.
+*/
+#ifdef SQLITE_EXTRA_DURABLE
+# warning Use SQLITE_DEFAULT_SYNCHRONOUS=3 instead of SQLITE_EXTRA_DURABLE
+# define SQLITE_DEFAULT_SYNCHRONOUS 3
+#endif
+
+/*
+** Default synchronous levels.
+**
+** Note that (for historcal reasons) the PAGER_SYNCHRONOUS_* macros differ
+** from the SQLITE_DEFAULT_SYNCHRONOUS value by 1.
+**
+**           PAGER_SYNCHRONOUS       DEFAULT_SYNCHRONOUS
+**   OFF           1                         0
+**   NORMAL        2                         1
+**   FULL          3                         2
+**   EXTRA         4                         3
+**
+** The "PRAGMA synchronous" statement also uses the zero-based numbers.
+** In other words, the zero-based numbers are used for all external interfaces
+** and the one-based values are used internally.
+*/
+#ifndef SQLITE_DEFAULT_SYNCHRONOUS
+# define SQLITE_DEFAULT_SYNCHRONOUS 2
+#endif
+#ifndef SQLITE_DEFAULT_WAL_SYNCHRONOUS
+# define SQLITE_DEFAULT_WAL_SYNCHRONOUS SQLITE_DEFAULT_SYNCHRONOUS
+#endif
+
+/*
+** Each database file to be accessed by the system is an instance
+** of the following structure.  There are normally two of these structures
+** in the sqlite.aDb[] array.  aDb[0] is the main database file and
+** aDb[1] is the database file used to hold temporary tables.  Additional
+** databases may be attached.
+*/
+struct Db {
+  char *zDbSName;      /* Name of this database. (schema name, not filename) */
+  Btree *pBt;          /* The B*Tree structure for this database file */
+  u8 safety_level;     /* How aggressive at syncing data to disk */
+  u8 bSyncSet;         /* True if "PRAGMA synchronous=N" has been run */
+  Schema *pSchema;     /* Pointer to database schema (possibly shared) */
+};
+
+/*
+** An instance of the following structure stores a database schema.
+**
+** Most Schema objects are associated with a Btree.  The exception is
+** the Schema for the TEMP databaes (sqlite3.aDb[1]) which is free-standing.
+** In shared cache mode, a single Schema object can be shared by multiple
+** Btrees that refer to the same underlying BtShared object.
+**
+** Schema objects are automatically deallocated when the last Btree that
+** references them is destroyed.   The TEMP Schema is manually freed by
+** sqlite3_close().
+*
+** A thread must be holding a mutex on the corresponding Btree in order
+** to access Schema content.  This implies that the thread must also be
+** holding a mutex on the sqlite3 connection pointer that owns the Btree.
+** For a TEMP Schema, only the connection mutex is required.
+*/
+struct Schema {
+  int schema_cookie;   /* Database schema version number for this file */
+  int iGeneration;     /* Generation counter.  Incremented with each change */
+  Hash tblHash;        /* All tables indexed by name */
+  Hash idxHash;        /* All (named) indices indexed by name */
+  Hash trigHash;       /* All triggers indexed by name */
+  Hash fkeyHash;       /* All foreign keys by referenced table name */
+  Table *pSeqTab;      /* The sqlite_sequence table used by AUTOINCREMENT */
+  u8 file_format;      /* Schema format version for this file */
+  u8 enc;              /* Text encoding used by this database */
+  u16 schemaFlags;     /* Flags associated with this schema */
+  int cache_size;      /* Number of pages to use in the cache */
+};
+
+/*
+** These macros can be used to test, set, or clear bits in the
+** Db.pSchema->flags field.
+*/
+#define DbHasProperty(D,I,P)     (((D)->aDb[I].pSchema->schemaFlags&(P))==(P))
+#define DbHasAnyProperty(D,I,P)  (((D)->aDb[I].pSchema->schemaFlags&(P))!=0)
+#define DbSetProperty(D,I,P)     (D)->aDb[I].pSchema->schemaFlags|=(P)
+#define DbClearProperty(D,I,P)   (D)->aDb[I].pSchema->schemaFlags&=~(P)
+
+/*
+** Allowed values for the DB.pSchema->flags field.
+**
+** The DB_SchemaLoaded flag is set after the database schema has been
+** read into internal hash tables.
+**
+** DB_UnresetViews means that one or more views have column names that
+** have been filled out.  If the schema changes, these column names might
+** changes and so the view will need to be reset.
+*/
+#define DB_SchemaLoaded    0x0001  /* The schema has been loaded */
+#define DB_UnresetViews    0x0002  /* Some views have defined column names */
+#define DB_ResetWanted     0x0008  /* Reset the schema when nSchemaLock==0 */
+
+/*
+** The number of different kinds of things that can be limited
+** using the sqlite3_limit() interface.
+*/
+#define SQLITE_N_LIMIT (SQLITE_LIMIT_WORKER_THREADS+1)
+
+/*
+** Lookaside malloc is a set of fixed-size buffers that can be used
+** to satisfy small transient memory allocation requests for objects
+** associated with a particular database connection.  The use of
+** lookaside malloc provides a significant performance enhancement
+** (approx 10%) by avoiding numerous malloc/free requests while parsing
+** SQL statements.
+**
+** The Lookaside structure holds configuration information about the
+** lookaside malloc subsystem.  Each available memory allocation in
+** the lookasi
