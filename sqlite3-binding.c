@@ -16209,4 +16209,186 @@ SQLITE_PRIVATE int sqlite3PCachePercentDirty(PCache*);
 SQLITE_PRIVATE int sqlite3PCacheIsDirty(PCache *pCache);
 #endif
 
-#endif /* 
+#endif /* _PCACHE_H_ */
+
+/************** End of pcache.h **********************************************/
+/************** Continuing where we left off in sqliteInt.h ******************/
+/************** Include os.h in the middle of sqliteInt.h ********************/
+/************** Begin file os.h **********************************************/
+/*
+** 2001 September 16
+**
+** The author disclaims copyright to this source code.  In place of
+** a legal notice, here is a blessing:
+**
+**    May you do good and not evil.
+**    May you find forgiveness for yourself and forgive others.
+**    May you share freely, never taking more than you give.
+**
+******************************************************************************
+**
+** This header file (together with is companion C source-code file
+** "os.c") attempt to abstract the underlying operating system so that
+** the SQLite library will work on both POSIX and windows systems.
+**
+** This header file is #include-ed by sqliteInt.h and thus ends up
+** being included by every source file.
+*/
+#ifndef _SQLITE_OS_H_
+#define _SQLITE_OS_H_
+
+/*
+** Attempt to automatically detect the operating system and setup the
+** necessary pre-processor macros for it.
+*/
+/************** Include os_setup.h in the middle of os.h *********************/
+/************** Begin file os_setup.h ****************************************/
+/*
+** 2013 November 25
+**
+** The author disclaims copyright to this source code.  In place of
+** a legal notice, here is a blessing:
+**
+**    May you do good and not evil.
+**    May you find forgiveness for yourself and forgive others.
+**    May you share freely, never taking more than you give.
+**
+******************************************************************************
+**
+** This file contains pre-processor directives related to operating system
+** detection and/or setup.
+*/
+#ifndef SQLITE_OS_SETUP_H
+#define SQLITE_OS_SETUP_H
+
+/*
+** Figure out if we are dealing with Unix, Windows, or some other operating
+** system.
+**
+** After the following block of preprocess macros, all of SQLITE_OS_UNIX,
+** SQLITE_OS_WIN, and SQLITE_OS_OTHER will defined to either 1 or 0.  One of
+** the three will be 1.  The other two will be 0.
+*/
+#if defined(SQLITE_OS_OTHER)
+#  if SQLITE_OS_OTHER==1
+#    undef SQLITE_OS_UNIX
+#    define SQLITE_OS_UNIX 0
+#    undef SQLITE_OS_WIN
+#    define SQLITE_OS_WIN 0
+#  else
+#    undef SQLITE_OS_OTHER
+#  endif
+#endif
+#if !defined(SQLITE_OS_UNIX) && !defined(SQLITE_OS_OTHER)
+#  define SQLITE_OS_OTHER 0
+#  ifndef SQLITE_OS_WIN
+#    if defined(_WIN32) || defined(WIN32) || defined(__CYGWIN__) || \
+        defined(__MINGW32__) || defined(__BORLANDC__)
+#      define SQLITE_OS_WIN 1
+#      define SQLITE_OS_UNIX 0
+#    else
+#      define SQLITE_OS_WIN 0
+#      define SQLITE_OS_UNIX 1
+#    endif
+#  else
+#    define SQLITE_OS_UNIX 0
+#  endif
+#else
+#  ifndef SQLITE_OS_WIN
+#    define SQLITE_OS_WIN 0
+#  endif
+#endif
+
+#endif /* SQLITE_OS_SETUP_H */
+
+/************** End of os_setup.h ********************************************/
+/************** Continuing where we left off in os.h *************************/
+
+/* If the SET_FULLSYNC macro is not defined above, then make it
+** a no-op
+*/
+#ifndef SET_FULLSYNC
+# define SET_FULLSYNC(x,y)
+#endif
+
+/* Maximum pathname length.  Note: FILENAME_MAX defined by stdio.h
+*/
+#ifndef SQLITE_MAX_PATHLEN
+# define SQLITE_MAX_PATHLEN FILENAME_MAX
+#endif
+
+/* Maximum number of symlinks that will be resolved while trying to
+** expand a filename in xFullPathname() in the VFS.
+*/
+#ifndef SQLITE_MAX_SYMLINK
+# define SQLITE_MAX_SYMLINK 200
+#endif
+
+/*
+** The default size of a disk sector
+*/
+#ifndef SQLITE_DEFAULT_SECTOR_SIZE
+# define SQLITE_DEFAULT_SECTOR_SIZE 4096
+#endif
+
+/*
+** Temporary files are named starting with this prefix followed by 16 random
+** alphanumeric characters, and no file extension. They are stored in the
+** OS's standard temporary file directory, and are deleted prior to exit.
+** If sqlite is being embedded in another program, you may wish to change the
+** prefix to reflect your program's name, so that if your program exits
+** prematurely, old temporary files can be easily identified. This can be done
+** using -DSQLITE_TEMP_FILE_PREFIX=myprefix_ on the compiler command line.
+**
+** 2006-10-31:  The default prefix used to be "sqlite_".  But then
+** Mcafee started using SQLite in their anti-virus product and it
+** started putting files with the "sqlite" name in the c:/temp folder.
+** This annoyed many windows users.  Those users would then do a
+** Google search for "sqlite", find the telephone numbers of the
+** developers and call to wake them up at night and complain.
+** For this reason, the default name prefix is changed to be "sqlite"
+** spelled backwards.  So the temp files are still identified, but
+** anybody smart enough to figure out the code is also likely smart
+** enough to know that calling the developer will not help get rid
+** of the file.
+*/
+#ifndef SQLITE_TEMP_FILE_PREFIX
+# define SQLITE_TEMP_FILE_PREFIX "etilqs_"
+#endif
+
+/*
+** The following values may be passed as the second argument to
+** sqlite3OsLock(). The various locks exhibit the following semantics:
+**
+** SHARED:    Any number of processes may hold a SHARED lock simultaneously.
+** RESERVED:  A single process may hold a RESERVED lock on a file at
+**            any time. Other processes may hold and obtain new SHARED locks.
+** PENDING:   A single process may hold a PENDING lock on a file at
+**            any one time. Existing SHARED locks may persist, but no new
+**            SHARED locks may be obtained by other processes.
+** EXCLUSIVE: An EXCLUSIVE lock precludes all other locks.
+**
+** PENDING_LOCK may not be passed directly to sqlite3OsLock(). Instead, a
+** process that requests an EXCLUSIVE lock may actually obtain a PENDING
+** lock. This can be upgraded to an EXCLUSIVE lock by a subsequent call to
+** sqlite3OsLock().
+*/
+#define NO_LOCK         0
+#define SHARED_LOCK     1
+#define RESERVED_LOCK   2
+#define PENDING_LOCK    3
+#define EXCLUSIVE_LOCK  4
+
+/*
+** File Locking Notes:  (Mostly about windows but also some info for Unix)
+**
+** We cannot use LockFileEx() or UnlockFileEx() on Win95/98/ME because
+** those functions are not available.  So we use only LockFile() and
+** UnlockFile().
+**
+** LockFile() prevents not just writing but also reading by other processes.
+** A SHARED_LOCK is obtained by locking a single randomly-chosen
+** byte out of a specific range of bytes. The lock byte is obtained at
+** random so two separate readers can probably access the file at the
+** same time, unless they are unlucky and choose the same lock byte.
+** An EXCLUSIVE_LOCK is obtai
