@@ -16697,4 +16697,151 @@ struct Schema {
 **
 ** The Lookaside structure holds configuration information about the
 ** lookaside malloc subsystem.  Each available memory allocation in
-** the lookasi
+** the lookaside subsystem is stored on a linked list of LookasideSlot
+** objects.
+**
+** Lookaside allocations are only allowed for objects that are associated
+** with a particular database connection.  Hence, schema information cannot
+** be stored in lookaside because in shared cache mode the schema information
+** is shared by multiple database connections.  Therefore, while parsing
+** schema information, the Lookaside.bEnabled flag is cleared so that
+** lookaside allocations are not used to construct the schema objects.
+**
+** New lookaside allocations are only allowed if bDisable==0.  When
+** bDisable is greater than zero, sz is set to zero which effectively
+** disables lookaside without adding a new test for the bDisable flag
+** in a performance-critical path.  sz should be set by to szTrue whenever
+** bDisable changes back to zero.
+**
+** Lookaside buffers are initially held on the pInit list.  As they are
+** used and freed, they are added back to the pFree list.  New allocations
+** come off of pFree first, then pInit as a fallback.  This dual-list
+** allows use to compute a high-water mark - the maximum number of allocations
+** outstanding at any point in the past - by subtracting the number of
+** allocations on the pInit list from the total number of allocations.
+**
+** Enhancement on 2019-12-12:  Two-size-lookaside
+** The default lookaside configuration is 100 slots of 1200 bytes each.
+** The larger slot sizes are important for performance, but they waste
+** a lot of space, as most lookaside allocations are less than 128 bytes.
+** The two-size-lookaside enhancement breaks up the lookaside allocation
+** into two pools:  One of 128-byte slots and the other of the default size
+** (1200-byte) slots.   Allocations are filled from the small-pool first,
+** failing over to the full-size pool if that does not work.  Thus more
+** lookaside slots are available while also using less memory.
+** This enhancement can be omitted by compiling with
+** SQLITE_OMIT_TWOSIZE_LOOKASIDE.
+*/
+struct Lookaside {
+  u32 bDisable;           /* Only operate the lookaside when zero */
+  u16 sz;                 /* Size of each buffer in bytes */
+  u16 szTrue;             /* True value of sz, even if disabled */
+  u8 bMalloced;           /* True if pStart obtained from sqlite3_malloc() */
+  u32 nSlot;              /* Number of lookaside slots allocated */
+  u32 anStat[3];          /* 0: hits.  1: size misses.  2: full misses */
+  LookasideSlot *pInit;   /* List of buffers not previously used */
+  LookasideSlot *pFree;   /* List of available buffers */
+#ifndef SQLITE_OMIT_TWOSIZE_LOOKASIDE
+  LookasideSlot *pSmallInit; /* List of small buffers not prediously used */
+  LookasideSlot *pSmallFree; /* List of available small buffers */
+  void *pMiddle;          /* First byte past end of full-size buffers and
+                          ** the first byte of LOOKASIDE_SMALL buffers */
+#endif /* SQLITE_OMIT_TWOSIZE_LOOKASIDE */
+  void *pStart;           /* First byte of available memory space */
+  void *pEnd;             /* First byte past end of available space */
+};
+struct LookasideSlot {
+  LookasideSlot *pNext;    /* Next buffer in the list of free buffers */
+};
+
+#define DisableLookaside  db->lookaside.bDisable++;db->lookaside.sz=0
+#define EnableLookaside   db->lookaside.bDisable--;\
+   db->lookaside.sz=db->lookaside.bDisable?0:db->lookaside.szTrue
+
+/* Size of the smaller allocations in two-size lookside */
+#ifdef SQLITE_OMIT_TWOSIZE_LOOKASIDE
+#  define LOOKASIDE_SMALL           0
+#else
+#  define LOOKASIDE_SMALL         128
+#endif
+
+/*
+** A hash table for built-in function definitions.  (Application-defined
+** functions use a regular table table from hash.h.)
+**
+** Hash each FuncDef structure into one of the FuncDefHash.a[] slots.
+** Collisions are on the FuncDef.u.pHash chain.  Use the SQLITE_FUNC_HASH()
+** macro to compute a hash on the function name.
+*/
+#define SQLITE_FUNC_HASH_SZ 23
+struct FuncDefHash {
+  FuncDef *a[SQLITE_FUNC_HASH_SZ];       /* Hash table for functions */
+};
+#define SQLITE_FUNC_HASH(C,L) (((C)+(L))%SQLITE_FUNC_HASH_SZ)
+
+#ifdef SQLITE_USER_AUTHENTICATION
+/*
+** Information held in the "sqlite3" database connection object and used
+** to manage user authentication.
+*/
+typedef struct sqlite3_userauth sqlite3_userauth;
+struct sqlite3_userauth {
+  u8 authLevel;                 /* Current authentication level */
+  int nAuthPW;                  /* Size of the zAuthPW in bytes */
+  char *zAuthPW;                /* Password used to authenticate */
+  char *zAuthUser;              /* User name used to authenticate */
+};
+
+/* Allowed values for sqlite3_userauth.authLevel */
+#define UAUTH_Unknown     0     /* Authentication not yet checked */
+#define UAUTH_Fail        1     /* User authentication failed */
+#define UAUTH_User        2     /* Authenticated as a normal user */
+#define UAUTH_Admin       3     /* Authenticated as an administrator */
+
+/* Functions used only by user authorization logic */
+SQLITE_PRIVATE int sqlite3UserAuthTable(const char*);
+SQLITE_PRIVATE int sqlite3UserAuthCheckLogin(sqlite3*,const char*,u8*);
+SQLITE_PRIVATE void sqlite3UserAuthInit(sqlite3*);
+SQLITE_PRIVATE void sqlite3CryptFunc(sqlite3_context*,int,sqlite3_value**);
+
+#endif /* SQLITE_USER_AUTHENTICATION */
+
+/*
+** typedef for the authorization callback function.
+*/
+#ifdef SQLITE_USER_AUTHENTICATION
+  typedef int (*sqlite3_xauth)(void*,int,const char*,const char*,const char*,
+                               const char*, const char*);
+#else
+  typedef int (*sqlite3_xauth)(void*,int,const char*,const char*,const char*,
+                               const char*);
+#endif
+
+#ifndef SQLITE_OMIT_DEPRECATED
+/* This is an extra SQLITE_TRACE macro that indicates "legacy" tracing
+** in the style of sqlite3_trace()
+*/
+#define SQLITE_TRACE_LEGACY          0x40     /* Use the legacy xTrace */
+#define SQLITE_TRACE_XPROFILE        0x80     /* Use the legacy xProfile */
+#else
+#define SQLITE_TRACE_LEGACY          0
+#define SQLITE_TRACE_XPROFILE        0
+#endif /* SQLITE_OMIT_DEPRECATED */
+#define SQLITE_TRACE_NONLEGACY_MASK  0x0f     /* Normal flags */
+
+/*
+** Maximum number of sqlite3.aDb[] entries.  This is the number of attached
+** databases plus 2 for "main" and "temp".
+*/
+#define SQLITE_MAX_DB (SQLITE_MAX_ATTACHED+2)
+
+/*
+** Each database connection is an instance of the following structure.
+*/
+struct sqlite3 {
+  sqlite3_vfs *pVfs;            /* OS Interface */
+  struct Vdbe *pVdbe;           /* List of active virtual machines */
+  CollSeq *pDfltColl;           /* BINARY collseq for the database encoding */
+  sqlite3_mutex *mutex;         /* Connection mutex */
+  Db *aDb;                      /* All backends */
+  int nDb;              
