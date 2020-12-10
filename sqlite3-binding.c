@@ -17071,4 +17071,126 @@ struct sqlite3 {
 #define SQLITE_GroupByOrder   0x00000004 /* GROUPBY cover of ORDERBY */
 #define SQLITE_FactorOutConst 0x00000008 /* Constant factoring */
 #define SQLITE_DistinctOpt    0x00000010 /* DISTINCT using indexes */
-#define SQLITE_Cover
+#define SQLITE_CoverIdxScan   0x00000020 /* Covering index scans */
+#define SQLITE_OrderByIdxJoin 0x00000040 /* ORDER BY of joins via index */
+#define SQLITE_Transitive     0x00000080 /* Transitive constraints */
+#define SQLITE_OmitNoopJoin   0x00000100 /* Omit unused tables in joins */
+#define SQLITE_CountOfView    0x00000200 /* The count-of-view optimization */
+#define SQLITE_CursorHints    0x00000400 /* Add OP_CursorHint opcodes */
+#define SQLITE_Stat4          0x00000800 /* Use STAT4 data */
+   /* TH3 expects this value  ^^^^^^^^^^ to be 0x0000800. Don't change it */
+#define SQLITE_PushDown       0x00001000 /* The push-down optimization */
+#define SQLITE_SimplifyJoin   0x00002000 /* Convert LEFT JOIN to JOIN */
+#define SQLITE_SkipScan       0x00004000 /* Skip-scans */
+#define SQLITE_PropagateConst 0x00008000 /* The constant propagation opt */
+#define SQLITE_MinMaxOpt      0x00010000 /* The min/max optimization */
+#define SQLITE_SeekScan       0x00020000 /* The OP_SeekScan optimization */
+#define SQLITE_OmitOrderBy    0x00040000 /* Omit pointless ORDER BY */
+   /* TH3 expects this value  ^^^^^^^^^^ to be 0x40000. Coordinate any change */
+#define SQLITE_BloomFilter    0x00080000 /* Use a Bloom filter on searches */
+#define SQLITE_BloomPulldown  0x00100000 /* Run Bloom filters early */
+#define SQLITE_BalancedMerge  0x00200000 /* Balance multi-way merges */
+#define SQLITE_ReleaseReg     0x00400000 /* Use OP_ReleaseReg for testing */
+#define SQLITE_FlttnUnionAll  0x00800000 /* Disable the UNION ALL flattener */
+   /* TH3 expects this value  ^^^^^^^^^^ See flatten04.test */
+#define SQLITE_AllOpts        0xffffffff /* All optimizations */
+
+/*
+** Macros for testing whether or not optimizations are enabled or disabled.
+*/
+#define OptimizationDisabled(db, mask)  (((db)->dbOptFlags&(mask))!=0)
+#define OptimizationEnabled(db, mask)   (((db)->dbOptFlags&(mask))==0)
+
+/*
+** Return true if it OK to factor constant expressions into the initialization
+** code. The argument is a Parse object for the code generator.
+*/
+#define ConstFactorOk(P) ((P)->okConstFactor)
+
+/* Possible values for the sqlite3.eOpenState field.
+** The numbers are randomly selected such that a minimum of three bits must
+** change to convert any number to another or to zero
+*/
+#define SQLITE_STATE_OPEN     0x76  /* Database is open */
+#define SQLITE_STATE_CLOSED   0xce  /* Database is closed */
+#define SQLITE_STATE_SICK     0xba  /* Error and awaiting close */
+#define SQLITE_STATE_BUSY     0x6d  /* Database currently in use */
+#define SQLITE_STATE_ERROR    0xd5  /* An SQLITE_MISUSE error occurred */
+#define SQLITE_STATE_ZOMBIE   0xa7  /* Close with last statement close */
+
+/*
+** Each SQL function is defined by an instance of the following
+** structure.  For global built-in functions (ex: substr(), max(), count())
+** a pointer to this structure is held in the sqlite3BuiltinFunctions object.
+** For per-connection application-defined functions, a pointer to this
+** structure is held in the db->aHash hash table.
+**
+** The u.pHash field is used by the global built-ins.  The u.pDestructor
+** field is used by per-connection app-def functions.
+*/
+struct FuncDef {
+  i8 nArg;             /* Number of arguments.  -1 means unlimited */
+  u32 funcFlags;       /* Some combination of SQLITE_FUNC_* */
+  void *pUserData;     /* User data parameter */
+  FuncDef *pNext;      /* Next function with same name */
+  void (*xSFunc)(sqlite3_context*,int,sqlite3_value**); /* func or agg-step */
+  void (*xFinalize)(sqlite3_context*);                  /* Agg finalizer */
+  void (*xValue)(sqlite3_context*);                     /* Current agg value */
+  void (*xInverse)(sqlite3_context*,int,sqlite3_value**); /* inverse agg-step */
+  const char *zName;   /* SQL name of the function. */
+  union {
+    FuncDef *pHash;      /* Next with a different name but the same hash */
+    FuncDestructor *pDestructor;   /* Reference counted destructor function */
+  } u; /* pHash if SQLITE_FUNC_BUILTIN, pDestructor otherwise */
+};
+
+/*
+** This structure encapsulates a user-function destructor callback (as
+** configured using create_function_v2()) and a reference counter. When
+** create_function_v2() is called to create a function with a destructor,
+** a single object of this type is allocated. FuncDestructor.nRef is set to
+** the number of FuncDef objects created (either 1 or 3, depending on whether
+** or not the specified encoding is SQLITE_ANY). The FuncDef.pDestructor
+** member of each of the new FuncDef objects is set to point to the allocated
+** FuncDestructor.
+**
+** Thereafter, when one of the FuncDef objects is deleted, the reference
+** count on this object is decremented. When it reaches 0, the destructor
+** is invoked and the FuncDestructor structure freed.
+*/
+struct FuncDestructor {
+  int nRef;
+  void (*xDestroy)(void *);
+  void *pUserData;
+};
+
+/*
+** Possible values for FuncDef.flags.  Note that the _LENGTH and _TYPEOF
+** values must correspond to OPFLAG_LENGTHARG and OPFLAG_TYPEOFARG.  And
+** SQLITE_FUNC_CONSTANT must be the same as SQLITE_DETERMINISTIC.  There
+** are assert() statements in the code to verify this.
+**
+** Value constraints (enforced via assert()):
+**     SQLITE_FUNC_MINMAX      ==  NC_MinMaxAgg      == SF_MinMaxAgg
+**     SQLITE_FUNC_ANYORDER    ==  NC_OrderAgg       == SF_OrderByReqd
+**     SQLITE_FUNC_LENGTH      ==  OPFLAG_LENGTHARG
+**     SQLITE_FUNC_TYPEOF      ==  OPFLAG_TYPEOFARG
+**     SQLITE_FUNC_CONSTANT    ==  SQLITE_DETERMINISTIC from the API
+**     SQLITE_FUNC_DIRECT      ==  SQLITE_DIRECTONLY from the API
+**     SQLITE_FUNC_UNSAFE      ==  SQLITE_INNOCUOUS
+**     SQLITE_FUNC_ENCMASK   depends on SQLITE_UTF* macros in the API
+*/
+#define SQLITE_FUNC_ENCMASK  0x0003 /* SQLITE_UTF8, SQLITE_UTF16BE or UTF16LE */
+#define SQLITE_FUNC_LIKE     0x0004 /* Candidate for the LIKE optimization */
+#define SQLITE_FUNC_CASE     0x0008 /* Case-sensitive LIKE-type function */
+#define SQLITE_FUNC_EPHEM    0x0010 /* Ephemeral.  Delete with VDBE */
+#define SQLITE_FUNC_NEEDCOLL 0x0020 /* sqlite3GetFuncCollSeq() might be called*/
+#define SQLITE_FUNC_LENGTH   0x0040 /* Built-in length() function */
+#define SQLITE_FUNC_TYPEOF   0x0080 /* Built-in typeof() function */
+#define SQLITE_FUNC_COUNT    0x0100 /* Built-in count(*) aggregate */
+/*                           0x0200 -- available for reuse */
+#define SQLITE_FUNC_UNLIKELY 0x0400 /* Built-in unlikely() function */
+#define SQLITE_FUNC_CONSTANT 0x0800 /* Constant inputs give a constant output */
+#define SQLITE_FUNC_MINMAX   0x1000 /* True for min() and max() aggregates */
+#define SQLITE_FUNC_SLOCHNG  0x2000 /* "Slow Change". Value constant during a
+                                   
