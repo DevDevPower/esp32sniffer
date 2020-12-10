@@ -16952,4 +16952,123 @@ struct sqlite3 {
   Db aDbStatic[2];              /* Static space for the 2 default backends */
   Savepoint *pSavepoint;        /* List of active savepoints */
   int nAnalysisLimit;           /* Number of index rows to ANALYZE */
-  int busyTim
+  int busyTimeout;              /* Busy handler timeout, in msec */
+  int nSavepoint;               /* Number of non-transaction savepoints */
+  int nStatement;               /* Number of nested statement-transactions  */
+  i64 nDeferredCons;            /* Net deferred constraints this transaction. */
+  i64 nDeferredImmCons;         /* Net deferred immediate constraints */
+  int *pnBytesFreed;            /* If not NULL, increment this in DbFree() */
+#ifdef SQLITE_ENABLE_UNLOCK_NOTIFY
+  /* The following variables are all protected by the STATIC_MAIN
+  ** mutex, not by sqlite3.mutex. They are used by code in notify.c.
+  **
+  ** When X.pUnlockConnection==Y, that means that X is waiting for Y to
+  ** unlock so that it can proceed.
+  **
+  ** When X.pBlockingConnection==Y, that means that something that X tried
+  ** tried to do recently failed with an SQLITE_LOCKED error due to locks
+  ** held by Y.
+  */
+  sqlite3 *pBlockingConnection; /* Connection that caused SQLITE_LOCKED */
+  sqlite3 *pUnlockConnection;           /* Connection to watch for unlock */
+  void *pUnlockArg;                     /* Argument to xUnlockNotify */
+  void (*xUnlockNotify)(void **, int);  /* Unlock notify callback */
+  sqlite3 *pNextBlocked;        /* Next in list of all blocked connections */
+#endif
+#ifdef SQLITE_USER_AUTHENTICATION
+  sqlite3_userauth auth;        /* User authentication information */
+#endif
+};
+
+/*
+** A macro to discover the encoding of a database.
+*/
+#define SCHEMA_ENC(db) ((db)->aDb[0].pSchema->enc)
+#define ENC(db)        ((db)->enc)
+
+/*
+** A u64 constant where the lower 32 bits are all zeros.  Only the
+** upper 32 bits are included in the argument.  Necessary because some
+** C-compilers still do not accept LL integer literals.
+*/
+#define HI(X)  ((u64)(X)<<32)
+
+/*
+** Possible values for the sqlite3.flags.
+**
+** Value constraints (enforced via assert()):
+**      SQLITE_FullFSync     == PAGER_FULLFSYNC
+**      SQLITE_CkptFullFSync == PAGER_CKPT_FULLFSYNC
+**      SQLITE_CacheSpill    == PAGER_CACHE_SPILL
+*/
+#define SQLITE_WriteSchema    0x00000001  /* OK to update SQLITE_SCHEMA */
+#define SQLITE_LegacyFileFmt  0x00000002  /* Create new databases in format 1 */
+#define SQLITE_FullColNames   0x00000004  /* Show full column names on SELECT */
+#define SQLITE_FullFSync      0x00000008  /* Use full fsync on the backend */
+#define SQLITE_CkptFullFSync  0x00000010  /* Use full fsync for checkpoint */
+#define SQLITE_CacheSpill     0x00000020  /* OK to spill pager cache */
+#define SQLITE_ShortColNames  0x00000040  /* Show short columns names */
+#define SQLITE_TrustedSchema  0x00000080  /* Allow unsafe functions and
+                                          ** vtabs in the schema definition */
+#define SQLITE_NullCallback   0x00000100  /* Invoke the callback once if the */
+                                          /*   result set is empty */
+#define SQLITE_IgnoreChecks   0x00000200  /* Do not enforce check constraints */
+#define SQLITE_ReadUncommit   0x00000400  /* READ UNCOMMITTED in shared-cache */
+#define SQLITE_NoCkptOnClose  0x00000800  /* No checkpoint on close()/DETACH */
+#define SQLITE_ReverseOrder   0x00001000  /* Reverse unordered SELECTs */
+#define SQLITE_RecTriggers    0x00002000  /* Enable recursive triggers */
+#define SQLITE_ForeignKeys    0x00004000  /* Enforce foreign key constraints  */
+#define SQLITE_AutoIndex      0x00008000  /* Enable automatic indexes */
+#define SQLITE_LoadExtension  0x00010000  /* Enable load_extension */
+#define SQLITE_LoadExtFunc    0x00020000  /* Enable load_extension() SQL func */
+#define SQLITE_EnableTrigger  0x00040000  /* True to enable triggers */
+#define SQLITE_DeferFKs       0x00080000  /* Defer all FK constraints */
+#define SQLITE_QueryOnly      0x00100000  /* Disable database changes */
+#define SQLITE_CellSizeCk     0x00200000  /* Check btree cell sizes on load */
+#define SQLITE_Fts3Tokenizer  0x00400000  /* Enable fts3_tokenizer(2) */
+#define SQLITE_EnableQPSG     0x00800000  /* Query Planner Stability Guarantee*/
+#define SQLITE_TriggerEQP     0x01000000  /* Show trigger EXPLAIN QUERY PLAN */
+#define SQLITE_ResetDatabase  0x02000000  /* Reset the database */
+#define SQLITE_LegacyAlter    0x04000000  /* Legacy ALTER TABLE behaviour */
+#define SQLITE_NoSchemaError  0x08000000  /* Do not report schema parse errors*/
+#define SQLITE_Defensive      0x10000000  /* Input SQL is likely hostile */
+#define SQLITE_DqsDDL         0x20000000  /* dbl-quoted strings allowed in DDL*/
+#define SQLITE_DqsDML         0x40000000  /* dbl-quoted strings allowed in DML*/
+#define SQLITE_EnableView     0x80000000  /* Enable the use of views */
+#define SQLITE_CountRows      HI(0x00001) /* Count rows changed by INSERT, */
+                                          /*   DELETE, or UPDATE and return */
+                                          /*   the count using a callback. */
+#define SQLITE_CorruptRdOnly  HI(0x00002) /* Prohibit writes due to error */
+
+/* Flags used only if debugging */
+#ifdef SQLITE_DEBUG
+#define SQLITE_SqlTrace       HI(0x0100000) /* Debug print SQL as it executes */
+#define SQLITE_VdbeListing    HI(0x0200000) /* Debug listings of VDBE progs */
+#define SQLITE_VdbeTrace      HI(0x0400000) /* True to trace VDBE execution */
+#define SQLITE_VdbeAddopTrace HI(0x0800000) /* Trace sqlite3VdbeAddOp() calls */
+#define SQLITE_VdbeEQP        HI(0x1000000) /* Debug EXPLAIN QUERY PLAN */
+#define SQLITE_ParserTrace    HI(0x2000000) /* PRAGMA parser_trace=ON */
+#endif
+
+/*
+** Allowed values for sqlite3.mDbFlags
+*/
+#define DBFLAG_SchemaChange   0x0001  /* Uncommitted Hash table changes */
+#define DBFLAG_PreferBuiltin  0x0002  /* Preference to built-in funcs */
+#define DBFLAG_Vacuum         0x0004  /* Currently in a VACUUM */
+#define DBFLAG_VacuumInto     0x0008  /* Currently running VACUUM INTO */
+#define DBFLAG_SchemaKnownOk  0x0010  /* Schema is known to be valid */
+#define DBFLAG_InternalFunc   0x0020  /* Allow use of internal functions */
+#define DBFLAG_EncodingFixed  0x0040  /* No longer possible to change enc. */
+
+/*
+** Bits of the sqlite3.dbOptFlags field that are used by the
+** sqlite3_test_control(SQLITE_TESTCTRL_OPTIMIZATIONS,...) interface to
+** selectively disable various optimizations.
+*/
+#define SQLITE_QueryFlattener 0x00000001 /* Query flattening */
+#define SQLITE_WindowFunc     0x00000002 /* Use xInverse for window functions */
+#define SQLITE_GroupByOrder   0x00000004 /* GROUPBY cover of ORDERBY */
+#define SQLITE_FactorOutConst 0x00000008 /* Constant factoring */
+#define SQLITE_DistinctOpt    0x00000010 /* DISTINCT using indexes */
+#define SQLITE_Cover
