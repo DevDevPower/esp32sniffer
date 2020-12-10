@@ -17472,4 +17472,136 @@ struct CollSeq {
 **
 ** These used to have mnemonic name like 'i' for SQLITE_AFF_INTEGER and
 ** 't' for SQLITE_AFF_TEXT.  But we can save a little space and improve
-** the spe
+** the speed a little by numbering the values consecutively.
+**
+** But rather than start with 0 or 1, we begin with 'A'.  That way,
+** when multiple affinity types are concatenated into a string and
+** used as the P4 operand, they will be more readable.
+**
+** Note also that the numeric types are grouped together so that testing
+** for a numeric type is a single comparison.  And the BLOB type is first.
+*/
+#define SQLITE_AFF_NONE     0x40  /* '@' */
+#define SQLITE_AFF_BLOB     0x41  /* 'A' */
+#define SQLITE_AFF_TEXT     0x42  /* 'B' */
+#define SQLITE_AFF_NUMERIC  0x43  /* 'C' */
+#define SQLITE_AFF_INTEGER  0x44  /* 'D' */
+#define SQLITE_AFF_REAL     0x45  /* 'E' */
+
+#define sqlite3IsNumericAffinity(X)  ((X)>=SQLITE_AFF_NUMERIC)
+
+/*
+** The SQLITE_AFF_MASK values masks off the significant bits of an
+** affinity value.
+*/
+#define SQLITE_AFF_MASK     0x47
+
+/*
+** Additional bit values that can be ORed with an affinity without
+** changing the affinity.
+**
+** The SQLITE_NOTNULL flag is a combination of NULLEQ and JUMPIFNULL.
+** It causes an assert() to fire if either operand to a comparison
+** operator is NULL.  It is added to certain comparison operators to
+** prove that the operands are always NOT NULL.
+*/
+#define SQLITE_JUMPIFNULL   0x10  /* jumps if either operand is NULL */
+#define SQLITE_NULLEQ       0x80  /* NULL=NULL */
+#define SQLITE_NOTNULL      0x90  /* Assert that operands are never NULL */
+
+/*
+** An object of this type is created for each virtual table present in
+** the database schema.
+**
+** If the database schema is shared, then there is one instance of this
+** structure for each database connection (sqlite3*) that uses the shared
+** schema. This is because each database connection requires its own unique
+** instance of the sqlite3_vtab* handle used to access the virtual table
+** implementation. sqlite3_vtab* handles can not be shared between
+** database connections, even when the rest of the in-memory database
+** schema is shared, as the implementation often stores the database
+** connection handle passed to it via the xConnect() or xCreate() method
+** during initialization internally. This database connection handle may
+** then be used by the virtual table implementation to access real tables
+** within the database. So that they appear as part of the callers
+** transaction, these accesses need to be made via the same database
+** connection as that used to execute SQL operations on the virtual table.
+**
+** All VTable objects that correspond to a single table in a shared
+** database schema are initially stored in a linked-list pointed to by
+** the Table.pVTable member variable of the corresponding Table object.
+** When an sqlite3_prepare() operation is required to access the virtual
+** table, it searches the list for the VTable that corresponds to the
+** database connection doing the preparing so as to use the correct
+** sqlite3_vtab* handle in the compiled query.
+**
+** When an in-memory Table object is deleted (for example when the
+** schema is being reloaded for some reason), the VTable objects are not
+** deleted and the sqlite3_vtab* handles are not xDisconnect()ed
+** immediately. Instead, they are moved from the Table.pVTable list to
+** another linked list headed by the sqlite3.pDisconnect member of the
+** corresponding sqlite3 structure. They are then deleted/xDisconnected
+** next time a statement is prepared using said sqlite3*. This is done
+** to avoid deadlock issues involving multiple sqlite3.mutex mutexes.
+** Refer to comments above function sqlite3VtabUnlockList() for an
+** explanation as to why it is safe to add an entry to an sqlite3.pDisconnect
+** list without holding the corresponding sqlite3.mutex mutex.
+**
+** The memory for objects of this type is always allocated by
+** sqlite3DbMalloc(), using the connection handle stored in VTable.db as
+** the first argument.
+*/
+struct VTable {
+  sqlite3 *db;              /* Database connection associated with this table */
+  Module *pMod;             /* Pointer to module implementation */
+  sqlite3_vtab *pVtab;      /* Pointer to vtab instance */
+  int nRef;                 /* Number of pointers to this structure */
+  u8 bConstraint;           /* True if constraints are supported */
+  u8 eVtabRisk;             /* Riskiness of allowing hacker access */
+  int iSavepoint;           /* Depth of the SAVEPOINT stack */
+  VTable *pNext;            /* Next in linked list (see above) */
+};
+
+/* Allowed values for VTable.eVtabRisk
+*/
+#define SQLITE_VTABRISK_Low          0
+#define SQLITE_VTABRISK_Normal       1
+#define SQLITE_VTABRISK_High         2
+
+/*
+** The schema for each SQL table, virtual table, and view is represented
+** in memory by an instance of the following structure.
+*/
+struct Table {
+  char *zName;         /* Name of the table or view */
+  Column *aCol;        /* Information about each column */
+  Index *pIndex;       /* List of SQL indexes on this table. */
+  char *zColAff;       /* String defining the affinity of each column */
+  ExprList *pCheck;    /* All CHECK constraints */
+                       /*   ... also used as column name list in a VIEW */
+  Pgno tnum;           /* Root BTree page for this table */
+  u32 nTabRef;         /* Number of pointers to this Table */
+  u32 tabFlags;        /* Mask of TF_* values */
+  i16 iPKey;           /* If not negative, use aCol[iPKey] as the rowid */
+  i16 nCol;            /* Number of columns in this table */
+  i16 nNVCol;          /* Number of columns that are not VIRTUAL */
+  LogEst nRowLogEst;   /* Estimated rows in table - from sqlite_stat1 table */
+  LogEst szTabRow;     /* Estimated size of each table row in bytes */
+#ifdef SQLITE_ENABLE_COSTMULT
+  LogEst costMult;     /* Cost multiplier for using this table */
+#endif
+  u8 keyConf;          /* What to do in case of uniqueness conflict on iPKey */
+  u8 eTabType;         /* 0: normal, 1: virtual, 2: view */
+  union {
+    struct {             /* Used by ordinary tables: */
+      int addColOffset;    /* Offset in CREATE TABLE stmt to add a new column */
+      FKey *pFKey;         /* Linked list of all foreign keys in this table */
+      ExprList *pDfltList; /* DEFAULT clauses on various columns.
+                           ** Or the AS clause for generated columns. */
+    } tab;
+    struct {             /* Used by views: */
+      Select *pSelect;     /* View definition */
+    } view;
+    struct {             /* Used by virtual tables only: */
+      int nArg;            /* Number of arguments to the module */
+      char **azArg;        /* 0: module 1: schema 2: vtab name 3...: args *
