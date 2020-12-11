@@ -17604,4 +17604,150 @@ struct Table {
     } view;
     struct {             /* Used by virtual tables only: */
       int nArg;            /* Number of arguments to the module */
-      char **azArg;        /* 0: module 1: schema 2: vtab name 3...: args *
+      char **azArg;        /* 0: module 1: schema 2: vtab name 3...: args */
+      VTable *p;           /* List of VTable objects. */
+    } vtab;
+  } u;
+  Trigger *pTrigger;   /* List of triggers on this object */
+  Schema *pSchema;     /* Schema that contains this table */
+};
+
+/*
+** Allowed values for Table.tabFlags.
+**
+** TF_OOOHidden applies to tables or view that have hidden columns that are
+** followed by non-hidden columns.  Example:  "CREATE VIRTUAL TABLE x USING
+** vtab1(a HIDDEN, b);".  Since "b" is a non-hidden column but "a" is hidden,
+** the TF_OOOHidden attribute would apply in this case.  Such tables require
+** special handling during INSERT processing. The "OOO" means "Out Of Order".
+**
+** Constraints:
+**
+**         TF_HasVirtual == COLFLAG_VIRTUAL
+**         TF_HasStored  == COLFLAG_STORED
+**         TF_HasHidden  == COLFLAG_HIDDEN
+*/
+#define TF_Readonly       0x00000001 /* Read-only system table */
+#define TF_HasHidden      0x00000002 /* Has one or more hidden columns */
+#define TF_HasPrimaryKey  0x00000004 /* Table has a primary key */
+#define TF_Autoincrement  0x00000008 /* Integer primary key is autoincrement */
+#define TF_HasStat1       0x00000010 /* nRowLogEst set from sqlite_stat1 */
+#define TF_HasVirtual     0x00000020 /* Has one or more VIRTUAL columns */
+#define TF_HasStored      0x00000040 /* Has one or more STORED columns */
+#define TF_HasGenerated   0x00000060 /* Combo: HasVirtual + HasStored */
+#define TF_WithoutRowid   0x00000080 /* No rowid.  PRIMARY KEY is the key */
+#define TF_StatsUsed      0x00000100 /* Query planner decisions affected by
+                                     ** Index.aiRowLogEst[] values */
+#define TF_NoVisibleRowid 0x00000200 /* No user-visible "rowid" column */
+#define TF_OOOHidden      0x00000400 /* Out-of-Order hidden columns */
+#define TF_HasNotNull     0x00000800 /* Contains NOT NULL constraints */
+#define TF_Shadow         0x00001000 /* True for a shadow table */
+#define TF_HasStat4       0x00002000 /* STAT4 info available for this table */
+#define TF_Ephemeral      0x00004000 /* An ephemeral table */
+#define TF_Eponymous      0x00008000 /* An eponymous virtual table */
+#define TF_Strict         0x00010000 /* STRICT mode */
+
+/*
+** Allowed values for Table.eTabType
+*/
+#define TABTYP_NORM      0     /* Ordinary table */
+#define TABTYP_VTAB      1     /* Virtual table */
+#define TABTYP_VIEW      2     /* A view */
+
+#define IsView(X)           ((X)->eTabType==TABTYP_VIEW)
+#define IsOrdinaryTable(X)  ((X)->eTabType==TABTYP_NORM)
+
+/*
+** Test to see whether or not a table is a virtual table.  This is
+** done as a macro so that it will be optimized out when virtual
+** table support is omitted from the build.
+*/
+#ifndef SQLITE_OMIT_VIRTUALTABLE
+#  define IsVirtual(X)      ((X)->eTabType==TABTYP_VTAB)
+#  define ExprIsVtab(X)  \
+    ((X)->op==TK_COLUMN && (X)->y.pTab!=0 && (X)->y.pTab->eTabType==TABTYP_VTAB)
+#else
+#  define IsVirtual(X)      0
+#  define ExprIsVtab(X)     0
+#endif
+
+/*
+** Macros to determine if a column is hidden.  IsOrdinaryHiddenColumn()
+** only works for non-virtual tables (ordinary tables and views) and is
+** always false unless SQLITE_ENABLE_HIDDEN_COLUMNS is defined.  The
+** IsHiddenColumn() macro is general purpose.
+*/
+#if defined(SQLITE_ENABLE_HIDDEN_COLUMNS)
+#  define IsHiddenColumn(X)         (((X)->colFlags & COLFLAG_HIDDEN)!=0)
+#  define IsOrdinaryHiddenColumn(X) (((X)->colFlags & COLFLAG_HIDDEN)!=0)
+#elif !defined(SQLITE_OMIT_VIRTUALTABLE)
+#  define IsHiddenColumn(X)         (((X)->colFlags & COLFLAG_HIDDEN)!=0)
+#  define IsOrdinaryHiddenColumn(X) 0
+#else
+#  define IsHiddenColumn(X)         0
+#  define IsOrdinaryHiddenColumn(X) 0
+#endif
+
+
+/* Does the table have a rowid */
+#define HasRowid(X)     (((X)->tabFlags & TF_WithoutRowid)==0)
+#define VisibleRowid(X) (((X)->tabFlags & TF_NoVisibleRowid)==0)
+
+/*
+** Each foreign key constraint is an instance of the following structure.
+**
+** A foreign key is associated with two tables.  The "from" table is
+** the table that contains the REFERENCES clause that creates the foreign
+** key.  The "to" table is the table that is named in the REFERENCES clause.
+** Consider this example:
+**
+**     CREATE TABLE ex1(
+**       a INTEGER PRIMARY KEY,
+**       b INTEGER CONSTRAINT fk1 REFERENCES ex2(x)
+**     );
+**
+** For foreign key "fk1", the from-table is "ex1" and the to-table is "ex2".
+** Equivalent names:
+**
+**     from-table == child-table
+**       to-table == parent-table
+**
+** Each REFERENCES clause generates an instance of the following structure
+** which is attached to the from-table.  The to-table need not exist when
+** the from-table is created.  The existence of the to-table is not checked.
+**
+** The list of all parents for child Table X is held at X.pFKey.
+**
+** A list of all children for a table named Z (which might not even exist)
+** is held in Schema.fkeyHash with a hash key of Z.
+*/
+struct FKey {
+  Table *pFrom;     /* Table containing the REFERENCES clause (aka: Child) */
+  FKey *pNextFrom;  /* Next FKey with the same in pFrom. Next parent of pFrom */
+  char *zTo;        /* Name of table that the key points to (aka: Parent) */
+  FKey *pNextTo;    /* Next with the same zTo. Next child of zTo. */
+  FKey *pPrevTo;    /* Previous with the same zTo */
+  int nCol;         /* Number of columns in this key */
+  /* EV: R-30323-21917 */
+  u8 isDeferred;       /* True if constraint checking is deferred till COMMIT */
+  u8 aAction[2];        /* ON DELETE and ON UPDATE actions, respectively */
+  Trigger *apTrigger[2];/* Triggers for aAction[] actions */
+  struct sColMap {      /* Mapping of columns in pFrom to columns in zTo */
+    int iFrom;            /* Index of column in pFrom */
+    char *zCol;           /* Name of column in zTo.  If NULL use PRIMARY KEY */
+  } aCol[1];            /* One entry for each of nCol columns */
+};
+
+/*
+** SQLite supports many different ways to resolve a constraint
+** error.  ROLLBACK processing means that a constraint violation
+** causes the operation in process to fail and for the current transaction
+** to be rolled back.  ABORT processing means the operation in process
+** fails and any prior changes from that one operation are backed out,
+** but the transaction is not rolled back.  FAIL processing means that
+** the operation in progress stops and returns an error code.  But prior
+** changes due to the same operation are not backed out and no rollback
+** occurs.  IGNORE means that the particular row that caused the constraint
+** error is not inserted or updated.  Processing continues and no error
+** is returned.  REPLACE means that preexisting database rows that caused
+** a UNIQUE constraint violation are removed so
