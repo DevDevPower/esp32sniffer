@@ -17750,4 +17750,143 @@ struct FKey {
 ** occurs.  IGNORE means that the particular row that caused the constraint
 ** error is not inserted or updated.  Processing continues and no error
 ** is returned.  REPLACE means that preexisting database rows that caused
-** a UNIQUE constraint violation are removed so
+** a UNIQUE constraint violation are removed so that the new insert or
+** update can proceed.  Processing continues and no error is reported.
+** UPDATE applies to insert operations only and means that the insert
+** is omitted and the DO UPDATE clause of an upsert is run instead.
+**
+** RESTRICT, SETNULL, SETDFLT, and CASCADE actions apply only to foreign keys.
+** RESTRICT is the same as ABORT for IMMEDIATE foreign keys and the
+** same as ROLLBACK for DEFERRED keys.  SETNULL means that the foreign
+** key is set to NULL.  SETDFLT means that the foreign key is set
+** to its default value.  CASCADE means that a DELETE or UPDATE of the
+** referenced table row is propagated into the row that holds the
+** foreign key.
+**
+** The OE_Default value is a place holder that means to use whatever
+** conflict resolution algorthm is required from context.
+**
+** The following symbolic values are used to record which type
+** of conflict resolution action to take.
+*/
+#define OE_None     0   /* There is no constraint to check */
+#define OE_Rollback 1   /* Fail the operation and rollback the transaction */
+#define OE_Abort    2   /* Back out changes but do no rollback transaction */
+#define OE_Fail     3   /* Stop the operation but leave all prior changes */
+#define OE_Ignore   4   /* Ignore the error. Do not do the INSERT or UPDATE */
+#define OE_Replace  5   /* Delete existing record, then do INSERT or UPDATE */
+#define OE_Update   6   /* Process as a DO UPDATE in an upsert */
+#define OE_Restrict 7   /* OE_Abort for IMMEDIATE, OE_Rollback for DEFERRED */
+#define OE_SetNull  8   /* Set the foreign key value to NULL */
+#define OE_SetDflt  9   /* Set the foreign key value to its default */
+#define OE_Cascade  10  /* Cascade the changes */
+#define OE_Default  11  /* Do whatever the default action is */
+
+
+/*
+** An instance of the following structure is passed as the first
+** argument to sqlite3VdbeKeyCompare and is used to control the
+** comparison of the two index keys.
+**
+** Note that aSortOrder[] and aColl[] have nField+1 slots.  There
+** are nField slots for the columns of an index then one extra slot
+** for the rowid at the end.
+*/
+struct KeyInfo {
+  u32 nRef;           /* Number of references to this KeyInfo object */
+  u8 enc;             /* Text encoding - one of the SQLITE_UTF* values */
+  u16 nKeyField;      /* Number of key columns in the index */
+  u16 nAllField;      /* Total columns, including key plus others */
+  sqlite3 *db;        /* The database connection */
+  u8 *aSortFlags;     /* Sort order for each column. */
+  CollSeq *aColl[1];  /* Collating sequence for each term of the key */
+};
+
+/*
+** Allowed bit values for entries in the KeyInfo.aSortFlags[] array.
+*/
+#define KEYINFO_ORDER_DESC    0x01    /* DESC sort order */
+#define KEYINFO_ORDER_BIGNULL 0x02    /* NULL is larger than any other value */
+
+/*
+** This object holds a record which has been parsed out into individual
+** fields, for the purposes of doing a comparison.
+**
+** A record is an object that contains one or more fields of data.
+** Records are used to store the content of a table row and to store
+** the key of an index.  A blob encoding of a record is created by
+** the OP_MakeRecord opcode of the VDBE and is disassembled by the
+** OP_Column opcode.
+**
+** An instance of this object serves as a "key" for doing a search on
+** an index b+tree. The goal of the search is to find the entry that
+** is closed to the key described by this object.  This object might hold
+** just a prefix of the key.  The number of fields is given by
+** pKeyInfo->nField.
+**
+** The r1 and r2 fields are the values to return if this key is less than
+** or greater than a key in the btree, respectively.  These are normally
+** -1 and +1 respectively, but might be inverted to +1 and -1 if the b-tree
+** is in DESC order.
+**
+** The key comparison functions actually return default_rc when they find
+** an equals comparison.  default_rc can be -1, 0, or +1.  If there are
+** multiple entries in the b-tree with the same key (when only looking
+** at the first pKeyInfo->nFields,) then default_rc can be set to -1 to
+** cause the search to find the last match, or +1 to cause the search to
+** find the first match.
+**
+** The key comparison functions will set eqSeen to true if they ever
+** get and equal results when comparing this structure to a b-tree record.
+** When default_rc!=0, the search might end up on the record immediately
+** before the first match or immediately after the last match.  The
+** eqSeen field will indicate whether or not an exact match exists in the
+** b-tree.
+*/
+struct UnpackedRecord {
+  KeyInfo *pKeyInfo;  /* Collation and sort-order information */
+  Mem *aMem;          /* Values */
+  union {
+    char *z;            /* Cache of aMem[0].z for vdbeRecordCompareString() */
+    i64 i;              /* Cache of aMem[0].u.i for vdbeRecordCompareInt() */
+  } u;
+  int n;              /* Cache of aMem[0].n used by vdbeRecordCompareString() */
+  u16 nField;         /* Number of entries in apMem[] */
+  i8 default_rc;      /* Comparison result if keys are equal */
+  u8 errCode;         /* Error detected by xRecordCompare (CORRUPT or NOMEM) */
+  i8 r1;              /* Value to return if (lhs < rhs) */
+  i8 r2;              /* Value to return if (lhs > rhs) */
+  u8 eqSeen;          /* True if an equality comparison has been seen */
+};
+
+
+/*
+** Each SQL index is represented in memory by an
+** instance of the following structure.
+**
+** The columns of the table that are to be indexed are described
+** by the aiColumn[] field of this structure.  For example, suppose
+** we have the following table and index:
+**
+**     CREATE TABLE Ex1(c1 int, c2 int, c3 text);
+**     CREATE INDEX Ex2 ON Ex1(c3,c1);
+**
+** In the Table structure describing Ex1, nCol==3 because there are
+** three columns in the table.  In the Index structure describing
+** Ex2, nColumn==2 since 2 of the 3 columns of Ex1 are indexed.
+** The value of aiColumn is {2, 0}.  aiColumn[0]==2 because the
+** first column to be indexed (c3) has an index of 2 in Ex1.aCol[].
+** The second column to be indexed (c1) has an index of 0 in
+** Ex1.aCol[], hence Ex2.aiColumn[1]==0.
+**
+** The Index.onError field determines whether or not the indexed columns
+** must be unique and what to do if they are not.  When Index.onError=OE_None,
+** it means this is not a unique index.  Otherwise it is a unique index
+** and the value of Index.onError indicate the which conflict resolution
+** algorithm to employ whenever an attempt is made to insert a non-unique
+** element.
+**
+** While parsing a CREATE TABLE or CREATE INDEX statement in order to
+** generate VDBE code (as opposed to parsing one read from an sqlite_schema
+** table as part of parsing an existing database schema), transient instances
+** of this structure may be
