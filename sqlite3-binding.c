@@ -18017,4 +18017,139 @@ struct AggInfo {
     i16 iColumn;             /* Column number within the source table */
     i16 iSorterColumn;       /* Column number in the sorting index */
   } *aCol;
-  int nColumn;            /
+  int nColumn;            /* Number of used entries in aCol[] */
+  int nAccumulator;       /* Number of columns that show through to the output.
+                          ** Additional columns are used only as parameters to
+                          ** aggregate functions */
+  struct AggInfo_func {   /* For each aggregate function */
+    Expr *pFExpr;            /* Expression encoding the function */
+    FuncDef *pFunc;          /* The aggregate function implementation */
+    int iMem;                /* Memory location that acts as accumulator */
+    int iDistinct;           /* Ephemeral table used to enforce DISTINCT */
+    int iDistAddr;           /* Address of OP_OpenEphemeral */
+  } *aFunc;
+  int nFunc;              /* Number of entries in aFunc[] */
+  u32 selId;              /* Select to which this AggInfo belongs */
+};
+
+/*
+** The datatype ynVar is a signed integer, either 16-bit or 32-bit.
+** Usually it is 16-bits.  But if SQLITE_MAX_VARIABLE_NUMBER is greater
+** than 32767 we have to make it 32-bit.  16-bit is preferred because
+** it uses less memory in the Expr object, which is a big memory user
+** in systems with lots of prepared statements.  And few applications
+** need more than about 10 or 20 variables.  But some extreme users want
+** to have prepared statements with over 32766 variables, and for them
+** the option is available (at compile-time).
+*/
+#if SQLITE_MAX_VARIABLE_NUMBER<32767
+typedef i16 ynVar;
+#else
+typedef int ynVar;
+#endif
+
+/*
+** Each node of an expression in the parse tree is an instance
+** of this structure.
+**
+** Expr.op is the opcode. The integer parser token codes are reused
+** as opcodes here. For example, the parser defines TK_GE to be an integer
+** code representing the ">=" operator. This same integer code is reused
+** to represent the greater-than-or-equal-to operator in the expression
+** tree.
+**
+** If the expression is an SQL literal (TK_INTEGER, TK_FLOAT, TK_BLOB,
+** or TK_STRING), then Expr.u.zToken contains the text of the SQL literal. If
+** the expression is a variable (TK_VARIABLE), then Expr.u.zToken contains the
+** variable name. Finally, if the expression is an SQL function (TK_FUNCTION),
+** then Expr.u.zToken contains the name of the function.
+**
+** Expr.pRight and Expr.pLeft are the left and right subexpressions of a
+** binary operator. Either or both may be NULL.
+**
+** Expr.x.pList is a list of arguments if the expression is an SQL function,
+** a CASE expression or an IN expression of the form "<lhs> IN (<y>, <z>...)".
+** Expr.x.pSelect is used if the expression is a sub-select or an expression of
+** the form "<lhs> IN (SELECT ...)". If the EP_xIsSelect bit is set in the
+** Expr.flags mask, then Expr.x.pSelect is valid. Otherwise, Expr.x.pList is
+** valid.
+**
+** An expression of the form ID or ID.ID refers to a column in a table.
+** For such expressions, Expr.op is set to TK_COLUMN and Expr.iTable is
+** the integer cursor number of a VDBE cursor pointing to that table and
+** Expr.iColumn is the column number for the specific column.  If the
+** expression is used as a result in an aggregate SELECT, then the
+** value is also stored in the Expr.iAgg column in the aggregate so that
+** it can be accessed after all aggregates are computed.
+**
+** If the expression is an unbound variable marker (a question mark
+** character '?' in the original SQL) then the Expr.iTable holds the index
+** number for that variable.
+**
+** If the expression is a subquery then Expr.iColumn holds an integer
+** register number containing the result of the subquery.  If the
+** subquery gives a constant result, then iTable is -1.  If the subquery
+** gives a different answer at different times during statement processing
+** then iTable is the address of a subroutine that computes the subquery.
+**
+** If the Expr is of type OP_Column, and the table it is selecting from
+** is a disk table or the "old.*" pseudo-table, then pTab points to the
+** corresponding table definition.
+**
+** ALLOCATION NOTES:
+**
+** Expr objects can use a lot of memory space in database schema.  To
+** help reduce memory requirements, sometimes an Expr object will be
+** truncated.  And to reduce the number of memory allocations, sometimes
+** two or more Expr objects will be stored in a single memory allocation,
+** together with Expr.u.zToken strings.
+**
+** If the EP_Reduced and EP_TokenOnly flags are set when
+** an Expr object is truncated.  When EP_Reduced is set, then all
+** the child Expr objects in the Expr.pLeft and Expr.pRight subtrees
+** are contained within the same memory allocation.  Note, however, that
+** the subtrees in Expr.x.pList or Expr.x.pSelect are always separately
+** allocated, regardless of whether or not EP_Reduced is set.
+*/
+struct Expr {
+  u8 op;                 /* Operation performed by this node */
+  char affExpr;          /* affinity, or RAISE type */
+  u8 op2;                /* TK_REGISTER/TK_TRUTH: original value of Expr.op
+                         ** TK_COLUMN: the value of p5 for OP_Column
+                         ** TK_AGG_FUNCTION: nesting depth
+                         ** TK_FUNCTION: NC_SelfRef flag if needs OP_PureFunc */
+#ifdef SQLITE_DEBUG
+  u8 vvaFlags;           /* Verification flags. */
+#endif
+  u32 flags;             /* Various flags.  EP_* See below */
+  union {
+    char *zToken;          /* Token value. Zero terminated and dequoted */
+    int iValue;            /* Non-negative integer value if EP_IntValue */
+  } u;
+
+  /* If the EP_TokenOnly flag is set in the Expr.flags mask, then no
+  ** space is allocated for the fields below this point. An attempt to
+  ** access them will result in a segfault or malfunction.
+  *********************************************************************/
+
+  Expr *pLeft;           /* Left subnode */
+  Expr *pRight;          /* Right subnode */
+  union {
+    ExprList *pList;     /* op = IN, EXISTS, SELECT, CASE, FUNCTION, BETWEEN */
+    Select *pSelect;     /* EP_xIsSelect and op = IN, EXISTS, SELECT */
+  } x;
+
+  /* If the EP_Reduced flag is set in the Expr.flags mask, then no
+  ** space is allocated for the fields below this point. An attempt to
+  ** access them will result in a segfault or malfunction.
+  *********************************************************************/
+
+#if SQLITE_MAX_EXPR_DEPTH>0
+  int nHeight;           /* Height of the tree headed by this node */
+#endif
+  int iTable;            /* TK_COLUMN: cursor number of table holding column
+                         ** TK_REGISTER: register number
+                         ** TK_TRIGGER: 1 -> new, 0 -> old
+                         ** EP_Unlikely:  134217728 times likelihood
+                         ** TK_IN: ephemerial table holding RHS
+   
