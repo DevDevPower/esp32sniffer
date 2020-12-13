@@ -17889,4 +17889,132 @@ struct UnpackedRecord {
 ** While parsing a CREATE TABLE or CREATE INDEX statement in order to
 ** generate VDBE code (as opposed to parsing one read from an sqlite_schema
 ** table as part of parsing an existing database schema), transient instances
-** of this structure may be
+** of this structure may be created. In this case the Index.tnum variable is
+** used to store the address of a VDBE instruction, not a database page
+** number (it cannot - the database page is not allocated until the VDBE
+** program is executed). See convertToWithoutRowidTable() for details.
+*/
+struct Index {
+  char *zName;             /* Name of this index */
+  i16 *aiColumn;           /* Which columns are used by this index.  1st is 0 */
+  LogEst *aiRowLogEst;     /* From ANALYZE: Est. rows selected by each column */
+  Table *pTable;           /* The SQL table being indexed */
+  char *zColAff;           /* String defining the affinity of each column */
+  Index *pNext;            /* The next index associated with the same table */
+  Schema *pSchema;         /* Schema containing this index */
+  u8 *aSortOrder;          /* for each column: True==DESC, False==ASC */
+  const char **azColl;     /* Array of collation sequence names for index */
+  Expr *pPartIdxWhere;     /* WHERE clause for partial indices */
+  ExprList *aColExpr;      /* Column expressions */
+  Pgno tnum;               /* DB Page containing root of this index */
+  LogEst szIdxRow;         /* Estimated average row size in bytes */
+  u16 nKeyCol;             /* Number of columns forming the key */
+  u16 nColumn;             /* Number of columns stored in the index */
+  u8 onError;              /* OE_Abort, OE_Ignore, OE_Replace, or OE_None */
+  unsigned idxType:2;      /* 0:Normal 1:UNIQUE, 2:PRIMARY KEY, 3:IPK */
+  unsigned bUnordered:1;   /* Use this index for == or IN queries only */
+  unsigned uniqNotNull:1;  /* True if UNIQUE and NOT NULL for all columns */
+  unsigned isResized:1;    /* True if resizeIndexObject() has been called */
+  unsigned isCovering:1;   /* True if this is a covering index */
+  unsigned noSkipScan:1;   /* Do not try to use skip-scan if true */
+  unsigned hasStat1:1;     /* aiRowLogEst values come from sqlite_stat1 */
+  unsigned bNoQuery:1;     /* Do not use this index to optimize queries */
+  unsigned bAscKeyBug:1;   /* True if the bba7b69f9849b5bf bug applies */
+  unsigned bHasVCol:1;     /* Index references one or more VIRTUAL columns */
+#ifdef SQLITE_ENABLE_STAT4
+  int nSample;             /* Number of elements in aSample[] */
+  int nSampleCol;          /* Size of IndexSample.anEq[] and so on */
+  tRowcnt *aAvgEq;         /* Average nEq values for keys not in aSample */
+  IndexSample *aSample;    /* Samples of the left-most key */
+  tRowcnt *aiRowEst;       /* Non-logarithmic stat1 data for this index */
+  tRowcnt nRowEst0;        /* Non-logarithmic number of rows in the index */
+#endif
+  Bitmask colNotIdxed;     /* 0 for unindexed columns in pTab */
+};
+
+/*
+** Allowed values for Index.idxType
+*/
+#define SQLITE_IDXTYPE_APPDEF      0   /* Created using CREATE INDEX */
+#define SQLITE_IDXTYPE_UNIQUE      1   /* Implements a UNIQUE constraint */
+#define SQLITE_IDXTYPE_PRIMARYKEY  2   /* Is the PRIMARY KEY for the table */
+#define SQLITE_IDXTYPE_IPK         3   /* INTEGER PRIMARY KEY index */
+
+/* Return true if index X is a PRIMARY KEY index */
+#define IsPrimaryKeyIndex(X)  ((X)->idxType==SQLITE_IDXTYPE_PRIMARYKEY)
+
+/* Return true if index X is a UNIQUE index */
+#define IsUniqueIndex(X)      ((X)->onError!=OE_None)
+
+/* The Index.aiColumn[] values are normally positive integer.  But
+** there are some negative values that have special meaning:
+*/
+#define XN_ROWID     (-1)     /* Indexed column is the rowid */
+#define XN_EXPR      (-2)     /* Indexed column is an expression */
+
+/*
+** Each sample stored in the sqlite_stat4 table is represented in memory
+** using a structure of this type.  See documentation at the top of the
+** analyze.c source file for additional information.
+*/
+struct IndexSample {
+  void *p;          /* Pointer to sampled record */
+  int n;            /* Size of record in bytes */
+  tRowcnt *anEq;    /* Est. number of rows where the key equals this sample */
+  tRowcnt *anLt;    /* Est. number of rows where key is less than this sample */
+  tRowcnt *anDLt;   /* Est. number of distinct keys less than this sample */
+};
+
+/*
+** Possible values to use within the flags argument to sqlite3GetToken().
+*/
+#define SQLITE_TOKEN_QUOTED    0x1 /* Token is a quoted identifier. */
+#define SQLITE_TOKEN_KEYWORD   0x2 /* Token is a keyword. */
+
+/*
+** Each token coming out of the lexer is an instance of
+** this structure.  Tokens are also used as part of an expression.
+**
+** The memory that "z" points to is owned by other objects.  Take care
+** that the owner of the "z" string does not deallocate the string before
+** the Token goes out of scope!  Very often, the "z" points to some place
+** in the middle of the Parse.zSql text.  But it might also point to a
+** static string.
+*/
+struct Token {
+  const char *z;     /* Text of the token.  Not NULL-terminated! */
+  unsigned int n;    /* Number of characters in this token */
+};
+
+/*
+** An instance of this structure contains information needed to generate
+** code for a SELECT that contains aggregate functions.
+**
+** If Expr.op==TK_AGG_COLUMN or TK_AGG_FUNCTION then Expr.pAggInfo is a
+** pointer to this structure.  The Expr.iAgg field is the index in
+** AggInfo.aCol[] or AggInfo.aFunc[] of information needed to generate
+** code for that node.
+**
+** AggInfo.pGroupBy and AggInfo.aFunc.pExpr point to fields within the
+** original Select structure that describes the SELECT statement.  These
+** fields do not need to be freed when deallocating the AggInfo structure.
+*/
+struct AggInfo {
+  u8 directMode;          /* Direct rendering mode means take data directly
+                          ** from source tables rather than from accumulators */
+  u8 useSortingIdx;       /* In direct mode, reference the sorting index rather
+                          ** than the source table */
+  int sortingIdx;         /* Cursor number of the sorting index */
+  int sortingIdxPTab;     /* Cursor number of pseudo-table */
+  int nSortingColumn;     /* Number of columns in the sorting index */
+  int mnReg, mxReg;       /* Range of registers allocated for aCol and aFunc */
+  ExprList *pGroupBy;     /* The group by clause */
+  struct AggInfo_col {    /* For each column used in source tables */
+    Table *pTab;             /* Source table */
+    Expr *pCExpr;            /* The original expression */
+    int iTable;              /* Cursor number of the source table */
+    int iMem;                /* Memory location that acts as accumulator */
+    i16 iColumn;             /* Column number within the source table */
+    i16 iSorterColumn;       /* Column number in the sorting index */
+  } *aCol;
+  int nColumn;            /
