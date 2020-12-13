@@ -18152,4 +18152,145 @@ struct Expr {
                          ** TK_TRIGGER: 1 -> new, 0 -> old
                          ** EP_Unlikely:  134217728 times likelihood
                          ** TK_IN: ephemerial table holding RHS
-   
+                         ** TK_SELECT_COLUMN: Number of columns on the LHS
+                         ** TK_SELECT: 1st register of result vector */
+  ynVar iColumn;         /* TK_COLUMN: column index.  -1 for rowid.
+                         ** TK_VARIABLE: variable number (always >= 1).
+                         ** TK_SELECT_COLUMN: column of the result vector */
+  i16 iAgg;              /* Which entry in pAggInfo->aCol[] or ->aFunc[] */
+  union {
+    int iJoin;             /* If EP_OuterON or EP_InnerON, the right table */
+    int iOfst;             /* else: start of token from start of statement */
+  } w;
+  AggInfo *pAggInfo;     /* Used by TK_AGG_COLUMN and TK_AGG_FUNCTION */
+  union {
+    Table *pTab;           /* TK_COLUMN: Table containing column. Can be NULL
+                           ** for a column of an index on an expression */
+    Window *pWin;          /* EP_WinFunc: Window/Filter defn for a function */
+    struct {               /* TK_IN, TK_SELECT, and TK_EXISTS */
+      int iAddr;             /* Subroutine entry address */
+      int regReturn;         /* Register used to hold return address */
+    } sub;
+  } y;
+};
+
+/* The following are the meanings of bits in the Expr.flags field.
+** Value restrictions:
+**
+**          EP_Agg == NC_HasAgg == SF_HasAgg
+**          EP_Win == NC_HasWin
+*/
+#define EP_OuterON    0x000001 /* Originates in ON/USING clause of outer join */
+#define EP_InnerON    0x000002 /* Originates in ON/USING of an inner join */
+#define EP_Distinct   0x000004 /* Aggregate function with DISTINCT keyword */
+#define EP_HasFunc    0x000008 /* Contains one or more functions of any kind */
+#define EP_Agg        0x000010 /* Contains one or more aggregate functions */
+#define EP_FixedCol   0x000020 /* TK_Column with a known fixed value */
+#define EP_VarSelect  0x000040 /* pSelect is correlated, not constant */
+#define EP_DblQuoted  0x000080 /* token.z was originally in "..." */
+#define EP_InfixFunc  0x000100 /* True for an infix function: LIKE, GLOB, etc */
+#define EP_Collate    0x000200 /* Tree contains a TK_COLLATE operator */
+#define EP_Commuted   0x000400 /* Comparison operator has been commuted */
+#define EP_IntValue   0x000800 /* Integer value contained in u.iValue */
+#define EP_xIsSelect  0x001000 /* x.pSelect is valid (otherwise x.pList is) */
+#define EP_Skip       0x002000 /* Operator does not contribute to affinity */
+#define EP_Reduced    0x004000 /* Expr struct EXPR_REDUCEDSIZE bytes only */
+#define EP_Win        0x008000 /* Contains window functions */
+#define EP_TokenOnly  0x010000 /* Expr struct EXPR_TOKENONLYSIZE bytes only */
+#define EP_MemToken   0x020000 /* Need to sqlite3DbFree() Expr.zToken */
+#define EP_IfNullRow  0x040000 /* The TK_IF_NULL_ROW opcode */
+#define EP_Unlikely   0x080000 /* unlikely() or likelihood() function */
+#define EP_ConstFunc  0x100000 /* A SQLITE_FUNC_CONSTANT or _SLOCHNG function */
+#define EP_CanBeNull  0x200000 /* Can be null despite NOT NULL constraint */
+#define EP_Subquery   0x400000 /* Tree contains a TK_SELECT operator */
+#define EP_Leaf       0x800000 /* Expr.pLeft, .pRight, .u.pSelect all NULL */
+#define EP_WinFunc   0x1000000 /* TK_FUNCTION with Expr.y.pWin set */
+#define EP_Subrtn    0x2000000 /* Uses Expr.y.sub. TK_IN, _SELECT, or _EXISTS */
+#define EP_Quoted    0x4000000 /* TK_ID was originally quoted */
+#define EP_Static    0x8000000 /* Held in memory not obtained from malloc() */
+#define EP_IsTrue   0x10000000 /* Always has boolean value of TRUE */
+#define EP_IsFalse  0x20000000 /* Always has boolean value of FALSE */
+#define EP_FromDDL  0x40000000 /* Originates from sqlite_schema */
+               /*   0x80000000 // Available */
+
+/* The EP_Propagate mask is a set of properties that automatically propagate
+** upwards into parent nodes.
+*/
+#define EP_Propagate (EP_Collate|EP_Subquery|EP_HasFunc)
+
+/* Macros can be used to test, set, or clear bits in the
+** Expr.flags field.
+*/
+#define ExprHasProperty(E,P)     (((E)->flags&(P))!=0)
+#define ExprHasAllProperty(E,P)  (((E)->flags&(P))==(P))
+#define ExprSetProperty(E,P)     (E)->flags|=(P)
+#define ExprClearProperty(E,P)   (E)->flags&=~(P)
+#define ExprAlwaysTrue(E)   (((E)->flags&(EP_OuterON|EP_IsTrue))==EP_IsTrue)
+#define ExprAlwaysFalse(E)  (((E)->flags&(EP_OuterON|EP_IsFalse))==EP_IsFalse)
+
+/* Macros used to ensure that the correct members of unions are accessed
+** in Expr.
+*/
+#define ExprUseUToken(E)    (((E)->flags&EP_IntValue)==0)
+#define ExprUseUValue(E)    (((E)->flags&EP_IntValue)!=0)
+#define ExprUseXList(E)     (((E)->flags&EP_xIsSelect)==0)
+#define ExprUseXSelect(E)   (((E)->flags&EP_xIsSelect)!=0)
+#define ExprUseYTab(E)      (((E)->flags&(EP_WinFunc|EP_Subrtn))==0)
+#define ExprUseYWin(E)      (((E)->flags&EP_WinFunc)!=0)
+#define ExprUseYSub(E)      (((E)->flags&EP_Subrtn)!=0)
+
+/* Flags for use with Expr.vvaFlags
+*/
+#define EP_NoReduce   0x01  /* Cannot EXPRDUP_REDUCE this Expr */
+#define EP_Immutable  0x02  /* Do not change this Expr node */
+
+/* The ExprSetVVAProperty() macro is used for Verification, Validation,
+** and Accreditation only.  It works like ExprSetProperty() during VVA
+** processes but is a no-op for delivery.
+*/
+#ifdef SQLITE_DEBUG
+# define ExprSetVVAProperty(E,P)   (E)->vvaFlags|=(P)
+# define ExprHasVVAProperty(E,P)   (((E)->vvaFlags&(P))!=0)
+# define ExprClearVVAProperties(E) (E)->vvaFlags = 0
+#else
+# define ExprSetVVAProperty(E,P)
+# define ExprHasVVAProperty(E,P)   0
+# define ExprClearVVAProperties(E)
+#endif
+
+/*
+** Macros to determine the number of bytes required by a normal Expr
+** struct, an Expr struct with the EP_Reduced flag set in Expr.flags
+** and an Expr struct with the EP_TokenOnly flag set.
+*/
+#define EXPR_FULLSIZE           sizeof(Expr)           /* Full size */
+#define EXPR_REDUCEDSIZE        offsetof(Expr,iTable)  /* Common features */
+#define EXPR_TOKENONLYSIZE      offsetof(Expr,pLeft)   /* Fewer features */
+
+/*
+** Flags passed to the sqlite3ExprDup() function. See the header comment
+** above sqlite3ExprDup() for details.
+*/
+#define EXPRDUP_REDUCE         0x0001  /* Used reduced-size Expr nodes */
+
+/*
+** True if the expression passed as an argument was a function with
+** an OVER() clause (a window function).
+*/
+#ifdef SQLITE_OMIT_WINDOWFUNC
+# define IsWindowFunc(p) 0
+#else
+# define IsWindowFunc(p) ( \
+    ExprHasProperty((p), EP_WinFunc) && p->y.pWin->eFrmType!=TK_FILTER \
+ )
+#endif
+
+/*
+** A list of expressions.  Each expression may optionally have a
+** name.  An expr/name combination can be used in several ways, such
+** as the list of "expr AS ID" fields following a "SELECT" or in the
+** list of "ID = expr" items in an UPDATE.  A list of expressions can
+** also be used as the argument to a function, in which case the a.zName
+** field is not used.
+**
+** In order to try to keep memory usage down, the
