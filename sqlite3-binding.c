@@ -18447,4 +18447,129 @@ struct OnOrUsing {
 ** the SrcList.a[] array.
 **
 ** With the addition of multiple database support, the following structure
-** can also be us
+** can also be used to describe a particular table such as the table that
+** is modified by an INSERT, DELETE, or UPDATE statement.  In standard SQL,
+** such a table must be a simple name: ID.  But in SQLite, the table can
+** now be identified by a database name, a dot, then the table name: ID.ID.
+**
+** The jointype starts out showing the join type between the current table
+** and the next table on the list.  The parser builds the list this way.
+** But sqlite3SrcListShiftJoinType() later shifts the jointypes so that each
+** jointype expresses the join between the table and the previous table.
+**
+** In the colUsed field, the high-order bit (bit 63) is set if the table
+** contains more than 63 columns and the 64-th or later column is used.
+*/
+struct SrcList {
+  int nSrc;        /* Number of tables or subqueries in the FROM clause */
+  u32 nAlloc;      /* Number of entries allocated in a[] below */
+  SrcItem a[1];    /* One entry for each identifier on the list */
+};
+
+/*
+** Permitted values of the SrcList.a.jointype field
+*/
+#define JT_INNER     0x01    /* Any kind of inner or cross join */
+#define JT_CROSS     0x02    /* Explicit use of the CROSS keyword */
+#define JT_NATURAL   0x04    /* True for a "natural" join */
+#define JT_LEFT      0x08    /* Left outer join */
+#define JT_RIGHT     0x10    /* Right outer join */
+#define JT_OUTER     0x20    /* The "OUTER" keyword is present */
+#define JT_LTORJ     0x40    /* One of the LEFT operands of a RIGHT JOIN
+                             ** Mnemonic: Left Table Of Right Join */
+#define JT_ERROR     0x80    /* unknown or unsupported join type */
+
+/*
+** Flags appropriate for the wctrlFlags parameter of sqlite3WhereBegin()
+** and the WhereInfo.wctrlFlags member.
+**
+** Value constraints (enforced via assert()):
+**     WHERE_USE_LIMIT  == SF_FixedLimit
+*/
+#define WHERE_ORDERBY_NORMAL   0x0000 /* No-op */
+#define WHERE_ORDERBY_MIN      0x0001 /* ORDER BY processing for min() func */
+#define WHERE_ORDERBY_MAX      0x0002 /* ORDER BY processing for max() func */
+#define WHERE_ONEPASS_DESIRED  0x0004 /* Want to do one-pass UPDATE/DELETE */
+#define WHERE_ONEPASS_MULTIROW 0x0008 /* ONEPASS is ok with multiple rows */
+#define WHERE_DUPLICATES_OK    0x0010 /* Ok to return a row more than once */
+#define WHERE_OR_SUBCLAUSE     0x0020 /* Processing a sub-WHERE as part of
+                                      ** the OR optimization  */
+#define WHERE_GROUPBY          0x0040 /* pOrderBy is really a GROUP BY */
+#define WHERE_DISTINCTBY       0x0080 /* pOrderby is really a DISTINCT clause */
+#define WHERE_WANT_DISTINCT    0x0100 /* All output needs to be distinct */
+#define WHERE_SORTBYGROUP      0x0200 /* Support sqlite3WhereIsSorted() */
+#define WHERE_AGG_DISTINCT     0x0400 /* Query is "SELECT agg(DISTINCT ...)" */
+#define WHERE_ORDERBY_LIMIT    0x0800 /* ORDERBY+LIMIT on the inner loop */
+#define WHERE_RIGHT_JOIN       0x1000 /* Processing a RIGHT JOIN */
+                        /*     0x2000    not currently used */
+#define WHERE_USE_LIMIT        0x4000 /* Use the LIMIT in cost estimates */
+                        /*     0x8000    not currently used */
+
+/* Allowed return values from sqlite3WhereIsDistinct()
+*/
+#define WHERE_DISTINCT_NOOP      0  /* DISTINCT keyword not used */
+#define WHERE_DISTINCT_UNIQUE    1  /* No duplicates */
+#define WHERE_DISTINCT_ORDERED   2  /* All duplicates are adjacent */
+#define WHERE_DISTINCT_UNORDERED 3  /* Duplicates are scattered */
+
+/*
+** A NameContext defines a context in which to resolve table and column
+** names.  The context consists of a list of tables (the pSrcList) field and
+** a list of named expression (pEList).  The named expression list may
+** be NULL.  The pSrc corresponds to the FROM clause of a SELECT or
+** to the table being operated on by INSERT, UPDATE, or DELETE.  The
+** pEList corresponds to the result set of a SELECT and is NULL for
+** other statements.
+**
+** NameContexts can be nested.  When resolving names, the inner-most
+** context is searched first.  If no match is found, the next outer
+** context is checked.  If there is still no match, the next context
+** is checked.  This process continues until either a match is found
+** or all contexts are check.  When a match is found, the nRef member of
+** the context containing the match is incremented.
+**
+** Each subquery gets a new NameContext.  The pNext field points to the
+** NameContext in the parent query.  Thus the process of scanning the
+** NameContext list corresponds to searching through successively outer
+** subqueries looking for a match.
+*/
+struct NameContext {
+  Parse *pParse;       /* The parser */
+  SrcList *pSrcList;   /* One or more tables used to resolve names */
+  union {
+    ExprList *pEList;    /* Optional list of result-set columns */
+    AggInfo *pAggInfo;   /* Information about aggregates at this level */
+    Upsert *pUpsert;     /* ON CONFLICT clause information from an upsert */
+    int iBaseReg;        /* For TK_REGISTER when parsing RETURNING */
+  } uNC;
+  NameContext *pNext;  /* Next outer name context.  NULL for outermost */
+  int nRef;            /* Number of names resolved by this context */
+  int nNcErr;          /* Number of errors encountered while resolving names */
+  int ncFlags;         /* Zero or more NC_* flags defined below */
+  Select *pWinSelect;  /* SELECT statement for any window functions */
+};
+
+/*
+** Allowed values for the NameContext, ncFlags field.
+**
+** Value constraints (all checked via assert()):
+**    NC_HasAgg    == SF_HasAgg       == EP_Agg
+**    NC_MinMaxAgg == SF_MinMaxAgg    == SQLITE_FUNC_MINMAX
+**    NC_OrderAgg  == SF_OrderByReqd  == SQLITE_FUNC_ANYORDER
+**    NC_HasWin    == EP_Win
+**
+*/
+#define NC_AllowAgg  0x000001 /* Aggregate functions are allowed here */
+#define NC_PartIdx   0x000002 /* True if resolving a partial index WHERE */
+#define NC_IsCheck   0x000004 /* True if resolving a CHECK constraint */
+#define NC_GenCol    0x000008 /* True for a GENERATED ALWAYS AS clause */
+#define NC_HasAgg    0x000010 /* One or more aggregate functions seen */
+#define NC_IdxExpr   0x000020 /* True if resolving columns of CREATE INDEX */
+#define NC_SelfRef   0x00002e /* Combo: PartIdx, isCheck, GenCol, and IdxExpr */
+#define NC_VarSelect 0x000040 /* A correlated subquery has been seen */
+#define NC_UEList    0x000080 /* True if uNC.pEList is used */
+#define NC_UAggInfo  0x000100 /* True if uNC.pAggInfo is used */
+#define NC_UUpsert   0x000200 /* True if uNC.pUpsert is used */
+#define NC_UBaseReg  0x000400 /* True if uNC.iBaseReg is used */
+#define NC_MinMaxAgg 0x001000 /* min/max aggregates seen.  See note above */
+#define NC_Complex   0x002000 /* True if a function 
