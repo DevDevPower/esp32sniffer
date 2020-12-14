@@ -18572,4 +18572,122 @@ struct NameContext {
 #define NC_UUpsert   0x000200 /* True if uNC.pUpsert is used */
 #define NC_UBaseReg  0x000400 /* True if uNC.iBaseReg is used */
 #define NC_MinMaxAgg 0x001000 /* min/max aggregates seen.  See note above */
-#define NC_Complex   0x002000 /* True if a function 
+#define NC_Complex   0x002000 /* True if a function or subquery seen */
+#define NC_AllowWin  0x004000 /* Window functions are allowed here */
+#define NC_HasWin    0x008000 /* One or more window functions seen */
+#define NC_IsDDL     0x010000 /* Resolving names in a CREATE statement */
+#define NC_InAggFunc 0x020000 /* True if analyzing arguments to an agg func */
+#define NC_FromDDL   0x040000 /* SQL text comes from sqlite_schema */
+#define NC_NoSelect  0x080000 /* Do not descend into sub-selects */
+#define NC_OrderAgg 0x8000000 /* Has an aggregate other than count/min/max */
+
+/*
+** An instance of the following object describes a single ON CONFLICT
+** clause in an upsert.
+**
+** The pUpsertTarget field is only set if the ON CONFLICT clause includes
+** conflict-target clause.  (In "ON CONFLICT(a,b)" the "(a,b)" is the
+** conflict-target clause.)  The pUpsertTargetWhere is the optional
+** WHERE clause used to identify partial unique indexes.
+**
+** pUpsertSet is the list of column=expr terms of the UPDATE statement.
+** The pUpsertSet field is NULL for a ON CONFLICT DO NOTHING.  The
+** pUpsertWhere is the WHERE clause for the UPDATE and is NULL if the
+** WHERE clause is omitted.
+*/
+struct Upsert {
+  ExprList *pUpsertTarget;  /* Optional description of conflict target */
+  Expr *pUpsertTargetWhere; /* WHERE clause for partial index targets */
+  ExprList *pUpsertSet;     /* The SET clause from an ON CONFLICT UPDATE */
+  Expr *pUpsertWhere;       /* WHERE clause for the ON CONFLICT UPDATE */
+  Upsert *pNextUpsert;      /* Next ON CONFLICT clause in the list */
+  u8 isDoUpdate;            /* True for DO UPDATE.  False for DO NOTHING */
+  /* Above this point is the parse tree for the ON CONFLICT clauses.
+  ** The next group of fields stores intermediate data. */
+  void *pToFree;            /* Free memory when deleting the Upsert object */
+  /* All fields above are owned by the Upsert object and must be freed
+  ** when the Upsert is destroyed.  The fields below are used to transfer
+  ** information from the INSERT processing down into the UPDATE processing
+  ** while generating code.  The fields below are owned by the INSERT
+  ** statement and will be freed by INSERT processing. */
+  Index *pUpsertIdx;        /* UNIQUE constraint specified by pUpsertTarget */
+  SrcList *pUpsertSrc;      /* Table to be updated */
+  int regData;              /* First register holding array of VALUES */
+  int iDataCur;             /* Index of the data cursor */
+  int iIdxCur;              /* Index of the first index cursor */
+};
+
+/*
+** An instance of the following structure contains all information
+** needed to generate code for a single SELECT statement.
+**
+** See the header comment on the computeLimitRegisters() routine for a
+** detailed description of the meaning of the iLimit and iOffset fields.
+**
+** addrOpenEphm[] entries contain the address of OP_OpenEphemeral opcodes.
+** These addresses must be stored so that we can go back and fill in
+** the P4_KEYINFO and P2 parameters later.  Neither the KeyInfo nor
+** the number of columns in P2 can be computed at the same time
+** as the OP_OpenEphm instruction is coded because not
+** enough information about the compound query is known at that point.
+** The KeyInfo for addrOpenTran[0] and [1] contains collating sequences
+** for the result set.  The KeyInfo for addrOpenEphm[2] contains collating
+** sequences for the ORDER BY clause.
+*/
+struct Select {
+  u8 op;                 /* One of: TK_UNION TK_ALL TK_INTERSECT TK_EXCEPT */
+  LogEst nSelectRow;     /* Estimated number of result rows */
+  u32 selFlags;          /* Various SF_* values */
+  int iLimit, iOffset;   /* Memory registers holding LIMIT & OFFSET counters */
+  u32 selId;             /* Unique identifier number for this SELECT */
+  int addrOpenEphm[2];   /* OP_OpenEphem opcodes related to this select */
+  ExprList *pEList;      /* The fields of the result */
+  SrcList *pSrc;         /* The FROM clause */
+  Expr *pWhere;          /* The WHERE clause */
+  ExprList *pGroupBy;    /* The GROUP BY clause */
+  Expr *pHaving;         /* The HAVING clause */
+  ExprList *pOrderBy;    /* The ORDER BY clause */
+  Select *pPrior;        /* Prior select in a compound select statement */
+  Select *pNext;         /* Next select to the left in a compound */
+  Expr *pLimit;          /* LIMIT expression. NULL means not used. */
+  With *pWith;           /* WITH clause attached to this select. Or NULL. */
+#ifndef SQLITE_OMIT_WINDOWFUNC
+  Window *pWin;          /* List of window functions */
+  Window *pWinDefn;      /* List of named window definitions */
+#endif
+};
+
+/*
+** Allowed values for Select.selFlags.  The "SF" prefix stands for
+** "Select Flag".
+**
+** Value constraints (all checked via assert())
+**     SF_HasAgg      == NC_HasAgg
+**     SF_MinMaxAgg   == NC_MinMaxAgg     == SQLITE_FUNC_MINMAX
+**     SF_OrderByReqd == NC_OrderAgg      == SQLITE_FUNC_ANYORDER
+**     SF_FixedLimit  == WHERE_USE_LIMIT
+*/
+#define SF_Distinct      0x0000001 /* Output should be DISTINCT */
+#define SF_All           0x0000002 /* Includes the ALL keyword */
+#define SF_Resolved      0x0000004 /* Identifiers have been resolved */
+#define SF_Aggregate     0x0000008 /* Contains agg functions or a GROUP BY */
+#define SF_HasAgg        0x0000010 /* Contains aggregate functions */
+#define SF_UsesEphemeral 0x0000020 /* Uses the OpenEphemeral opcode */
+#define SF_Expanded      0x0000040 /* sqlite3SelectExpand() called on this */
+#define SF_HasTypeInfo   0x0000080 /* FROM subqueries have Table metadata */
+#define SF_Compound      0x0000100 /* Part of a compound query */
+#define SF_Values        0x0000200 /* Synthesized from VALUES clause */
+#define SF_MultiValue    0x0000400 /* Single VALUES term with multiple rows */
+#define SF_NestedFrom    0x0000800 /* Part of a parenthesized FROM clause */
+#define SF_MinMaxAgg     0x0001000 /* Aggregate containing min() or max() */
+#define SF_Recursive     0x0002000 /* The recursive part of a recursive CTE */
+#define SF_FixedLimit    0x0004000 /* nSelectRow set by a constant LIMIT */
+#define SF_MaybeConvert  0x0008000 /* Need convertCompoundSelectToSubquery() */
+#define SF_Converted     0x0010000 /* By convertCompoundSelectToSubquery() */
+#define SF_IncludeHidden 0x0020000 /* Include hidden columns in output */
+#define SF_ComplexResult 0x0040000 /* Result contains subquery or function */
+#define SF_WhereBegin    0x0080000 /* Really a WhereBegin() call.  Debug Only */
+#define SF_WinRewrite    0x0100000 /* Window function rewrite accomplished */
+#define SF_View          0x0200000 /* SELECT statement is a view */
+#define SF_NoopOrderBy   0x0400000 /* ORDER BY is ignored for this query */
+#define SF_UFSrcCheck    0x0800000 /* Check pSrc as required by UPDATE...FROM */
