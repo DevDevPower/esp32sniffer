@@ -18817,4 +18817,133 @@ struct SelectDest {
 ** loading and saving of autoincrement information.
 */
 struct AutoincInfo {
-  AutoincInf
+  AutoincInfo *pNext;   /* Next info block in a list of them all */
+  Table *pTab;          /* Table this info block refers to */
+  int iDb;              /* Index in sqlite3.aDb[] of database holding pTab */
+  int regCtr;           /* Memory register holding the rowid counter */
+};
+
+/*
+** At least one instance of the following structure is created for each
+** trigger that may be fired while parsing an INSERT, UPDATE or DELETE
+** statement. All such objects are stored in the linked list headed at
+** Parse.pTriggerPrg and deleted once statement compilation has been
+** completed.
+**
+** A Vdbe sub-program that implements the body and WHEN clause of trigger
+** TriggerPrg.pTrigger, assuming a default ON CONFLICT clause of
+** TriggerPrg.orconf, is stored in the TriggerPrg.pProgram variable.
+** The Parse.pTriggerPrg list never contains two entries with the same
+** values for both pTrigger and orconf.
+**
+** The TriggerPrg.aColmask[0] variable is set to a mask of old.* columns
+** accessed (or set to 0 for triggers fired as a result of INSERT
+** statements). Similarly, the TriggerPrg.aColmask[1] variable is set to
+** a mask of new.* columns used by the program.
+*/
+struct TriggerPrg {
+  Trigger *pTrigger;      /* Trigger this program was coded from */
+  TriggerPrg *pNext;      /* Next entry in Parse.pTriggerPrg list */
+  SubProgram *pProgram;   /* Program implementing pTrigger/orconf */
+  int orconf;             /* Default ON CONFLICT policy */
+  u32 aColmask[2];        /* Masks of old.*, new.* columns accessed */
+};
+
+/*
+** The yDbMask datatype for the bitmask of all attached databases.
+*/
+#if SQLITE_MAX_ATTACHED>30
+  typedef unsigned char yDbMask[(SQLITE_MAX_ATTACHED+9)/8];
+# define DbMaskTest(M,I)    (((M)[(I)/8]&(1<<((I)&7)))!=0)
+# define DbMaskZero(M)      memset((M),0,sizeof(M))
+# define DbMaskSet(M,I)     (M)[(I)/8]|=(1<<((I)&7))
+# define DbMaskAllZero(M)   sqlite3DbMaskAllZero(M)
+# define DbMaskNonZero(M)   (sqlite3DbMaskAllZero(M)==0)
+#else
+  typedef unsigned int yDbMask;
+# define DbMaskTest(M,I)    (((M)&(((yDbMask)1)<<(I)))!=0)
+# define DbMaskZero(M)      (M)=0
+# define DbMaskSet(M,I)     (M)|=(((yDbMask)1)<<(I))
+# define DbMaskAllZero(M)   (M)==0
+# define DbMaskNonZero(M)   (M)!=0
+#endif
+
+/*
+** An instance of the ParseCleanup object specifies an operation that
+** should be performed after parsing to deallocation resources obtained
+** during the parse and which are no longer needed.
+*/
+struct ParseCleanup {
+  ParseCleanup *pNext;               /* Next cleanup task */
+  void *pPtr;                        /* Pointer to object to deallocate */
+  void (*xCleanup)(sqlite3*,void*);  /* Deallocation routine */
+};
+
+/*
+** An SQL parser context.  A copy of this structure is passed through
+** the parser and down into all the parser action routine in order to
+** carry around information that is global to the entire parse.
+**
+** The structure is divided into two parts.  When the parser and code
+** generate call themselves recursively, the first part of the structure
+** is constant but the second part is reset at the beginning and end of
+** each recursion.
+**
+** The nTableLock and aTableLock variables are only used if the shared-cache
+** feature is enabled (if sqlite3Tsd()->useSharedData is true). They are
+** used to store the set of table-locks required by the statement being
+** compiled. Function sqlite3TableLock() is used to add entries to the
+** list.
+*/
+struct Parse {
+  sqlite3 *db;         /* The main database structure */
+  char *zErrMsg;       /* An error message */
+  Vdbe *pVdbe;         /* An engine for executing database bytecode */
+  int rc;              /* Return code from execution */
+  u8 colNamesSet;      /* TRUE after OP_ColumnName has been issued to pVdbe */
+  u8 checkSchema;      /* Causes schema cookie check after an error */
+  u8 nested;           /* Number of nested calls to the parser/code generator */
+  u8 nTempReg;         /* Number of temporary registers in aTempReg[] */
+  u8 isMultiWrite;     /* True if statement may modify/insert multiple rows */
+  u8 mayAbort;         /* True if statement may throw an ABORT exception */
+  u8 hasCompound;      /* Need to invoke convertCompoundSelectToSubquery() */
+  u8 okConstFactor;    /* OK to factor out constants */
+  u8 disableLookaside; /* Number of times lookaside has been disabled */
+  u8 disableVtab;      /* Disable all virtual tables for this parse */
+  u8 withinRJSubrtn;   /* Nesting level for RIGHT JOIN body subroutines */
+#if defined(SQLITE_DEBUG) || defined(SQLITE_COVERAGE_TEST)
+  u8 earlyCleanup;     /* OOM inside sqlite3ParserAddCleanup() */
+#endif
+  int nRangeReg;       /* Size of the temporary register block */
+  int iRangeReg;       /* First register in temporary register block */
+  int nErr;            /* Number of errors seen */
+  int nTab;            /* Number of previously allocated VDBE cursors */
+  int nMem;            /* Number of memory cells used so far */
+  int szOpAlloc;       /* Bytes of memory space allocated for Vdbe.aOp[] */
+  int iSelfTab;        /* Table associated with an index on expr, or negative
+                       ** of the base register during check-constraint eval */
+  int nLabel;          /* The *negative* of the number of labels used */
+  int nLabelAlloc;     /* Number of slots in aLabel */
+  int *aLabel;         /* Space to hold the labels */
+  ExprList *pConstExpr;/* Constant expressions */
+  Token constraintName;/* Name of the constraint currently being parsed */
+  yDbMask writeMask;   /* Start a write transaction on these databases */
+  yDbMask cookieMask;  /* Bitmask of schema verified databases */
+  int regRowid;        /* Register holding rowid of CREATE TABLE entry */
+  int regRoot;         /* Register holding root page number for new objects */
+  int nMaxArg;         /* Max args passed to user function by sub-program */
+  int nSelect;         /* Number of SELECT stmts. Counter for Select.selId */
+#ifndef SQLITE_OMIT_SHARED_CACHE
+  int nTableLock;        /* Number of locks in aTableLock */
+  TableLock *aTableLock; /* Required table locks for shared-cache mode */
+#endif
+  AutoincInfo *pAinc;  /* Information about AUTOINCREMENT counters */
+  Parse *pToplevel;    /* Parse structure for main program (or NULL) */
+  Table *pTriggerTab;  /* Table triggers are being coded for */
+  TriggerPrg *pTriggerPrg;  /* Linked list of coded triggers */
+  ParseCleanup *pCleanup;   /* List of cleanup operations to run after parse */
+  union {
+    int addrCrTab;         /* Address of OP_CreateBtree on CREATE TABLE */
+    Returning *pReturning; /* The RETURNING clause */
+  } u1;
+  u32 nQueryLoop;      /* Est numbe
