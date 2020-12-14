@@ -18691,3 +18691,130 @@ struct Select {
 #define SF_View          0x0200000 /* SELECT statement is a view */
 #define SF_NoopOrderBy   0x0400000 /* ORDER BY is ignored for this query */
 #define SF_UFSrcCheck    0x0800000 /* Check pSrc as required by UPDATE...FROM */
+#define SF_PushDown      0x1000000 /* SELECT has be modified by push-down opt */
+#define SF_MultiPart     0x2000000 /* Has multiple incompatible PARTITIONs */
+#define SF_CopyCte       0x4000000 /* SELECT statement is a copy of a CTE */
+#define SF_OrderByReqd   0x8000000 /* The ORDER BY clause may not be omitted */
+
+/* True if S exists and has SF_NestedFrom */
+#define IsNestedFrom(S) ((S)!=0 && ((S)->selFlags&SF_NestedFrom)!=0)
+
+/*
+** The results of a SELECT can be distributed in several ways, as defined
+** by one of the following macros.  The "SRT" prefix means "SELECT Result
+** Type".
+**
+**     SRT_Union       Store results as a key in a temporary index
+**                     identified by pDest->iSDParm.
+**
+**     SRT_Except      Remove results from the temporary index pDest->iSDParm.
+**
+**     SRT_Exists      Store a 1 in memory cell pDest->iSDParm if the result
+**                     set is not empty.
+**
+**     SRT_Discard     Throw the results away.  This is used by SELECT
+**                     statements within triggers whose only purpose is
+**                     the side-effects of functions.
+**
+**     SRT_Output      Generate a row of output (using the OP_ResultRow
+**                     opcode) for each row in the result set.
+**
+**     SRT_Mem         Only valid if the result is a single column.
+**                     Store the first column of the first result row
+**                     in register pDest->iSDParm then abandon the rest
+**                     of the query.  This destination implies "LIMIT 1".
+**
+**     SRT_Set         The result must be a single column.  Store each
+**                     row of result as the key in table pDest->iSDParm.
+**                     Apply the affinity pDest->affSdst before storing
+**                     results.  Used to implement "IN (SELECT ...)".
+**
+**     SRT_EphemTab    Create an temporary table pDest->iSDParm and store
+**                     the result there. The cursor is left open after
+**                     returning.  This is like SRT_Table except that
+**                     this destination uses OP_OpenEphemeral to create
+**                     the table first.
+**
+**     SRT_Coroutine   Generate a co-routine that returns a new row of
+**                     results each time it is invoked.  The entry point
+**                     of the co-routine is stored in register pDest->iSDParm
+**                     and the result row is stored in pDest->nDest registers
+**                     starting with pDest->iSdst.
+**
+**     SRT_Table       Store results in temporary table pDest->iSDParm.
+**     SRT_Fifo        This is like SRT_EphemTab except that the table
+**                     is assumed to already be open.  SRT_Fifo has
+**                     the additional property of being able to ignore
+**                     the ORDER BY clause.
+**
+**     SRT_DistFifo    Store results in a temporary table pDest->iSDParm.
+**                     But also use temporary table pDest->iSDParm+1 as
+**                     a record of all prior results and ignore any duplicate
+**                     rows.  Name means:  "Distinct Fifo".
+**
+**     SRT_Queue       Store results in priority queue pDest->iSDParm (really
+**                     an index).  Append a sequence number so that all entries
+**                     are distinct.
+**
+**     SRT_DistQueue   Store results in priority queue pDest->iSDParm only if
+**                     the same record has never been stored before.  The
+**                     index at pDest->iSDParm+1 hold all prior stores.
+**
+**     SRT_Upfrom      Store results in the temporary table already opened by
+**                     pDest->iSDParm. If (pDest->iSDParm<0), then the temp
+**                     table is an intkey table - in this case the first
+**                     column returned by the SELECT is used as the integer
+**                     key. If (pDest->iSDParm>0), then the table is an index
+**                     table. (pDest->iSDParm) is the number of key columns in
+**                     each index record in this case.
+*/
+#define SRT_Union        1  /* Store result as keys in an index */
+#define SRT_Except       2  /* Remove result from a UNION index */
+#define SRT_Exists       3  /* Store 1 if the result is not empty */
+#define SRT_Discard      4  /* Do not save the results anywhere */
+#define SRT_DistFifo     5  /* Like SRT_Fifo, but unique results only */
+#define SRT_DistQueue    6  /* Like SRT_Queue, but unique results only */
+
+/* The DISTINCT clause is ignored for all of the above.  Not that
+** IgnorableDistinct() implies IgnorableOrderby() */
+#define IgnorableDistinct(X) ((X->eDest)<=SRT_DistQueue)
+
+#define SRT_Queue        7  /* Store result in an queue */
+#define SRT_Fifo         8  /* Store result as data with an automatic rowid */
+
+/* The ORDER BY clause is ignored for all of the above */
+#define IgnorableOrderby(X) ((X->eDest)<=SRT_Fifo)
+
+#define SRT_Output       9  /* Output each row of result */
+#define SRT_Mem         10  /* Store result in a memory cell */
+#define SRT_Set         11  /* Store results as keys in an index */
+#define SRT_EphemTab    12  /* Create transient tab and store like SRT_Table */
+#define SRT_Coroutine   13  /* Generate a single row of result */
+#define SRT_Table       14  /* Store result as data with an automatic rowid */
+#define SRT_Upfrom      15  /* Store result as data with rowid */
+
+/*
+** An instance of this object describes where to put of the results of
+** a SELECT statement.
+*/
+struct SelectDest {
+  u8 eDest;            /* How to dispose of the results.  One of SRT_* above. */
+  int iSDParm;         /* A parameter used by the eDest disposal method */
+  int iSDParm2;        /* A second parameter for the eDest disposal method */
+  int iSdst;           /* Base register where results are written */
+  int nSdst;           /* Number of registers allocated */
+  char *zAffSdst;      /* Affinity used when eDest==SRT_Set */
+  ExprList *pOrderBy;  /* Key columns for SRT_Queue and SRT_DistQueue */
+};
+
+/*
+** During code generation of statements that do inserts into AUTOINCREMENT
+** tables, the following information is attached to the Table.u.autoInc.p
+** pointer of each autoincrement table to record some side information that
+** the code generator needs.  We have to keep per-table autoincrement
+** information in case inserts are done within triggers.  Triggers do not
+** normally coordinate their activities, but we do need to coordinate the
+** loading and saving of autoincrement information.
+*/
+struct AutoincInfo {
+  AutoincInf
