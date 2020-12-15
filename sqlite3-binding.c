@@ -19083,4 +19083,151 @@ struct AuthContext {
 #define OPFLAG_PREFORMAT     0x80    /* OP_Insert uses preformatted cell */
 
 /*
-** Each trigger present in the database schema 
+** Each trigger present in the database schema is stored as an instance of
+** struct Trigger.
+**
+** Pointers to instances of struct Trigger are stored in two ways.
+** 1. In the "trigHash" hash table (part of the sqlite3* that represents the
+**    database). This allows Trigger structures to be retrieved by name.
+** 2. All triggers associated with a single table form a linked list, using the
+**    pNext member of struct Trigger. A pointer to the first element of the
+**    linked list is stored as the "pTrigger" member of the associated
+**    struct Table.
+**
+** The "step_list" member points to the first element of a linked list
+** containing the SQL statements specified as the trigger program.
+*/
+struct Trigger {
+  char *zName;            /* The name of the trigger                        */
+  char *table;            /* The table or view to which the trigger applies */
+  u8 op;                  /* One of TK_DELETE, TK_UPDATE, TK_INSERT         */
+  u8 tr_tm;               /* One of TRIGGER_BEFORE, TRIGGER_AFTER */
+  u8 bReturning;          /* This trigger implements a RETURNING clause */
+  Expr *pWhen;            /* The WHEN clause of the expression (may be NULL) */
+  IdList *pColumns;       /* If this is an UPDATE OF <column-list> trigger,
+                             the <column-list> is stored here */
+  Schema *pSchema;        /* Schema containing the trigger */
+  Schema *pTabSchema;     /* Schema containing the table */
+  TriggerStep *step_list; /* Link list of trigger program steps             */
+  Trigger *pNext;         /* Next trigger associated with the table */
+};
+
+/*
+** A trigger is either a BEFORE or an AFTER trigger.  The following constants
+** determine which.
+**
+** If there are multiple triggers, you might of some BEFORE and some AFTER.
+** In that cases, the constants below can be ORed together.
+*/
+#define TRIGGER_BEFORE  1
+#define TRIGGER_AFTER   2
+
+/*
+** An instance of struct TriggerStep is used to store a single SQL statement
+** that is a part of a trigger-program.
+**
+** Instances of struct TriggerStep are stored in a singly linked list (linked
+** using the "pNext" member) referenced by the "step_list" member of the
+** associated struct Trigger instance. The first element of the linked list is
+** the first step of the trigger-program.
+**
+** The "op" member indicates whether this is a "DELETE", "INSERT", "UPDATE" or
+** "SELECT" statement. The meanings of the other members is determined by the
+** value of "op" as follows:
+**
+** (op == TK_INSERT)
+** orconf    -> stores the ON CONFLICT algorithm
+** pSelect   -> The content to be inserted - either a SELECT statement or
+**              a VALUES clause.
+** zTarget   -> Dequoted name of the table to insert into.
+** pIdList   -> If this is an INSERT INTO ... (<column-names>) VALUES ...
+**              statement, then this stores the column-names to be
+**              inserted into.
+** pUpsert   -> The ON CONFLICT clauses for an Upsert
+**
+** (op == TK_DELETE)
+** zTarget   -> Dequoted name of the table to delete from.
+** pWhere    -> The WHERE clause of the DELETE statement if one is specified.
+**              Otherwise NULL.
+**
+** (op == TK_UPDATE)
+** zTarget   -> Dequoted name of the table to update.
+** pWhere    -> The WHERE clause of the UPDATE statement if one is specified.
+**              Otherwise NULL.
+** pExprList -> A list of the columns to update and the expressions to update
+**              them to. See sqlite3Update() documentation of "pChanges"
+**              argument.
+**
+** (op == TK_SELECT)
+** pSelect   -> The SELECT statement
+**
+** (op == TK_RETURNING)
+** pExprList -> The list of expressions that follow the RETURNING keyword.
+**
+*/
+struct TriggerStep {
+  u8 op;               /* One of TK_DELETE, TK_UPDATE, TK_INSERT, TK_SELECT,
+                       ** or TK_RETURNING */
+  u8 orconf;           /* OE_Rollback etc. */
+  Trigger *pTrig;      /* The trigger that this step is a part of */
+  Select *pSelect;     /* SELECT statement or RHS of INSERT INTO SELECT ... */
+  char *zTarget;       /* Target table for DELETE, UPDATE, INSERT */
+  SrcList *pFrom;      /* FROM clause for UPDATE statement (if any) */
+  Expr *pWhere;        /* The WHERE clause for DELETE or UPDATE steps */
+  ExprList *pExprList; /* SET clause for UPDATE, or RETURNING clause */
+  IdList *pIdList;     /* Column names for INSERT */
+  Upsert *pUpsert;     /* Upsert clauses on an INSERT */
+  char *zSpan;         /* Original SQL text of this command */
+  TriggerStep *pNext;  /* Next in the link-list */
+  TriggerStep *pLast;  /* Last element in link-list. Valid for 1st elem only */
+};
+
+/*
+** Information about a RETURNING clause
+*/
+struct Returning {
+  Parse *pParse;        /* The parse that includes the RETURNING clause */
+  ExprList *pReturnEL;  /* List of expressions to return */
+  Trigger retTrig;      /* The transient trigger that implements RETURNING */
+  TriggerStep retTStep; /* The trigger step */
+  int iRetCur;          /* Transient table holding RETURNING results */
+  int nRetCol;          /* Number of in pReturnEL after expansion */
+  int iRetReg;          /* Register array for holding a row of RETURNING */
+};
+
+/*
+** An objected used to accumulate the text of a string where we
+** do not necessarily know how big the string will be in the end.
+*/
+struct sqlite3_str {
+  sqlite3 *db;         /* Optional database for lookaside.  Can be NULL */
+  char *zText;         /* The string collected so far */
+  u32  nAlloc;         /* Amount of space allocated in zText */
+  u32  mxAlloc;        /* Maximum allowed allocation.  0 for no malloc usage */
+  u32  nChar;          /* Length of the string so far */
+  u8   accError;       /* SQLITE_NOMEM or SQLITE_TOOBIG */
+  u8   printfFlags;    /* SQLITE_PRINTF flags below */
+};
+#define SQLITE_PRINTF_INTERNAL 0x01  /* Internal-use-only converters allowed */
+#define SQLITE_PRINTF_SQLFUNC  0x02  /* SQL function arguments to VXPrintf */
+#define SQLITE_PRINTF_MALLOCED 0x04  /* True if xText is allocated space */
+
+#define isMalloced(X)  (((X)->printfFlags & SQLITE_PRINTF_MALLOCED)!=0)
+
+
+/*
+** A pointer to this structure is used to communicate information
+** from sqlite3Init and OP_ParseSchema into the sqlite3InitCallback.
+*/
+typedef struct {
+  sqlite3 *db;        /* The database being initialized */
+  char **pzErrMsg;    /* Error message stored here */
+  int iDb;            /* 0 for main database.  1 for TEMP, 2.. for ATTACHed */
+  int rc;             /* Result code stored here */
+  u32 mInitFlags;     /* Flags controlling error messages */
+  u32 nInitRow;       /* Number of rows processed */
+  Pgno mxPage;        /* Maximum page number.  0 for no limit. */
+} InitData;
+
+/*
+** Allowed values fo
