@@ -19518,4 +19518,153 @@ struct Window {
   Expr *pEnd;             /* Expression for "<expr> FOLLOWING" */
   Window **ppThis;        /* Pointer to this object in Select.pWin list */
   Window *pNextWin;       /* Next window function belonging to this SELECT */
-  E
+  Expr *pFilter;          /* The FILTER expression */
+  FuncDef *pWFunc;        /* The function */
+  int iEphCsr;            /* Partition buffer or Peer buffer */
+  int regAccum;           /* Accumulator */
+  int regResult;          /* Interim result */
+  int csrApp;             /* Function cursor (used by min/max) */
+  int regApp;             /* Function register (also used by min/max) */
+  int regPart;            /* Array of registers for PARTITION BY values */
+  Expr *pOwner;           /* Expression object this window is attached to */
+  int nBufferCol;         /* Number of columns in buffer table */
+  int iArgCol;            /* Offset of first argument for this function */
+  int regOne;             /* Register containing constant value 1 */
+  int regStartRowid;
+  int regEndRowid;
+  u8 bExprArgs;           /* Defer evaluation of window function arguments
+                          ** due to the SQLITE_SUBTYPE flag */
+};
+
+#ifndef SQLITE_OMIT_WINDOWFUNC
+SQLITE_PRIVATE void sqlite3WindowDelete(sqlite3*, Window*);
+SQLITE_PRIVATE void sqlite3WindowUnlinkFromSelect(Window*);
+SQLITE_PRIVATE void sqlite3WindowListDelete(sqlite3 *db, Window *p);
+SQLITE_PRIVATE Window *sqlite3WindowAlloc(Parse*, int, int, Expr*, int , Expr*, u8);
+SQLITE_PRIVATE void sqlite3WindowAttach(Parse*, Expr*, Window*);
+SQLITE_PRIVATE void sqlite3WindowLink(Select *pSel, Window *pWin);
+SQLITE_PRIVATE int sqlite3WindowCompare(const Parse*, const Window*, const Window*, int);
+SQLITE_PRIVATE void sqlite3WindowCodeInit(Parse*, Select*);
+SQLITE_PRIVATE void sqlite3WindowCodeStep(Parse*, Select*, WhereInfo*, int, int);
+SQLITE_PRIVATE int sqlite3WindowRewrite(Parse*, Select*);
+SQLITE_PRIVATE void sqlite3WindowUpdate(Parse*, Window*, Window*, FuncDef*);
+SQLITE_PRIVATE Window *sqlite3WindowDup(sqlite3 *db, Expr *pOwner, Window *p);
+SQLITE_PRIVATE Window *sqlite3WindowListDup(sqlite3 *db, Window *p);
+SQLITE_PRIVATE void sqlite3WindowFunctions(void);
+SQLITE_PRIVATE void sqlite3WindowChain(Parse*, Window*, Window*);
+SQLITE_PRIVATE Window *sqlite3WindowAssemble(Parse*, Window*, ExprList*, ExprList*, Token*);
+#else
+# define sqlite3WindowDelete(a,b)
+# define sqlite3WindowFunctions()
+# define sqlite3WindowAttach(a,b,c)
+#endif
+
+/*
+** Assuming zIn points to the first byte of a UTF-8 character,
+** advance zIn to point to the first byte of the next UTF-8 character.
+*/
+#define SQLITE_SKIP_UTF8(zIn) {                        \
+  if( (*(zIn++))>=0xc0 ){                              \
+    while( (*zIn & 0xc0)==0x80 ){ zIn++; }             \
+  }                                                    \
+}
+
+/*
+** The SQLITE_*_BKPT macros are substitutes for the error codes with
+** the same name but without the _BKPT suffix.  These macros invoke
+** routines that report the line-number on which the error originated
+** using sqlite3_log().  The routines also provide a convenient place
+** to set a debugger breakpoint.
+*/
+SQLITE_PRIVATE int sqlite3ReportError(int iErr, int lineno, const char *zType);
+SQLITE_PRIVATE int sqlite3CorruptError(int);
+SQLITE_PRIVATE int sqlite3MisuseError(int);
+SQLITE_PRIVATE int sqlite3CantopenError(int);
+#define SQLITE_CORRUPT_BKPT sqlite3CorruptError(__LINE__)
+#define SQLITE_MISUSE_BKPT sqlite3MisuseError(__LINE__)
+#define SQLITE_CANTOPEN_BKPT sqlite3CantopenError(__LINE__)
+#ifdef SQLITE_DEBUG
+SQLITE_PRIVATE   int sqlite3NomemError(int);
+SQLITE_PRIVATE   int sqlite3IoerrnomemError(int);
+# define SQLITE_NOMEM_BKPT sqlite3NomemError(__LINE__)
+# define SQLITE_IOERR_NOMEM_BKPT sqlite3IoerrnomemError(__LINE__)
+#else
+# define SQLITE_NOMEM_BKPT SQLITE_NOMEM
+# define SQLITE_IOERR_NOMEM_BKPT SQLITE_IOERR_NOMEM
+#endif
+#if defined(SQLITE_DEBUG) || defined(SQLITE_ENABLE_CORRUPT_PGNO)
+SQLITE_PRIVATE   int sqlite3CorruptPgnoError(int,Pgno);
+# define SQLITE_CORRUPT_PGNO(P) sqlite3CorruptPgnoError(__LINE__,(P))
+#else
+# define SQLITE_CORRUPT_PGNO(P) sqlite3CorruptError(__LINE__)
+#endif
+
+/*
+** FTS3 and FTS4 both require virtual table support
+*/
+#if defined(SQLITE_OMIT_VIRTUALTABLE)
+# undef SQLITE_ENABLE_FTS3
+# undef SQLITE_ENABLE_FTS4
+#endif
+
+/*
+** FTS4 is really an extension for FTS3.  It is enabled using the
+** SQLITE_ENABLE_FTS3 macro.  But to avoid confusion we also call
+** the SQLITE_ENABLE_FTS4 macro to serve as an alias for SQLITE_ENABLE_FTS3.
+*/
+#if defined(SQLITE_ENABLE_FTS4) && !defined(SQLITE_ENABLE_FTS3)
+# define SQLITE_ENABLE_FTS3 1
+#endif
+
+/*
+** The ctype.h header is needed for non-ASCII systems.  It is also
+** needed by FTS3 when FTS3 is included in the amalgamation.
+*/
+#if !defined(SQLITE_ASCII) || \
+    (defined(SQLITE_ENABLE_FTS3) && defined(SQLITE_AMALGAMATION))
+# include <ctype.h>
+#endif
+
+/*
+** The following macros mimic the standard library functions toupper(),
+** isspace(), isalnum(), isdigit() and isxdigit(), respectively. The
+** sqlite versions only work for ASCII characters, regardless of locale.
+*/
+#ifdef SQLITE_ASCII
+# define sqlite3Toupper(x)  ((x)&~(sqlite3CtypeMap[(unsigned char)(x)]&0x20))
+# define sqlite3Isspace(x)   (sqlite3CtypeMap[(unsigned char)(x)]&0x01)
+# define sqlite3Isalnum(x)   (sqlite3CtypeMap[(unsigned char)(x)]&0x06)
+# define sqlite3Isalpha(x)   (sqlite3CtypeMap[(unsigned char)(x)]&0x02)
+# define sqlite3Isdigit(x)   (sqlite3CtypeMap[(unsigned char)(x)]&0x04)
+# define sqlite3Isxdigit(x)  (sqlite3CtypeMap[(unsigned char)(x)]&0x08)
+# define sqlite3Tolower(x)   (sqlite3UpperToLower[(unsigned char)(x)])
+# define sqlite3Isquote(x)   (sqlite3CtypeMap[(unsigned char)(x)]&0x80)
+#else
+# define sqlite3Toupper(x)   toupper((unsigned char)(x))
+# define sqlite3Isspace(x)   isspace((unsigned char)(x))
+# define sqlite3Isalnum(x)   isalnum((unsigned char)(x))
+# define sqlite3Isalpha(x)   isalpha((unsigned char)(x))
+# define sqlite3Isdigit(x)   isdigit((unsigned char)(x))
+# define sqlite3Isxdigit(x)  isxdigit((unsigned char)(x))
+# define sqlite3Tolower(x)   tolower((unsigned char)(x))
+# define sqlite3Isquote(x)   ((x)=='"'||(x)=='\''||(x)=='['||(x)=='`')
+#endif
+SQLITE_PRIVATE int sqlite3IsIdChar(u8);
+
+/*
+** Internal function prototypes
+*/
+SQLITE_PRIVATE int sqlite3StrICmp(const char*,const char*);
+SQLITE_PRIVATE int sqlite3Strlen30(const char*);
+#define sqlite3Strlen30NN(C) (strlen(C)&0x3fffffff)
+SQLITE_PRIVATE char *sqlite3ColumnType(Column*,char*);
+#define sqlite3StrNICmp sqlite3_strnicmp
+
+SQLITE_PRIVATE int sqlite3MallocInit(void);
+SQLITE_PRIVATE void sqlite3MallocEnd(void);
+SQLITE_PRIVATE void *sqlite3Malloc(u64);
+SQLITE_PRIVATE void *sqlite3MallocZero(u64);
+SQLITE_PRIVATE void *sqlite3DbMallocZero(sqlite3*, u64);
+SQLITE_PRIVATE void *sqlite3DbMallocRaw(sqlite3*, u64);
+SQLITE_PRIVATE void *sqlite3DbMallocRawNN(sqlite3*, u64);
+SQLITE_PRIVATE char *sqlite3DbStrDup(sqlite3*,const
