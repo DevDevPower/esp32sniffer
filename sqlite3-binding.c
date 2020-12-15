@@ -19361,4 +19361,161 @@ struct Walker {
     struct RefSrcList *pRefSrcList;           /* sqlite3ReferencesSrcList() */
     int *aiCol;                               /* array of column indexes */
     struct IdxCover *pIdxCover;               /* Check for index coverage */
-    struct IdxExprTrans *pIdxTrans;           /* Convert idxed expr to colu
+    struct IdxExprTrans *pIdxTrans;           /* Convert idxed expr to column */
+    ExprList *pGroupBy;                       /* GROUP BY clause */
+    Select *pSelect;                          /* HAVING to WHERE clause ctx */
+    struct WindowRewrite *pRewrite;           /* Window rewrite context */
+    struct WhereConst *pConst;                /* WHERE clause constants */
+    struct RenameCtx *pRename;                /* RENAME COLUMN context */
+    struct Table *pTab;                       /* Table of generated column */
+    SrcItem *pSrcItem;                        /* A single FROM clause item */
+    DbFixer *pFix;
+  } u;
+};
+
+/*
+** The following structure contains information used by the sqliteFix...
+** routines as they walk the parse tree to make database references
+** explicit.
+*/
+struct DbFixer {
+  Parse *pParse;      /* The parsing context.  Error messages written here */
+  Walker w;           /* Walker object */
+  Schema *pSchema;    /* Fix items to this schema */
+  u8 bTemp;           /* True for TEMP schema entries */
+  const char *zDb;    /* Make sure all objects are contained in this database */
+  const char *zType;  /* Type of the container - used for error messages */
+  const Token *pName; /* Name of the container - used for error messages */
+};
+
+/* Forward declarations */
+SQLITE_PRIVATE int sqlite3WalkExpr(Walker*, Expr*);
+SQLITE_PRIVATE int sqlite3WalkExprList(Walker*, ExprList*);
+SQLITE_PRIVATE int sqlite3WalkSelect(Walker*, Select*);
+SQLITE_PRIVATE int sqlite3WalkSelectExpr(Walker*, Select*);
+SQLITE_PRIVATE int sqlite3WalkSelectFrom(Walker*, Select*);
+SQLITE_PRIVATE int sqlite3ExprWalkNoop(Walker*, Expr*);
+SQLITE_PRIVATE int sqlite3SelectWalkNoop(Walker*, Select*);
+SQLITE_PRIVATE int sqlite3SelectWalkFail(Walker*, Select*);
+SQLITE_PRIVATE int sqlite3WalkerDepthIncrease(Walker*,Select*);
+SQLITE_PRIVATE void sqlite3WalkerDepthDecrease(Walker*,Select*);
+SQLITE_PRIVATE void sqlite3WalkWinDefnDummyCallback(Walker*,Select*);
+
+#ifdef SQLITE_DEBUG
+SQLITE_PRIVATE void sqlite3SelectWalkAssert2(Walker*, Select*);
+#endif
+
+#ifndef SQLITE_OMIT_CTE
+SQLITE_PRIVATE void sqlite3SelectPopWith(Walker*, Select*);
+#else
+# define sqlite3SelectPopWith 0
+#endif
+
+/*
+** Return code from the parse-tree walking primitives and their
+** callbacks.
+*/
+#define WRC_Continue    0   /* Continue down into children */
+#define WRC_Prune       1   /* Omit children but continue walking siblings */
+#define WRC_Abort       2   /* Abandon the tree walk */
+
+/*
+** A single common table expression
+*/
+struct Cte {
+  char *zName;            /* Name of this CTE */
+  ExprList *pCols;        /* List of explicit column names, or NULL */
+  Select *pSelect;        /* The definition of this CTE */
+  const char *zCteErr;    /* Error message for circular references */
+  CteUse *pUse;           /* Usage information for this CTE */
+  u8 eM10d;               /* The MATERIALIZED flag */
+};
+
+/*
+** Allowed values for the materialized flag (eM10d):
+*/
+#define M10d_Yes       0  /* AS MATERIALIZED */
+#define M10d_Any       1  /* Not specified.  Query planner's choice */
+#define M10d_No        2  /* AS NOT MATERIALIZED */
+
+/*
+** An instance of the With object represents a WITH clause containing
+** one or more CTEs (common table expressions).
+*/
+struct With {
+  int nCte;               /* Number of CTEs in the WITH clause */
+  int bView;              /* Belongs to the outermost Select of a view */
+  With *pOuter;           /* Containing WITH clause, or NULL */
+  Cte a[1];               /* For each CTE in the WITH clause.... */
+};
+
+/*
+** The Cte object is not guaranteed to persist for the entire duration
+** of code generation.  (The query flattener or other parser tree
+** edits might delete it.)  The following object records information
+** about each Common Table Expression that must be preserved for the
+** duration of the parse.
+**
+** The CteUse objects are freed using sqlite3ParserAddCleanup() rather
+** than sqlite3SelectDelete(), which is what enables them to persist
+** until the end of code generation.
+*/
+struct CteUse {
+  int nUse;              /* Number of users of this CTE */
+  int addrM9e;           /* Start of subroutine to compute materialization */
+  int regRtn;            /* Return address register for addrM9e subroutine */
+  int iCur;              /* Ephemeral table holding the materialization */
+  LogEst nRowEst;        /* Estimated number of rows in the table */
+  u8 eM10d;              /* The MATERIALIZED flag */
+};
+
+
+#ifdef SQLITE_DEBUG
+/*
+** An instance of the TreeView object is used for printing the content of
+** data structures on sqlite3DebugPrintf() using a tree-like view.
+*/
+struct TreeView {
+  int iLevel;             /* Which level of the tree we are on */
+  u8  bLine[100];         /* Draw vertical in column i if bLine[i] is true */
+};
+#endif /* SQLITE_DEBUG */
+
+/*
+** This object is used in various ways, most (but not all) related to window
+** functions.
+**
+**   (1) A single instance of this structure is attached to the
+**       the Expr.y.pWin field for each window function in an expression tree.
+**       This object holds the information contained in the OVER clause,
+**       plus additional fields used during code generation.
+**
+**   (2) All window functions in a single SELECT form a linked-list
+**       attached to Select.pWin.  The Window.pFunc and Window.pExpr
+**       fields point back to the expression that is the window function.
+**
+**   (3) The terms of the WINDOW clause of a SELECT are instances of this
+**       object on a linked list attached to Select.pWinDefn.
+**
+**   (4) For an aggregate function with a FILTER clause, an instance
+**       of this object is stored in Expr.y.pWin with eFrmType set to
+**       TK_FILTER. In this case the only field used is Window.pFilter.
+**
+** The uses (1) and (2) are really the same Window object that just happens
+** to be accessible in two different ways.  Use case (3) are separate objects.
+*/
+struct Window {
+  char *zName;            /* Name of window (may be NULL) */
+  char *zBase;            /* Name of base window for chaining (may be NULL) */
+  ExprList *pPartition;   /* PARTITION BY clause */
+  ExprList *pOrderBy;     /* ORDER BY clause */
+  u8 eFrmType;            /* TK_RANGE, TK_GROUPS, TK_ROWS, or 0 */
+  u8 eStart;              /* UNBOUNDED, CURRENT, PRECEDING or FOLLOWING */
+  u8 eEnd;                /* UNBOUNDED, CURRENT, PRECEDING or FOLLOWING */
+  u8 bImplicitFrame;      /* True if frame was implicitly specified */
+  u8 eExclude;            /* TK_NO, TK_CURRENT, TK_TIES, TK_GROUP, or 0 */
+  Expr *pStart;           /* Expression for "<expr> PRECEDING" */
+  Expr *pEnd;             /* Expression for "<expr> FOLLOWING" */
+  Window **ppThis;        /* Pointer to this object in Select.pWin list */
+  Window *pNextWin;       /* Next window function belonging to this SELECT */
+  E
