@@ -19230,4 +19230,135 @@ typedef struct {
 } InitData;
 
 /*
-** Allowed values fo
+** Allowed values for mInitFlags
+*/
+#define INITFLAG_AlterMask     0x0003  /* Types of ALTER */
+#define INITFLAG_AlterRename   0x0001  /* Reparse after a RENAME */
+#define INITFLAG_AlterDrop     0x0002  /* Reparse after a DROP COLUMN */
+#define INITFLAG_AlterAdd      0x0003  /* Reparse after an ADD COLUMN */
+
+/* Tuning parameters are set using SQLITE_TESTCTRL_TUNE and are controlled
+** on debug-builds of the CLI using ".testctrl tune ID VALUE".  Tuning
+** parameters are for temporary use during development, to help find
+** optimial values for parameters in the query planner.  The should not
+** be used on trunk check-ins.  They are a temporary mechanism available
+** for transient development builds only.
+**
+** Tuning parameters are numbered starting with 1.
+*/
+#define SQLITE_NTUNE  6             /* Should be zero for all trunk check-ins */
+#ifdef SQLITE_DEBUG
+# define Tuning(X)  (sqlite3Config.aTune[(X)-1])
+#else
+# define Tuning(X)  0
+#endif
+
+/*
+** Structure containing global configuration data for the SQLite library.
+**
+** This structure also contains some state information.
+*/
+struct Sqlite3Config {
+  int bMemstat;                     /* True to enable memory status */
+  u8 bCoreMutex;                    /* True to enable core mutexing */
+  u8 bFullMutex;                    /* True to enable full mutexing */
+  u8 bOpenUri;                      /* True to interpret filenames as URIs */
+  u8 bUseCis;                       /* Use covering indices for full-scans */
+  u8 bSmallMalloc;                  /* Avoid large memory allocations if true */
+  u8 bExtraSchemaChecks;            /* Verify type,name,tbl_name in schema */
+  int mxStrlen;                     /* Maximum string length */
+  int neverCorrupt;                 /* Database is always well-formed */
+  int szLookaside;                  /* Default lookaside buffer size */
+  int nLookaside;                   /* Default lookaside buffer count */
+  int nStmtSpill;                   /* Stmt-journal spill-to-disk threshold */
+  sqlite3_mem_methods m;            /* Low-level memory allocation interface */
+  sqlite3_mutex_methods mutex;      /* Low-level mutex interface */
+  sqlite3_pcache_methods2 pcache2;  /* Low-level page-cache interface */
+  void *pHeap;                      /* Heap storage space */
+  int nHeap;                        /* Size of pHeap[] */
+  int mnReq, mxReq;                 /* Min and max heap requests sizes */
+  sqlite3_int64 szMmap;             /* mmap() space per open file */
+  sqlite3_int64 mxMmap;             /* Maximum value for szMmap */
+  void *pPage;                      /* Page cache memory */
+  int szPage;                       /* Size of each page in pPage[] */
+  int nPage;                        /* Number of pages in pPage[] */
+  int mxParserStack;                /* maximum depth of the parser stack */
+  int sharedCacheEnabled;           /* true if shared-cache mode enabled */
+  u32 szPma;                        /* Maximum Sorter PMA size */
+  /* The above might be initialized to non-zero.  The following need to always
+  ** initially be zero, however. */
+  int isInit;                       /* True after initialization has finished */
+  int inProgress;                   /* True while initialization in progress */
+  int isMutexInit;                  /* True after mutexes are initialized */
+  int isMallocInit;                 /* True after malloc is initialized */
+  int isPCacheInit;                 /* True after malloc is initialized */
+  int nRefInitMutex;                /* Number of users of pInitMutex */
+  sqlite3_mutex *pInitMutex;        /* Mutex used by sqlite3_initialize() */
+  void (*xLog)(void*,int,const char*); /* Function for logging */
+  void *pLogArg;                       /* First argument to xLog() */
+#ifdef SQLITE_ENABLE_SQLLOG
+  void(*xSqllog)(void*,sqlite3*,const char*, int);
+  void *pSqllogArg;
+#endif
+#ifdef SQLITE_VDBE_COVERAGE
+  /* The following callback (if not NULL) is invoked on every VDBE branch
+  ** operation.  Set the callback using SQLITE_TESTCTRL_VDBE_COVERAGE.
+  */
+  void (*xVdbeBranch)(void*,unsigned iSrcLine,u8 eThis,u8 eMx);  /* Callback */
+  void *pVdbeBranchArg;                                     /* 1st argument */
+#endif
+#ifndef SQLITE_OMIT_DESERIALIZE
+  sqlite3_int64 mxMemdbSize;        /* Default max memdb size */
+#endif
+#ifndef SQLITE_UNTESTABLE
+  int (*xTestCallback)(int);        /* Invoked by sqlite3FaultSim() */
+#endif
+  int bLocaltimeFault;              /* True to fail localtime() calls */
+  int (*xAltLocaltime)(const void*,void*); /* Alternative localtime() routine */
+  int iOnceResetThreshold;          /* When to reset OP_Once counters */
+  u32 szSorterRef;                  /* Min size in bytes to use sorter-refs */
+  unsigned int iPrngSeed;           /* Alternative fixed seed for the PRNG */
+  /* vvvv--- must be last ---vvv */
+#ifdef SQLITE_DEBUG
+  sqlite3_int64 aTune[SQLITE_NTUNE]; /* Tuning parameters */
+#endif
+};
+
+/*
+** This macro is used inside of assert() statements to indicate that
+** the assert is only valid on a well-formed database.  Instead of:
+**
+**     assert( X );
+**
+** One writes:
+**
+**     assert( X || CORRUPT_DB );
+**
+** CORRUPT_DB is true during normal operation.  CORRUPT_DB does not indicate
+** that the database is definitely corrupt, only that it might be corrupt.
+** For most test cases, CORRUPT_DB is set to false using a special
+** sqlite3_test_control().  This enables assert() statements to prove
+** things that are always true for well-formed databases.
+*/
+#define CORRUPT_DB  (sqlite3Config.neverCorrupt==0)
+
+/*
+** Context pointer passed down through the tree-walk.
+*/
+struct Walker {
+  Parse *pParse;                            /* Parser context.  */
+  int (*xExprCallback)(Walker*, Expr*);     /* Callback for expressions */
+  int (*xSelectCallback)(Walker*,Select*);  /* Callback for SELECTs */
+  void (*xSelectCallback2)(Walker*,Select*);/* Second callback for SELECTs */
+  int walkerDepth;                          /* Number of subqueries */
+  u16 eCode;                                /* A small processing code */
+  union {                                   /* Extra data for callback */
+    NameContext *pNC;                         /* Naming context */
+    int n;                                    /* A counter */
+    int iCur;                                 /* A cursor number */
+    SrcList *pSrcList;                        /* FROM clause */
+    struct CCurHint *pCCurHint;               /* Used by codeCursorHint() */
+    struct RefSrcList *pRefSrcList;           /* sqlite3ReferencesSrcList() */
+    int *aiCol;                               /* array of column indexes */
+    struct IdxCover *pIdxCover;               /* Check for index coverage */
+    struct IdxExprTrans *pIdxTrans;           /* Convert idxed expr to colu
