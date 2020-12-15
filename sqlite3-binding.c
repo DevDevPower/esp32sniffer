@@ -18946,4 +18946,141 @@ struct Parse {
     int addrCrTab;         /* Address of OP_CreateBtree on CREATE TABLE */
     Returning *pReturning; /* The RETURNING clause */
   } u1;
-  u32 nQueryLoop;      /* Est numbe
+  u32 nQueryLoop;      /* Est number of iterations of a query (10*log2(N)) */
+  u32 oldmask;         /* Mask of old.* columns referenced */
+  u32 newmask;         /* Mask of new.* columns referenced */
+  u8 eTriggerOp;       /* TK_UPDATE, TK_INSERT or TK_DELETE */
+  u8 bReturning;       /* Coding a RETURNING trigger */
+  u8 eOrconf;          /* Default ON CONFLICT policy for trigger steps */
+  u8 disableTriggers;  /* True to disable triggers */
+
+  /**************************************************************************
+  ** Fields above must be initialized to zero.  The fields that follow,
+  ** down to the beginning of the recursive section, do not need to be
+  ** initialized as they will be set before being used.  The boundary is
+  ** determined by offsetof(Parse,aTempReg).
+  **************************************************************************/
+
+  int aTempReg[8];        /* Holding area for temporary registers */
+  Parse *pOuterParse;     /* Outer Parse object when nested */
+  Token sNameToken;       /* Token with unqualified schema object name */
+
+  /************************************************************************
+  ** Above is constant between recursions.  Below is reset before and after
+  ** each recursion.  The boundary between these two regions is determined
+  ** using offsetof(Parse,sLastToken) so the sLastToken field must be the
+  ** first field in the recursive region.
+  ************************************************************************/
+
+  Token sLastToken;       /* The last token parsed */
+  ynVar nVar;               /* Number of '?' variables seen in the SQL so far */
+  u8 iPkSortOrder;          /* ASC or DESC for INTEGER PRIMARY KEY */
+  u8 explain;               /* True if the EXPLAIN flag is found on the query */
+  u8 eParseMode;            /* PARSE_MODE_XXX constant */
+#ifndef SQLITE_OMIT_VIRTUALTABLE
+  int nVtabLock;            /* Number of virtual tables to lock */
+#endif
+  int nHeight;              /* Expression tree height of current sub-select */
+#ifndef SQLITE_OMIT_EXPLAIN
+  int addrExplain;          /* Address of current OP_Explain opcode */
+#endif
+  VList *pVList;            /* Mapping between variable names and numbers */
+  Vdbe *pReprepare;         /* VM being reprepared (sqlite3Reprepare()) */
+  const char *zTail;        /* All SQL text past the last semicolon parsed */
+  Table *pNewTable;         /* A table being constructed by CREATE TABLE */
+  Index *pNewIndex;         /* An index being constructed by CREATE INDEX.
+                            ** Also used to hold redundant UNIQUE constraints
+                            ** during a RENAME COLUMN */
+  Trigger *pNewTrigger;     /* Trigger under construct by a CREATE TRIGGER */
+  const char *zAuthContext; /* The 6th parameter to db->xAuth callbacks */
+#ifndef SQLITE_OMIT_VIRTUALTABLE
+  Token sArg;               /* Complete text of a module argument */
+  Table **apVtabLock;       /* Pointer to virtual tables needing locking */
+#endif
+  With *pWith;              /* Current WITH clause, or NULL */
+#ifndef SQLITE_OMIT_ALTERTABLE
+  RenameToken *pRename;     /* Tokens subject to renaming by ALTER TABLE */
+#endif
+};
+
+/* Allowed values for Parse.eParseMode
+*/
+#define PARSE_MODE_NORMAL        0
+#define PARSE_MODE_DECLARE_VTAB  1
+#define PARSE_MODE_RENAME        2
+#define PARSE_MODE_UNMAP         3
+
+/*
+** Sizes and pointers of various parts of the Parse object.
+*/
+#define PARSE_HDR(X)  (((char*)(X))+offsetof(Parse,zErrMsg))
+#define PARSE_HDR_SZ (offsetof(Parse,aTempReg)-offsetof(Parse,zErrMsg)) /* Recursive part w/o aColCache*/
+#define PARSE_RECURSE_SZ offsetof(Parse,sLastToken)    /* Recursive part */
+#define PARSE_TAIL_SZ (sizeof(Parse)-PARSE_RECURSE_SZ) /* Non-recursive part */
+#define PARSE_TAIL(X) (((char*)(X))+PARSE_RECURSE_SZ)  /* Pointer to tail */
+
+/*
+** Return true if currently inside an sqlite3_declare_vtab() call.
+*/
+#ifdef SQLITE_OMIT_VIRTUALTABLE
+  #define IN_DECLARE_VTAB 0
+#else
+  #define IN_DECLARE_VTAB (pParse->eParseMode==PARSE_MODE_DECLARE_VTAB)
+#endif
+
+#if defined(SQLITE_OMIT_ALTERTABLE)
+  #define IN_RENAME_OBJECT 0
+#else
+  #define IN_RENAME_OBJECT (pParse->eParseMode>=PARSE_MODE_RENAME)
+#endif
+
+#if defined(SQLITE_OMIT_VIRTUALTABLE) && defined(SQLITE_OMIT_ALTERTABLE)
+  #define IN_SPECIAL_PARSE 0
+#else
+  #define IN_SPECIAL_PARSE (pParse->eParseMode!=PARSE_MODE_NORMAL)
+#endif
+
+/*
+** An instance of the following structure can be declared on a stack and used
+** to save the Parse.zAuthContext value so that it can be restored later.
+*/
+struct AuthContext {
+  const char *zAuthContext;   /* Put saved Parse.zAuthContext here */
+  Parse *pParse;              /* The Parse structure */
+};
+
+/*
+** Bitfield flags for P5 value in various opcodes.
+**
+** Value constraints (enforced via assert()):
+**    OPFLAG_LENGTHARG    == SQLITE_FUNC_LENGTH
+**    OPFLAG_TYPEOFARG    == SQLITE_FUNC_TYPEOF
+**    OPFLAG_BULKCSR      == BTREE_BULKLOAD
+**    OPFLAG_SEEKEQ       == BTREE_SEEK_EQ
+**    OPFLAG_FORDELETE    == BTREE_FORDELETE
+**    OPFLAG_SAVEPOSITION == BTREE_SAVEPOSITION
+**    OPFLAG_AUXDELETE    == BTREE_AUXDELETE
+*/
+#define OPFLAG_NCHANGE       0x01    /* OP_Insert: Set to update db->nChange */
+                                     /* Also used in P2 (not P5) of OP_Delete */
+#define OPFLAG_NOCHNG        0x01    /* OP_VColumn nochange for UPDATE */
+#define OPFLAG_EPHEM         0x01    /* OP_Column: Ephemeral output is ok */
+#define OPFLAG_LASTROWID     0x20    /* Set to update db->lastRowid */
+#define OPFLAG_ISUPDATE      0x04    /* This OP_Insert is an sql UPDATE */
+#define OPFLAG_APPEND        0x08    /* This is likely to be an append */
+#define OPFLAG_USESEEKRESULT 0x10    /* Try to avoid a seek in BtreeInsert() */
+#define OPFLAG_ISNOOP        0x40    /* OP_Delete does pre-update-hook only */
+#define OPFLAG_LENGTHARG     0x40    /* OP_Column only used for length() */
+#define OPFLAG_TYPEOFARG     0x80    /* OP_Column only used for typeof() */
+#define OPFLAG_BULKCSR       0x01    /* OP_Open** used to open bulk cursor */
+#define OPFLAG_SEEKEQ        0x02    /* OP_Open** cursor uses EQ seek only */
+#define OPFLAG_FORDELETE     0x08    /* OP_Open should use BTREE_FORDELETE */
+#define OPFLAG_P2ISREG       0x10    /* P2 to OP_Open** is a register number */
+#define OPFLAG_PERMUTE       0x01    /* OP_Compare: use the permutation */
+#define OPFLAG_SAVEPOSITION  0x02    /* OP_Delete/Insert: save cursor pos */
+#define OPFLAG_AUXDELETE     0x04    /* OP_Delete: index in a DELETE op */
+#define OPFLAG_NOCHNG_MAGIC  0x6d    /* OP_MakeRecord: serialtype 10 is ok */
+#define OPFLAG_PREFORMAT     0x80    /* OP_Insert uses preformatted cell */
+
+/*
+** Each trigger present in the database schema 
