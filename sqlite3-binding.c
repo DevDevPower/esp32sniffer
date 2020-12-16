@@ -19667,4 +19667,160 @@ SQLITE_PRIVATE void *sqlite3MallocZero(u64);
 SQLITE_PRIVATE void *sqlite3DbMallocZero(sqlite3*, u64);
 SQLITE_PRIVATE void *sqlite3DbMallocRaw(sqlite3*, u64);
 SQLITE_PRIVATE void *sqlite3DbMallocRawNN(sqlite3*, u64);
-SQLITE_PRIVATE char *sqlite3DbStrDup(sqlite3*,const
+SQLITE_PRIVATE char *sqlite3DbStrDup(sqlite3*,const char*);
+SQLITE_PRIVATE char *sqlite3DbStrNDup(sqlite3*,const char*, u64);
+SQLITE_PRIVATE char *sqlite3DbSpanDup(sqlite3*,const char*,const char*);
+SQLITE_PRIVATE void *sqlite3Realloc(void*, u64);
+SQLITE_PRIVATE void *sqlite3DbReallocOrFree(sqlite3 *, void *, u64);
+SQLITE_PRIVATE void *sqlite3DbRealloc(sqlite3 *, void *, u64);
+SQLITE_PRIVATE void sqlite3DbFree(sqlite3*, void*);
+SQLITE_PRIVATE void sqlite3DbFreeNN(sqlite3*, void*);
+SQLITE_PRIVATE int sqlite3MallocSize(const void*);
+SQLITE_PRIVATE int sqlite3DbMallocSize(sqlite3*, const void*);
+SQLITE_PRIVATE void *sqlite3PageMalloc(int);
+SQLITE_PRIVATE void sqlite3PageFree(void*);
+SQLITE_PRIVATE void sqlite3MemSetDefault(void);
+#ifndef SQLITE_UNTESTABLE
+SQLITE_PRIVATE void sqlite3BenignMallocHooks(void (*)(void), void (*)(void));
+#endif
+SQLITE_PRIVATE int sqlite3HeapNearlyFull(void);
+
+/*
+** On systems with ample stack space and that support alloca(), make
+** use of alloca() to obtain space for large automatic objects.  By default,
+** obtain space from malloc().
+**
+** The alloca() routine never returns NULL.  This will cause code paths
+** that deal with sqlite3StackAlloc() failures to be unreachable.
+*/
+#ifdef SQLITE_USE_ALLOCA
+# define sqlite3StackAllocRaw(D,N)   alloca(N)
+# define sqlite3StackAllocZero(D,N)  memset(alloca(N), 0, N)
+# define sqlite3StackFree(D,P)
+#else
+# define sqlite3StackAllocRaw(D,N)   sqlite3DbMallocRaw(D,N)
+# define sqlite3StackAllocZero(D,N)  sqlite3DbMallocZero(D,N)
+# define sqlite3StackFree(D,P)       sqlite3DbFree(D,P)
+#endif
+
+/* Do not allow both MEMSYS5 and MEMSYS3 to be defined together.  If they
+** are, disable MEMSYS3
+*/
+#ifdef SQLITE_ENABLE_MEMSYS5
+SQLITE_PRIVATE const sqlite3_mem_methods *sqlite3MemGetMemsys5(void);
+#undef SQLITE_ENABLE_MEMSYS3
+#endif
+#ifdef SQLITE_ENABLE_MEMSYS3
+SQLITE_PRIVATE const sqlite3_mem_methods *sqlite3MemGetMemsys3(void);
+#endif
+
+
+#ifndef SQLITE_MUTEX_OMIT
+SQLITE_PRIVATE   sqlite3_mutex_methods const *sqlite3DefaultMutex(void);
+SQLITE_PRIVATE   sqlite3_mutex_methods const *sqlite3NoopMutex(void);
+SQLITE_PRIVATE   sqlite3_mutex *sqlite3MutexAlloc(int);
+SQLITE_PRIVATE   int sqlite3MutexInit(void);
+SQLITE_PRIVATE   int sqlite3MutexEnd(void);
+#endif
+#if !defined(SQLITE_MUTEX_OMIT) && !defined(SQLITE_MUTEX_NOOP)
+SQLITE_PRIVATE   void sqlite3MemoryBarrier(void);
+#else
+# define sqlite3MemoryBarrier()
+#endif
+
+SQLITE_PRIVATE sqlite3_int64 sqlite3StatusValue(int);
+SQLITE_PRIVATE void sqlite3StatusUp(int, int);
+SQLITE_PRIVATE void sqlite3StatusDown(int, int);
+SQLITE_PRIVATE void sqlite3StatusHighwater(int, int);
+SQLITE_PRIVATE int sqlite3LookasideUsed(sqlite3*,int*);
+
+/* Access to mutexes used by sqlite3_status() */
+SQLITE_PRIVATE sqlite3_mutex *sqlite3Pcache1Mutex(void);
+SQLITE_PRIVATE sqlite3_mutex *sqlite3MallocMutex(void);
+
+#if defined(SQLITE_ENABLE_MULTITHREADED_CHECKS) && !defined(SQLITE_MUTEX_OMIT)
+SQLITE_PRIVATE void sqlite3MutexWarnOnContention(sqlite3_mutex*);
+#else
+# define sqlite3MutexWarnOnContention(x)
+#endif
+
+#ifndef SQLITE_OMIT_FLOATING_POINT
+# define EXP754 (((u64)0x7ff)<<52)
+# define MAN754 ((((u64)1)<<52)-1)
+# define IsNaN(X) (((X)&EXP754)==EXP754 && ((X)&MAN754)!=0)
+SQLITE_PRIVATE   int sqlite3IsNaN(double);
+#else
+# define IsNaN(X)         0
+# define sqlite3IsNaN(X)  0
+#endif
+
+/*
+** An instance of the following structure holds information about SQL
+** functions arguments that are the parameters to the printf() function.
+*/
+struct PrintfArguments {
+  int nArg;                /* Total number of arguments */
+  int nUsed;               /* Number of arguments used so far */
+  sqlite3_value **apArg;   /* The argument values */
+};
+
+SQLITE_PRIVATE char *sqlite3MPrintf(sqlite3*,const char*, ...);
+SQLITE_PRIVATE char *sqlite3VMPrintf(sqlite3*,const char*, va_list);
+#if defined(SQLITE_DEBUG) || defined(SQLITE_HAVE_OS_TRACE)
+SQLITE_PRIVATE   void sqlite3DebugPrintf(const char*, ...);
+#endif
+#if defined(SQLITE_TEST)
+SQLITE_PRIVATE   void *sqlite3TestTextToPtr(const char*);
+#endif
+
+#if defined(SQLITE_DEBUG)
+SQLITE_PRIVATE   void sqlite3TreeViewLine(TreeView*, const char *zFormat, ...);
+SQLITE_PRIVATE   void sqlite3TreeViewExpr(TreeView*, const Expr*, u8);
+SQLITE_PRIVATE   void sqlite3TreeViewBareExprList(TreeView*, const ExprList*, const char*);
+SQLITE_PRIVATE   void sqlite3TreeViewExprList(TreeView*, const ExprList*, u8, const char*);
+SQLITE_PRIVATE   void sqlite3TreeViewBareIdList(TreeView*, const IdList*, const char*);
+SQLITE_PRIVATE   void sqlite3TreeViewIdList(TreeView*, const IdList*, u8, const char*);
+SQLITE_PRIVATE   void sqlite3TreeViewColumnList(TreeView*, const Column*, int, u8);
+SQLITE_PRIVATE   void sqlite3TreeViewSrcList(TreeView*, const SrcList*);
+SQLITE_PRIVATE   void sqlite3TreeViewSelect(TreeView*, const Select*, u8);
+SQLITE_PRIVATE   void sqlite3TreeViewWith(TreeView*, const With*, u8);
+SQLITE_PRIVATE   void sqlite3TreeViewUpsert(TreeView*, const Upsert*, u8);
+#if TREETRACE_ENABLED
+SQLITE_PRIVATE   void sqlite3TreeViewDelete(const With*, const SrcList*, const Expr*,
+                             const ExprList*,const Expr*, const Trigger*);
+SQLITE_PRIVATE   void sqlite3TreeViewInsert(const With*, const SrcList*,
+                             const IdList*, const Select*, const ExprList*,
+                             int, const Upsert*, const Trigger*);
+SQLITE_PRIVATE   void sqlite3TreeViewUpdate(const With*, const SrcList*, const ExprList*,
+                             const Expr*, int, const ExprList*, const Expr*,
+                             const Upsert*, const Trigger*);
+#endif
+#ifndef SQLITE_OMIT_TRIGGER
+SQLITE_PRIVATE   void sqlite3TreeViewTriggerStep(TreeView*, const TriggerStep*, u8, u8);
+SQLITE_PRIVATE   void sqlite3TreeViewTrigger(TreeView*, const Trigger*, u8, u8);
+#endif
+#ifndef SQLITE_OMIT_WINDOWFUNC
+SQLITE_PRIVATE   void sqlite3TreeViewWindow(TreeView*, const Window*, u8);
+SQLITE_PRIVATE   void sqlite3TreeViewWinFunc(TreeView*, const Window*, u8);
+#endif
+SQLITE_PRIVATE   void sqlite3ShowExpr(const Expr*);
+SQLITE_PRIVATE   void sqlite3ShowExprList(const ExprList*);
+SQLITE_PRIVATE   void sqlite3ShowIdList(const IdList*);
+SQLITE_PRIVATE   void sqlite3ShowSrcList(const SrcList*);
+SQLITE_PRIVATE   void sqlite3ShowSelect(const Select*);
+SQLITE_PRIVATE   void sqlite3ShowWith(const With*);
+SQLITE_PRIVATE   void sqlite3ShowUpsert(const Upsert*);
+#ifndef SQLITE_OMIT_TRIGGER
+SQLITE_PRIVATE   void sqlite3ShowTriggerStep(const TriggerStep*);
+SQLITE_PRIVATE   void sqlite3ShowTriggerStepList(const TriggerStep*);
+SQLITE_PRIVATE   void sqlite3ShowTrigger(const Trigger*);
+SQLITE_PRIVATE   void sqlite3ShowTriggerList(const Trigger*);
+#endif
+#ifndef SQLITE_OMIT_WINDOWFUNC
+SQLITE_PRIVATE   void sqlite3ShowWindow(const Window*);
+SQLITE_PRIVATE   void sqlite3ShowWinFunc(const Window*);
+#endif
+#endif
+
+SQLITE_PRIVATE void sqlite3SetString(char **, sqlite3*, const char*);
+SQLITE_PRIVATE void sqlit
