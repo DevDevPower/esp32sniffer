@@ -19823,4 +19823,131 @@ SQLITE_PRIVATE   void sqlite3ShowWinFunc(const Window*);
 #endif
 
 SQLITE_PRIVATE void sqlite3SetString(char **, sqlite3*, const char*);
-SQLITE_PRIVATE void sqlit
+SQLITE_PRIVATE void sqlite3ErrorMsg(Parse*, const char*, ...);
+SQLITE_PRIVATE int sqlite3ErrorToParser(sqlite3*,int);
+SQLITE_PRIVATE void sqlite3Dequote(char*);
+SQLITE_PRIVATE void sqlite3DequoteExpr(Expr*);
+SQLITE_PRIVATE void sqlite3DequoteToken(Token*);
+SQLITE_PRIVATE void sqlite3TokenInit(Token*,char*);
+SQLITE_PRIVATE int sqlite3KeywordCode(const unsigned char*, int);
+SQLITE_PRIVATE int sqlite3RunParser(Parse*, const char*);
+SQLITE_PRIVATE void sqlite3FinishCoding(Parse*);
+SQLITE_PRIVATE int sqlite3GetTempReg(Parse*);
+SQLITE_PRIVATE void sqlite3ReleaseTempReg(Parse*,int);
+SQLITE_PRIVATE int sqlite3GetTempRange(Parse*,int);
+SQLITE_PRIVATE void sqlite3ReleaseTempRange(Parse*,int,int);
+SQLITE_PRIVATE void sqlite3ClearTempRegCache(Parse*);
+#ifdef SQLITE_DEBUG
+SQLITE_PRIVATE int sqlite3NoTempsInRange(Parse*,int,int);
+#endif
+SQLITE_PRIVATE Expr *sqlite3ExprAlloc(sqlite3*,int,const Token*,int);
+SQLITE_PRIVATE Expr *sqlite3Expr(sqlite3*,int,const char*);
+SQLITE_PRIVATE void sqlite3ExprAttachSubtrees(sqlite3*,Expr*,Expr*,Expr*);
+SQLITE_PRIVATE Expr *sqlite3PExpr(Parse*, int, Expr*, Expr*);
+SQLITE_PRIVATE void sqlite3PExprAddSelect(Parse*, Expr*, Select*);
+SQLITE_PRIVATE Expr *sqlite3ExprAnd(Parse*,Expr*, Expr*);
+SQLITE_PRIVATE Expr *sqlite3ExprSimplifiedAndOr(Expr*);
+SQLITE_PRIVATE Expr *sqlite3ExprFunction(Parse*,ExprList*, const Token*, int);
+SQLITE_PRIVATE void sqlite3ExprFunctionUsable(Parse*,const Expr*,const FuncDef*);
+SQLITE_PRIVATE void sqlite3ExprAssignVarNumber(Parse*, Expr*, u32);
+SQLITE_PRIVATE void sqlite3ExprDelete(sqlite3*, Expr*);
+SQLITE_PRIVATE void sqlite3ExprDeferredDelete(Parse*, Expr*);
+SQLITE_PRIVATE void sqlite3ExprUnmapAndDelete(Parse*, Expr*);
+SQLITE_PRIVATE ExprList *sqlite3ExprListAppend(Parse*,ExprList*,Expr*);
+SQLITE_PRIVATE ExprList *sqlite3ExprListAppendVector(Parse*,ExprList*,IdList*,Expr*);
+SQLITE_PRIVATE Select *sqlite3ExprListToValues(Parse*, int, ExprList*);
+SQLITE_PRIVATE void sqlite3ExprListSetSortOrder(ExprList*,int,int);
+SQLITE_PRIVATE void sqlite3ExprListSetName(Parse*,ExprList*,const Token*,int);
+SQLITE_PRIVATE void sqlite3ExprListSetSpan(Parse*,ExprList*,const char*,const char*);
+SQLITE_PRIVATE void sqlite3ExprListDelete(sqlite3*, ExprList*);
+SQLITE_PRIVATE u32 sqlite3ExprListFlags(const ExprList*);
+SQLITE_PRIVATE int sqlite3IndexHasDuplicateRootPage(Index*);
+SQLITE_PRIVATE int sqlite3Init(sqlite3*, char**);
+SQLITE_PRIVATE int sqlite3InitCallback(void*, int, char**, char**);
+SQLITE_PRIVATE int sqlite3InitOne(sqlite3*, int, char**, u32);
+SQLITE_PRIVATE void sqlite3Pragma(Parse*,Token*,Token*,Token*,int);
+#ifndef SQLITE_OMIT_VIRTUALTABLE
+SQLITE_PRIVATE Module *sqlite3PragmaVtabRegister(sqlite3*,const char *zName);
+#endif
+SQLITE_PRIVATE void sqlite3ResetAllSchemasOfConnection(sqlite3*);
+SQLITE_PRIVATE void sqlite3ResetOneSchema(sqlite3*,int);
+SQLITE_PRIVATE void sqlite3CollapseDatabaseArray(sqlite3*);
+SQLITE_PRIVATE void sqlite3CommitInternalChanges(sqlite3*);
+SQLITE_PRIVATE void sqlite3ColumnSetExpr(Parse*,Table*,Column*,Expr*);
+SQLITE_PRIVATE Expr *sqlite3ColumnExpr(Table*,Column*);
+SQLITE_PRIVATE void sqlite3ColumnSetColl(sqlite3*,Column*,const char*zColl);
+SQLITE_PRIVATE const char *sqlite3ColumnColl(Column*);
+SQLITE_PRIVATE void sqlite3DeleteColumnNames(sqlite3*,Table*);
+SQLITE_PRIVATE void sqlite3GenerateColumnNames(Parse *pParse, Select *pSelect);
+SQLITE_PRIVATE int sqlite3ColumnsFromExprList(Parse*,ExprList*,i16*,Column**);
+SQLITE_PRIVATE void sqlite3SelectAddColumnTypeAndCollation(Parse*,Table*,Select*,char);
+SQLITE_PRIVATE Table *sqlite3ResultSetOfSelect(Parse*,Select*,char);
+SQLITE_PRIVATE void sqlite3OpenSchemaTable(Parse *, int);
+SQLITE_PRIVATE Index *sqlite3PrimaryKeyIndex(Table*);
+SQLITE_PRIVATE i16 sqlite3TableColumnToIndex(Index*, i16);
+#ifdef SQLITE_OMIT_GENERATED_COLUMNS
+# define sqlite3TableColumnToStorage(T,X) (X)  /* No-op pass-through */
+# define sqlite3StorageColumnToTable(T,X) (X)  /* No-op pass-through */
+#else
+SQLITE_PRIVATE   i16 sqlite3TableColumnToStorage(Table*, i16);
+SQLITE_PRIVATE   i16 sqlite3StorageColumnToTable(Table*, i16);
+#endif
+SQLITE_PRIVATE void sqlite3StartTable(Parse*,Token*,Token*,int,int,int,int);
+#if SQLITE_ENABLE_HIDDEN_COLUMNS
+SQLITE_PRIVATE   void sqlite3ColumnPropertiesFromName(Table*, Column*);
+#else
+# define sqlite3ColumnPropertiesFromName(T,C) /* no-op */
+#endif
+SQLITE_PRIVATE void sqlite3AddColumn(Parse*,Token,Token);
+SQLITE_PRIVATE void sqlite3AddNotNull(Parse*, int);
+SQLITE_PRIVATE void sqlite3AddPrimaryKey(Parse*, ExprList*, int, int, int);
+SQLITE_PRIVATE void sqlite3AddCheckConstraint(Parse*, Expr*, const char*, const char*);
+SQLITE_PRIVATE void sqlite3AddDefaultValue(Parse*,Expr*,const char*,const char*);
+SQLITE_PRIVATE void sqlite3AddCollateType(Parse*, Token*);
+SQLITE_PRIVATE void sqlite3AddGenerated(Parse*,Expr*,Token*);
+SQLITE_PRIVATE void sqlite3EndTable(Parse*,Token*,Token*,u32,Select*);
+SQLITE_PRIVATE void sqlite3AddReturning(Parse*,ExprList*);
+SQLITE_PRIVATE int sqlite3ParseUri(const char*,const char*,unsigned int*,
+                    sqlite3_vfs**,char**,char **);
+#define sqlite3CodecQueryParameters(A,B,C) 0
+SQLITE_PRIVATE Btree *sqlite3DbNameToBtree(sqlite3*,const char*);
+
+#ifdef SQLITE_UNTESTABLE
+# define sqlite3FaultSim(X) SQLITE_OK
+#else
+SQLITE_PRIVATE   int sqlite3FaultSim(int);
+#endif
+
+SQLITE_PRIVATE Bitvec *sqlite3BitvecCreate(u32);
+SQLITE_PRIVATE int sqlite3BitvecTest(Bitvec*, u32);
+SQLITE_PRIVATE int sqlite3BitvecTestNotNull(Bitvec*, u32);
+SQLITE_PRIVATE int sqlite3BitvecSet(Bitvec*, u32);
+SQLITE_PRIVATE void sqlite3BitvecClear(Bitvec*, u32, void*);
+SQLITE_PRIVATE void sqlite3BitvecDestroy(Bitvec*);
+SQLITE_PRIVATE u32 sqlite3BitvecSize(Bitvec*);
+#ifndef SQLITE_UNTESTABLE
+SQLITE_PRIVATE int sqlite3BitvecBuiltinTest(int,int*);
+#endif
+
+SQLITE_PRIVATE RowSet *sqlite3RowSetInit(sqlite3*);
+SQLITE_PRIVATE void sqlite3RowSetDelete(void*);
+SQLITE_PRIVATE void sqlite3RowSetClear(void*);
+SQLITE_PRIVATE void sqlite3RowSetInsert(RowSet*, i64);
+SQLITE_PRIVATE int sqlite3RowSetTest(RowSet*, int iBatch, i64);
+SQLITE_PRIVATE int sqlite3RowSetNext(RowSet*, i64*);
+
+SQLITE_PRIVATE void sqlite3CreateView(Parse*,Token*,Token*,Token*,ExprList*,Select*,int,int);
+
+#if !defined(SQLITE_OMIT_VIEW) || !defined(SQLITE_OMIT_VIRTUALTABLE)
+SQLITE_PRIVATE   int sqlite3ViewGetColumnNames(Parse*,Table*);
+#else
+# define sqlite3ViewGetColumnNames(A,B) 0
+#endif
+
+#if SQLITE_MAX_ATTACHED>30
+SQLITE_PRIVATE   int sqlite3DbMaskAllZero(yDbMask);
+#endif
+SQLITE_PRIVATE void sqlite3DropTable(Parse*, SrcList*, int, int);
+SQLITE_PRIVATE void sqlite3CodeDropTable(Parse*, Table*, int, int);
+SQLITE_PRIVATE void sqlite3DeleteTable(sqlite3*, Table*);
+SQLITE_PRIVATE void sqlite3FreeIndex(sqlite3*, Inde
