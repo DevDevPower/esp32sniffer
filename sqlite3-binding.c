@@ -20173,4 +20173,140 @@ SQLITE_PRIVATE   SrcList *sqlite3TriggerStepSrc(Parse*, TriggerStep*);
 #endif
 
 SQLITE_PRIVATE int sqlite3JoinType(Parse*, Token*, Token*, Token*);
-SQLITE_PRIVATE int sqlite3ColumnI
+SQLITE_PRIVATE int sqlite3ColumnIndex(Table *pTab, const char *zCol);
+SQLITE_PRIVATE void sqlite3SrcItemColumnUsed(SrcItem*,int);
+SQLITE_PRIVATE void sqlite3SetJoinExpr(Expr*,int,u32);
+SQLITE_PRIVATE void sqlite3CreateForeignKey(Parse*, ExprList*, Token*, ExprList*, int);
+SQLITE_PRIVATE void sqlite3DeferForeignKey(Parse*, int);
+#ifndef SQLITE_OMIT_AUTHORIZATION
+SQLITE_PRIVATE   void sqlite3AuthRead(Parse*,Expr*,Schema*,SrcList*);
+SQLITE_PRIVATE   int sqlite3AuthCheck(Parse*,int, const char*, const char*, const char*);
+SQLITE_PRIVATE   void sqlite3AuthContextPush(Parse*, AuthContext*, const char*);
+SQLITE_PRIVATE   void sqlite3AuthContextPop(AuthContext*);
+SQLITE_PRIVATE   int sqlite3AuthReadCol(Parse*, const char *, const char *, int);
+#else
+# define sqlite3AuthRead(a,b,c,d)
+# define sqlite3AuthCheck(a,b,c,d,e)    SQLITE_OK
+# define sqlite3AuthContextPush(a,b,c)
+# define sqlite3AuthContextPop(a)  ((void)(a))
+#endif
+SQLITE_PRIVATE int sqlite3DbIsNamed(sqlite3 *db, int iDb, const char *zName);
+SQLITE_PRIVATE void sqlite3Attach(Parse*, Expr*, Expr*, Expr*);
+SQLITE_PRIVATE void sqlite3Detach(Parse*, Expr*);
+SQLITE_PRIVATE void sqlite3FixInit(DbFixer*, Parse*, int, const char*, const Token*);
+SQLITE_PRIVATE int sqlite3FixSrcList(DbFixer*, SrcList*);
+SQLITE_PRIVATE int sqlite3FixSelect(DbFixer*, Select*);
+SQLITE_PRIVATE int sqlite3FixExpr(DbFixer*, Expr*);
+SQLITE_PRIVATE int sqlite3FixTriggerStep(DbFixer*, TriggerStep*);
+SQLITE_PRIVATE int sqlite3RealSameAsInt(double,sqlite3_int64);
+SQLITE_PRIVATE void sqlite3Int64ToText(i64,char*);
+SQLITE_PRIVATE int sqlite3AtoF(const char *z, double*, int, u8);
+SQLITE_PRIVATE int sqlite3GetInt32(const char *, int*);
+SQLITE_PRIVATE int sqlite3GetUInt32(const char*, u32*);
+SQLITE_PRIVATE int sqlite3Atoi(const char*);
+#ifndef SQLITE_OMIT_UTF16
+SQLITE_PRIVATE int sqlite3Utf16ByteLen(const void *pData, int nChar);
+#endif
+SQLITE_PRIVATE int sqlite3Utf8CharLen(const char *pData, int nByte);
+SQLITE_PRIVATE u32 sqlite3Utf8Read(const u8**);
+SQLITE_PRIVATE LogEst sqlite3LogEst(u64);
+SQLITE_PRIVATE LogEst sqlite3LogEstAdd(LogEst,LogEst);
+SQLITE_PRIVATE LogEst sqlite3LogEstFromDouble(double);
+SQLITE_PRIVATE u64 sqlite3LogEstToInt(LogEst);
+SQLITE_PRIVATE VList *sqlite3VListAdd(sqlite3*,VList*,const char*,int,int);
+SQLITE_PRIVATE const char *sqlite3VListNumToName(VList*,int);
+SQLITE_PRIVATE int sqlite3VListNameToNum(VList*,const char*,int);
+
+/*
+** Routines to read and write variable-length integers.  These used to
+** be defined locally, but now we use the varint routines in the util.c
+** file.
+*/
+SQLITE_PRIVATE int sqlite3PutVarint(unsigned char*, u64);
+SQLITE_PRIVATE u8 sqlite3GetVarint(const unsigned char *, u64 *);
+SQLITE_PRIVATE u8 sqlite3GetVarint32(const unsigned char *, u32 *);
+SQLITE_PRIVATE int sqlite3VarintLen(u64 v);
+
+/*
+** The common case is for a varint to be a single byte.  They following
+** macros handle the common case without a procedure call, but then call
+** the procedure for larger varints.
+*/
+#define getVarint32(A,B)  \
+  (u8)((*(A)<(u8)0x80)?((B)=(u32)*(A)),1:sqlite3GetVarint32((A),(u32 *)&(B)))
+#define getVarint32NR(A,B) \
+  B=(u32)*(A);if(B>=0x80)sqlite3GetVarint32((A),(u32*)&(B))
+#define putVarint32(A,B)  \
+  (u8)(((u32)(B)<(u32)0x80)?(*(A)=(unsigned char)(B)),1:\
+  sqlite3PutVarint((A),(B)))
+#define getVarint    sqlite3GetVarint
+#define putVarint    sqlite3PutVarint
+
+
+SQLITE_PRIVATE const char *sqlite3IndexAffinityStr(sqlite3*, Index*);
+SQLITE_PRIVATE void sqlite3TableAffinity(Vdbe*, Table*, int);
+SQLITE_PRIVATE char sqlite3CompareAffinity(const Expr *pExpr, char aff2);
+SQLITE_PRIVATE int sqlite3IndexAffinityOk(const Expr *pExpr, char idx_affinity);
+SQLITE_PRIVATE char sqlite3TableColumnAffinity(const Table*,int);
+SQLITE_PRIVATE char sqlite3ExprAffinity(const Expr *pExpr);
+SQLITE_PRIVATE int sqlite3Atoi64(const char*, i64*, int, u8);
+SQLITE_PRIVATE int sqlite3DecOrHexToI64(const char*, i64*);
+SQLITE_PRIVATE void sqlite3ErrorWithMsg(sqlite3*, int, const char*,...);
+SQLITE_PRIVATE void sqlite3Error(sqlite3*,int);
+SQLITE_PRIVATE void sqlite3ErrorClear(sqlite3*);
+SQLITE_PRIVATE void sqlite3SystemError(sqlite3*,int);
+SQLITE_PRIVATE void *sqlite3HexToBlob(sqlite3*, const char *z, int n);
+SQLITE_PRIVATE u8 sqlite3HexToInt(int h);
+SQLITE_PRIVATE int sqlite3TwoPartName(Parse *, Token *, Token *, Token **);
+
+#if defined(SQLITE_NEED_ERR_NAME)
+SQLITE_PRIVATE const char *sqlite3ErrName(int);
+#endif
+
+#ifndef SQLITE_OMIT_DESERIALIZE
+SQLITE_PRIVATE int sqlite3MemdbInit(void);
+#endif
+
+SQLITE_PRIVATE const char *sqlite3ErrStr(int);
+SQLITE_PRIVATE int sqlite3ReadSchema(Parse *pParse);
+SQLITE_PRIVATE CollSeq *sqlite3FindCollSeq(sqlite3*,u8 enc, const char*,int);
+SQLITE_PRIVATE int sqlite3IsBinary(const CollSeq*);
+SQLITE_PRIVATE CollSeq *sqlite3LocateCollSeq(Parse *pParse, const char*zName);
+SQLITE_PRIVATE void sqlite3SetTextEncoding(sqlite3 *db, u8);
+SQLITE_PRIVATE CollSeq *sqlite3ExprCollSeq(Parse *pParse, const Expr *pExpr);
+SQLITE_PRIVATE CollSeq *sqlite3ExprNNCollSeq(Parse *pParse, const Expr *pExpr);
+SQLITE_PRIVATE int sqlite3ExprCollSeqMatch(Parse*,const Expr*,const Expr*);
+SQLITE_PRIVATE Expr *sqlite3ExprAddCollateToken(const Parse *pParse, Expr*, const Token*, int);
+SQLITE_PRIVATE Expr *sqlite3ExprAddCollateString(const Parse*,Expr*,const char*);
+SQLITE_PRIVATE Expr *sqlite3ExprSkipCollate(Expr*);
+SQLITE_PRIVATE Expr *sqlite3ExprSkipCollateAndLikely(Expr*);
+SQLITE_PRIVATE int sqlite3CheckCollSeq(Parse *, CollSeq *);
+SQLITE_PRIVATE int sqlite3WritableSchema(sqlite3*);
+SQLITE_PRIVATE int sqlite3CheckObjectName(Parse*, const char*,const char*,const char*);
+SQLITE_PRIVATE void sqlite3VdbeSetChanges(sqlite3 *, i64);
+SQLITE_PRIVATE int sqlite3AddInt64(i64*,i64);
+SQLITE_PRIVATE int sqlite3SubInt64(i64*,i64);
+SQLITE_PRIVATE int sqlite3MulInt64(i64*,i64);
+SQLITE_PRIVATE int sqlite3AbsInt32(int);
+#ifdef SQLITE_ENABLE_8_3_NAMES
+SQLITE_PRIVATE void sqlite3FileSuffix3(const char*, char*);
+#else
+# define sqlite3FileSuffix3(X,Y)
+#endif
+SQLITE_PRIVATE u8 sqlite3GetBoolean(const char *z,u8);
+
+SQLITE_PRIVATE const void *sqlite3ValueText(sqlite3_value*, u8);
+SQLITE_PRIVATE int sqlite3ValueBytes(sqlite3_value*, u8);
+SQLITE_PRIVATE void sqlite3ValueSetStr(sqlite3_value*, int, const void *,u8,
+                        void(*)(void*));
+SQLITE_PRIVATE void sqlite3ValueSetNull(sqlite3_value*);
+SQLITE_PRIVATE void sqlite3ValueFree(sqlite3_value*);
+#ifndef SQLITE_UNTESTABLE
+SQLITE_PRIVATE void sqlite3ResultIntReal(sqlite3_context*);
+#endif
+SQLITE_PRIVATE sqlite3_value *sqlite3ValueNew(sqlite3 *);
+#ifndef SQLITE_OMIT_UTF16
+SQLITE_PRIVATE char *sqlite3Utf16to8(sqlite3 *, const void*, int, u8);
+#endif
+SQLITE_PRIVATE int sqlite3ValueFromExpr(sqlite3 *, const Expr *, u8, u8, sqlite3_value **);
+SQLITE_PRIVATE void s
