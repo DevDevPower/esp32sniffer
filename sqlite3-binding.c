@@ -19950,4 +19950,110 @@ SQLITE_PRIVATE   int sqlite3DbMaskAllZero(yDbMask);
 SQLITE_PRIVATE void sqlite3DropTable(Parse*, SrcList*, int, int);
 SQLITE_PRIVATE void sqlite3CodeDropTable(Parse*, Table*, int, int);
 SQLITE_PRIVATE void sqlite3DeleteTable(sqlite3*, Table*);
-SQLITE_PRIVATE void sqlite3FreeIndex(sqlite3*, Inde
+SQLITE_PRIVATE void sqlite3FreeIndex(sqlite3*, Index*);
+#ifndef SQLITE_OMIT_AUTOINCREMENT
+SQLITE_PRIVATE   void sqlite3AutoincrementBegin(Parse *pParse);
+SQLITE_PRIVATE   void sqlite3AutoincrementEnd(Parse *pParse);
+#else
+# define sqlite3AutoincrementBegin(X)
+# define sqlite3AutoincrementEnd(X)
+#endif
+SQLITE_PRIVATE void sqlite3Insert(Parse*, SrcList*, Select*, IdList*, int, Upsert*);
+#ifndef SQLITE_OMIT_GENERATED_COLUMNS
+SQLITE_PRIVATE   void sqlite3ComputeGeneratedColumns(Parse*, int, Table*);
+#endif
+SQLITE_PRIVATE void *sqlite3ArrayAllocate(sqlite3*,void*,int,int*,int*);
+SQLITE_PRIVATE IdList *sqlite3IdListAppend(Parse*, IdList*, Token*);
+SQLITE_PRIVATE int sqlite3IdListIndex(IdList*,const char*);
+SQLITE_PRIVATE SrcList *sqlite3SrcListEnlarge(Parse*, SrcList*, int, int);
+SQLITE_PRIVATE SrcList *sqlite3SrcListAppendList(Parse *pParse, SrcList *p1, SrcList *p2);
+SQLITE_PRIVATE SrcList *sqlite3SrcListAppend(Parse*, SrcList*, Token*, Token*);
+SQLITE_PRIVATE SrcList *sqlite3SrcListAppendFromTerm(Parse*, SrcList*, Token*, Token*,
+                                      Token*, Select*, OnOrUsing*);
+SQLITE_PRIVATE void sqlite3SrcListIndexedBy(Parse *, SrcList *, Token *);
+SQLITE_PRIVATE void sqlite3SrcListFuncArgs(Parse*, SrcList*, ExprList*);
+SQLITE_PRIVATE int sqlite3IndexedByLookup(Parse *, SrcItem *);
+SQLITE_PRIVATE void sqlite3SrcListShiftJoinType(Parse*,SrcList*);
+SQLITE_PRIVATE void sqlite3SrcListAssignCursors(Parse*, SrcList*);
+SQLITE_PRIVATE void sqlite3IdListDelete(sqlite3*, IdList*);
+SQLITE_PRIVATE void sqlite3ClearOnOrUsing(sqlite3*, OnOrUsing*);
+SQLITE_PRIVATE void sqlite3SrcListDelete(sqlite3*, SrcList*);
+SQLITE_PRIVATE Index *sqlite3AllocateIndexObject(sqlite3*,i16,int,char**);
+SQLITE_PRIVATE void sqlite3CreateIndex(Parse*,Token*,Token*,SrcList*,ExprList*,int,Token*,
+                          Expr*, int, int, u8);
+SQLITE_PRIVATE void sqlite3DropIndex(Parse*, SrcList*, int);
+SQLITE_PRIVATE int sqlite3Select(Parse*, Select*, SelectDest*);
+SQLITE_PRIVATE Select *sqlite3SelectNew(Parse*,ExprList*,SrcList*,Expr*,ExprList*,
+                         Expr*,ExprList*,u32,Expr*);
+SQLITE_PRIVATE void sqlite3SelectDelete(sqlite3*, Select*);
+SQLITE_PRIVATE Table *sqlite3SrcListLookup(Parse*, SrcList*);
+SQLITE_PRIVATE int sqlite3IsReadOnly(Parse*, Table*, int);
+SQLITE_PRIVATE void sqlite3OpenTable(Parse*, int iCur, int iDb, Table*, int);
+#if defined(SQLITE_ENABLE_UPDATE_DELETE_LIMIT) && !defined(SQLITE_OMIT_SUBQUERY)
+SQLITE_PRIVATE Expr *sqlite3LimitWhere(Parse*,SrcList*,Expr*,ExprList*,Expr*,char*);
+#endif
+SQLITE_PRIVATE void sqlite3CodeChangeCount(Vdbe*,int,const char*);
+SQLITE_PRIVATE void sqlite3DeleteFrom(Parse*, SrcList*, Expr*, ExprList*, Expr*);
+SQLITE_PRIVATE void sqlite3Update(Parse*, SrcList*, ExprList*,Expr*,int,ExprList*,Expr*,
+                   Upsert*);
+SQLITE_PRIVATE WhereInfo *sqlite3WhereBegin(Parse*,SrcList*,Expr*,ExprList*,
+                             ExprList*,Select*,u16,int);
+SQLITE_PRIVATE void sqlite3WhereEnd(WhereInfo*);
+SQLITE_PRIVATE LogEst sqlite3WhereOutputRowCount(WhereInfo*);
+SQLITE_PRIVATE int sqlite3WhereIsDistinct(WhereInfo*);
+SQLITE_PRIVATE int sqlite3WhereIsOrdered(WhereInfo*);
+SQLITE_PRIVATE int sqlite3WhereOrderByLimitOptLabel(WhereInfo*);
+SQLITE_PRIVATE void sqlite3WhereMinMaxOptEarlyOut(Vdbe*,WhereInfo*);
+SQLITE_PRIVATE int sqlite3WhereIsSorted(WhereInfo*);
+SQLITE_PRIVATE int sqlite3WhereContinueLabel(WhereInfo*);
+SQLITE_PRIVATE int sqlite3WhereBreakLabel(WhereInfo*);
+SQLITE_PRIVATE int sqlite3WhereOkOnePass(WhereInfo*, int*);
+#define ONEPASS_OFF      0        /* Use of ONEPASS not allowed */
+#define ONEPASS_SINGLE   1        /* ONEPASS valid for a single row update */
+#define ONEPASS_MULTI    2        /* ONEPASS is valid for multiple rows */
+SQLITE_PRIVATE int sqlite3WhereUsesDeferredSeek(WhereInfo*);
+SQLITE_PRIVATE void sqlite3ExprCodeLoadIndexColumn(Parse*, Index*, int, int, int);
+SQLITE_PRIVATE int sqlite3ExprCodeGetColumn(Parse*, Table*, int, int, int, u8);
+SQLITE_PRIVATE void sqlite3ExprCodeGetColumnOfTable(Vdbe*, Table*, int, int, int);
+SQLITE_PRIVATE void sqlite3ExprCodeMove(Parse*, int, int, int);
+SQLITE_PRIVATE void sqlite3ExprCode(Parse*, Expr*, int);
+#ifndef SQLITE_OMIT_GENERATED_COLUMNS
+SQLITE_PRIVATE void sqlite3ExprCodeGeneratedColumn(Parse*, Table*, Column*, int);
+#endif
+SQLITE_PRIVATE void sqlite3ExprCodeCopy(Parse*, Expr*, int);
+SQLITE_PRIVATE void sqlite3ExprCodeFactorable(Parse*, Expr*, int);
+SQLITE_PRIVATE int sqlite3ExprCodeRunJustOnce(Parse*, Expr*, int);
+SQLITE_PRIVATE int sqlite3ExprCodeTemp(Parse*, Expr*, int*);
+SQLITE_PRIVATE int sqlite3ExprCodeTarget(Parse*, Expr*, int);
+SQLITE_PRIVATE int sqlite3ExprCodeExprList(Parse*, ExprList*, int, int, u8);
+#define SQLITE_ECEL_DUP      0x01  /* Deep, not shallow copies */
+#define SQLITE_ECEL_FACTOR   0x02  /* Factor out constant terms */
+#define SQLITE_ECEL_REF      0x04  /* Use ExprList.u.x.iOrderByCol */
+#define SQLITE_ECEL_OMITREF  0x08  /* Omit if ExprList.u.x.iOrderByCol */
+SQLITE_PRIVATE void sqlite3ExprIfTrue(Parse*, Expr*, int, int);
+SQLITE_PRIVATE void sqlite3ExprIfFalse(Parse*, Expr*, int, int);
+SQLITE_PRIVATE void sqlite3ExprIfFalseDup(Parse*, Expr*, int, int);
+SQLITE_PRIVATE Table *sqlite3FindTable(sqlite3*,const char*, const char*);
+#define LOCATE_VIEW    0x01
+#define LOCATE_NOERR   0x02
+SQLITE_PRIVATE Table *sqlite3LocateTable(Parse*,u32 flags,const char*, const char*);
+SQLITE_PRIVATE const char *sqlite3PreferredTableName(const char*);
+SQLITE_PRIVATE Table *sqlite3LocateTableItem(Parse*,u32 flags,SrcItem *);
+SQLITE_PRIVATE Index *sqlite3FindIndex(sqlite3*,const char*, const char*);
+SQLITE_PRIVATE void sqlite3UnlinkAndDeleteTable(sqlite3*,int,const char*);
+SQLITE_PRIVATE void sqlite3UnlinkAndDeleteIndex(sqlite3*,int,const char*);
+SQLITE_PRIVATE void sqlite3Vacuum(Parse*,Token*,Expr*);
+SQLITE_PRIVATE int sqlite3RunVacuum(char**, sqlite3*, int, sqlite3_value*);
+SQLITE_PRIVATE char *sqlite3NameFromToken(sqlite3*, const Token*);
+SQLITE_PRIVATE int sqlite3ExprCompare(const Parse*,const Expr*,const Expr*, int);
+SQLITE_PRIVATE int sqlite3ExprCompareSkip(Expr*,Expr*,int);
+SQLITE_PRIVATE int sqlite3ExprListCompare(const ExprList*,const ExprList*, int);
+SQLITE_PRIVATE int sqlite3ExprImpliesExpr(const Parse*,const Expr*,const Expr*, int);
+SQLITE_PRIVATE int sqlite3ExprImpliesNonNullRow(Expr*,int);
+SQLITE_PRIVATE void sqlite3AggInfoPersistWalkerInit(Walker*,Parse*);
+SQLITE_PRIVATE void sqlite3ExprAnalyzeAggregates(NameContext*, Expr*);
+SQLITE_PRIVATE void sqlite3ExprAnalyzeAggList(NameContext*,ExprList*);
+SQLITE_PRIVATE int sqlite3ExprCoveredByIndex(Expr*, int iCur, Index *pIdx);
+SQLITE_PRIVATE int sqlite3ReferencesSrcList(Parse*, Expr*, SrcList*);
+SQLITE_PRIVATE Vdbe *sqlite3GetVdbe(Parse*);
+#ifndef SQ
