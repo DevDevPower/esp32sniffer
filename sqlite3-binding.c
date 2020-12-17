@@ -20309,4 +20309,140 @@ SQLITE_PRIVATE sqlite3_value *sqlite3ValueNew(sqlite3 *);
 SQLITE_PRIVATE char *sqlite3Utf16to8(sqlite3 *, const void*, int, u8);
 #endif
 SQLITE_PRIVATE int sqlite3ValueFromExpr(sqlite3 *, const Expr *, u8, u8, sqlite3_value **);
+SQLITE_PRIVATE void sqlite3ValueApplyAffinity(sqlite3_value *, u8, u8);
+#ifndef SQLITE_AMALGAMATION
+SQLITE_PRIVATE const unsigned char sqlite3OpcodeProperty[];
+SQLITE_PRIVATE const char sqlite3StrBINARY[];
+SQLITE_PRIVATE const unsigned char sqlite3StdTypeLen[];
+SQLITE_PRIVATE const char sqlite3StdTypeAffinity[];
+SQLITE_PRIVATE const char sqlite3StdTypeMap[];
+SQLITE_PRIVATE const char *sqlite3StdType[];
+SQLITE_PRIVATE const unsigned char sqlite3UpperToLower[];
+SQLITE_PRIVATE const unsigned char *sqlite3aLTb;
+SQLITE_PRIVATE const unsigned char *sqlite3aEQb;
+SQLITE_PRIVATE const unsigned char *sqlite3aGTb;
+SQLITE_PRIVATE const unsigned char sqlite3CtypeMap[];
+SQLITE_PRIVATE SQLITE_WSD struct Sqlite3Config sqlite3Config;
+SQLITE_PRIVATE FuncDefHash sqlite3BuiltinFunctions;
+#ifndef SQLITE_OMIT_WSD
+SQLITE_PRIVATE int sqlite3PendingByte;
+#endif
+#endif /* SQLITE_AMALGAMATION */
+#ifdef VDBE_PROFILE
+SQLITE_PRIVATE sqlite3_uint64 sqlite3NProfileCnt;
+#endif
+SQLITE_PRIVATE void sqlite3RootPageMoved(sqlite3*, int, Pgno, Pgno);
+SQLITE_PRIVATE void sqlite3Reindex(Parse*, Token*, Token*);
+SQLITE_PRIVATE void sqlite3AlterFunctions(void);
+SQLITE_PRIVATE void sqlite3AlterRenameTable(Parse*, SrcList*, Token*);
+SQLITE_PRIVATE void sqlite3AlterRenameColumn(Parse*, SrcList*, Token*, Token*);
+SQLITE_PRIVATE int sqlite3GetToken(const unsigned char *, int *);
+SQLITE_PRIVATE void sqlite3NestedParse(Parse*, const char*, ...);
+SQLITE_PRIVATE void sqlite3ExpirePreparedStatements(sqlite3*, int);
+SQLITE_PRIVATE void sqlite3CodeRhsOfIN(Parse*, Expr*, int);
+SQLITE_PRIVATE int sqlite3CodeSubselect(Parse*, Expr*);
+SQLITE_PRIVATE void sqlite3SelectPrep(Parse*, Select*, NameContext*);
+SQLITE_PRIVATE int sqlite3ExpandSubquery(Parse*, SrcItem*);
+SQLITE_PRIVATE void sqlite3SelectWrongNumTermsError(Parse *pParse, Select *p);
+SQLITE_PRIVATE int sqlite3MatchEName(
+  const struct ExprList_item*,
+  const char*,
+  const char*,
+  const char*
+);
+SQLITE_PRIVATE Bitmask sqlite3ExprColUsed(Expr*);
+SQLITE_PRIVATE u8 sqlite3StrIHash(const char*);
+SQLITE_PRIVATE int sqlite3ResolveExprNames(NameContext*, Expr*);
+SQLITE_PRIVATE int sqlite3ResolveExprListNames(NameContext*, ExprList*);
+SQLITE_PRIVATE void sqlite3ResolveSelectNames(Parse*, Select*, NameContext*);
+SQLITE_PRIVATE int sqlite3ResolveSelfReference(Parse*,Table*,int,Expr*,ExprList*);
+SQLITE_PRIVATE int sqlite3ResolveOrderGroupBy(Parse*, Select*, ExprList*, const char*);
+SQLITE_PRIVATE void sqlite3ColumnDefault(Vdbe *, Table *, int, int);
+SQLITE_PRIVATE void sqlite3AlterFinishAddColumn(Parse *, Token *);
+SQLITE_PRIVATE void sqlite3AlterBeginAddColumn(Parse *, SrcList *);
+SQLITE_PRIVATE void sqlite3AlterDropColumn(Parse*, SrcList*, const Token*);
+SQLITE_PRIVATE const void *sqlite3RenameTokenMap(Parse*, const void*, const Token*);
+SQLITE_PRIVATE void sqlite3RenameTokenRemap(Parse*, const void *pTo, const void *pFrom);
+SQLITE_PRIVATE void sqlite3RenameExprUnmap(Parse*, Expr*);
+SQLITE_PRIVATE void sqlite3RenameExprlistUnmap(Parse*, ExprList*);
+SQLITE_PRIVATE CollSeq *sqlite3GetCollSeq(Parse*, u8, CollSeq *, const char*);
+SQLITE_PRIVATE char sqlite3AffinityType(const char*, Column*);
+SQLITE_PRIVATE void sqlite3Analyze(Parse*, Token*, Token*);
+SQLITE_PRIVATE int sqlite3InvokeBusyHandler(BusyHandler*);
+SQLITE_PRIVATE int sqlite3FindDb(sqlite3*, Token*);
+SQLITE_PRIVATE int sqlite3FindDbName(sqlite3 *, const char *);
+SQLITE_PRIVATE int sqlite3AnalysisLoad(sqlite3*,int iDB);
+SQLITE_PRIVATE void sqlite3DeleteIndexSamples(sqlite3*,Index*);
+SQLITE_PRIVATE void sqlite3DefaultRowEst(Index*);
+SQLITE_PRIVATE void sqlite3RegisterLikeFunctions(sqlite3*, int);
+SQLITE_PRIVATE int sqlite3IsLikeFunction(sqlite3*,Expr*,int*,char*);
+SQLITE_PRIVATE void sqlite3SchemaClear(void *);
+SQLITE_PRIVATE Schema *sqlite3SchemaGet(sqlite3 *, Btree *);
+SQLITE_PRIVATE int sqlite3SchemaToIndex(sqlite3 *db, Schema *);
+SQLITE_PRIVATE KeyInfo *sqlite3KeyInfoAlloc(sqlite3*,int,int);
+SQLITE_PRIVATE void sqlite3KeyInfoUnref(KeyInfo*);
+SQLITE_PRIVATE KeyInfo *sqlite3KeyInfoRef(KeyInfo*);
+SQLITE_PRIVATE KeyInfo *sqlite3KeyInfoOfIndex(Parse*, Index*);
+SQLITE_PRIVATE KeyInfo *sqlite3KeyInfoFromExprList(Parse*, ExprList*, int, int);
+SQLITE_PRIVATE const char *sqlite3SelectOpName(int);
+SQLITE_PRIVATE int sqlite3HasExplicitNulls(Parse*, ExprList*);
+
+#ifdef SQLITE_DEBUG
+SQLITE_PRIVATE int sqlite3KeyInfoIsWriteable(KeyInfo*);
+#endif
+SQLITE_PRIVATE int sqlite3CreateFunc(sqlite3 *, const char *, int, int, void *,
+  void (*)(sqlite3_context*,int,sqlite3_value **),
+  void (*)(sqlite3_context*,int,sqlite3_value **),
+  void (*)(sqlite3_context*),
+  void (*)(sqlite3_context*),
+  void (*)(sqlite3_context*,int,sqlite3_value **),
+  FuncDestructor *pDestructor
+);
+SQLITE_PRIVATE void sqlite3NoopDestructor(void*);
+SQLITE_PRIVATE void *sqlite3OomFault(sqlite3*);
+SQLITE_PRIVATE void sqlite3OomClear(sqlite3*);
+SQLITE_PRIVATE int sqlite3ApiExit(sqlite3 *db, int);
+SQLITE_PRIVATE int sqlite3OpenTempDatabase(Parse *);
+
+SQLITE_PRIVATE void sqlite3StrAccumInit(StrAccum*, sqlite3*, char*, int, int);
+SQLITE_PRIVATE int sqlite3StrAccumEnlarge(StrAccum*, int);
+SQLITE_PRIVATE char *sqlite3StrAccumFinish(StrAccum*);
+SQLITE_PRIVATE void sqlite3StrAccumSetError(StrAccum*, u8);
+SQLITE_PRIVATE void sqlite3ResultStrAccum(sqlite3_context*,StrAccum*);
+SQLITE_PRIVATE void sqlite3SelectDestInit(SelectDest*,int,int);
+SQLITE_PRIVATE Expr *sqlite3CreateColumnExpr(sqlite3 *, SrcList *, int, int);
+SQLITE_PRIVATE void sqlite3RecordErrorByteOffset(sqlite3*,const char*);
+SQLITE_PRIVATE void sqlite3RecordErrorOffsetOfExpr(sqlite3*,const Expr*);
+
+SQLITE_PRIVATE void sqlite3BackupRestart(sqlite3_backup *);
+SQLITE_PRIVATE void sqlite3BackupUpdate(sqlite3_backup *, Pgno, const u8 *);
+
+#ifndef SQLITE_OMIT_SUBQUERY
+SQLITE_PRIVATE int sqlite3ExprCheckIN(Parse*, Expr*);
+#else
+# define sqlite3ExprCheckIN(x,y) SQLITE_OK
+#endif
+
+#ifdef SQLITE_ENABLE_STAT4
+SQLITE_PRIVATE int sqlite3Stat4ProbeSetValue(
+    Parse*,Index*,UnpackedRecord**,Expr*,int,int,int*);
+SQLITE_PRIVATE int sqlite3Stat4ValueFromExpr(Parse*, Expr*, u8, sqlite3_value**);
+SQLITE_PRIVATE void sqlite3Stat4ProbeFree(UnpackedRecord*);
+SQLITE_PRIVATE int sqlite3Stat4Column(sqlite3*, const void*, int, int, sqlite3_value**);
+SQLITE_PRIVATE char sqlite3IndexColumnAffinity(sqlite3*, Index*, int);
+#endif
+
+/*
+** The interface to the LEMON-generated parser
+*/
+#ifndef SQLITE_AMALGAMATION
+SQLITE_PRIVATE   void *sqlite3ParserAlloc(void*(*)(u64), Parse*);
+SQLITE_PRIVATE   void sqlite3ParserFree(void*, void(*)(void*));
+#endif
+SQLITE_PRIVATE void sqlite3Parser(void*, int, Token);
+SQLITE_PRIVATE int sqlite3ParserFallback(int);
+#ifdef YYTRACKMAXSTACKDEPTH
+SQLITE_PRIVATE   int sqlite3ParserStackPeak(void*);
+#endif
+
 SQLITE_PRIVATE void s
