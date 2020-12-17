@@ -20445,4 +20445,147 @@ SQLITE_PRIVATE int sqlite3ParserFallback(int);
 SQLITE_PRIVATE   int sqlite3ParserStackPeak(void*);
 #endif
 
-SQLITE_PRIVATE void s
+SQLITE_PRIVATE void sqlite3AutoLoadExtensions(sqlite3*);
+#ifndef SQLITE_OMIT_LOAD_EXTENSION
+SQLITE_PRIVATE   void sqlite3CloseExtensions(sqlite3*);
+#else
+# define sqlite3CloseExtensions(X)
+#endif
+
+#ifndef SQLITE_OMIT_SHARED_CACHE
+SQLITE_PRIVATE   void sqlite3TableLock(Parse *, int, Pgno, u8, const char *);
+#else
+  #define sqlite3TableLock(v,w,x,y,z)
+#endif
+
+#ifdef SQLITE_TEST
+SQLITE_PRIVATE   int sqlite3Utf8To8(unsigned char*);
+#endif
+
+#ifdef SQLITE_OMIT_VIRTUALTABLE
+#  define sqlite3VtabClear(D,T)
+#  define sqlite3VtabSync(X,Y) SQLITE_OK
+#  define sqlite3VtabRollback(X)
+#  define sqlite3VtabCommit(X)
+#  define sqlite3VtabInSync(db) 0
+#  define sqlite3VtabLock(X)
+#  define sqlite3VtabUnlock(X)
+#  define sqlite3VtabModuleUnref(D,X)
+#  define sqlite3VtabUnlockList(X)
+#  define sqlite3VtabSavepoint(X, Y, Z) SQLITE_OK
+#  define sqlite3GetVTable(X,Y)  ((VTable*)0)
+#else
+SQLITE_PRIVATE    void sqlite3VtabClear(sqlite3 *db, Table*);
+SQLITE_PRIVATE    void sqlite3VtabDisconnect(sqlite3 *db, Table *p);
+SQLITE_PRIVATE    int sqlite3VtabSync(sqlite3 *db, Vdbe*);
+SQLITE_PRIVATE    int sqlite3VtabRollback(sqlite3 *db);
+SQLITE_PRIVATE    int sqlite3VtabCommit(sqlite3 *db);
+SQLITE_PRIVATE    void sqlite3VtabLock(VTable *);
+SQLITE_PRIVATE    void sqlite3VtabUnlock(VTable *);
+SQLITE_PRIVATE    void sqlite3VtabModuleUnref(sqlite3*,Module*);
+SQLITE_PRIVATE    void sqlite3VtabUnlockList(sqlite3*);
+SQLITE_PRIVATE    int sqlite3VtabSavepoint(sqlite3 *, int, int);
+SQLITE_PRIVATE    void sqlite3VtabImportErrmsg(Vdbe*, sqlite3_vtab*);
+SQLITE_PRIVATE    VTable *sqlite3GetVTable(sqlite3*, Table*);
+SQLITE_PRIVATE    Module *sqlite3VtabCreateModule(
+     sqlite3*,
+     const char*,
+     const sqlite3_module*,
+     void*,
+     void(*)(void*)
+   );
+#  define sqlite3VtabInSync(db) ((db)->nVTrans>0 && (db)->aVTrans==0)
+#endif
+SQLITE_PRIVATE int sqlite3ReadOnlyShadowTables(sqlite3 *db);
+#ifndef SQLITE_OMIT_VIRTUALTABLE
+SQLITE_PRIVATE   int sqlite3ShadowTableName(sqlite3 *db, const char *zName);
+SQLITE_PRIVATE   int sqlite3IsShadowTableOf(sqlite3*,Table*,const char*);
+SQLITE_PRIVATE   void sqlite3MarkAllShadowTablesOf(sqlite3*, Table*);
+#else
+# define sqlite3ShadowTableName(A,B) 0
+# define sqlite3IsShadowTableOf(A,B,C) 0
+# define sqlite3MarkAllShadowTablesOf(A,B)
+#endif
+SQLITE_PRIVATE int sqlite3VtabEponymousTableInit(Parse*,Module*);
+SQLITE_PRIVATE void sqlite3VtabEponymousTableClear(sqlite3*,Module*);
+SQLITE_PRIVATE void sqlite3VtabMakeWritable(Parse*,Table*);
+SQLITE_PRIVATE void sqlite3VtabBeginParse(Parse*, Token*, Token*, Token*, int);
+SQLITE_PRIVATE void sqlite3VtabFinishParse(Parse*, Token*);
+SQLITE_PRIVATE void sqlite3VtabArgInit(Parse*);
+SQLITE_PRIVATE void sqlite3VtabArgExtend(Parse*, Token*);
+SQLITE_PRIVATE int sqlite3VtabCallCreate(sqlite3*, int, const char *, char **);
+SQLITE_PRIVATE int sqlite3VtabCallConnect(Parse*, Table*);
+SQLITE_PRIVATE int sqlite3VtabCallDestroy(sqlite3*, int, const char *);
+SQLITE_PRIVATE int sqlite3VtabBegin(sqlite3 *, VTable *);
+
+SQLITE_PRIVATE FuncDef *sqlite3VtabOverloadFunction(sqlite3 *,FuncDef*, int nArg, Expr*);
+#if (defined(SQLITE_ENABLE_DBPAGE_VTAB) || defined(SQLITE_TEST)) \
+    && !defined(SQLITE_OMIT_VIRTUALTABLE)
+SQLITE_PRIVATE   void sqlite3VtabUsesAllSchemas(sqlite3_index_info*);
+#endif
+SQLITE_PRIVATE sqlite3_int64 sqlite3StmtCurrentTime(sqlite3_context*);
+SQLITE_PRIVATE int sqlite3VdbeParameterIndex(Vdbe*, const char*, int);
+SQLITE_PRIVATE int sqlite3TransferBindings(sqlite3_stmt *, sqlite3_stmt *);
+SQLITE_PRIVATE void sqlite3ParseObjectInit(Parse*,sqlite3*);
+SQLITE_PRIVATE void sqlite3ParseObjectReset(Parse*);
+SQLITE_PRIVATE void *sqlite3ParserAddCleanup(Parse*,void(*)(sqlite3*,void*),void*);
+#ifdef SQLITE_ENABLE_NORMALIZE
+SQLITE_PRIVATE char *sqlite3Normalize(Vdbe*, const char*);
+#endif
+SQLITE_PRIVATE int sqlite3Reprepare(Vdbe*);
+SQLITE_PRIVATE void sqlite3ExprListCheckLength(Parse*, ExprList*, const char*);
+SQLITE_PRIVATE CollSeq *sqlite3ExprCompareCollSeq(Parse*,const Expr*);
+SQLITE_PRIVATE CollSeq *sqlite3BinaryCompareCollSeq(Parse *, const Expr*, const Expr*);
+SQLITE_PRIVATE int sqlite3TempInMemory(const sqlite3*);
+SQLITE_PRIVATE const char *sqlite3JournalModename(int);
+#ifndef SQLITE_OMIT_WAL
+SQLITE_PRIVATE   int sqlite3Checkpoint(sqlite3*, int, int, int*, int*);
+SQLITE_PRIVATE   int sqlite3WalDefaultHook(void*,sqlite3*,const char*,int);
+#endif
+#ifndef SQLITE_OMIT_CTE
+SQLITE_PRIVATE   Cte *sqlite3CteNew(Parse*,Token*,ExprList*,Select*,u8);
+SQLITE_PRIVATE   void sqlite3CteDelete(sqlite3*,Cte*);
+SQLITE_PRIVATE   With *sqlite3WithAdd(Parse*,With*,Cte*);
+SQLITE_PRIVATE   void sqlite3WithDelete(sqlite3*,With*);
+SQLITE_PRIVATE   With *sqlite3WithPush(Parse*, With*, u8);
+#else
+# define sqlite3CteNew(P,T,E,S)   ((void*)0)
+# define sqlite3CteDelete(D,C)
+# define sqlite3CteWithAdd(P,W,C) ((void*)0)
+# define sqlite3WithDelete(x,y)
+# define sqlite3WithPush(x,y,z) ((void*)0)
+#endif
+#ifndef SQLITE_OMIT_UPSERT
+SQLITE_PRIVATE   Upsert *sqlite3UpsertNew(sqlite3*,ExprList*,Expr*,ExprList*,Expr*,Upsert*);
+SQLITE_PRIVATE   void sqlite3UpsertDelete(sqlite3*,Upsert*);
+SQLITE_PRIVATE   Upsert *sqlite3UpsertDup(sqlite3*,Upsert*);
+SQLITE_PRIVATE   int sqlite3UpsertAnalyzeTarget(Parse*,SrcList*,Upsert*);
+SQLITE_PRIVATE   void sqlite3UpsertDoUpdate(Parse*,Upsert*,Table*,Index*,int);
+SQLITE_PRIVATE   Upsert *sqlite3UpsertOfIndex(Upsert*,Index*);
+SQLITE_PRIVATE   int sqlite3UpsertNextIsIPK(Upsert*);
+#else
+#define sqlite3UpsertNew(u,v,w,x,y,z) ((Upsert*)0)
+#define sqlite3UpsertDelete(x,y)
+#define sqlite3UpsertDup(x,y)         ((Upsert*)0)
+#define sqlite3UpsertOfIndex(x,y)     ((Upsert*)0)
+#define sqlite3UpsertNextIsIPK(x)     0
+#endif
+
+
+/* Declarations for functions in fkey.c. All of these are replaced by
+** no-op macros if OMIT_FOREIGN_KEY is defined. In this case no foreign
+** key functionality is available. If OMIT_TRIGGER is defined but
+** OMIT_FOREIGN_KEY is not, only some of the functions are no-oped. In
+** this case foreign keys are parsed, but no other functionality is
+** provided (enforcement of FK constraints requires the triggers sub-system).
+*/
+#if !defined(SQLITE_OMIT_FOREIGN_KEY) && !defined(SQLITE_OMIT_TRIGGER)
+SQLITE_PRIVATE   void sqlite3FkCheck(Parse*, Table*, int, int, int*, int);
+SQLITE_PRIVATE   void sqlite3FkDropTable(Parse*, SrcList *, Table*);
+SQLITE_PRIVATE   void sqlite3FkActions(Parse*, Table*, ExprList*, int, int*, int);
+SQLITE_PRIVATE   int sqlite3FkRequired(Parse*, Table*, int*, int);
+SQLITE_PRIVATE   u32 sqlite3FkOldmask(Parse*, Table*);
+SQLITE_PRIVATE   FKey *sqlite3FkReferences(Table *);
+SQLITE_PRIVATE   void sqlite3FkClearTriggerCache(sqlite3*,int);
+#else
+  #define sqlite3FkActions(a,b,c,d
