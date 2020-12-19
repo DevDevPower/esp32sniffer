@@ -20766,4 +20766,216 @@ SQLITE_PRIVATE const char **sqlite3CompileOptions(int *pnOpt);
 /*
 ** 2004 May 22
 **
-** The author disclaims copyright to this
+** The author disclaims copyright to this source code.  In place of
+** a legal notice, here is a blessing:
+**
+**    May you do good and not evil.
+**    May you find forgiveness for yourself and forgive others.
+**    May you share freely, never taking more than you give.
+**
+******************************************************************************
+**
+** This file contains macros and a little bit of code that is common to
+** all of the platform-specific files (os_*.c) and is #included into those
+** files.
+**
+** This file should be #included by the os_*.c files only.  It is not a
+** general purpose header file.
+*/
+#ifndef _OS_COMMON_H_
+#define _OS_COMMON_H_
+
+/*
+** At least two bugs have slipped in because we changed the MEMORY_DEBUG
+** macro to SQLITE_DEBUG and some older makefiles have not yet made the
+** switch.  The following code should catch this problem at compile-time.
+*/
+#ifdef MEMORY_DEBUG
+# error "The MEMORY_DEBUG macro is obsolete.  Use SQLITE_DEBUG instead."
+#endif
+
+/*
+** Macros for performance tracing.  Normally turned off.  Only works
+** on i486 hardware.
+*/
+#ifdef SQLITE_PERFORMANCE_TRACE
+
+/*
+** hwtime.h contains inline assembler code for implementing
+** high-performance timing routines.
+*/
+/************** Include hwtime.h in the middle of os_common.h ****************/
+/************** Begin file hwtime.h ******************************************/
+/*
+** 2008 May 27
+**
+** The author disclaims copyright to this source code.  In place of
+** a legal notice, here is a blessing:
+**
+**    May you do good and not evil.
+**    May you find forgiveness for yourself and forgive others.
+**    May you share freely, never taking more than you give.
+**
+******************************************************************************
+**
+** This file contains inline asm code for retrieving "high-performance"
+** counters for x86 and x86_64 class CPUs.
+*/
+#ifndef SQLITE_HWTIME_H
+#define SQLITE_HWTIME_H
+
+/*
+** The following routine only works on pentium-class (or newer) processors.
+** It uses the RDTSC opcode to read the cycle count value out of the
+** processor and returns that value.  This can be used for high-res
+** profiling.
+*/
+#if !defined(__STRICT_ANSI__) && \
+    (defined(__GNUC__) || defined(_MSC_VER)) && \
+    (defined(i386) || defined(__i386__) || defined(_M_IX86))
+
+  #if defined(__GNUC__)
+
+  __inline__ sqlite_uint64 sqlite3Hwtime(void){
+     unsigned int lo, hi;
+     __asm__ __volatile__ ("rdtsc" : "=a" (lo), "=d" (hi));
+     return (sqlite_uint64)hi << 32 | lo;
+  }
+
+  #elif defined(_MSC_VER)
+
+  __declspec(naked) __inline sqlite_uint64 __cdecl sqlite3Hwtime(void){
+     __asm {
+        rdtsc
+        ret       ; return value at EDX:EAX
+     }
+  }
+
+  #endif
+
+#elif !defined(__STRICT_ANSI__) && (defined(__GNUC__) && defined(__x86_64__))
+
+  __inline__ sqlite_uint64 sqlite3Hwtime(void){
+      unsigned long val;
+      __asm__ __volatile__ ("rdtsc" : "=A" (val));
+      return val;
+  }
+
+#elif !defined(__STRICT_ANSI__) && (defined(__GNUC__) && defined(__ppc__))
+
+  __inline__ sqlite_uint64 sqlite3Hwtime(void){
+      unsigned long long retval;
+      unsigned long junk;
+      __asm__ __volatile__ ("\n\
+          1:      mftbu   %1\n\
+                  mftb    %L0\n\
+                  mftbu   %0\n\
+                  cmpw    %0,%1\n\
+                  bne     1b"
+                  : "=r" (retval), "=r" (junk));
+      return retval;
+  }
+
+#else
+
+  /*
+  ** asm() is needed for hardware timing support.  Without asm(),
+  ** disable the sqlite3Hwtime() routine.
+  **
+  ** sqlite3Hwtime() is only used for some obscure debugging
+  ** and analysis configurations, not in any deliverable, so this
+  ** should not be a great loss.
+  */
+SQLITE_PRIVATE   sqlite_uint64 sqlite3Hwtime(void){ return ((sqlite_uint64)0); }
+
+#endif
+
+#endif /* !defined(SQLITE_HWTIME_H) */
+
+/************** End of hwtime.h **********************************************/
+/************** Continuing where we left off in os_common.h ******************/
+
+static sqlite_uint64 g_start;
+static sqlite_uint64 g_elapsed;
+#define TIMER_START       g_start=sqlite3Hwtime()
+#define TIMER_END         g_elapsed=sqlite3Hwtime()-g_start
+#define TIMER_ELAPSED     g_elapsed
+#else
+#define TIMER_START
+#define TIMER_END
+#define TIMER_ELAPSED     ((sqlite_uint64)0)
+#endif
+
+/*
+** If we compile with the SQLITE_TEST macro set, then the following block
+** of code will give us the ability to simulate a disk I/O error.  This
+** is used for testing the I/O recovery logic.
+*/
+#if defined(SQLITE_TEST)
+SQLITE_API extern int sqlite3_io_error_hit;
+SQLITE_API extern int sqlite3_io_error_hardhit;
+SQLITE_API extern int sqlite3_io_error_pending;
+SQLITE_API extern int sqlite3_io_error_persist;
+SQLITE_API extern int sqlite3_io_error_benign;
+SQLITE_API extern int sqlite3_diskfull_pending;
+SQLITE_API extern int sqlite3_diskfull;
+#define SimulateIOErrorBenign(X) sqlite3_io_error_benign=(X)
+#define SimulateIOError(CODE)  \
+  if( (sqlite3_io_error_persist && sqlite3_io_error_hit) \
+       || sqlite3_io_error_pending-- == 1 )  \
+              { local_ioerr(); CODE; }
+static void local_ioerr(){
+  IOTRACE(("IOERR\n"));
+  sqlite3_io_error_hit++;
+  if( !sqlite3_io_error_benign ) sqlite3_io_error_hardhit++;
+}
+#define SimulateDiskfullError(CODE) \
+   if( sqlite3_diskfull_pending ){ \
+     if( sqlite3_diskfull_pending == 1 ){ \
+       local_ioerr(); \
+       sqlite3_diskfull = 1; \
+       sqlite3_io_error_hit = 1; \
+       CODE; \
+     }else{ \
+       sqlite3_diskfull_pending--; \
+     } \
+   }
+#else
+#define SimulateIOErrorBenign(X)
+#define SimulateIOError(A)
+#define SimulateDiskfullError(A)
+#endif /* defined(SQLITE_TEST) */
+
+/*
+** When testing, keep a count of the number of open files.
+*/
+#if defined(SQLITE_TEST)
+SQLITE_API extern int sqlite3_open_file_count;
+#define OpenCounter(X)  sqlite3_open_file_count+=(X)
+#else
+#define OpenCounter(X)
+#endif /* defined(SQLITE_TEST) */
+
+#endif /* !defined(_OS_COMMON_H_) */
+
+/************** End of os_common.h *******************************************/
+/************** Begin file ctime.c *******************************************/
+/* DO NOT EDIT!
+** This file is automatically generated by the script in the canonical
+** SQLite source tree at tool/mkctimec.tcl.
+**
+** To modify this header, edit any of the various lists in that script
+** which specify categories of generated conditionals in this file.
+*/
+
+/*
+** 2010 February 23
+**
+** The author disclaims copyright to this source code.  In place of
+** a legal notice, here is a blessing:
+**
+**    May you do good and not evil.
+**    May you find forgiveness for yourself and forgive others.
+**    May you share freely, never taking more than you give.
+**
+************
