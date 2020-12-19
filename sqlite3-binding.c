@@ -21489,4 +21489,294 @@ static const char * const sqlite3azCompileOpt[] = {
 #endif
 #ifdef SQLITE_OMIT_CAST
   "OMIT_CAST",
-#en
+#endif
+#ifdef SQLITE_OMIT_CHECK
+  "OMIT_CHECK",
+#endif
+#ifdef SQLITE_OMIT_COMPLETE
+  "OMIT_COMPLETE",
+#endif
+#ifdef SQLITE_OMIT_COMPOUND_SELECT
+  "OMIT_COMPOUND_SELECT",
+#endif
+#ifdef SQLITE_OMIT_CONFLICT_CLAUSE
+  "OMIT_CONFLICT_CLAUSE",
+#endif
+#ifdef SQLITE_OMIT_CTE
+  "OMIT_CTE",
+#endif
+#if defined(SQLITE_OMIT_DATETIME_FUNCS) || defined(SQLITE_OMIT_FLOATING_POINT)
+  "OMIT_DATETIME_FUNCS",
+#endif
+#ifdef SQLITE_OMIT_DECLTYPE
+  "OMIT_DECLTYPE",
+#endif
+#ifdef SQLITE_OMIT_DEPRECATED
+  "OMIT_DEPRECATED",
+#endif
+#ifdef SQLITE_OMIT_DESERIALIZE
+  "OMIT_DESERIALIZE",
+#endif
+#ifdef SQLITE_OMIT_DISKIO
+  "OMIT_DISKIO",
+#endif
+#ifdef SQLITE_OMIT_EXPLAIN
+  "OMIT_EXPLAIN",
+#endif
+#ifdef SQLITE_OMIT_FLAG_PRAGMAS
+  "OMIT_FLAG_PRAGMAS",
+#endif
+#ifdef SQLITE_OMIT_FLOATING_POINT
+  "OMIT_FLOATING_POINT",
+#endif
+#ifdef SQLITE_OMIT_FOREIGN_KEY
+  "OMIT_FOREIGN_KEY",
+#endif
+#ifdef SQLITE_OMIT_GET_TABLE
+  "OMIT_GET_TABLE",
+#endif
+#ifdef SQLITE_OMIT_HEX_INTEGER
+  "OMIT_HEX_INTEGER",
+#endif
+#ifdef SQLITE_OMIT_INCRBLOB
+  "OMIT_INCRBLOB",
+#endif
+#ifdef SQLITE_OMIT_INTEGRITY_CHECK
+  "OMIT_INTEGRITY_CHECK",
+#endif
+#ifdef SQLITE_OMIT_INTROSPECTION_PRAGMAS
+  "OMIT_INTROSPECTION_PRAGMAS",
+#endif
+#ifdef SQLITE_OMIT_JSON
+  "OMIT_JSON",
+#endif
+#ifdef SQLITE_OMIT_LIKE_OPTIMIZATION
+  "OMIT_LIKE_OPTIMIZATION",
+#endif
+#ifdef SQLITE_OMIT_LOAD_EXTENSION
+  "OMIT_LOAD_EXTENSION",
+#endif
+#ifdef SQLITE_OMIT_LOCALTIME
+  "OMIT_LOCALTIME",
+#endif
+#ifdef SQLITE_OMIT_LOOKASIDE
+  "OMIT_LOOKASIDE",
+#endif
+#ifdef SQLITE_OMIT_MEMORYDB
+  "OMIT_MEMORYDB",
+#endif
+#ifdef SQLITE_OMIT_OR_OPTIMIZATION
+  "OMIT_OR_OPTIMIZATION",
+#endif
+#ifdef SQLITE_OMIT_PAGER_PRAGMAS
+  "OMIT_PAGER_PRAGMAS",
+#endif
+#ifdef SQLITE_OMIT_PARSER_TRACE
+  "OMIT_PARSER_TRACE",
+#endif
+#ifdef SQLITE_OMIT_POPEN
+  "OMIT_POPEN",
+#endif
+#ifdef SQLITE_OMIT_PRAGMA
+  "OMIT_PRAGMA",
+#endif
+#ifdef SQLITE_OMIT_PROGRESS_CALLBACK
+  "OMIT_PROGRESS_CALLBACK",
+#endif
+#ifdef SQLITE_OMIT_QUICKBALANCE
+  "OMIT_QUICKBALANCE",
+#endif
+#ifdef SQLITE_OMIT_REINDEX
+  "OMIT_REINDEX",
+#endif
+#ifdef SQLITE_OMIT_SCHEMA_PRAGMAS
+  "OMIT_SCHEMA_PRAGMAS",
+#endif
+#ifdef SQLITE_OMIT_SCHEMA_VERSION_PRAGMAS
+  "OMIT_SCHEMA_VERSION_PRAGMAS",
+#endif
+#ifdef SQLITE_OMIT_SHARED_CACHE
+  "OMIT_SHARED_CACHE",
+#endif
+#ifdef SQLITE_OMIT_SHUTDOWN_DIRECTORIES
+  "OMIT_SHUTDOWN_DIRECTORIES",
+#endif
+#ifdef SQLITE_OMIT_SUBQUERY
+  "OMIT_SUBQUERY",
+#endif
+#ifdef SQLITE_OMIT_TCL_VARIABLE
+  "OMIT_TCL_VARIABLE",
+#endif
+#ifdef SQLITE_OMIT_TEMPDB
+  "OMIT_TEMPDB",
+#endif
+#ifdef SQLITE_OMIT_TEST_CONTROL
+  "OMIT_TEST_CONTROL",
+#endif
+#ifdef SQLITE_OMIT_TRACE
+# if SQLITE_OMIT_TRACE != 1
+  "OMIT_TRACE=" CTIMEOPT_VAL(SQLITE_OMIT_TRACE),
+# endif
+#endif
+#ifdef SQLITE_OMIT_TRIGGER
+  "OMIT_TRIGGER",
+#endif
+#ifdef SQLITE_OMIT_TRUNCATE_OPTIMIZATION
+  "OMIT_TRUNCATE_OPTIMIZATION",
+#endif
+#ifdef SQLITE_OMIT_UTF16
+  "OMIT_UTF16",
+#endif
+#ifdef SQLITE_OMIT_VACUUM
+  "OMIT_VACUUM",
+#endif
+#ifdef SQLITE_OMIT_VIEW
+  "OMIT_VIEW",
+#endif
+#ifdef SQLITE_OMIT_VIRTUALTABLE
+  "OMIT_VIRTUALTABLE",
+#endif
+#ifdef SQLITE_OMIT_WAL
+  "OMIT_WAL",
+#endif
+#ifdef SQLITE_OMIT_WSD
+  "OMIT_WSD",
+#endif
+#ifdef SQLITE_OMIT_XFER_OPT
+  "OMIT_XFER_OPT",
+#endif
+#ifdef SQLITE_PCACHE_SEPARATE_HEADER
+  "PCACHE_SEPARATE_HEADER",
+#endif
+#ifdef SQLITE_PERFORMANCE_TRACE
+  "PERFORMANCE_TRACE",
+#endif
+#ifdef SQLITE_POWERSAFE_OVERWRITE
+# if SQLITE_POWERSAFE_OVERWRITE != 1
+  "POWERSAFE_OVERWRITE=" CTIMEOPT_VAL(SQLITE_POWERSAFE_OVERWRITE),
+# endif
+#endif
+#ifdef SQLITE_PREFER_PROXY_LOCKING
+  "PREFER_PROXY_LOCKING",
+#endif
+#ifdef SQLITE_PROXY_DEBUG
+  "PROXY_DEBUG",
+#endif
+#ifdef SQLITE_REVERSE_UNORDERED_SELECTS
+  "REVERSE_UNORDERED_SELECTS",
+#endif
+#ifdef SQLITE_RTREE_INT_ONLY
+  "RTREE_INT_ONLY",
+#endif
+#ifdef SQLITE_SECURE_DELETE
+  "SECURE_DELETE",
+#endif
+#ifdef SQLITE_SMALL_STACK
+  "SMALL_STACK",
+#endif
+#ifdef SQLITE_SORTER_PMASZ
+  "SORTER_PMASZ=" CTIMEOPT_VAL(SQLITE_SORTER_PMASZ),
+#endif
+#ifdef SQLITE_SOUNDEX
+  "SOUNDEX",
+#endif
+#ifdef SQLITE_STAT4_SAMPLES
+  "STAT4_SAMPLES=" CTIMEOPT_VAL(SQLITE_STAT4_SAMPLES),
+#endif
+#ifdef SQLITE_STMTJRNL_SPILL
+  "STMTJRNL_SPILL=" CTIMEOPT_VAL(SQLITE_STMTJRNL_SPILL),
+#endif
+#ifdef SQLITE_SUBSTR_COMPATIBILITY
+  "SUBSTR_COMPATIBILITY",
+#endif
+#if (!defined(SQLITE_WIN32_MALLOC) \
+     && !defined(SQLITE_ZERO_MALLOC) \
+     && !defined(SQLITE_MEMDEBUG) \
+    ) || defined(SQLITE_SYSTEM_MALLOC)
+  "SYSTEM_MALLOC",
+#endif
+#ifdef SQLITE_TCL
+  "TCL",
+#endif
+#ifdef SQLITE_TEMP_STORE
+  "TEMP_STORE=" CTIMEOPT_VAL(SQLITE_TEMP_STORE),
+#endif
+#ifdef SQLITE_TEST
+  "TEST",
+#endif
+#if defined(SQLITE_THREADSAFE)
+  "THREADSAFE=" CTIMEOPT_VAL(SQLITE_THREADSAFE),
+#elif defined(THREADSAFE)
+  "THREADSAFE=" CTIMEOPT_VAL(THREADSAFE),
+#else
+  "THREADSAFE=1",
+#endif
+#ifdef SQLITE_UNLINK_AFTER_CLOSE
+  "UNLINK_AFTER_CLOSE",
+#endif
+#ifdef SQLITE_UNTESTABLE
+  "UNTESTABLE",
+#endif
+#ifdef SQLITE_USER_AUTHENTICATION
+  "USER_AUTHENTICATION",
+#endif
+#ifdef SQLITE_USE_ALLOCA
+  "USE_ALLOCA",
+#endif
+#ifdef SQLITE_USE_FCNTL_TRACE
+  "USE_FCNTL_TRACE",
+#endif
+#ifdef SQLITE_USE_URI
+  "USE_URI",
+#endif
+#ifdef SQLITE_VDBE_COVERAGE
+  "VDBE_COVERAGE",
+#endif
+#ifdef SQLITE_WIN32_MALLOC
+  "WIN32_MALLOC",
+#endif
+#ifdef SQLITE_ZERO_MALLOC
+  "ZERO_MALLOC",
+#endif
+
+} ;
+
+SQLITE_PRIVATE const char **sqlite3CompileOptions(int *pnOpt){
+  *pnOpt = sizeof(sqlite3azCompileOpt) / sizeof(sqlite3azCompileOpt[0]);
+  return (const char**)sqlite3azCompileOpt;
+}
+
+#endif /* SQLITE_OMIT_COMPILEOPTION_DIAGS */
+
+/************** End of ctime.c ***********************************************/
+/************** Begin file global.c ******************************************/
+/*
+** 2008 June 13
+**
+** The author disclaims copyright to this source code.  In place of
+** a legal notice, here is a blessing:
+**
+**    May you do good and not evil.
+**    May you find forgiveness for yourself and forgive others.
+**    May you share freely, never taking more than you give.
+**
+*************************************************************************
+**
+** This file contains definitions of global variables and constants.
+*/
+/* #include "sqliteInt.h" */
+
+/* An array to map all upper-case characters into their corresponding
+** lower-case character.
+**
+** SQLite only considers US-ASCII (or EBCDIC) characters.  We do not
+** handle case conversions for the UTF character set since the tables
+** involved are nearly as big or bigger than SQLite itself.
+*/
+SQLITE_PRIVATE const unsigned char sqlite3UpperToLower[] = {
+#ifdef SQLITE_ASCII
+      0,  1,  2,  3,  4,  5,  6,  7,  8,  9, 10, 11, 12, 13, 14, 15, 16, 17,
+     18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35,
+     36, 37, 38, 39, 40, 41, 42, 43, 44, 45, 46, 47, 48, 49, 50, 51, 52, 53,
+     54, 55, 56, 57, 58, 59, 60, 61, 62, 63, 64, 97, 98, 99,100,101,102,103,
+    104,105,106,107,108,109,110,111,112,113,114,115,116,11
