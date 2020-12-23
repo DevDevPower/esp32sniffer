@@ -22265,4 +22265,134 @@ struct VdbeCursor {
 #endif
   Bool isEphemeral:1;     /* True for an ephemeral table */
   Bool useRandomRowid:1;  /* Generate new record numbers semi-randomly */
-  Bool isOrder
+  Bool isOrdered:1;       /* True if the table is not BTREE_UNORDERED */
+  Bool noReuse:1;         /* OpenEphemeral may not reuse this cursor */
+  u16 seekHit;            /* See the OP_SeekHit and OP_IfNoHope opcodes */
+  union {                 /* pBtx for isEphermeral.  pAltMap otherwise */
+    Btree *pBtx;            /* Separate file holding temporary table */
+    u32 *aAltMap;           /* Mapping from table to index column numbers */
+  } ub;
+  i64 seqCount;           /* Sequence counter */
+
+  /* Cached OP_Column parse information is only valid if cacheStatus matches
+  ** Vdbe.cacheCtr.  Vdbe.cacheCtr will never take on the value of
+  ** CACHE_STALE (0) and so setting cacheStatus=CACHE_STALE guarantees that
+  ** the cache is out of date. */
+  u32 cacheStatus;        /* Cache is valid if this matches Vdbe.cacheCtr */
+  int seekResult;         /* Result of previous sqlite3BtreeMoveto() or 0
+                          ** if there have been no prior seeks on the cursor. */
+  /* seekResult does not distinguish between "no seeks have ever occurred
+  ** on this cursor" and "the most recent seek was an exact match".
+  ** For CURTYPE_PSEUDO, seekResult is the register holding the record */
+
+  /* When a new VdbeCursor is allocated, only the fields above are zeroed.
+  ** The fields that follow are uninitialized, and must be individually
+  ** initialized prior to first use. */
+  VdbeCursor *pAltCursor; /* Associated index cursor from which to read */
+  union {
+    BtCursor *pCursor;          /* CURTYPE_BTREE or _PSEUDO.  Btree cursor */
+    sqlite3_vtab_cursor *pVCur; /* CURTYPE_VTAB.              Vtab cursor */
+    VdbeSorter *pSorter;        /* CURTYPE_SORTER.            Sorter object */
+  } uc;
+  KeyInfo *pKeyInfo;      /* Info about index keys needed by index cursors */
+  u32 iHdrOffset;         /* Offset to next unparsed byte of the header */
+  Pgno pgnoRoot;          /* Root page of the open btree cursor */
+  i16 nField;             /* Number of fields in the header */
+  u16 nHdrParsed;         /* Number of header fields parsed so far */
+  i64 movetoTarget;       /* Argument to the deferred sqlite3BtreeMoveto() */
+  u32 *aOffset;           /* Pointer to aType[nField] */
+  const u8 *aRow;         /* Data for the current row, if all on one page */
+  u32 payloadSize;        /* Total number of bytes in the record */
+  u32 szRow;              /* Byte available in aRow */
+#ifdef SQLITE_ENABLE_COLUMN_USED_MASK
+  u64 maskUsed;           /* Mask of columns used by this cursor */
+#endif
+
+  /* 2*nField extra array elements allocated for aType[], beyond the one
+  ** static element declared in the structure.  nField total array slots for
+  ** aType[] and nField+1 array slots for aOffset[] */
+  u32 aType[1];           /* Type values record decode.  MUST BE LAST */
+};
+
+/* Return true if P is a null-only cursor
+*/
+#define IsNullCursor(P) \
+  ((P)->eCurType==CURTYPE_PSEUDO && (P)->nullRow && (P)->seekResult==0)
+
+
+/*
+** A value for VdbeCursor.cacheStatus that means the cache is always invalid.
+*/
+#define CACHE_STALE 0
+
+/*
+** When a sub-program is executed (OP_Program), a structure of this type
+** is allocated to store the current value of the program counter, as
+** well as the current memory cell array and various other frame specific
+** values stored in the Vdbe struct. When the sub-program is finished,
+** these values are copied back to the Vdbe from the VdbeFrame structure,
+** restoring the state of the VM to as it was before the sub-program
+** began executing.
+**
+** The memory for a VdbeFrame object is allocated and managed by a memory
+** cell in the parent (calling) frame. When the memory cell is deleted or
+** overwritten, the VdbeFrame object is not freed immediately. Instead, it
+** is linked into the Vdbe.pDelFrame list. The contents of the Vdbe.pDelFrame
+** list is deleted when the VM is reset in VdbeHalt(). The reason for doing
+** this instead of deleting the VdbeFrame immediately is to avoid recursive
+** calls to sqlite3VdbeMemRelease() when the memory cells belonging to the
+** child frame are released.
+**
+** The currently executing frame is stored in Vdbe.pFrame. Vdbe.pFrame is
+** set to NULL if the currently executing frame is the main program.
+*/
+typedef struct VdbeFrame VdbeFrame;
+struct VdbeFrame {
+  Vdbe *v;                /* VM this frame belongs to */
+  VdbeFrame *pParent;     /* Parent of this frame, or NULL if parent is main */
+  Op *aOp;                /* Program instructions for parent frame */
+  i64 *anExec;            /* Event counters from parent frame */
+  Mem *aMem;              /* Array of memory cells for parent frame */
+  VdbeCursor **apCsr;     /* Array of Vdbe cursors for parent frame */
+  u8 *aOnce;              /* Bitmask used by OP_Once */
+  void *token;            /* Copy of SubProgram.token */
+  i64 lastRowid;          /* Last insert rowid (sqlite3.lastRowid) */
+  AuxData *pAuxData;      /* Linked list of auxdata allocations */
+#if SQLITE_DEBUG
+  u32 iFrameMagic;        /* magic number for sanity checking */
+#endif
+  int nCursor;            /* Number of entries in apCsr */
+  int pc;                 /* Program Counter in parent (calling) frame */
+  int nOp;                /* Size of aOp array */
+  int nMem;               /* Number of entries in aMem */
+  int nChildMem;          /* Number of memory cells for child frame */
+  int nChildCsr;          /* Number of cursors for child frame */
+  i64 nChange;            /* Statement changes (Vdbe.nChange)     */
+  i64 nDbChange;          /* Value of db->nChange */
+};
+
+/* Magic number for sanity checking on VdbeFrame objects */
+#define SQLITE_FRAME_MAGIC 0x879fb71e
+
+/*
+** Return a pointer to the array of registers allocated for use
+** by a VdbeFrame.
+*/
+#define VdbeFrameMem(p) ((Mem *)&((u8 *)p)[ROUND8(sizeof(VdbeFrame))])
+
+/*
+** Internally, the vdbe manipulates nearly all SQL values as Mem
+** structures. Each Mem struct may cache multiple representations (string,
+** integer etc.) of the same value.
+*/
+struct sqlite3_value {
+  union MemValue {
+    double r;           /* Real value used when MEM_Real is set in flags */
+    i64 i;              /* Integer value used when MEM_Int is set in flags */
+    int nZero;          /* Extra zero bytes when MEM_Zero and MEM_Blob set */
+    const char *zPType; /* Pointer type when MEM_Term|MEM_Subtype|MEM_Null */
+    FuncDef *pDef;      /* Used only when flags==MEM_Agg */
+  } u;
+  char *z;            /* String or BLOB value */
+  int n;              /* Number of characters in string value, excluding '\0' */
+  
