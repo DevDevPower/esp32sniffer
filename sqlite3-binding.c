@@ -23015,4 +23015,213 @@ SQLITE_API int sqlite3_status64(
   pMutex = statMutex[op] ? sqlite3Pcache1Mutex() : sqlite3MallocMutex();
   sqlite3_mutex_enter(pMutex);
   *pCurrent = wsdStat.nowValue[op];
-  *pHighwater = wsdStat.mxV
+  *pHighwater = wsdStat.mxValue[op];
+  if( resetFlag ){
+    wsdStat.mxValue[op] = wsdStat.nowValue[op];
+  }
+  sqlite3_mutex_leave(pMutex);
+  (void)pMutex;  /* Prevent warning when SQLITE_THREADSAFE=0 */
+  return SQLITE_OK;
+}
+SQLITE_API int sqlite3_status(int op, int *pCurrent, int *pHighwater, int resetFlag){
+  sqlite3_int64 iCur = 0, iHwtr = 0;
+  int rc;
+#ifdef SQLITE_ENABLE_API_ARMOR
+  if( pCurrent==0 || pHighwater==0 ) return SQLITE_MISUSE_BKPT;
+#endif
+  rc = sqlite3_status64(op, &iCur, &iHwtr, resetFlag);
+  if( rc==0 ){
+    *pCurrent = (int)iCur;
+    *pHighwater = (int)iHwtr;
+  }
+  return rc;
+}
+
+/*
+** Return the number of LookasideSlot elements on the linked list
+*/
+static u32 countLookasideSlots(LookasideSlot *p){
+  u32 cnt = 0;
+  while( p ){
+    p = p->pNext;
+    cnt++;
+  }
+  return cnt;
+}
+
+/*
+** Count the number of slots of lookaside memory that are outstanding
+*/
+SQLITE_PRIVATE int sqlite3LookasideUsed(sqlite3 *db, int *pHighwater){
+  u32 nInit = countLookasideSlots(db->lookaside.pInit);
+  u32 nFree = countLookasideSlots(db->lookaside.pFree);
+#ifndef SQLITE_OMIT_TWOSIZE_LOOKASIDE
+  nInit += countLookasideSlots(db->lookaside.pSmallInit);
+  nFree += countLookasideSlots(db->lookaside.pSmallFree);
+#endif /* SQLITE_OMIT_TWOSIZE_LOOKASIDE */
+  if( pHighwater ) *pHighwater = db->lookaside.nSlot - nInit;
+  return db->lookaside.nSlot - (nInit+nFree);
+}
+
+/*
+** Query status information for a single database connection
+*/
+SQLITE_API int sqlite3_db_status(
+  sqlite3 *db,          /* The database connection whose status is desired */
+  int op,               /* Status verb */
+  int *pCurrent,        /* Write current value here */
+  int *pHighwater,      /* Write high-water mark here */
+  int resetFlag         /* Reset high-water mark if true */
+){
+  int rc = SQLITE_OK;   /* Return code */
+#ifdef SQLITE_ENABLE_API_ARMOR
+  if( !sqlite3SafetyCheckOk(db) || pCurrent==0|| pHighwater==0 ){
+    return SQLITE_MISUSE_BKPT;
+  }
+#endif
+  sqlite3_mutex_enter(db->mutex);
+  switch( op ){
+    case SQLITE_DBSTATUS_LOOKASIDE_USED: {
+      *pCurrent = sqlite3LookasideUsed(db, pHighwater);
+      if( resetFlag ){
+        LookasideSlot *p = db->lookaside.pFree;
+        if( p ){
+          while( p->pNext ) p = p->pNext;
+          p->pNext = db->lookaside.pInit;
+          db->lookaside.pInit = db->lookaside.pFree;
+          db->lookaside.pFree = 0;
+        }
+#ifndef SQLITE_OMIT_TWOSIZE_LOOKASIDE
+        p = db->lookaside.pSmallFree;
+        if( p ){
+          while( p->pNext ) p = p->pNext;
+          p->pNext = db->lookaside.pSmallInit;
+          db->lookaside.pSmallInit = db->lookaside.pSmallFree;
+          db->lookaside.pSmallFree = 0;
+        }
+#endif
+      }
+      break;
+    }
+
+    case SQLITE_DBSTATUS_LOOKASIDE_HIT:
+    case SQLITE_DBSTATUS_LOOKASIDE_MISS_SIZE:
+    case SQLITE_DBSTATUS_LOOKASIDE_MISS_FULL: {
+      testcase( op==SQLITE_DBSTATUS_LOOKASIDE_HIT );
+      testcase( op==SQLITE_DBSTATUS_LOOKASIDE_MISS_SIZE );
+      testcase( op==SQLITE_DBSTATUS_LOOKASIDE_MISS_FULL );
+      assert( (op-SQLITE_DBSTATUS_LOOKASIDE_HIT)>=0 );
+      assert( (op-SQLITE_DBSTATUS_LOOKASIDE_HIT)<3 );
+      *pCurrent = 0;
+      *pHighwater = db->lookaside.anStat[op - SQLITE_DBSTATUS_LOOKASIDE_HIT];
+      if( resetFlag ){
+        db->lookaside.anStat[op - SQLITE_DBSTATUS_LOOKASIDE_HIT] = 0;
+      }
+      break;
+    }
+
+    /*
+    ** Return an approximation for the amount of memory currently used
+    ** by all pagers associated with the given database connection.  The
+    ** highwater mark is meaningless and is returned as zero.
+    */
+    case SQLITE_DBSTATUS_CACHE_USED_SHARED:
+    case SQLITE_DBSTATUS_CACHE_USED: {
+      int totalUsed = 0;
+      int i;
+      sqlite3BtreeEnterAll(db);
+      for(i=0; i<db->nDb; i++){
+        Btree *pBt = db->aDb[i].pBt;
+        if( pBt ){
+          Pager *pPager = sqlite3BtreePager(pBt);
+          int nByte = sqlite3PagerMemUsed(pPager);
+          if( op==SQLITE_DBSTATUS_CACHE_USED_SHARED ){
+            nByte = nByte / sqlite3BtreeConnectionCount(pBt);
+          }
+          totalUsed += nByte;
+        }
+      }
+      sqlite3BtreeLeaveAll(db);
+      *pCurrent = totalUsed;
+      *pHighwater = 0;
+      break;
+    }
+
+    /*
+    ** *pCurrent gets an accurate estimate of the amount of memory used
+    ** to store the schema for all databases (main, temp, and any ATTACHed
+    ** databases.  *pHighwater is set to zero.
+    */
+    case SQLITE_DBSTATUS_SCHEMA_USED: {
+      int i;                      /* Used to iterate through schemas */
+      int nByte = 0;              /* Used to accumulate return value */
+
+      sqlite3BtreeEnterAll(db);
+      db->pnBytesFreed = &nByte;
+      for(i=0; i<db->nDb; i++){
+        Schema *pSchema = db->aDb[i].pSchema;
+        if( ALWAYS(pSchema!=0) ){
+          HashElem *p;
+
+          nByte += sqlite3GlobalConfig.m.xRoundup(sizeof(HashElem)) * (
+              pSchema->tblHash.count
+            + pSchema->trigHash.count
+            + pSchema->idxHash.count
+            + pSchema->fkeyHash.count
+          );
+          nByte += sqlite3_msize(pSchema->tblHash.ht);
+          nByte += sqlite3_msize(pSchema->trigHash.ht);
+          nByte += sqlite3_msize(pSchema->idxHash.ht);
+          nByte += sqlite3_msize(pSchema->fkeyHash.ht);
+
+          for(p=sqliteHashFirst(&pSchema->trigHash); p; p=sqliteHashNext(p)){
+            sqlite3DeleteTrigger(db, (Trigger*)sqliteHashData(p));
+          }
+          for(p=sqliteHashFirst(&pSchema->tblHash); p; p=sqliteHashNext(p)){
+            sqlite3DeleteTable(db, (Table *)sqliteHashData(p));
+          }
+        }
+      }
+      db->pnBytesFreed = 0;
+      sqlite3BtreeLeaveAll(db);
+
+      *pHighwater = 0;
+      *pCurrent = nByte;
+      break;
+    }
+
+    /*
+    ** *pCurrent gets an accurate estimate of the amount of memory used
+    ** to store all prepared statements.
+    ** *pHighwater is set to zero.
+    */
+    case SQLITE_DBSTATUS_STMT_USED: {
+      struct Vdbe *pVdbe;         /* Used to iterate through VMs */
+      int nByte = 0;              /* Used to accumulate return value */
+
+      db->pnBytesFreed = &nByte;
+      for(pVdbe=db->pVdbe; pVdbe; pVdbe=pVdbe->pNext){
+        sqlite3VdbeDelete(pVdbe);
+      }
+      db->pnBytesFreed = 0;
+
+      *pHighwater = 0;  /* IMP: R-64479-57858 */
+      *pCurrent = nByte;
+
+      break;
+    }
+
+    /*
+    ** Set *pCurrent to the total cache hits or misses encountered by all
+    ** pagers the database handle is connected to. *pHighwater is always set
+    ** to zero.
+    */
+    case SQLITE_DBSTATUS_CACHE_SPILL:
+      op = SQLITE_DBSTATUS_CACHE_WRITE+1;
+      /* no break */ deliberate_fall_through
+    case SQLITE_DBSTATUS_CACHE_HIT:
+    case SQLITE_DBSTATUS_CACHE_MISS:
+    case SQLITE_DBSTATUS_CACHE_WRITE:{
+      int i;
+      int nRet = 0;
+      assert( SQLITE_DBSTATUS_CACHE
