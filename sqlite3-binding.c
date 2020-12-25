@@ -22821,4 +22821,198 @@ SQLITE_PRIVATE void sqlite3VdbePreUpdateHook(
 #endif
 SQLITE_PRIVATE int sqlite3VdbeTransferError(Vdbe *p);
 
-SQLITE_PRIVATE int sqlite3VdbeSorterInit(sqlite3 *,
+SQLITE_PRIVATE int sqlite3VdbeSorterInit(sqlite3 *, int, VdbeCursor *);
+SQLITE_PRIVATE void sqlite3VdbeSorterReset(sqlite3 *, VdbeSorter *);
+SQLITE_PRIVATE void sqlite3VdbeSorterClose(sqlite3 *, VdbeCursor *);
+SQLITE_PRIVATE int sqlite3VdbeSorterRowkey(const VdbeCursor *, Mem *);
+SQLITE_PRIVATE int sqlite3VdbeSorterNext(sqlite3 *, const VdbeCursor *);
+SQLITE_PRIVATE int sqlite3VdbeSorterRewind(const VdbeCursor *, int *);
+SQLITE_PRIVATE int sqlite3VdbeSorterWrite(const VdbeCursor *, Mem *);
+SQLITE_PRIVATE int sqlite3VdbeSorterCompare(const VdbeCursor *, Mem *, int, int *);
+
+#ifdef SQLITE_DEBUG
+SQLITE_PRIVATE   void sqlite3VdbeIncrWriteCounter(Vdbe*, VdbeCursor*);
+SQLITE_PRIVATE   void sqlite3VdbeAssertAbortable(Vdbe*);
+#else
+# define sqlite3VdbeIncrWriteCounter(V,C)
+# define sqlite3VdbeAssertAbortable(V)
+#endif
+
+#if !defined(SQLITE_OMIT_SHARED_CACHE)
+SQLITE_PRIVATE   void sqlite3VdbeEnter(Vdbe*);
+#else
+# define sqlite3VdbeEnter(X)
+#endif
+
+#if !defined(SQLITE_OMIT_SHARED_CACHE) && SQLITE_THREADSAFE>0
+SQLITE_PRIVATE   void sqlite3VdbeLeave(Vdbe*);
+#else
+# define sqlite3VdbeLeave(X)
+#endif
+
+#ifdef SQLITE_DEBUG
+SQLITE_PRIVATE void sqlite3VdbeMemAboutToChange(Vdbe*,Mem*);
+SQLITE_PRIVATE int sqlite3VdbeCheckMemInvariants(Mem*);
+#endif
+
+#ifndef SQLITE_OMIT_FOREIGN_KEY
+SQLITE_PRIVATE int sqlite3VdbeCheckFk(Vdbe *, int);
+#else
+# define sqlite3VdbeCheckFk(p,i) 0
+#endif
+
+#ifdef SQLITE_DEBUG
+SQLITE_PRIVATE   void sqlite3VdbePrintSql(Vdbe*);
+SQLITE_PRIVATE   void sqlite3VdbeMemPrettyPrint(Mem *pMem, StrAccum *pStr);
+#endif
+#ifndef SQLITE_OMIT_UTF16
+SQLITE_PRIVATE   int sqlite3VdbeMemTranslate(Mem*, u8);
+SQLITE_PRIVATE   int sqlite3VdbeMemHandleBom(Mem *pMem);
+#endif
+
+#ifndef SQLITE_OMIT_INCRBLOB
+SQLITE_PRIVATE   int sqlite3VdbeMemExpandBlob(Mem *);
+  #define ExpandBlob(P) (((P)->flags&MEM_Zero)?sqlite3VdbeMemExpandBlob(P):0)
+#else
+  #define sqlite3VdbeMemExpandBlob(x) SQLITE_OK
+  #define ExpandBlob(P) SQLITE_OK
+#endif
+
+#endif /* !defined(SQLITE_VDBEINT_H) */
+
+/************** End of vdbeInt.h *********************************************/
+/************** Continuing where we left off in status.c *********************/
+
+/*
+** Variables in which to record status information.
+*/
+#if SQLITE_PTRSIZE>4
+typedef sqlite3_int64 sqlite3StatValueType;
+#else
+typedef u32 sqlite3StatValueType;
+#endif
+typedef struct sqlite3StatType sqlite3StatType;
+static SQLITE_WSD struct sqlite3StatType {
+  sqlite3StatValueType nowValue[10];  /* Current value */
+  sqlite3StatValueType mxValue[10];   /* Maximum value */
+} sqlite3Stat = { {0,}, {0,} };
+
+/*
+** Elements of sqlite3Stat[] are protected by either the memory allocator
+** mutex, or by the pcache1 mutex.  The following array determines which.
+*/
+static const char statMutex[] = {
+  0,  /* SQLITE_STATUS_MEMORY_USED */
+  1,  /* SQLITE_STATUS_PAGECACHE_USED */
+  1,  /* SQLITE_STATUS_PAGECACHE_OVERFLOW */
+  0,  /* SQLITE_STATUS_SCRATCH_USED */
+  0,  /* SQLITE_STATUS_SCRATCH_OVERFLOW */
+  0,  /* SQLITE_STATUS_MALLOC_SIZE */
+  0,  /* SQLITE_STATUS_PARSER_STACK */
+  1,  /* SQLITE_STATUS_PAGECACHE_SIZE */
+  0,  /* SQLITE_STATUS_SCRATCH_SIZE */
+  0,  /* SQLITE_STATUS_MALLOC_COUNT */
+};
+
+
+/* The "wsdStat" macro will resolve to the status information
+** state vector.  If writable static data is unsupported on the target,
+** we have to locate the state vector at run-time.  In the more common
+** case where writable static data is supported, wsdStat can refer directly
+** to the "sqlite3Stat" state vector declared above.
+*/
+#ifdef SQLITE_OMIT_WSD
+# define wsdStatInit  sqlite3StatType *x = &GLOBAL(sqlite3StatType,sqlite3Stat)
+# define wsdStat x[0]
+#else
+# define wsdStatInit
+# define wsdStat sqlite3Stat
+#endif
+
+/*
+** Return the current value of a status parameter.  The caller must
+** be holding the appropriate mutex.
+*/
+SQLITE_PRIVATE sqlite3_int64 sqlite3StatusValue(int op){
+  wsdStatInit;
+  assert( op>=0 && op<ArraySize(wsdStat.nowValue) );
+  assert( op>=0 && op<ArraySize(statMutex) );
+  assert( sqlite3_mutex_held(statMutex[op] ? sqlite3Pcache1Mutex()
+                                           : sqlite3MallocMutex()) );
+  return wsdStat.nowValue[op];
+}
+
+/*
+** Add N to the value of a status record.  The caller must hold the
+** appropriate mutex.  (Locking is checked by assert()).
+**
+** The StatusUp() routine can accept positive or negative values for N.
+** The value of N is added to the current status value and the high-water
+** mark is adjusted if necessary.
+**
+** The StatusDown() routine lowers the current value by N.  The highwater
+** mark is unchanged.  N must be non-negative for StatusDown().
+*/
+SQLITE_PRIVATE void sqlite3StatusUp(int op, int N){
+  wsdStatInit;
+  assert( op>=0 && op<ArraySize(wsdStat.nowValue) );
+  assert( op>=0 && op<ArraySize(statMutex) );
+  assert( sqlite3_mutex_held(statMutex[op] ? sqlite3Pcache1Mutex()
+                                           : sqlite3MallocMutex()) );
+  wsdStat.nowValue[op] += N;
+  if( wsdStat.nowValue[op]>wsdStat.mxValue[op] ){
+    wsdStat.mxValue[op] = wsdStat.nowValue[op];
+  }
+}
+SQLITE_PRIVATE void sqlite3StatusDown(int op, int N){
+  wsdStatInit;
+  assert( N>=0 );
+  assert( op>=0 && op<ArraySize(statMutex) );
+  assert( sqlite3_mutex_held(statMutex[op] ? sqlite3Pcache1Mutex()
+                                           : sqlite3MallocMutex()) );
+  assert( op>=0 && op<ArraySize(wsdStat.nowValue) );
+  wsdStat.nowValue[op] -= N;
+}
+
+/*
+** Adjust the highwater mark if necessary.
+** The caller must hold the appropriate mutex.
+*/
+SQLITE_PRIVATE void sqlite3StatusHighwater(int op, int X){
+  sqlite3StatValueType newValue;
+  wsdStatInit;
+  assert( X>=0 );
+  newValue = (sqlite3StatValueType)X;
+  assert( op>=0 && op<ArraySize(wsdStat.nowValue) );
+  assert( op>=0 && op<ArraySize(statMutex) );
+  assert( sqlite3_mutex_held(statMutex[op] ? sqlite3Pcache1Mutex()
+                                           : sqlite3MallocMutex()) );
+  assert( op==SQLITE_STATUS_MALLOC_SIZE
+          || op==SQLITE_STATUS_PAGECACHE_SIZE
+          || op==SQLITE_STATUS_PARSER_STACK );
+  if( newValue>wsdStat.mxValue[op] ){
+    wsdStat.mxValue[op] = newValue;
+  }
+}
+
+/*
+** Query status information.
+*/
+SQLITE_API int sqlite3_status64(
+  int op,
+  sqlite3_int64 *pCurrent,
+  sqlite3_int64 *pHighwater,
+  int resetFlag
+){
+  sqlite3_mutex *pMutex;
+  wsdStatInit;
+  if( op<0 || op>=ArraySize(wsdStat.nowValue) ){
+    return SQLITE_MISUSE_BKPT;
+  }
+#ifdef SQLITE_ENABLE_API_ARMOR
+  if( pCurrent==0 || pHighwater==0 ) return SQLITE_MISUSE_BKPT;
+#endif
+  pMutex = statMutex[op] ? sqlite3Pcache1Mutex() : sqlite3MallocMutex();
+  sqlite3_mutex_enter(pMutex);
+  *pCurrent = wsdStat.nowValue[op];
+  *pHighwater = wsdStat.mxV
