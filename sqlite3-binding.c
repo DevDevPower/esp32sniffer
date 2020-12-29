@@ -23728,4 +23728,226 @@ static void computeHMS(DateTime *p){
 */
 static void computeYMD_HMS(DateTime *p){
   computeYMD(p);
-  
+  computeHMS(p);
+}
+
+/*
+** Clear the YMD and HMS and the TZ
+*/
+static void clearYMD_HMS_TZ(DateTime *p){
+  p->validYMD = 0;
+  p->validHMS = 0;
+  p->validTZ = 0;
+}
+
+#ifndef SQLITE_OMIT_LOCALTIME
+/*
+** On recent Windows platforms, the localtime_s() function is available
+** as part of the "Secure CRT". It is essentially equivalent to
+** localtime_r() available under most POSIX platforms, except that the
+** order of the parameters is reversed.
+**
+** See http://msdn.microsoft.com/en-us/library/a442x3ye(VS.80).aspx.
+**
+** If the user has not indicated to use localtime_r() or localtime_s()
+** already, check for an MSVC build environment that provides
+** localtime_s().
+*/
+#if !HAVE_LOCALTIME_R && !HAVE_LOCALTIME_S \
+    && defined(_MSC_VER) && defined(_CRT_INSECURE_DEPRECATE)
+#undef  HAVE_LOCALTIME_S
+#define HAVE_LOCALTIME_S 1
+#endif
+
+/*
+** The following routine implements the rough equivalent of localtime_r()
+** using whatever operating-system specific localtime facility that
+** is available.  This routine returns 0 on success and
+** non-zero on any kind of error.
+**
+** If the sqlite3GlobalConfig.bLocaltimeFault variable is non-zero then this
+** routine will always fail.  If bLocaltimeFault is nonzero and
+** sqlite3GlobalConfig.xAltLocaltime is not NULL, then xAltLocaltime() is
+** invoked in place of the OS-defined localtime() function.
+**
+** EVIDENCE-OF: R-62172-00036 In this implementation, the standard C
+** library function localtime_r() is used to assist in the calculation of
+** local time.
+*/
+static int osLocaltime(time_t *t, struct tm *pTm){
+  int rc;
+#if !HAVE_LOCALTIME_R && !HAVE_LOCALTIME_S
+  struct tm *pX;
+#if SQLITE_THREADSAFE>0
+  sqlite3_mutex *mutex = sqlite3MutexAlloc(SQLITE_MUTEX_STATIC_MAIN);
+#endif
+  sqlite3_mutex_enter(mutex);
+  pX = localtime(t);
+#ifndef SQLITE_UNTESTABLE
+  if( sqlite3GlobalConfig.bLocaltimeFault ){
+    if( sqlite3GlobalConfig.xAltLocaltime!=0
+     && 0==sqlite3GlobalConfig.xAltLocaltime((const void*)t,(void*)pTm)
+    ){
+      pX = pTm;
+    }else{
+      pX = 0;
+    }
+  }
+#endif
+  if( pX ) *pTm = *pX;
+#if SQLITE_THREADSAFE>0
+  sqlite3_mutex_leave(mutex);
+#endif
+  rc = pX==0;
+#else
+#ifndef SQLITE_UNTESTABLE
+  if( sqlite3GlobalConfig.bLocaltimeFault ){
+    if( sqlite3GlobalConfig.xAltLocaltime!=0 ){
+      return sqlite3GlobalConfig.xAltLocaltime((const void*)t,(void*)pTm);
+    }else{
+      return 1;
+    }
+  }
+#endif
+#if HAVE_LOCALTIME_R
+  rc = localtime_r(t, pTm)==0;
+#else
+  rc = localtime_s(pTm, t);
+#endif /* HAVE_LOCALTIME_R */
+#endif /* HAVE_LOCALTIME_R || HAVE_LOCALTIME_S */
+  return rc;
+}
+#endif /* SQLITE_OMIT_LOCALTIME */
+
+
+#ifndef SQLITE_OMIT_LOCALTIME
+/*
+** Assuming the input DateTime is UTC, move it to its localtime equivalent.
+*/
+static int toLocaltime(
+  DateTime *p,                   /* Date at which to calculate offset */
+  sqlite3_context *pCtx          /* Write error here if one occurs */
+){
+  time_t t;
+  struct tm sLocal;
+  int iYearDiff;
+
+  /* Initialize the contents of sLocal to avoid a compiler warning. */
+  memset(&sLocal, 0, sizeof(sLocal));
+
+  computeJD(p);
+  if( p->iJD<2108667600*(i64)100000 /* 1970-01-01 */
+   || p->iJD>2130141456*(i64)100000 /* 2038-01-18 */
+  ){
+    /* EVIDENCE-OF: R-55269-29598 The localtime_r() C function normally only
+    ** works for years between 1970 and 2037. For dates outside this range,
+    ** SQLite attempts to map the year into an equivalent year within this
+    ** range, do the calculation, then map the year back.
+    */
+    DateTime x = *p;
+    computeYMD_HMS(&x);
+    iYearDiff = (2000 + x.Y%4) - x.Y;
+    x.Y += iYearDiff;
+    x.validJD = 0;
+    computeJD(&x);
+    t = (time_t)(x.iJD/1000 -  21086676*(i64)10000);
+  }else{
+    iYearDiff = 0;
+    t = (time_t)(p->iJD/1000 -  21086676*(i64)10000);
+  }
+  if( osLocaltime(&t, &sLocal) ){
+    sqlite3_result_error(pCtx, "local time unavailable", -1);
+    return SQLITE_ERROR;
+  }
+  p->Y = sLocal.tm_year + 1900 - iYearDiff;
+  p->M = sLocal.tm_mon + 1;
+  p->D = sLocal.tm_mday;
+  p->h = sLocal.tm_hour;
+  p->m = sLocal.tm_min;
+  p->s = sLocal.tm_sec + (p->iJD%1000)*0.001;
+  p->validYMD = 1;
+  p->validHMS = 1;
+  p->validJD = 0;
+  p->rawS = 0;
+  p->validTZ = 0;
+  p->isError = 0;
+  return SQLITE_OK;
+}
+#endif /* SQLITE_OMIT_LOCALTIME */
+
+/*
+** The following table defines various date transformations of the form
+**
+**            'NNN days'
+**
+** Where NNN is an arbitrary floating-point number and "days" can be one
+** of several units of time.
+*/
+static const struct {
+  u8 nName;           /* Length of the name */
+  char zName[7];      /* Name of the transformation */
+  float rLimit;       /* Maximum NNN value for this transform */
+  float rXform;       /* Constant used for this transform */
+} aXformType[] = {
+  { 6, "second", 4.6427e+14,       1.0  },
+  { 6, "minute", 7.7379e+12,      60.0  },
+  { 4, "hour",   1.2897e+11,    3600.0  },
+  { 3, "day",    5373485.0,    86400.0  },
+  { 5, "month",  176546.0,   2592000.0  },
+  { 4, "year",   14713.0,   31536000.0  },
+};
+
+/*
+** Process a modifier to a date-time stamp.  The modifiers are
+** as follows:
+**
+**     NNN days
+**     NNN hours
+**     NNN minutes
+**     NNN.NNNN seconds
+**     NNN months
+**     NNN years
+**     start of month
+**     start of year
+**     start of week
+**     start of day
+**     weekday N
+**     unixepoch
+**     localtime
+**     utc
+**
+** Return 0 on success and 1 if there is any kind of error. If the error
+** is in a system call (i.e. localtime()), then an error message is written
+** to context pCtx. If the error is an unrecognized modifier, no error is
+** written to pCtx.
+*/
+static int parseModifier(
+  sqlite3_context *pCtx,      /* Function context */
+  const char *z,              /* The text of the modifier */
+  int n,                      /* Length of zMod in bytes */
+  DateTime *p,                /* The date/time value to be modified */
+  int idx                     /* Parameter index of the modifier */
+){
+  int rc = 1;
+  double r;
+  switch(sqlite3UpperToLower[(u8)z[0]] ){
+    case 'a': {
+      /*
+      **    auto
+      **
+      ** If rawS is available, then interpret as a julian day number, or
+      ** a unix timestamp, depending on its magnitude.
+      */
+      if( sqlite3_stricmp(z, "auto")==0 ){
+        if( idx>1 ) return 1; /* IMP: R-33611-57934 */
+        if( !p->rawS || p->validJD ){
+          rc = 0;
+          p->rawS = 0;
+        }else if( p->s>=-21086676*(i64)10000        /* -4713-11-24 12:00:00 */
+               && p->s<=(25340230*(i64)10000)+799   /*  9999-12-31 23:59:59 */
+        ){
+          r = p->s*1000.0 + 210866760000000.0;
+          clearYMD_HMS_TZ(p);
+          p->iJD = (sqlite3_int64)(r + 0.5);
+          p->validJD = 1;
+          p->rawS = 0
