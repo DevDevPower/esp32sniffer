@@ -23434,4 +23434,298 @@ static int parseTimezone(const char *zDate, DateTime *p){
     sgn = -1;
   }else if( c=='+' ){
     sgn = +1;
+  }else if( c=='Z' || c=='z' ){
+    zDate++;
+    goto zulu_time;
+  }else{
+    return c!=0;
+  }
+  zDate++;
+  if( getDigits(zDate, "20b:20e", &nHr, &nMn)!=2 ){
+    return 1;
+  }
+  zDate += 5;
+  p->tz = sgn*(nMn + nHr*60);
+zulu_time:
+  while( sqlite3Isspace(*zDate) ){ zDate++; }
+  p->tzSet = 1;
+  return *zDate!=0;
+}
+
+/*
+** Parse times of the form HH:MM or HH:MM:SS or HH:MM:SS.FFFF.
+** The HH, MM, and SS must each be exactly 2 digits.  The
+** fractional seconds FFFF can be one or more digits.
+**
+** Return 1 if there is a parsing error and 0 on success.
+*/
+static int parseHhMmSs(const char *zDate, DateTime *p){
+  int h, m, s;
+  double ms = 0.0;
+  if( getDigits(zDate, "20c:20e", &h, &m)!=2 ){
+    return 1;
+  }
+  zDate += 5;
+  if( *zDate==':' ){
+    zDate++;
+    if( getDigits(zDate, "20e", &s)!=1 ){
+      return 1;
+    }
+    zDate += 2;
+    if( *zDate=='.' && sqlite3Isdigit(zDate[1]) ){
+      double rScale = 1.0;
+      zDate++;
+      while( sqlite3Isdigit(*zDate) ){
+        ms = ms*10.0 + *zDate - '0';
+        rScale *= 10.0;
+        zDate++;
+      }
+      ms /= rScale;
+    }
+  }else{
+    s = 0;
+  }
+  p->validJD = 0;
+  p->rawS = 0;
+  p->validHMS = 1;
+  p->h = h;
+  p->m = m;
+  p->s = s + ms;
+  if( parseTimezone(zDate, p) ) return 1;
+  p->validTZ = (p->tz!=0)?1:0;
+  return 0;
+}
+
+/*
+** Put the DateTime object into its error state.
+*/
+static void datetimeError(DateTime *p){
+  memset(p, 0, sizeof(*p));
+  p->isError = 1;
+}
+
+/*
+** Convert from YYYY-MM-DD HH:MM:SS to julian day.  We always assume
+** that the YYYY-MM-DD is according to the Gregorian calendar.
+**
+** Reference:  Meeus page 61
+*/
+static void computeJD(DateTime *p){
+  int Y, M, D, A, B, X1, X2;
+
+  if( p->validJD ) return;
+  if( p->validYMD ){
+    Y = p->Y;
+    M = p->M;
+    D = p->D;
+  }else{
+    Y = 2000;  /* If no YMD specified, assume 2000-Jan-01 */
+    M = 1;
+    D = 1;
+  }
+  if( Y<-4713 || Y>9999 || p->rawS ){
+    datetimeError(p);
+    return;
+  }
+  if( M<=2 ){
+    Y--;
+    M += 12;
+  }
+  A = Y/100;
+  B = 2 - A + (A/4);
+  X1 = 36525*(Y+4716)/100;
+  X2 = 306001*(M+1)/10000;
+  p->iJD = (sqlite3_int64)((X1 + X2 + D + B - 1524.5 ) * 86400000);
+  p->validJD = 1;
+  if( p->validHMS ){
+    p->iJD += p->h*3600000 + p->m*60000 + (sqlite3_int64)(p->s*1000);
+    if( p->validTZ ){
+      p->iJD -= p->tz*60000;
+      p->validYMD = 0;
+      p->validHMS = 0;
+      p->validTZ = 0;
+    }
+  }
+}
+
+/*
+** Parse dates of the form
+**
+**     YYYY-MM-DD HH:MM:SS.FFF
+**     YYYY-MM-DD HH:MM:SS
+**     YYYY-MM-DD HH:MM
+**     YYYY-MM-DD
+**
+** Write the result into the DateTime structure and return 0
+** on success and 1 if the input string is not a well-formed
+** date.
+*/
+static int parseYyyyMmDd(const char *zDate, DateTime *p){
+  int Y, M, D, neg;
+
+  if( zDate[0]=='-' ){
+    zDate++;
+    neg = 1;
+  }else{
+    neg = 0;
+  }
+  if( getDigits(zDate, "40f-21a-21d", &Y, &M, &D)!=3 ){
+    return 1;
+  }
+  zDate += 10;
+  while( sqlite3Isspace(*zDate) || 'T'==*(u8*)zDate ){ zDate++; }
+  if( parseHhMmSs(zDate, p)==0 ){
+    /* We got the time */
+  }else if( *zDate==0 ){
+    p->validHMS = 0;
+  }else{
+    return 1;
+  }
+  p->validJD = 0;
+  p->validYMD = 1;
+  p->Y = neg ? -Y : Y;
+  p->M = M;
+  p->D = D;
+  if( p->validTZ ){
+    computeJD(p);
+  }
+  return 0;
+}
+
+/*
+** Set the time to the current time reported by the VFS.
+**
+** Return the number of errors.
+*/
+static int setDateTimeToCurrent(sqlite3_context *context, DateTime *p){
+  p->iJD = sqlite3StmtCurrentTime(context);
+  if( p->iJD>0 ){
+    p->validJD = 1;
+    return 0;
+  }else{
+    return 1;
+  }
+}
+
+/*
+** Input "r" is a numeric quantity which might be a julian day number,
+** or the number of seconds since 1970.  If the value if r is within
+** range of a julian day number, install it as such and set validJD.
+** If the value is a valid unix timestamp, put it in p->s and set p->rawS.
+*/
+static void setRawDateNumber(DateTime *p, double r){
+  p->s = r;
+  p->rawS = 1;
+  if( r>=0.0 && r<5373484.5 ){
+    p->iJD = (sqlite3_int64)(r*86400000.0 + 0.5);
+    p->validJD = 1;
+  }
+}
+
+/*
+** Attempt to parse the given string into a julian day number.  Return
+** the number of errors.
+**
+** The following are acceptable forms for the input string:
+**
+**      YYYY-MM-DD HH:MM:SS.FFF  +/-HH:MM
+**      DDDD.DD
+**      now
+**
+** In the first form, the +/-HH:MM is always optional.  The fractional
+** seconds extension (the ".FFF") is optional.  The seconds portion
+** (":SS.FFF") is option.  The year and date can be omitted as long
+** as there is a time string.  The time string can be omitted as long
+** as there is a year and date.
+*/
+static int parseDateOrTime(
+  sqlite3_context *context,
+  const char *zDate,
+  DateTime *p
+){
+  double r;
+  if( parseYyyyMmDd(zDate,p)==0 ){
+    return 0;
+  }else if( parseHhMmSs(zDate, p)==0 ){
+    return 0;
+  }else if( sqlite3StrICmp(zDate,"now")==0 && sqlite3NotPureFunc(context) ){
+    return setDateTimeToCurrent(context, p);
+  }else if( sqlite3AtoF(zDate, &r, sqlite3Strlen30(zDate), SQLITE_UTF8)>0 ){
+    setRawDateNumber(p, r);
+    return 0;
+  }
+  return 1;
+}
+
+/* The julian day number for 9999-12-31 23:59:59.999 is 5373484.4999999.
+** Multiplying this by 86400000 gives 464269060799999 as the maximum value
+** for DateTime.iJD.
+**
+** But some older compilers (ex: gcc 4.2.1 on older Macs) cannot deal with
+** such a large integer literal, so we have to encode it.
+*/
+#define INT_464269060799999  ((((i64)0x1a640)<<32)|0x1072fdff)
+
+/*
+** Return TRUE if the given julian day number is within range.
+**
+** The input is the JulianDay times 86400000.
+*/
+static int validJulianDay(sqlite3_int64 iJD){
+  return iJD>=0 && iJD<=INT_464269060799999;
+}
+
+/*
+** Compute the Year, Month, and Day from the julian day number.
+*/
+static void computeYMD(DateTime *p){
+  int Z, A, B, C, D, E, X1;
+  if( p->validYMD ) return;
+  if( !p->validJD ){
+    p->Y = 2000;
+    p->M = 1;
+    p->D = 1;
+  }else if( !validJulianDay(p->iJD) ){
+    datetimeError(p);
+    return;
+  }else{
+    Z = (int)((p->iJD + 43200000)/86400000);
+    A = (int)((Z - 1867216.25)/36524.25);
+    A = Z + 1 + A - (A/4);
+    B = A + 1524;
+    C = (int)((B - 122.1)/365.25);
+    D = (36525*(C&32767))/100;
+    E = (int)((B-D)/30.6001);
+    X1 = (int)(30.6001*E);
+    p->D = B - D - X1;
+    p->M = E<14 ? E-1 : E-13;
+    p->Y = p->M>2 ? C - 4716 : C - 4715;
+  }
+  p->validYMD = 1;
+}
+
+/*
+** Compute the Hour, Minute, and Seconds from the julian day number.
+*/
+static void computeHMS(DateTime *p){
+  int s;
+  if( p->validHMS ) return;
+  computeJD(p);
+  s = (int)((p->iJD + 43200000) % 86400000);
+  p->s = s/1000.0;
+  s = (int)p->s;
+  p->s -= s;
+  p->h = s/3600;
+  s -= p->h*3600;
+  p->m = s/60;
+  p->s += s - p->m*60;
+  p->rawS = 0;
+  p->validHMS = 1;
+}
+
+/*
+** Compute both YMD and HMS
+*/
+static void computeYMD_HMS(DateTime *p){
+  computeYMD(p);
   
