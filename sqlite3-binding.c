@@ -23224,4 +23224,214 @@ SQLITE_API int sqlite3_db_status(
     case SQLITE_DBSTATUS_CACHE_WRITE:{
       int i;
       int nRet = 0;
-      assert( SQLITE_DBSTATUS_CACHE
+      assert( SQLITE_DBSTATUS_CACHE_MISS==SQLITE_DBSTATUS_CACHE_HIT+1 );
+      assert( SQLITE_DBSTATUS_CACHE_WRITE==SQLITE_DBSTATUS_CACHE_HIT+2 );
+
+      for(i=0; i<db->nDb; i++){
+        if( db->aDb[i].pBt ){
+          Pager *pPager = sqlite3BtreePager(db->aDb[i].pBt);
+          sqlite3PagerCacheStat(pPager, op, resetFlag, &nRet);
+        }
+      }
+      *pHighwater = 0; /* IMP: R-42420-56072 */
+                       /* IMP: R-54100-20147 */
+                       /* IMP: R-29431-39229 */
+      *pCurrent = nRet;
+      break;
+    }
+
+    /* Set *pCurrent to non-zero if there are unresolved deferred foreign
+    ** key constraints.  Set *pCurrent to zero if all foreign key constraints
+    ** have been satisfied.  The *pHighwater is always set to zero.
+    */
+    case SQLITE_DBSTATUS_DEFERRED_FKS: {
+      *pHighwater = 0;  /* IMP: R-11967-56545 */
+      *pCurrent = db->nDeferredImmCons>0 || db->nDeferredCons>0;
+      break;
+    }
+
+    default: {
+      rc = SQLITE_ERROR;
+    }
+  }
+  sqlite3_mutex_leave(db->mutex);
+  return rc;
+}
+
+/************** End of status.c **********************************************/
+/************** Begin file date.c ********************************************/
+/*
+** 2003 October 31
+**
+** The author disclaims copyright to this source code.  In place of
+** a legal notice, here is a blessing:
+**
+**    May you do good and not evil.
+**    May you find forgiveness for yourself and forgive others.
+**    May you share freely, never taking more than you give.
+**
+*************************************************************************
+** This file contains the C functions that implement date and time
+** functions for SQLite.
+**
+** There is only one exported symbol in this file - the function
+** sqlite3RegisterDateTimeFunctions() found at the bottom of the file.
+** All other code has file scope.
+**
+** SQLite processes all times and dates as julian day numbers.  The
+** dates and times are stored as the number of days since noon
+** in Greenwich on November 24, 4714 B.C. according to the Gregorian
+** calendar system.
+**
+** 1970-01-01 00:00:00 is JD 2440587.5
+** 2000-01-01 00:00:00 is JD 2451544.5
+**
+** This implementation requires years to be expressed as a 4-digit number
+** which means that only dates between 0000-01-01 and 9999-12-31 can
+** be represented, even though julian day numbers allow a much wider
+** range of dates.
+**
+** The Gregorian calendar system is used for all dates and times,
+** even those that predate the Gregorian calendar.  Historians usually
+** use the julian calendar for dates prior to 1582-10-15 and for some
+** dates afterwards, depending on locale.  Beware of this difference.
+**
+** The conversion algorithms are implemented based on descriptions
+** in the following text:
+**
+**      Jean Meeus
+**      Astronomical Algorithms, 2nd Edition, 1998
+**      ISBN 0-943396-61-1
+**      Willmann-Bell, Inc
+**      Richmond, Virginia (USA)
+*/
+/* #include "sqliteInt.h" */
+/* #include <stdlib.h> */
+/* #include <assert.h> */
+#include <time.h>
+
+#ifndef SQLITE_OMIT_DATETIME_FUNCS
+
+/*
+** The MSVC CRT on Windows CE may not have a localtime() function.
+** So declare a substitute.  The substitute function itself is
+** defined in "os_win.c".
+*/
+#if !defined(SQLITE_OMIT_LOCALTIME) && defined(_WIN32_WCE) && \
+    (!defined(SQLITE_MSVC_LOCALTIME_API) || !SQLITE_MSVC_LOCALTIME_API)
+struct tm *__cdecl localtime(const time_t *);
+#endif
+
+/*
+** A structure for holding a single date and time.
+*/
+typedef struct DateTime DateTime;
+struct DateTime {
+  sqlite3_int64 iJD;  /* The julian day number times 86400000 */
+  int Y, M, D;        /* Year, month, and day */
+  int h, m;           /* Hour and minutes */
+  int tz;             /* Timezone offset in minutes */
+  double s;           /* Seconds */
+  char validJD;       /* True (1) if iJD is valid */
+  char rawS;          /* Raw numeric value stored in s */
+  char validYMD;      /* True (1) if Y,M,D are valid */
+  char validHMS;      /* True (1) if h,m,s are valid */
+  char validTZ;       /* True (1) if tz is valid */
+  char tzSet;         /* Timezone was set explicitly */
+  char isError;       /* An overflow has occurred */
+};
+
+
+/*
+** Convert zDate into one or more integers according to the conversion
+** specifier zFormat.
+**
+** zFormat[] contains 4 characters for each integer converted, except for
+** the last integer which is specified by three characters.  The meaning
+** of a four-character format specifiers ABCD is:
+**
+**    A:   number of digits to convert.  Always "2" or "4".
+**    B:   minimum value.  Always "0" or "1".
+**    C:   maximum value, decoded as:
+**           a:  12
+**           b:  14
+**           c:  24
+**           d:  31
+**           e:  59
+**           f:  9999
+**    D:   the separator character, or \000 to indicate this is the
+**         last number to convert.
+**
+** Example:  To translate an ISO-8601 date YYYY-MM-DD, the format would
+** be "40f-21a-20c".  The "40f-" indicates the 4-digit year followed by "-".
+** The "21a-" indicates the 2-digit month followed by "-".  The "20c" indicates
+** the 2-digit day which is the last integer in the set.
+**
+** The function returns the number of successful conversions.
+*/
+static int getDigits(const char *zDate, const char *zFormat, ...){
+  /* The aMx[] array translates the 3rd character of each format
+  ** spec into a max size:    a   b   c   d   e     f */
+  static const u16 aMx[] = { 12, 14, 24, 31, 59, 9999 };
+  va_list ap;
+  int cnt = 0;
+  char nextC;
+  va_start(ap, zFormat);
+  do{
+    char N = zFormat[0] - '0';
+    char min = zFormat[1] - '0';
+    int val = 0;
+    u16 max;
+
+    assert( zFormat[2]>='a' && zFormat[2]<='f' );
+    max = aMx[zFormat[2] - 'a'];
+    nextC = zFormat[3];
+    val = 0;
+    while( N-- ){
+      if( !sqlite3Isdigit(*zDate) ){
+        goto end_getDigits;
+      }
+      val = val*10 + *zDate - '0';
+      zDate++;
+    }
+    if( val<(int)min || val>(int)max || (nextC!=0 && nextC!=*zDate) ){
+      goto end_getDigits;
+    }
+    *va_arg(ap,int*) = val;
+    zDate++;
+    cnt++;
+    zFormat += 4;
+  }while( nextC );
+end_getDigits:
+  va_end(ap);
+  return cnt;
+}
+
+/*
+** Parse a timezone extension on the end of a date-time.
+** The extension is of the form:
+**
+**        (+/-)HH:MM
+**
+** Or the "zulu" notation:
+**
+**        Z
+**
+** If the parse is successful, write the number of minutes
+** of change in p->tz and return 0.  If a parser error occurs,
+** return non-zero.
+**
+** A missing specifier is not considered an error.
+*/
+static int parseTimezone(const char *zDate, DateTime *p){
+  int sgn = 0;
+  int nHr, nMn;
+  int c;
+  while( sqlite3Isspace(*zDate) ){ zDate++; }
+  p->tz = 0;
+  c = *zDate;
+  if( c=='-' ){
+    sgn = -1;
+  }else if( c=='+' ){
+    sgn = +1;
+  
