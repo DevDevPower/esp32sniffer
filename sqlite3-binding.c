@@ -24684,4 +24684,187 @@ SQLITE_API int sqlite3_open_file_count = 0;
 **
 */
 #if defined(SQLITE_TEST)
-SQLITE_API int sqlit
+SQLITE_API int sqlite3_memdebug_vfs_oom_test = 1;
+  #define DO_OS_MALLOC_TEST(x)                                       \
+  if (sqlite3_memdebug_vfs_oom_test && (!x || !sqlite3JournalIsInMemory(x))) { \
+    void *pTstAlloc = sqlite3Malloc(10);                             \
+    if (!pTstAlloc) return SQLITE_IOERR_NOMEM_BKPT;                  \
+    sqlite3_free(pTstAlloc);                                         \
+  }
+#else
+  #define DO_OS_MALLOC_TEST(x)
+#endif
+
+/*
+** The following routines are convenience wrappers around methods
+** of the sqlite3_file object.  This is mostly just syntactic sugar. All
+** of this would be completely automatic if SQLite were coded using
+** C++ instead of plain old C.
+*/
+SQLITE_PRIVATE void sqlite3OsClose(sqlite3_file *pId){
+  if( pId->pMethods ){
+    pId->pMethods->xClose(pId);
+    pId->pMethods = 0;
+  }
+}
+SQLITE_PRIVATE int sqlite3OsRead(sqlite3_file *id, void *pBuf, int amt, i64 offset){
+  DO_OS_MALLOC_TEST(id);
+  return id->pMethods->xRead(id, pBuf, amt, offset);
+}
+SQLITE_PRIVATE int sqlite3OsWrite(sqlite3_file *id, const void *pBuf, int amt, i64 offset){
+  DO_OS_MALLOC_TEST(id);
+  return id->pMethods->xWrite(id, pBuf, amt, offset);
+}
+SQLITE_PRIVATE int sqlite3OsTruncate(sqlite3_file *id, i64 size){
+  return id->pMethods->xTruncate(id, size);
+}
+SQLITE_PRIVATE int sqlite3OsSync(sqlite3_file *id, int flags){
+  DO_OS_MALLOC_TEST(id);
+  return flags ? id->pMethods->xSync(id, flags) : SQLITE_OK;
+}
+SQLITE_PRIVATE int sqlite3OsFileSize(sqlite3_file *id, i64 *pSize){
+  DO_OS_MALLOC_TEST(id);
+  return id->pMethods->xFileSize(id, pSize);
+}
+SQLITE_PRIVATE int sqlite3OsLock(sqlite3_file *id, int lockType){
+  DO_OS_MALLOC_TEST(id);
+  return id->pMethods->xLock(id, lockType);
+}
+SQLITE_PRIVATE int sqlite3OsUnlock(sqlite3_file *id, int lockType){
+  return id->pMethods->xUnlock(id, lockType);
+}
+SQLITE_PRIVATE int sqlite3OsCheckReservedLock(sqlite3_file *id, int *pResOut){
+  DO_OS_MALLOC_TEST(id);
+  return id->pMethods->xCheckReservedLock(id, pResOut);
+}
+
+/*
+** Use sqlite3OsFileControl() when we are doing something that might fail
+** and we need to know about the failures.  Use sqlite3OsFileControlHint()
+** when simply tossing information over the wall to the VFS and we do not
+** really care if the VFS receives and understands the information since it
+** is only a hint and can be safely ignored.  The sqlite3OsFileControlHint()
+** routine has no return value since the return value would be meaningless.
+*/
+SQLITE_PRIVATE int sqlite3OsFileControl(sqlite3_file *id, int op, void *pArg){
+  if( id->pMethods==0 ) return SQLITE_NOTFOUND;
+#ifdef SQLITE_TEST
+  if( op!=SQLITE_FCNTL_COMMIT_PHASETWO
+   && op!=SQLITE_FCNTL_LOCK_TIMEOUT
+   && op!=SQLITE_FCNTL_CKPT_DONE
+   && op!=SQLITE_FCNTL_CKPT_START
+  ){
+    /* Faults are not injected into COMMIT_PHASETWO because, assuming SQLite
+    ** is using a regular VFS, it is called after the corresponding
+    ** transaction has been committed. Injecting a fault at this point
+    ** confuses the test scripts - the COMMIT comand returns SQLITE_NOMEM
+    ** but the transaction is committed anyway.
+    **
+    ** The core must call OsFileControl() though, not OsFileControlHint(),
+    ** as if a custom VFS (e.g. zipvfs) returns an error here, it probably
+    ** means the commit really has failed and an error should be returned
+    ** to the user.
+    **
+    ** The CKPT_DONE and CKPT_START file-controls are write-only signals
+    ** to the cksumvfs.  Their return code is meaningless and is ignored
+    ** by the SQLite core, so there is no point in simulating OOMs for them.
+    */
+    DO_OS_MALLOC_TEST(id);
+  }
+#endif
+  return id->pMethods->xFileControl(id, op, pArg);
+}
+SQLITE_PRIVATE void sqlite3OsFileControlHint(sqlite3_file *id, int op, void *pArg){
+  if( id->pMethods ) (void)id->pMethods->xFileControl(id, op, pArg);
+}
+
+SQLITE_PRIVATE int sqlite3OsSectorSize(sqlite3_file *id){
+  int (*xSectorSize)(sqlite3_file*) = id->pMethods->xSectorSize;
+  return (xSectorSize ? xSectorSize(id) : SQLITE_DEFAULT_SECTOR_SIZE);
+}
+SQLITE_PRIVATE int sqlite3OsDeviceCharacteristics(sqlite3_file *id){
+  if( NEVER(id->pMethods==0) ) return 0;
+  return id->pMethods->xDeviceCharacteristics(id);
+}
+#ifndef SQLITE_OMIT_WAL
+SQLITE_PRIVATE int sqlite3OsShmLock(sqlite3_file *id, int offset, int n, int flags){
+  return id->pMethods->xShmLock(id, offset, n, flags);
+}
+SQLITE_PRIVATE void sqlite3OsShmBarrier(sqlite3_file *id){
+  id->pMethods->xShmBarrier(id);
+}
+SQLITE_PRIVATE int sqlite3OsShmUnmap(sqlite3_file *id, int deleteFlag){
+  return id->pMethods->xShmUnmap(id, deleteFlag);
+}
+SQLITE_PRIVATE int sqlite3OsShmMap(
+  sqlite3_file *id,               /* Database file handle */
+  int iPage,
+  int pgsz,
+  int bExtend,                    /* True to extend file if necessary */
+  void volatile **pp              /* OUT: Pointer to mapping */
+){
+  DO_OS_MALLOC_TEST(id);
+  return id->pMethods->xShmMap(id, iPage, pgsz, bExtend, pp);
+}
+#endif /* SQLITE_OMIT_WAL */
+
+#if SQLITE_MAX_MMAP_SIZE>0
+/* The real implementation of xFetch and xUnfetch */
+SQLITE_PRIVATE int sqlite3OsFetch(sqlite3_file *id, i64 iOff, int iAmt, void **pp){
+  DO_OS_MALLOC_TEST(id);
+  return id->pMethods->xFetch(id, iOff, iAmt, pp);
+}
+SQLITE_PRIVATE int sqlite3OsUnfetch(sqlite3_file *id, i64 iOff, void *p){
+  return id->pMethods->xUnfetch(id, iOff, p);
+}
+#else
+/* No-op stubs to use when memory-mapped I/O is disabled */
+SQLITE_PRIVATE int sqlite3OsFetch(sqlite3_file *id, i64 iOff, int iAmt, void **pp){
+  *pp = 0;
+  return SQLITE_OK;
+}
+SQLITE_PRIVATE int sqlite3OsUnfetch(sqlite3_file *id, i64 iOff, void *p){
+  return SQLITE_OK;
+}
+#endif
+
+/*
+** The next group of routines are convenience wrappers around the
+** VFS methods.
+*/
+SQLITE_PRIVATE int sqlite3OsOpen(
+  sqlite3_vfs *pVfs,
+  const char *zPath,
+  sqlite3_file *pFile,
+  int flags,
+  int *pFlagsOut
+){
+  int rc;
+  DO_OS_MALLOC_TEST(0);
+  /* 0x87f7f is a mask of SQLITE_OPEN_ flags that are valid to be passed
+  ** down into the VFS layer.  Some SQLITE_OPEN_ flags (for example,
+  ** SQLITE_OPEN_FULLMUTEX or SQLITE_OPEN_SHAREDCACHE) are blocked before
+  ** reaching the VFS. */
+  rc = pVfs->xOpen(pVfs, zPath, pFile, flags & 0x1087f7f, pFlagsOut);
+  assert( rc==SQLITE_OK || pFile->pMethods==0 );
+  return rc;
+}
+SQLITE_PRIVATE int sqlite3OsDelete(sqlite3_vfs *pVfs, const char *zPath, int dirSync){
+  DO_OS_MALLOC_TEST(0);
+  assert( dirSync==0 || dirSync==1 );
+  return pVfs->xDelete!=0 ? pVfs->xDelete(pVfs, zPath, dirSync) : SQLITE_OK;
+}
+SQLITE_PRIVATE int sqlite3OsAccess(
+  sqlite3_vfs *pVfs,
+  const char *zPath,
+  int flags,
+  int *pResOut
+){
+  DO_OS_MALLOC_TEST(0);
+  return pVfs->xAccess(pVfs, zPath, flags, pResOut);
+}
+SQLITE_PRIVATE int sqlite3OsFullPathname(
+  sqlite3_vfs *pVfs,
+  const char *zPath,
+  int nPathOut,
+  char *z
