@@ -24466,4 +24466,222 @@ static void strftimeFunc(
       }
       case 'm': {
         sqlite3_str_appendf(&sRes,"%02d",x.M);
-       
+        break;
+      }
+      case 'M': {
+        sqlite3_str_appendf(&sRes,"%02d",x.m);
+        break;
+      }
+      case 's': {
+        i64 iS = (i64)(x.iJD/1000 - 21086676*(i64)10000);
+        sqlite3_str_appendf(&sRes,"%lld",iS);
+        break;
+      }
+      case 'S': {
+        sqlite3_str_appendf(&sRes,"%02d",(int)x.s);
+        break;
+      }
+      case 'w': {
+        sqlite3_str_appendchar(&sRes, 1,
+                       (char)(((x.iJD+129600000)/86400000) % 7) + '0');
+        break;
+      }
+      case 'Y': {
+        sqlite3_str_appendf(&sRes,"%04d",x.Y);
+        break;
+      }
+      case '%': {
+        sqlite3_str_appendchar(&sRes, 1, '%');
+        break;
+      }
+      default: {
+        sqlite3_str_reset(&sRes);
+        return;
+      }
+    }
+  }
+  if( j<i ) sqlite3_str_append(&sRes, zFmt+j, (int)(i-j));
+  sqlite3ResultStrAccum(context, &sRes);
+}
+
+/*
+** current_time()
+**
+** This function returns the same value as time('now').
+*/
+static void ctimeFunc(
+  sqlite3_context *context,
+  int NotUsed,
+  sqlite3_value **NotUsed2
+){
+  UNUSED_PARAMETER2(NotUsed, NotUsed2);
+  timeFunc(context, 0, 0);
+}
+
+/*
+** current_date()
+**
+** This function returns the same value as date('now').
+*/
+static void cdateFunc(
+  sqlite3_context *context,
+  int NotUsed,
+  sqlite3_value **NotUsed2
+){
+  UNUSED_PARAMETER2(NotUsed, NotUsed2);
+  dateFunc(context, 0, 0);
+}
+
+/*
+** current_timestamp()
+**
+** This function returns the same value as datetime('now').
+*/
+static void ctimestampFunc(
+  sqlite3_context *context,
+  int NotUsed,
+  sqlite3_value **NotUsed2
+){
+  UNUSED_PARAMETER2(NotUsed, NotUsed2);
+  datetimeFunc(context, 0, 0);
+}
+#endif /* !defined(SQLITE_OMIT_DATETIME_FUNCS) */
+
+#ifdef SQLITE_OMIT_DATETIME_FUNCS
+/*
+** If the library is compiled to omit the full-scale date and time
+** handling (to get a smaller binary), the following minimal version
+** of the functions current_time(), current_date() and current_timestamp()
+** are included instead. This is to support column declarations that
+** include "DEFAULT CURRENT_TIME" etc.
+**
+** This function uses the C-library functions time(), gmtime()
+** and strftime(). The format string to pass to strftime() is supplied
+** as the user-data for the function.
+*/
+static void currentTimeFunc(
+  sqlite3_context *context,
+  int argc,
+  sqlite3_value **argv
+){
+  time_t t;
+  char *zFormat = (char *)sqlite3_user_data(context);
+  sqlite3_int64 iT;
+  struct tm *pTm;
+  struct tm sNow;
+  char zBuf[20];
+
+  UNUSED_PARAMETER(argc);
+  UNUSED_PARAMETER(argv);
+
+  iT = sqlite3StmtCurrentTime(context);
+  if( iT<=0 ) return;
+  t = iT/1000 - 10000*(sqlite3_int64)21086676;
+#if HAVE_GMTIME_R
+  pTm = gmtime_r(&t, &sNow);
+#else
+  sqlite3_mutex_enter(sqlite3MutexAlloc(SQLITE_MUTEX_STATIC_MAIN));
+  pTm = gmtime(&t);
+  if( pTm ) memcpy(&sNow, pTm, sizeof(sNow));
+  sqlite3_mutex_leave(sqlite3MutexAlloc(SQLITE_MUTEX_STATIC_MAIN));
+#endif
+  if( pTm ){
+    strftime(zBuf, 20, zFormat, &sNow);
+    sqlite3_result_text(context, zBuf, -1, SQLITE_TRANSIENT);
+  }
+}
+#endif
+
+/*
+** This function registered all of the above C functions as SQL
+** functions.  This should be the only routine in this file with
+** external linkage.
+*/
+SQLITE_PRIVATE void sqlite3RegisterDateTimeFunctions(void){
+  static FuncDef aDateTimeFuncs[] = {
+#ifndef SQLITE_OMIT_DATETIME_FUNCS
+    PURE_DATE(julianday,        -1, 0, 0, juliandayFunc ),
+    PURE_DATE(unixepoch,        -1, 0, 0, unixepochFunc ),
+    PURE_DATE(date,             -1, 0, 0, dateFunc      ),
+    PURE_DATE(time,             -1, 0, 0, timeFunc      ),
+    PURE_DATE(datetime,         -1, 0, 0, datetimeFunc  ),
+    PURE_DATE(strftime,         -1, 0, 0, strftimeFunc  ),
+    DFUNCTION(current_time,      0, 0, 0, ctimeFunc     ),
+    DFUNCTION(current_timestamp, 0, 0, 0, ctimestampFunc),
+    DFUNCTION(current_date,      0, 0, 0, cdateFunc     ),
+#else
+    STR_FUNCTION(current_time,      0, "%H:%M:%S",          0, currentTimeFunc),
+    STR_FUNCTION(current_date,      0, "%Y-%m-%d",          0, currentTimeFunc),
+    STR_FUNCTION(current_timestamp, 0, "%Y-%m-%d %H:%M:%S", 0, currentTimeFunc),
+#endif
+  };
+  sqlite3InsertBuiltinFuncs(aDateTimeFuncs, ArraySize(aDateTimeFuncs));
+}
+
+/************** End of date.c ************************************************/
+/************** Begin file os.c **********************************************/
+/*
+** 2005 November 29
+**
+** The author disclaims copyright to this source code.  In place of
+** a legal notice, here is a blessing:
+**
+**    May you do good and not evil.
+**    May you find forgiveness for yourself and forgive others.
+**    May you share freely, never taking more than you give.
+**
+******************************************************************************
+**
+** This file contains OS interface code that is common to all
+** architectures.
+*/
+/* #include "sqliteInt.h" */
+
+/*
+** If we compile with the SQLITE_TEST macro set, then the following block
+** of code will give us the ability to simulate a disk I/O error.  This
+** is used for testing the I/O recovery logic.
+*/
+#if defined(SQLITE_TEST)
+SQLITE_API int sqlite3_io_error_hit = 0;            /* Total number of I/O Errors */
+SQLITE_API int sqlite3_io_error_hardhit = 0;        /* Number of non-benign errors */
+SQLITE_API int sqlite3_io_error_pending = 0;        /* Count down to first I/O error */
+SQLITE_API int sqlite3_io_error_persist = 0;        /* True if I/O errors persist */
+SQLITE_API int sqlite3_io_error_benign = 0;         /* True if errors are benign */
+SQLITE_API int sqlite3_diskfull_pending = 0;
+SQLITE_API int sqlite3_diskfull = 0;
+#endif /* defined(SQLITE_TEST) */
+
+/*
+** When testing, also keep a count of the number of open files.
+*/
+#if defined(SQLITE_TEST)
+SQLITE_API int sqlite3_open_file_count = 0;
+#endif /* defined(SQLITE_TEST) */
+
+/*
+** The default SQLite sqlite3_vfs implementations do not allocate
+** memory (actually, os_unix.c allocates a small amount of memory
+** from within OsOpen()), but some third-party implementations may.
+** So we test the effects of a malloc() failing and the sqlite3OsXXX()
+** function returning SQLITE_IOERR_NOMEM using the DO_OS_MALLOC_TEST macro.
+**
+** The following functions are instrumented for malloc() failure
+** testing:
+**
+**     sqlite3OsRead()
+**     sqlite3OsWrite()
+**     sqlite3OsSync()
+**     sqlite3OsFileSize()
+**     sqlite3OsLock()
+**     sqlite3OsCheckReservedLock()
+**     sqlite3OsFileControl()
+**     sqlite3OsShmMap()
+**     sqlite3OsOpen()
+**     sqlite3OsDelete()
+**     sqlite3OsAccess()
+**     sqlite3OsFullPathname()
+**
+*/
+#if defined(SQLITE_TEST)
+SQLITE_API int sqlit
