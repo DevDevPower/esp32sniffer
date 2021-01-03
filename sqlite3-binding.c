@@ -25089,4 +25089,198 @@ SQLITE_API int sqlite3_vfs_unregister(sqlite3_vfs *pVfs){
 ** SQLITE_NOMEM) to the user. However, sometimes a fault is not necessarily
 ** fatal. For example, if a malloc fails while resizing a hash table, this
 ** is completely recoverable simply by not carrying out the resize. The
-** hash table wi
+** hash table will continue to function normally.  So a malloc failure
+** during a hash table resize is a benign fault.
+*/
+
+/* #include "sqliteInt.h" */
+
+#ifndef SQLITE_UNTESTABLE
+
+/*
+** Global variables.
+*/
+typedef struct BenignMallocHooks BenignMallocHooks;
+static SQLITE_WSD struct BenignMallocHooks {
+  void (*xBenignBegin)(void);
+  void (*xBenignEnd)(void);
+} sqlite3Hooks = { 0, 0 };
+
+/* The "wsdHooks" macro will resolve to the appropriate BenignMallocHooks
+** structure.  If writable static data is unsupported on the target,
+** we have to locate the state vector at run-time.  In the more common
+** case where writable static data is supported, wsdHooks can refer directly
+** to the "sqlite3Hooks" state vector declared above.
+*/
+#ifdef SQLITE_OMIT_WSD
+# define wsdHooksInit \
+  BenignMallocHooks *x = &GLOBAL(BenignMallocHooks,sqlite3Hooks)
+# define wsdHooks x[0]
+#else
+# define wsdHooksInit
+# define wsdHooks sqlite3Hooks
+#endif
+
+
+/*
+** Register hooks to call when sqlite3BeginBenignMalloc() and
+** sqlite3EndBenignMalloc() are called, respectively.
+*/
+SQLITE_PRIVATE void sqlite3BenignMallocHooks(
+  void (*xBenignBegin)(void),
+  void (*xBenignEnd)(void)
+){
+  wsdHooksInit;
+  wsdHooks.xBenignBegin = xBenignBegin;
+  wsdHooks.xBenignEnd = xBenignEnd;
+}
+
+/*
+** This (sqlite3EndBenignMalloc()) is called by SQLite code to indicate that
+** subsequent malloc failures are benign. A call to sqlite3EndBenignMalloc()
+** indicates that subsequent malloc failures are non-benign.
+*/
+SQLITE_PRIVATE void sqlite3BeginBenignMalloc(void){
+  wsdHooksInit;
+  if( wsdHooks.xBenignBegin ){
+    wsdHooks.xBenignBegin();
+  }
+}
+SQLITE_PRIVATE void sqlite3EndBenignMalloc(void){
+  wsdHooksInit;
+  if( wsdHooks.xBenignEnd ){
+    wsdHooks.xBenignEnd();
+  }
+}
+
+#endif   /* #ifndef SQLITE_UNTESTABLE */
+
+/************** End of fault.c ***********************************************/
+/************** Begin file mem0.c ********************************************/
+/*
+** 2008 October 28
+**
+** The author disclaims copyright to this source code.  In place of
+** a legal notice, here is a blessing:
+**
+**    May you do good and not evil.
+**    May you find forgiveness for yourself and forgive others.
+**    May you share freely, never taking more than you give.
+**
+*************************************************************************
+**
+** This file contains a no-op memory allocation drivers for use when
+** SQLITE_ZERO_MALLOC is defined.  The allocation drivers implemented
+** here always fail.  SQLite will not operate with these drivers.  These
+** are merely placeholders.  Real drivers must be substituted using
+** sqlite3_config() before SQLite will operate.
+*/
+/* #include "sqliteInt.h" */
+
+/*
+** This version of the memory allocator is the default.  It is
+** used when no other memory allocator is specified using compile-time
+** macros.
+*/
+#ifdef SQLITE_ZERO_MALLOC
+
+/*
+** No-op versions of all memory allocation routines
+*/
+static void *sqlite3MemMalloc(int nByte){ return 0; }
+static void sqlite3MemFree(void *pPrior){ return; }
+static void *sqlite3MemRealloc(void *pPrior, int nByte){ return 0; }
+static int sqlite3MemSize(void *pPrior){ return 0; }
+static int sqlite3MemRoundup(int n){ return n; }
+static int sqlite3MemInit(void *NotUsed){ return SQLITE_OK; }
+static void sqlite3MemShutdown(void *NotUsed){ return; }
+
+/*
+** This routine is the only routine in this file with external linkage.
+**
+** Populate the low-level memory allocation function pointers in
+** sqlite3GlobalConfig.m with pointers to the routines in this file.
+*/
+SQLITE_PRIVATE void sqlite3MemSetDefault(void){
+  static const sqlite3_mem_methods defaultMethods = {
+     sqlite3MemMalloc,
+     sqlite3MemFree,
+     sqlite3MemRealloc,
+     sqlite3MemSize,
+     sqlite3MemRoundup,
+     sqlite3MemInit,
+     sqlite3MemShutdown,
+     0
+  };
+  sqlite3_config(SQLITE_CONFIG_MALLOC, &defaultMethods);
+}
+
+#endif /* SQLITE_ZERO_MALLOC */
+
+/************** End of mem0.c ************************************************/
+/************** Begin file mem1.c ********************************************/
+/*
+** 2007 August 14
+**
+** The author disclaims copyright to this source code.  In place of
+** a legal notice, here is a blessing:
+**
+**    May you do good and not evil.
+**    May you find forgiveness for yourself and forgive others.
+**    May you share freely, never taking more than you give.
+**
+*************************************************************************
+**
+** This file contains low-level memory allocation drivers for when
+** SQLite will use the standard C-library malloc/realloc/free interface
+** to obtain the memory it needs.
+**
+** This file contains implementations of the low-level memory allocation
+** routines specified in the sqlite3_mem_methods object.  The content of
+** this file is only used if SQLITE_SYSTEM_MALLOC is defined.  The
+** SQLITE_SYSTEM_MALLOC macro is defined automatically if neither the
+** SQLITE_MEMDEBUG nor the SQLITE_WIN32_MALLOC macros are defined.  The
+** default configuration is to use memory allocation routines in this
+** file.
+**
+** C-preprocessor macro summary:
+**
+**    HAVE_MALLOC_USABLE_SIZE     The configure script sets this symbol if
+**                                the malloc_usable_size() interface exists
+**                                on the target platform.  Or, this symbol
+**                                can be set manually, if desired.
+**                                If an equivalent interface exists by
+**                                a different name, using a separate -D
+**                                option to rename it.
+**
+**    SQLITE_WITHOUT_ZONEMALLOC   Some older macs lack support for the zone
+**                                memory allocator.  Set this symbol to enable
+**                                building on older macs.
+**
+**    SQLITE_WITHOUT_MSIZE        Set this symbol to disable the use of
+**                                _msize() on windows systems.  This might
+**                                be necessary when compiling for Delphi,
+**                                for example.
+*/
+/* #include "sqliteInt.h" */
+
+/*
+** This version of the memory allocator is the default.  It is
+** used when no other memory allocator is specified using compile-time
+** macros.
+*/
+#ifdef SQLITE_SYSTEM_MALLOC
+#if defined(__APPLE__) && !defined(SQLITE_WITHOUT_ZONEMALLOC)
+
+/*
+** Use the zone allocator available on apple products unless the
+** SQLITE_WITHOUT_ZONEMALLOC symbol is defined.
+*/
+#include <sys/sysctl.h>
+#include <malloc/malloc.h>
+#ifdef SQLITE_MIGHT_BE_SINGLE_CORE
+#include <libkern/OSAtomic.h>
+#endif /* SQLITE_MIGHT_BE_SINGLE_CORE */
+static malloc_zone_t* _sqliteZone_;
+#define SQLITE_MALLOC(x) malloc_zone_malloc(_sqliteZone_, (x))
+#define SQLITE_
