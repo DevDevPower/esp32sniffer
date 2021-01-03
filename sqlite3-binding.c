@@ -24867,4 +24867,226 @@ SQLITE_PRIVATE int sqlite3OsFullPathname(
   sqlite3_vfs *pVfs,
   const char *zPath,
   int nPathOut,
-  char *z
+  char *zPathOut
+){
+  DO_OS_MALLOC_TEST(0);
+  zPathOut[0] = 0;
+  return pVfs->xFullPathname(pVfs, zPath, nPathOut, zPathOut);
+}
+#ifndef SQLITE_OMIT_LOAD_EXTENSION
+SQLITE_PRIVATE void *sqlite3OsDlOpen(sqlite3_vfs *pVfs, const char *zPath){
+  assert( zPath!=0 );
+  assert( strlen(zPath)<=SQLITE_MAX_PATHLEN );  /* tag-20210611-1 */
+  return pVfs->xDlOpen(pVfs, zPath);
+}
+SQLITE_PRIVATE void sqlite3OsDlError(sqlite3_vfs *pVfs, int nByte, char *zBufOut){
+  pVfs->xDlError(pVfs, nByte, zBufOut);
+}
+SQLITE_PRIVATE void (*sqlite3OsDlSym(sqlite3_vfs *pVfs, void *pHdle, const char *zSym))(void){
+  return pVfs->xDlSym(pVfs, pHdle, zSym);
+}
+SQLITE_PRIVATE void sqlite3OsDlClose(sqlite3_vfs *pVfs, void *pHandle){
+  pVfs->xDlClose(pVfs, pHandle);
+}
+#endif /* SQLITE_OMIT_LOAD_EXTENSION */
+SQLITE_PRIVATE int sqlite3OsRandomness(sqlite3_vfs *pVfs, int nByte, char *zBufOut){
+  if( sqlite3Config.iPrngSeed ){
+    memset(zBufOut, 0, nByte);
+    if( ALWAYS(nByte>(signed)sizeof(unsigned)) ) nByte = sizeof(unsigned int);
+    memcpy(zBufOut, &sqlite3Config.iPrngSeed, nByte);
+    return SQLITE_OK;
+  }else{
+    return pVfs->xRandomness(pVfs, nByte, zBufOut);
+  }
+
+}
+SQLITE_PRIVATE int sqlite3OsSleep(sqlite3_vfs *pVfs, int nMicro){
+  return pVfs->xSleep(pVfs, nMicro);
+}
+SQLITE_PRIVATE int sqlite3OsGetLastError(sqlite3_vfs *pVfs){
+  return pVfs->xGetLastError ? pVfs->xGetLastError(pVfs, 0, 0) : 0;
+}
+SQLITE_PRIVATE int sqlite3OsCurrentTimeInt64(sqlite3_vfs *pVfs, sqlite3_int64 *pTimeOut){
+  int rc;
+  /* IMPLEMENTATION-OF: R-49045-42493 SQLite will use the xCurrentTimeInt64()
+  ** method to get the current date and time if that method is available
+  ** (if iVersion is 2 or greater and the function pointer is not NULL) and
+  ** will fall back to xCurrentTime() if xCurrentTimeInt64() is
+  ** unavailable.
+  */
+  if( pVfs->iVersion>=2 && pVfs->xCurrentTimeInt64 ){
+    rc = pVfs->xCurrentTimeInt64(pVfs, pTimeOut);
+  }else{
+    double r;
+    rc = pVfs->xCurrentTime(pVfs, &r);
+    *pTimeOut = (sqlite3_int64)(r*86400000.0);
+  }
+  return rc;
+}
+
+SQLITE_PRIVATE int sqlite3OsOpenMalloc(
+  sqlite3_vfs *pVfs,
+  const char *zFile,
+  sqlite3_file **ppFile,
+  int flags,
+  int *pOutFlags
+){
+  int rc;
+  sqlite3_file *pFile;
+  pFile = (sqlite3_file *)sqlite3MallocZero(pVfs->szOsFile);
+  if( pFile ){
+    rc = sqlite3OsOpen(pVfs, zFile, pFile, flags, pOutFlags);
+    if( rc!=SQLITE_OK ){
+      sqlite3_free(pFile);
+      *ppFile = 0;
+    }else{
+      *ppFile = pFile;
+    }
+  }else{
+    *ppFile = 0;
+    rc = SQLITE_NOMEM_BKPT;
+  }
+  assert( *ppFile!=0 || rc!=SQLITE_OK );
+  return rc;
+}
+SQLITE_PRIVATE void sqlite3OsCloseFree(sqlite3_file *pFile){
+  assert( pFile );
+  sqlite3OsClose(pFile);
+  sqlite3_free(pFile);
+}
+
+/*
+** This function is a wrapper around the OS specific implementation of
+** sqlite3_os_init(). The purpose of the wrapper is to provide the
+** ability to simulate a malloc failure, so that the handling of an
+** error in sqlite3_os_init() by the upper layers can be tested.
+*/
+SQLITE_PRIVATE int sqlite3OsInit(void){
+  void *p = sqlite3_malloc(10);
+  if( p==0 ) return SQLITE_NOMEM_BKPT;
+  sqlite3_free(p);
+  return sqlite3_os_init();
+}
+
+/*
+** The list of all registered VFS implementations.
+*/
+static sqlite3_vfs * SQLITE_WSD vfsList = 0;
+#define vfsList GLOBAL(sqlite3_vfs *, vfsList)
+
+/*
+** Locate a VFS by name.  If no name is given, simply return the
+** first VFS on the list.
+*/
+SQLITE_API sqlite3_vfs *sqlite3_vfs_find(const char *zVfs){
+  sqlite3_vfs *pVfs = 0;
+#if SQLITE_THREADSAFE
+  sqlite3_mutex *mutex;
+#endif
+#ifndef SQLITE_OMIT_AUTOINIT
+  int rc = sqlite3_initialize();
+  if( rc ) return 0;
+#endif
+#if SQLITE_THREADSAFE
+  mutex = sqlite3MutexAlloc(SQLITE_MUTEX_STATIC_MAIN);
+#endif
+  sqlite3_mutex_enter(mutex);
+  for(pVfs = vfsList; pVfs; pVfs=pVfs->pNext){
+    if( zVfs==0 ) break;
+    if( strcmp(zVfs, pVfs->zName)==0 ) break;
+  }
+  sqlite3_mutex_leave(mutex);
+  return pVfs;
+}
+
+/*
+** Unlink a VFS from the linked list
+*/
+static void vfsUnlink(sqlite3_vfs *pVfs){
+  assert( sqlite3_mutex_held(sqlite3MutexAlloc(SQLITE_MUTEX_STATIC_MAIN)) );
+  if( pVfs==0 ){
+    /* No-op */
+  }else if( vfsList==pVfs ){
+    vfsList = pVfs->pNext;
+  }else if( vfsList ){
+    sqlite3_vfs *p = vfsList;
+    while( p->pNext && p->pNext!=pVfs ){
+      p = p->pNext;
+    }
+    if( p->pNext==pVfs ){
+      p->pNext = pVfs->pNext;
+    }
+  }
+}
+
+/*
+** Register a VFS with the system.  It is harmless to register the same
+** VFS multiple times.  The new VFS becomes the default if makeDflt is
+** true.
+*/
+SQLITE_API int sqlite3_vfs_register(sqlite3_vfs *pVfs, int makeDflt){
+  MUTEX_LOGIC(sqlite3_mutex *mutex;)
+#ifndef SQLITE_OMIT_AUTOINIT
+  int rc = sqlite3_initialize();
+  if( rc ) return rc;
+#endif
+#ifdef SQLITE_ENABLE_API_ARMOR
+  if( pVfs==0 ) return SQLITE_MISUSE_BKPT;
+#endif
+
+  MUTEX_LOGIC( mutex = sqlite3MutexAlloc(SQLITE_MUTEX_STATIC_MAIN); )
+  sqlite3_mutex_enter(mutex);
+  vfsUnlink(pVfs);
+  if( makeDflt || vfsList==0 ){
+    pVfs->pNext = vfsList;
+    vfsList = pVfs;
+  }else{
+    pVfs->pNext = vfsList->pNext;
+    vfsList->pNext = pVfs;
+  }
+  assert(vfsList);
+  sqlite3_mutex_leave(mutex);
+  return SQLITE_OK;
+}
+
+/*
+** Unregister a VFS so that it is no longer accessible.
+*/
+SQLITE_API int sqlite3_vfs_unregister(sqlite3_vfs *pVfs){
+  MUTEX_LOGIC(sqlite3_mutex *mutex;)
+#ifndef SQLITE_OMIT_AUTOINIT
+  int rc = sqlite3_initialize();
+  if( rc ) return rc;
+#endif
+  MUTEX_LOGIC( mutex = sqlite3MutexAlloc(SQLITE_MUTEX_STATIC_MAIN); )
+  sqlite3_mutex_enter(mutex);
+  vfsUnlink(pVfs);
+  sqlite3_mutex_leave(mutex);
+  return SQLITE_OK;
+}
+
+/************** End of os.c **************************************************/
+/************** Begin file fault.c *******************************************/
+/*
+** 2008 Jan 22
+**
+** The author disclaims copyright to this source code.  In place of
+** a legal notice, here is a blessing:
+**
+**    May you do good and not evil.
+**    May you find forgiveness for yourself and forgive others.
+**    May you share freely, never taking more than you give.
+**
+*************************************************************************
+**
+** This file contains code to support the concept of "benign"
+** malloc failures (when the xMalloc() or xRealloc() method of the
+** sqlite3_mem_methods structure fails to allocate a block of memory
+** and returns 0).
+**
+** Most malloc failures are non-benign. After they occur, SQLite
+** abandons the current operation and returns an error code (usually
+** SQLITE_NOMEM) to the user. However, sometimes a fault is not necessarily
+** fatal. For example, if a malloc fails while resizing a hash table, this
+** is completely recoverable simply by not carrying out the resize. The
+** hash table wi
