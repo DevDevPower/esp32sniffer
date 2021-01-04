@@ -25991,3 +25991,205 @@ SQLITE_PRIVATE void sqlite3MemdebugSync(){
 SQLITE_PRIVATE void sqlite3MemdebugDump(const char *zFilename){
   FILE *out;
   struct MemBlockHdr *pHdr;
+  void **pBt;
+  int i;
+  out = fopen(zFilename, "w");
+  if( out==0 ){
+    fprintf(stderr, "** Unable to output memory debug output log: %s **\n",
+                    zFilename);
+    return;
+  }
+  for(pHdr=mem.pFirst; pHdr; pHdr=pHdr->pNext){
+    char *z = (char*)pHdr;
+    z -= pHdr->nBacktraceSlots*sizeof(void*) + pHdr->nTitle;
+    fprintf(out, "**** %lld bytes at %p from %s ****\n",
+            pHdr->iSize, &pHdr[1], pHdr->nTitle ? z : "???");
+    if( pHdr->nBacktrace ){
+      fflush(out);
+      pBt = (void**)pHdr;
+      pBt -= pHdr->nBacktraceSlots;
+      backtrace_symbols_fd(pBt, pHdr->nBacktrace, fileno(out));
+      fprintf(out, "\n");
+    }
+  }
+  fprintf(out, "COUNTS:\n");
+  for(i=0; i<NCSIZE-1; i++){
+    if( mem.nAlloc[i] ){
+      fprintf(out, "   %5d: %10d %10d %10d\n",
+            i*8, mem.nAlloc[i], mem.nCurrent[i], mem.mxCurrent[i]);
+    }
+  }
+  if( mem.nAlloc[NCSIZE-1] ){
+    fprintf(out, "   %5d: %10d %10d %10d\n",
+             NCSIZE*8-8, mem.nAlloc[NCSIZE-1],
+             mem.nCurrent[NCSIZE-1], mem.mxCurrent[NCSIZE-1]);
+  }
+  fclose(out);
+}
+
+/*
+** Return the number of times sqlite3MemMalloc() has been called.
+*/
+SQLITE_PRIVATE int sqlite3MemdebugMallocCount(){
+  int i;
+  int nTotal = 0;
+  for(i=0; i<NCSIZE; i++){
+    nTotal += mem.nAlloc[i];
+  }
+  return nTotal;
+}
+
+
+#endif /* SQLITE_MEMDEBUG */
+
+/************** End of mem2.c ************************************************/
+/************** Begin file mem3.c ********************************************/
+/*
+** 2007 October 14
+**
+** The author disclaims copyright to this source code.  In place of
+** a legal notice, here is a blessing:
+**
+**    May you do good and not evil.
+**    May you find forgiveness for yourself and forgive others.
+**    May you share freely, never taking more than you give.
+**
+*************************************************************************
+** This file contains the C functions that implement a memory
+** allocation subsystem for use by SQLite.
+**
+** This version of the memory allocation subsystem omits all
+** use of malloc(). The SQLite user supplies a block of memory
+** before calling sqlite3_initialize() from which allocations
+** are made and returned by the xMalloc() and xRealloc()
+** implementations. Once sqlite3_initialize() has been called,
+** the amount of memory available to SQLite is fixed and cannot
+** be changed.
+**
+** This version of the memory allocation subsystem is included
+** in the build only if SQLITE_ENABLE_MEMSYS3 is defined.
+*/
+/* #include "sqliteInt.h" */
+
+/*
+** This version of the memory allocator is only built into the library
+** SQLITE_ENABLE_MEMSYS3 is defined. Defining this symbol does not
+** mean that the library will use a memory-pool by default, just that
+** it is available. The mempool allocator is activated by calling
+** sqlite3_config().
+*/
+#ifdef SQLITE_ENABLE_MEMSYS3
+
+/*
+** Maximum size (in Mem3Blocks) of a "small" chunk.
+*/
+#define MX_SMALL 10
+
+
+/*
+** Number of freelist hash slots
+*/
+#define N_HASH  61
+
+/*
+** A memory allocation (also called a "chunk") consists of two or
+** more blocks where each block is 8 bytes.  The first 8 bytes are
+** a header that is not returned to the user.
+**
+** A chunk is two or more blocks that is either checked out or
+** free.  The first block has format u.hdr.  u.hdr.size4x is 4 times the
+** size of the allocation in blocks if the allocation is free.
+** The u.hdr.size4x&1 bit is true if the chunk is checked out and
+** false if the chunk is on the freelist.  The u.hdr.size4x&2 bit
+** is true if the previous chunk is checked out and false if the
+** previous chunk is free.  The u.hdr.prevSize field is the size of
+** the previous chunk in blocks if the previous chunk is on the
+** freelist. If the previous chunk is checked out, then
+** u.hdr.prevSize can be part of the data for that chunk and should
+** not be read or written.
+**
+** We often identify a chunk by its index in mem3.aPool[].  When
+** this is done, the chunk index refers to the second block of
+** the chunk.  In this way, the first chunk has an index of 1.
+** A chunk index of 0 means "no such chunk" and is the equivalent
+** of a NULL pointer.
+**
+** The second block of free chunks is of the form u.list.  The
+** two fields form a double-linked list of chunks of related sizes.
+** Pointers to the head of the list are stored in mem3.aiSmall[]
+** for smaller chunks and mem3.aiHash[] for larger chunks.
+**
+** The second block of a chunk is user data if the chunk is checked
+** out.  If a chunk is checked out, the user data may extend into
+** the u.hdr.prevSize value of the following chunk.
+*/
+typedef struct Mem3Block Mem3Block;
+struct Mem3Block {
+  union {
+    struct {
+      u32 prevSize;   /* Size of previous chunk in Mem3Block elements */
+      u32 size4x;     /* 4x the size of current chunk in Mem3Block elements */
+    } hdr;
+    struct {
+      u32 next;       /* Index in mem3.aPool[] of next free chunk */
+      u32 prev;       /* Index in mem3.aPool[] of previous free chunk */
+    } list;
+  } u;
+};
+
+/*
+** All of the static variables used by this module are collected
+** into a single structure named "mem3".  This is to keep the
+** static variables organized and to reduce namespace pollution
+** when this module is combined with other in the amalgamation.
+*/
+static SQLITE_WSD struct Mem3Global {
+  /*
+  ** Memory available for allocation. nPool is the size of the array
+  ** (in Mem3Blocks) pointed to by aPool less 2.
+  */
+  u32 nPool;
+  Mem3Block *aPool;
+
+  /*
+  ** True if we are evaluating an out-of-memory callback.
+  */
+  int alarmBusy;
+
+  /*
+  ** Mutex to control access to the memory allocation subsystem.
+  */
+  sqlite3_mutex *mutex;
+
+  /*
+  ** The minimum amount of free space that we have seen.
+  */
+  u32 mnKeyBlk;
+
+  /*
+  ** iKeyBlk is the index of the key chunk.  Most new allocations
+  ** occur off of this chunk.  szKeyBlk is the size (in Mem3Blocks)
+  ** of the current key chunk.  iKeyBlk is 0 if there is no key chunk.
+  ** The key chunk is not in either the aiHash[] or aiSmall[].
+  */
+  u32 iKeyBlk;
+  u32 szKeyBlk;
+
+  /*
+  ** Array of lists of free blocks according to the block size
+  ** for smaller chunks, or a hash on the block size for larger
+  ** chunks.
+  */
+  u32 aiSmall[MX_SMALL-1];   /* For sizes 2 through MX_SMALL, inclusive */
+  u32 aiHash[N_HASH];        /* For sizes MX_SMALL+1 and larger */
+} mem3 = { 97535575 };
+
+#define mem3 GLOBAL(struct Mem3Global, mem3)
+
+/*
+** Unlink the chunk at mem3.aPool[i] from list it is currently
+** on.  *pRoot is the list that i is a member of.
+*/
+static void memsys3UnlinkFromList(u32 i, u32 *pRoot){
+  u32 next = mem3.aPool[i].u.list.next;
+  u32 prev = mem3.aPool[
