@@ -28670,4 +28670,240 @@ static void winMutexFree(sqlite3_mutex *p){
 ** be entered multiple times by the same thread.  In such cases the,
 ** mutex must be exited an equal number of times before another thread
 ** can enter.  If the same thread tries to enter any other kind of mutex
-** more tha
+** more than once, the behavior is undefined.
+*/
+static void winMutexEnter(sqlite3_mutex *p){
+#if defined(SQLITE_DEBUG) || defined(SQLITE_TEST)
+  DWORD tid = GetCurrentThreadId();
+#endif
+#ifdef SQLITE_DEBUG
+  assert( p );
+  assert( p->id==SQLITE_MUTEX_RECURSIVE || winMutexNotheld2(p, tid) );
+#else
+  assert( p );
+#endif
+  assert( winMutex_isInit==1 );
+  EnterCriticalSection(&p->mutex);
+#ifdef SQLITE_DEBUG
+  assert( p->nRef>0 || p->owner==0 );
+  p->owner = tid;
+  p->nRef++;
+  if( p->trace ){
+    OSTRACE(("ENTER-MUTEX tid=%lu, mutex(%d)=%p (%d), nRef=%d\n",
+             tid, p->id, p, p->trace, p->nRef));
+  }
+#endif
+}
+
+static int winMutexTry(sqlite3_mutex *p){
+#if defined(SQLITE_DEBUG) || defined(SQLITE_TEST)
+  DWORD tid = GetCurrentThreadId();
+#endif
+  int rc = SQLITE_BUSY;
+  assert( p );
+  assert( p->id==SQLITE_MUTEX_RECURSIVE || winMutexNotheld2(p, tid) );
+  /*
+  ** The sqlite3_mutex_try() routine is very rarely used, and when it
+  ** is used it is merely an optimization.  So it is OK for it to always
+  ** fail.
+  **
+  ** The TryEnterCriticalSection() interface is only available on WinNT.
+  ** And some windows compilers complain if you try to use it without
+  ** first doing some #defines that prevent SQLite from building on Win98.
+  ** For that reason, we will omit this optimization for now.  See
+  ** ticket #2685.
+  */
+#if defined(_WIN32_WINNT) && _WIN32_WINNT >= 0x0400
+  assert( winMutex_isInit==1 );
+  assert( winMutex_isNt>=-1 && winMutex_isNt<=1 );
+  if( winMutex_isNt<0 ){
+    winMutex_isNt = sqlite3_win32_is_nt();
+  }
+  assert( winMutex_isNt==0 || winMutex_isNt==1 );
+  if( winMutex_isNt && TryEnterCriticalSection(&p->mutex) ){
+#ifdef SQLITE_DEBUG
+    p->owner = tid;
+    p->nRef++;
+#endif
+    rc = SQLITE_OK;
+  }
+#else
+  UNUSED_PARAMETER(p);
+#endif
+#ifdef SQLITE_DEBUG
+  if( p->trace ){
+    OSTRACE(("TRY-MUTEX tid=%lu, mutex(%d)=%p (%d), owner=%lu, nRef=%d, rc=%s\n",
+             tid, p->id, p, p->trace, p->owner, p->nRef, sqlite3ErrName(rc)));
+  }
+#endif
+  return rc;
+}
+
+/*
+** The sqlite3_mutex_leave() routine exits a mutex that was
+** previously entered by the same thread.  The behavior
+** is undefined if the mutex is not currently entered or
+** is not currently allocated.  SQLite will never do either.
+*/
+static void winMutexLeave(sqlite3_mutex *p){
+#if defined(SQLITE_DEBUG) || defined(SQLITE_TEST)
+  DWORD tid = GetCurrentThreadId();
+#endif
+  assert( p );
+#ifdef SQLITE_DEBUG
+  assert( p->nRef>0 );
+  assert( p->owner==tid );
+  p->nRef--;
+  if( p->nRef==0 ) p->owner = 0;
+  assert( p->nRef==0 || p->id==SQLITE_MUTEX_RECURSIVE );
+#endif
+  assert( winMutex_isInit==1 );
+  LeaveCriticalSection(&p->mutex);
+#ifdef SQLITE_DEBUG
+  if( p->trace ){
+    OSTRACE(("LEAVE-MUTEX tid=%lu, mutex(%d)=%p (%d), nRef=%d\n",
+             tid, p->id, p, p->trace, p->nRef));
+  }
+#endif
+}
+
+SQLITE_PRIVATE sqlite3_mutex_methods const *sqlite3DefaultMutex(void){
+  static const sqlite3_mutex_methods sMutex = {
+    winMutexInit,
+    winMutexEnd,
+    winMutexAlloc,
+    winMutexFree,
+    winMutexEnter,
+    winMutexTry,
+    winMutexLeave,
+#ifdef SQLITE_DEBUG
+    winMutexHeld,
+    winMutexNotheld
+#else
+    0,
+    0
+#endif
+  };
+  return &sMutex;
+}
+
+#endif /* SQLITE_MUTEX_W32 */
+
+/************** End of mutex_w32.c *******************************************/
+/************** Begin file malloc.c ******************************************/
+/*
+** 2001 September 15
+**
+** The author disclaims copyright to this source code.  In place of
+** a legal notice, here is a blessing:
+**
+**    May you do good and not evil.
+**    May you find forgiveness for yourself and forgive others.
+**    May you share freely, never taking more than you give.
+**
+*************************************************************************
+**
+** Memory allocation functions used throughout sqlite.
+*/
+/* #include "sqliteInt.h" */
+/* #include <stdarg.h> */
+
+/*
+** Attempt to release up to n bytes of non-essential memory currently
+** held by SQLite. An example of non-essential memory is memory used to
+** cache database pages that are not currently in use.
+*/
+SQLITE_API int sqlite3_release_memory(int n){
+#ifdef SQLITE_ENABLE_MEMORY_MANAGEMENT
+  return sqlite3PcacheReleaseMemory(n);
+#else
+  /* IMPLEMENTATION-OF: R-34391-24921 The sqlite3_release_memory() routine
+  ** is a no-op returning zero if SQLite is not compiled with
+  ** SQLITE_ENABLE_MEMORY_MANAGEMENT. */
+  UNUSED_PARAMETER(n);
+  return 0;
+#endif
+}
+
+/*
+** Default value of the hard heap limit.  0 means "no limit".
+*/
+#ifndef SQLITE_MAX_MEMORY
+# define SQLITE_MAX_MEMORY 0
+#endif
+
+/*
+** State information local to the memory allocation subsystem.
+*/
+static SQLITE_WSD struct Mem0Global {
+  sqlite3_mutex *mutex;         /* Mutex to serialize access */
+  sqlite3_int64 alarmThreshold; /* The soft heap limit */
+  sqlite3_int64 hardLimit;      /* The hard upper bound on memory */
+
+  /*
+  ** True if heap is nearly "full" where "full" is defined by the
+  ** sqlite3_soft_heap_limit() setting.
+  */
+  int nearlyFull;
+} mem0 = { 0, SQLITE_MAX_MEMORY, SQLITE_MAX_MEMORY, 0 };
+
+#define mem0 GLOBAL(struct Mem0Global, mem0)
+
+/*
+** Return the memory allocator mutex. sqlite3_status() needs it.
+*/
+SQLITE_PRIVATE sqlite3_mutex *sqlite3MallocMutex(void){
+  return mem0.mutex;
+}
+
+#ifndef SQLITE_OMIT_DEPRECATED
+/*
+** Deprecated external interface.  It used to set an alarm callback
+** that was invoked when memory usage grew too large.  Now it is a
+** no-op.
+*/
+SQLITE_API int sqlite3_memory_alarm(
+  void(*xCallback)(void *pArg, sqlite3_int64 used,int N),
+  void *pArg,
+  sqlite3_int64 iThreshold
+){
+  (void)xCallback;
+  (void)pArg;
+  (void)iThreshold;
+  return SQLITE_OK;
+}
+#endif
+
+/*
+** Set the soft heap-size limit for the library.  An argument of
+** zero disables the limit.  A negative argument is a no-op used to
+** obtain the return value.
+**
+** The return value is the value of the heap limit just before this
+** interface was called.
+**
+** If the hard heap limit is enabled, then the soft heap limit cannot
+** be disabled nor raised above the hard heap limit.
+*/
+SQLITE_API sqlite3_int64 sqlite3_soft_heap_limit64(sqlite3_int64 n){
+  sqlite3_int64 priorLimit;
+  sqlite3_int64 excess;
+  sqlite3_int64 nUsed;
+#ifndef SQLITE_OMIT_AUTOINIT
+  int rc = sqlite3_initialize();
+  if( rc ) return -1;
+#endif
+  sqlite3_mutex_enter(mem0.mutex);
+  priorLimit = mem0.alarmThreshold;
+  if( n<0 ){
+    sqlite3_mutex_leave(mem0.mutex);
+    return priorLimit;
+  }
+  if( mem0.hardLimit>0 && (n>mem0.hardLimit || n==0) ){
+    n = mem0.hardLimit;
+  }
+  mem0.alarmThreshold = n;
+  nUsed = sqlite3StatusValue(SQLITE_STATUS_MEMORY_USED);
+  AtomicStore(&mem0.nearlyFull, n>0 && n<=nUsed);
+  sqlite3_mutex_leave(mem0.mutex);
+  excess = sqlite
