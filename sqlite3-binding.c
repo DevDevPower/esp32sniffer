@@ -29571,4 +29571,190 @@ SQLITE_PRIVATE void *sqlite3OomFault(sqlite3 *db){
     if( db->pParse ){
       Parse *pParse;
       sqlite3ErrorMsg(db->pParse, "out of memory");
-      db->pParse->rc 
+      db->pParse->rc = SQLITE_NOMEM_BKPT;
+      for(pParse=db->pParse->pOuterParse; pParse; pParse = pParse->pOuterParse){
+        pParse->nErr++;
+        pParse->rc = SQLITE_NOMEM;
+      }
+    }
+  }
+  return 0;
+}
+
+/*
+** This routine reactivates the memory allocator and clears the
+** db->mallocFailed flag as necessary.
+**
+** The memory allocator is not restarted if there are running
+** VDBEs.
+*/
+SQLITE_PRIVATE void sqlite3OomClear(sqlite3 *db){
+  if( db->mallocFailed && db->nVdbeExec==0 ){
+    db->mallocFailed = 0;
+    AtomicStore(&db->u1.isInterrupted, 0);
+    assert( db->lookaside.bDisable>0 );
+    EnableLookaside;
+  }
+}
+
+/*
+** Take actions at the end of an API call to deal with error codes.
+*/
+static SQLITE_NOINLINE int apiHandleError(sqlite3 *db, int rc){
+  if( db->mallocFailed || rc==SQLITE_IOERR_NOMEM ){
+    sqlite3OomClear(db);
+    sqlite3Error(db, SQLITE_NOMEM);
+    return SQLITE_NOMEM_BKPT;
+  }
+  return rc & db->errMask;
+}
+
+/*
+** This function must be called before exiting any API function (i.e.
+** returning control to the user) that has called sqlite3_malloc or
+** sqlite3_realloc.
+**
+** The returned value is normally a copy of the second argument to this
+** function. However, if a malloc() failure has occurred since the previous
+** invocation SQLITE_NOMEM is returned instead.
+**
+** If an OOM as occurred, then the connection error-code (the value
+** returned by sqlite3_errcode()) is set to SQLITE_NOMEM.
+*/
+SQLITE_PRIVATE int sqlite3ApiExit(sqlite3* db, int rc){
+  /* If the db handle must hold the connection handle mutex here.
+  ** Otherwise the read (and possible write) of db->mallocFailed
+  ** is unsafe, as is the call to sqlite3Error().
+  */
+  assert( db!=0 );
+  assert( sqlite3_mutex_held(db->mutex) );
+  if( db->mallocFailed || rc ){
+    return apiHandleError(db, rc);
+  }
+  return rc & db->errMask;
+}
+
+/************** End of malloc.c **********************************************/
+/************** Begin file printf.c ******************************************/
+/*
+** The "printf" code that follows dates from the 1980's.  It is in
+** the public domain.
+**
+**************************************************************************
+**
+** This file contains code for a set of "printf"-like routines.  These
+** routines format strings much like the printf() from the standard C
+** library, though the implementation here has enhancements to support
+** SQLite.
+*/
+/* #include "sqliteInt.h" */
+
+/*
+** Conversion types fall into various categories as defined by the
+** following enumeration.
+*/
+#define etRADIX       0 /* non-decimal integer types.  %x %o */
+#define etFLOAT       1 /* Floating point.  %f */
+#define etEXP         2 /* Exponentional notation. %e and %E */
+#define etGENERIC     3 /* Floating or exponential, depending on exponent. %g */
+#define etSIZE        4 /* Return number of characters processed so far. %n */
+#define etSTRING      5 /* Strings. %s */
+#define etDYNSTRING   6 /* Dynamically allocated strings. %z */
+#define etPERCENT     7 /* Percent symbol. %% */
+#define etCHARX       8 /* Characters. %c */
+/* The rest are extensions, not normally found in printf() */
+#define etSQLESCAPE   9 /* Strings with '\'' doubled.  %q */
+#define etSQLESCAPE2 10 /* Strings with '\'' doubled and enclosed in '',
+                          NULL pointers replaced by SQL NULL.  %Q */
+#define etTOKEN      11 /* a pointer to a Token structure */
+#define etSRCITEM    12 /* a pointer to a SrcItem */
+#define etPOINTER    13 /* The %p conversion */
+#define etSQLESCAPE3 14 /* %w -> Strings with '\"' doubled */
+#define etORDINAL    15 /* %r -> 1st, 2nd, 3rd, 4th, etc.  English only */
+#define etDECIMAL    16 /* %d or %u, but not %x, %o */
+
+#define etINVALID    17 /* Any unrecognized conversion type */
+
+
+/*
+** An "etByte" is an 8-bit unsigned value.
+*/
+typedef unsigned char etByte;
+
+/*
+** Each builtin conversion character (ex: the 'd' in "%d") is described
+** by an instance of the following structure
+*/
+typedef struct et_info {   /* Information about each format field */
+  char fmttype;            /* The format field code letter */
+  etByte base;             /* The base for radix conversion */
+  etByte flags;            /* One or more of FLAG_ constants below */
+  etByte type;             /* Conversion paradigm */
+  etByte charset;          /* Offset into aDigits[] of the digits string */
+  etByte prefix;           /* Offset into aPrefix[] of the prefix string */
+} et_info;
+
+/*
+** Allowed values for et_info.flags
+*/
+#define FLAG_SIGNED    1     /* True if the value to convert is signed */
+#define FLAG_STRING    4     /* Allow infinite precision */
+
+
+/*
+** The following table is searched linearly, so it is good to put the
+** most frequently used conversion types first.
+*/
+static const char aDigits[] = "0123456789ABCDEF0123456789abcdef";
+static const char aPrefix[] = "-x0\000X0";
+static const et_info fmtinfo[] = {
+  {  'd', 10, 1, etDECIMAL,    0,  0 },
+  {  's',  0, 4, etSTRING,     0,  0 },
+  {  'g',  0, 1, etGENERIC,    30, 0 },
+  {  'z',  0, 4, etDYNSTRING,  0,  0 },
+  {  'q',  0, 4, etSQLESCAPE,  0,  0 },
+  {  'Q',  0, 4, etSQLESCAPE2, 0,  0 },
+  {  'w',  0, 4, etSQLESCAPE3, 0,  0 },
+  {  'c',  0, 0, etCHARX,      0,  0 },
+  {  'o',  8, 0, etRADIX,      0,  2 },
+  {  'u', 10, 0, etDECIMAL,    0,  0 },
+  {  'x', 16, 0, etRADIX,      16, 1 },
+  {  'X', 16, 0, etRADIX,      0,  4 },
+#ifndef SQLITE_OMIT_FLOATING_POINT
+  {  'f',  0, 1, etFLOAT,      0,  0 },
+  {  'e',  0, 1, etEXP,        30, 0 },
+  {  'E',  0, 1, etEXP,        14, 0 },
+  {  'G',  0, 1, etGENERIC,    14, 0 },
+#endif
+  {  'i', 10, 1, etDECIMAL,    0,  0 },
+  {  'n',  0, 0, etSIZE,       0,  0 },
+  {  '%',  0, 0, etPERCENT,    0,  0 },
+  {  'p', 16, 0, etPOINTER,    0,  1 },
+
+  /* All the rest are undocumented and are for internal use only */
+  {  'T',  0, 0, etTOKEN,      0,  0 },
+  {  'S',  0, 0, etSRCITEM,    0,  0 },
+  {  'r', 10, 1, etORDINAL,    0,  0 },
+};
+
+/* Notes:
+**
+**    %S    Takes a pointer to SrcItem.  Shows name or database.name
+**    %!S   Like %S but prefer the zName over the zAlias
+*/
+
+/* Floating point constants used for rounding */
+static const double arRound[] = {
+  5.0e-01, 5.0e-02, 5.0e-03, 5.0e-04, 5.0e-05,
+  5.0e-06, 5.0e-07, 5.0e-08, 5.0e-09, 5.0e-10,
+};
+
+/*
+** If SQLITE_OMIT_FLOATING_POINT is defined, then none of the floating point
+** conversions will work.
+*/
+#ifndef SQLITE_OMIT_FLOATING_POINT
+/*
+** "*val" is a double such that 0.1 <= *val < 10.0
+** Return the ascii code for the leading digit of *val, then
+** multiply "*val" by 10.0
