@@ -28906,4 +28906,231 @@ SQLITE_API sqlite3_int64 sqlite3_soft_heap_limit64(sqlite3_int64 n){
   nUsed = sqlite3StatusValue(SQLITE_STATUS_MEMORY_USED);
   AtomicStore(&mem0.nearlyFull, n>0 && n<=nUsed);
   sqlite3_mutex_leave(mem0.mutex);
-  excess = sqlite
+  excess = sqlite3_memory_used() - n;
+  if( excess>0 ) sqlite3_release_memory((int)(excess & 0x7fffffff));
+  return priorLimit;
+}
+SQLITE_API void sqlite3_soft_heap_limit(int n){
+  if( n<0 ) n = 0;
+  sqlite3_soft_heap_limit64(n);
+}
+
+/*
+** Set the hard heap-size limit for the library. An argument of zero
+** disables the hard heap limit.  A negative argument is a no-op used
+** to obtain the return value without affecting the hard heap limit.
+**
+** The return value is the value of the hard heap limit just prior to
+** calling this interface.
+**
+** Setting the hard heap limit will also activate the soft heap limit
+** and constrain the soft heap limit to be no more than the hard heap
+** limit.
+*/
+SQLITE_API sqlite3_int64 sqlite3_hard_heap_limit64(sqlite3_int64 n){
+  sqlite3_int64 priorLimit;
+#ifndef SQLITE_OMIT_AUTOINIT
+  int rc = sqlite3_initialize();
+  if( rc ) return -1;
+#endif
+  sqlite3_mutex_enter(mem0.mutex);
+  priorLimit = mem0.hardLimit;
+  if( n>=0 ){
+    mem0.hardLimit = n;
+    if( n<mem0.alarmThreshold || mem0.alarmThreshold==0 ){
+      mem0.alarmThreshold = n;
+    }
+  }
+  sqlite3_mutex_leave(mem0.mutex);
+  return priorLimit;
+}
+
+
+/*
+** Initialize the memory allocation subsystem.
+*/
+SQLITE_PRIVATE int sqlite3MallocInit(void){
+  int rc;
+  if( sqlite3GlobalConfig.m.xMalloc==0 ){
+    sqlite3MemSetDefault();
+  }
+  mem0.mutex = sqlite3MutexAlloc(SQLITE_MUTEX_STATIC_MEM);
+  if( sqlite3GlobalConfig.pPage==0 || sqlite3GlobalConfig.szPage<512
+      || sqlite3GlobalConfig.nPage<=0 ){
+    sqlite3GlobalConfig.pPage = 0;
+    sqlite3GlobalConfig.szPage = 0;
+  }
+  rc = sqlite3GlobalConfig.m.xInit(sqlite3GlobalConfig.m.pAppData);
+  if( rc!=SQLITE_OK ) memset(&mem0, 0, sizeof(mem0));
+  return rc;
+}
+
+/*
+** Return true if the heap is currently under memory pressure - in other
+** words if the amount of heap used is close to the limit set by
+** sqlite3_soft_heap_limit().
+*/
+SQLITE_PRIVATE int sqlite3HeapNearlyFull(void){
+  return AtomicLoad(&mem0.nearlyFull);
+}
+
+/*
+** Deinitialize the memory allocation subsystem.
+*/
+SQLITE_PRIVATE void sqlite3MallocEnd(void){
+  if( sqlite3GlobalConfig.m.xShutdown ){
+    sqlite3GlobalConfig.m.xShutdown(sqlite3GlobalConfig.m.pAppData);
+  }
+  memset(&mem0, 0, sizeof(mem0));
+}
+
+/*
+** Return the amount of memory currently checked out.
+*/
+SQLITE_API sqlite3_int64 sqlite3_memory_used(void){
+  sqlite3_int64 res, mx;
+  sqlite3_status64(SQLITE_STATUS_MEMORY_USED, &res, &mx, 0);
+  return res;
+}
+
+/*
+** Return the maximum amount of memory that has ever been
+** checked out since either the beginning of this process
+** or since the most recent reset.
+*/
+SQLITE_API sqlite3_int64 sqlite3_memory_highwater(int resetFlag){
+  sqlite3_int64 res, mx;
+  sqlite3_status64(SQLITE_STATUS_MEMORY_USED, &res, &mx, resetFlag);
+  return mx;
+}
+
+/*
+** Trigger the alarm
+*/
+static void sqlite3MallocAlarm(int nByte){
+  if( mem0.alarmThreshold<=0 ) return;
+  sqlite3_mutex_leave(mem0.mutex);
+  sqlite3_release_memory(nByte);
+  sqlite3_mutex_enter(mem0.mutex);
+}
+
+/*
+** Do a memory allocation with statistics and alarms.  Assume the
+** lock is already held.
+*/
+static void mallocWithAlarm(int n, void **pp){
+  void *p;
+  int nFull;
+  assert( sqlite3_mutex_held(mem0.mutex) );
+  assert( n>0 );
+
+  /* In Firefox (circa 2017-02-08), xRoundup() is remapped to an internal
+  ** implementation of malloc_good_size(), which must be called in debug
+  ** mode and specifically when the DMD "Dark Matter Detector" is enabled
+  ** or else a crash results.  Hence, do not attempt to optimize out the
+  ** following xRoundup() call. */
+  nFull = sqlite3GlobalConfig.m.xRoundup(n);
+
+  sqlite3StatusHighwater(SQLITE_STATUS_MALLOC_SIZE, n);
+  if( mem0.alarmThreshold>0 ){
+    sqlite3_int64 nUsed = sqlite3StatusValue(SQLITE_STATUS_MEMORY_USED);
+    if( nUsed >= mem0.alarmThreshold - nFull ){
+      AtomicStore(&mem0.nearlyFull, 1);
+      sqlite3MallocAlarm(nFull);
+      if( mem0.hardLimit ){
+        nUsed = sqlite3StatusValue(SQLITE_STATUS_MEMORY_USED);
+        if( nUsed >= mem0.hardLimit - nFull ){
+          *pp = 0;
+          return;
+        }
+      }
+    }else{
+      AtomicStore(&mem0.nearlyFull, 0);
+    }
+  }
+  p = sqlite3GlobalConfig.m.xMalloc(nFull);
+#ifdef SQLITE_ENABLE_MEMORY_MANAGEMENT
+  if( p==0 && mem0.alarmThreshold>0 ){
+    sqlite3MallocAlarm(nFull);
+    p = sqlite3GlobalConfig.m.xMalloc(nFull);
+  }
+#endif
+  if( p ){
+    nFull = sqlite3MallocSize(p);
+    sqlite3StatusUp(SQLITE_STATUS_MEMORY_USED, nFull);
+    sqlite3StatusUp(SQLITE_STATUS_MALLOC_COUNT, 1);
+  }
+  *pp = p;
+}
+
+/*
+** Allocate memory.  This routine is like sqlite3_malloc() except that it
+** assumes the memory subsystem has already been initialized.
+*/
+SQLITE_PRIVATE void *sqlite3Malloc(u64 n){
+  void *p;
+  if( n==0 || n>=0x7fffff00 ){
+    /* A memory allocation of a number of bytes which is near the maximum
+    ** signed integer value might cause an integer overflow inside of the
+    ** xMalloc().  Hence we limit the maximum size to 0x7fffff00, giving
+    ** 255 bytes of overhead.  SQLite itself will never use anything near
+    ** this amount.  The only way to reach the limit is with sqlite3_malloc() */
+    p = 0;
+  }else if( sqlite3GlobalConfig.bMemstat ){
+    sqlite3_mutex_enter(mem0.mutex);
+    mallocWithAlarm((int)n, &p);
+    sqlite3_mutex_leave(mem0.mutex);
+  }else{
+    p = sqlite3GlobalConfig.m.xMalloc((int)n);
+  }
+  assert( EIGHT_BYTE_ALIGNMENT(p) );  /* IMP: R-11148-40995 */
+  return p;
+}
+
+/*
+** This version of the memory allocation is for use by the application.
+** First make sure the memory subsystem is initialized, then do the
+** allocation.
+*/
+SQLITE_API void *sqlite3_malloc(int n){
+#ifndef SQLITE_OMIT_AUTOINIT
+  if( sqlite3_initialize() ) return 0;
+#endif
+  return n<=0 ? 0 : sqlite3Malloc(n);
+}
+SQLITE_API void *sqlite3_malloc64(sqlite3_uint64 n){
+#ifndef SQLITE_OMIT_AUTOINIT
+  if( sqlite3_initialize() ) return 0;
+#endif
+  return sqlite3Malloc(n);
+}
+
+/*
+** TRUE if p is a lookaside memory allocation from db
+*/
+#ifndef SQLITE_OMIT_LOOKASIDE
+static int isLookaside(sqlite3 *db, const void *p){
+  return SQLITE_WITHIN(p, db->lookaside.pStart, db->lookaside.pEnd);
+}
+#else
+#define isLookaside(A,B) 0
+#endif
+
+/*
+** Return the size of a memory allocation previously obtained from
+** sqlite3Malloc() or sqlite3_malloc().
+*/
+SQLITE_PRIVATE int sqlite3MallocSize(const void *p){
+  assert( sqlite3MemdebugHasType(p, MEMTYPE_HEAP) );
+  return sqlite3GlobalConfig.m.xSize((void*)p);
+}
+static int lookasideMallocSize(sqlite3 *db, const void *p){
+#ifndef SQLITE_OMIT_TWOSIZE_LOOKASIDE
+  return p<db->lookaside.pMiddle ? db->lookaside.szTrue : LOOKASIDE_SMALL;
+#else
+  return db->lookaside.szTrue;
+#endif
+}
+SQLITE_PRIVATE int sqlite3DbMallocSize(sqlite3 *db, const void *p){
+  assert( p!=0 );
+#if
