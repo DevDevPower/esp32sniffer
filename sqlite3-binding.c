@@ -30358,4 +30358,190 @@ SQLITE_API void sqlite3_str_vappendf(
             length = 1;
           }else if( ch<0x00800 ){
             buf[0] = 0xc0 + (u8)((ch>>6)&0x1f);
-            buf[1] = 0x80 + (u8)(ch & 0x3f)
+            buf[1] = 0x80 + (u8)(ch & 0x3f);
+            length = 2;
+          }else if( ch<0x10000 ){
+            buf[0] = 0xe0 + (u8)((ch>>12)&0x0f);
+            buf[1] = 0x80 + (u8)((ch>>6) & 0x3f);
+            buf[2] = 0x80 + (u8)(ch & 0x3f);
+            length = 3;
+          }else{
+            buf[0] = 0xf0 + (u8)((ch>>18) & 0x07);
+            buf[1] = 0x80 + (u8)((ch>>12) & 0x3f);
+            buf[2] = 0x80 + (u8)((ch>>6) & 0x3f);
+            buf[3] = 0x80 + (u8)(ch & 0x3f);
+            length = 4;
+          }
+        }
+        if( precision>1 ){
+          width -= precision-1;
+          if( width>1 && !flag_leftjustify ){
+            sqlite3_str_appendchar(pAccum, width-1, ' ');
+            width = 0;
+          }
+          while( precision-- > 1 ){
+            sqlite3_str_append(pAccum, buf, length);
+          }
+        }
+        bufpt = buf;
+        flag_altform2 = 1;
+        goto adjust_width_for_utf8;
+      case etSTRING:
+      case etDYNSTRING:
+        if( bArgList ){
+          bufpt = getTextArg(pArgList);
+          xtype = etSTRING;
+        }else{
+          bufpt = va_arg(ap,char*);
+        }
+        if( bufpt==0 ){
+          bufpt = "";
+        }else if( xtype==etDYNSTRING ){
+          if( pAccum->nChar==0
+           && pAccum->mxAlloc
+           && width==0
+           && precision<0
+           && pAccum->accError==0
+          ){
+            /* Special optimization for sqlite3_mprintf("%z..."):
+            ** Extend an existing memory allocation rather than creating
+            ** a new one. */
+            assert( (pAccum->printfFlags&SQLITE_PRINTF_MALLOCED)==0 );
+            pAccum->zText = bufpt;
+            pAccum->nAlloc = sqlite3DbMallocSize(pAccum->db, bufpt);
+            pAccum->nChar = 0x7fffffff & (int)strlen(bufpt);
+            pAccum->printfFlags |= SQLITE_PRINTF_MALLOCED;
+            length = 0;
+            break;
+          }
+          zExtra = bufpt;
+        }
+        if( precision>=0 ){
+          if( flag_altform2 ){
+            /* Set length to the number of bytes needed in order to display
+            ** precision characters */
+            unsigned char *z = (unsigned char*)bufpt;
+            while( precision-- > 0 && z[0] ){
+              SQLITE_SKIP_UTF8(z);
+            }
+            length = (int)(z - (unsigned char*)bufpt);
+          }else{
+            for(length=0; length<precision && bufpt[length]; length++){}
+          }
+        }else{
+          length = 0x7fffffff & (int)strlen(bufpt);
+        }
+      adjust_width_for_utf8:
+        if( flag_altform2 && width>0 ){
+          /* Adjust width to account for extra bytes in UTF-8 characters */
+          int ii = length - 1;
+          while( ii>=0 ) if( (bufpt[ii--] & 0xc0)==0x80 ) width++;
+        }
+        break;
+      case etSQLESCAPE:           /* %q: Escape ' characters */
+      case etSQLESCAPE2:          /* %Q: Escape ' and enclose in '...' */
+      case etSQLESCAPE3: {        /* %w: Escape " characters */
+        i64 i, j, k, n;
+        int needQuote, isnull;
+        char ch;
+        char q = ((xtype==etSQLESCAPE3)?'"':'\'');   /* Quote character */
+        char *escarg;
+
+        if( bArgList ){
+          escarg = getTextArg(pArgList);
+        }else{
+          escarg = va_arg(ap,char*);
+        }
+        isnull = escarg==0;
+        if( isnull ) escarg = (xtype==etSQLESCAPE2 ? "NULL" : "(NULL)");
+        /* For %q, %Q, and %w, the precision is the number of bytes (or
+        ** characters if the ! flags is present) to use from the input.
+        ** Because of the extra quoting characters inserted, the number
+        ** of output characters may be larger than the precision.
+        */
+        k = precision;
+        for(i=n=0; k!=0 && (ch=escarg[i])!=0; i++, k--){
+          if( ch==q )  n++;
+          if( flag_altform2 && (ch&0xc0)==0xc0 ){
+            while( (escarg[i+1]&0xc0)==0x80 ){ i++; }
+          }
+        }
+        needQuote = !isnull && xtype==etSQLESCAPE2;
+        n += i + 3;
+        if( n>etBUFSIZE ){
+          bufpt = zExtra = printfTempBuf(pAccum, n);
+          if( bufpt==0 ) return;
+        }else{
+          bufpt = buf;
+        }
+        j = 0;
+        if( needQuote ) bufpt[j++] = q;
+        k = i;
+        for(i=0; i<k; i++){
+          bufpt[j++] = ch = escarg[i];
+          if( ch==q ) bufpt[j++] = ch;
+        }
+        if( needQuote ) bufpt[j++] = q;
+        bufpt[j] = 0;
+        length = j;
+        goto adjust_width_for_utf8;
+      }
+      case etTOKEN: {
+        if( (pAccum->printfFlags & SQLITE_PRINTF_INTERNAL)==0 ) return;
+        if( flag_alternateform ){
+          /* %#T means an Expr pointer that uses Expr.u.zToken */
+          Expr *pExpr = va_arg(ap,Expr*);
+          if( ALWAYS(pExpr) && ALWAYS(!ExprHasProperty(pExpr,EP_IntValue)) ){
+            sqlite3_str_appendall(pAccum, (const char*)pExpr->u.zToken);
+            sqlite3RecordErrorOffsetOfExpr(pAccum->db, pExpr);
+          }
+        }else{
+          /* %T means a Token pointer */
+          Token *pToken = va_arg(ap, Token*);
+          assert( bArgList==0 );
+          if( pToken && pToken->n ){
+            sqlite3_str_append(pAccum, (const char*)pToken->z, pToken->n);
+            sqlite3RecordErrorByteOffset(pAccum->db, pToken->z);
+          }
+        }
+        length = width = 0;
+        break;
+      }
+      case etSRCITEM: {
+        SrcItem *pItem;
+        if( (pAccum->printfFlags & SQLITE_PRINTF_INTERNAL)==0 ) return;
+        pItem = va_arg(ap, SrcItem*);
+        assert( bArgList==0 );
+        if( pItem->zAlias && !flag_altform2 ){
+          sqlite3_str_appendall(pAccum, pItem->zAlias);
+        }else if( pItem->zName ){
+          if( pItem->zDatabase ){
+            sqlite3_str_appendall(pAccum, pItem->zDatabase);
+            sqlite3_str_append(pAccum, ".", 1);
+          }
+          sqlite3_str_appendall(pAccum, pItem->zName);
+        }else if( pItem->zAlias ){
+          sqlite3_str_appendall(pAccum, pItem->zAlias);
+        }else{
+          Select *pSel = pItem->pSelect;
+          assert( pSel!=0 );
+          if( pSel->selFlags & SF_NestedFrom ){
+            sqlite3_str_appendf(pAccum, "(join-%u)", pSel->selId);
+          }else{
+            sqlite3_str_appendf(pAccum, "(subquery-%u)", pSel->selId);
+          }
+        }
+        length = width = 0;
+        break;
+      }
+      default: {
+        assert( xtype==etINVALID );
+        return;
+      }
+    }/* End switch over the format type */
+    /*
+    ** The text of the conversion is pointed to by "bufpt" and is
+    ** "length" characters long.  The field width is "width".  Do
+    ** the output.  Both length and width are in bytes, not characters,
+    ** at this point.  If the "!" flag was present on string conversions
+ 
