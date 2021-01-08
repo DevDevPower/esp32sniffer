@@ -30153,4 +30153,209 @@ SQLITE_API void sqlite3_str_vappendf(
           pre = &aPrefix[infop->prefix];
           for(; (x=(*pre))!=0; pre++) *(--bufpt) = x;
         }
-  
+        length = (int)(&zOut[nOut-1]-bufpt);
+        break;
+      case etFLOAT:
+      case etEXP:
+      case etGENERIC:
+        if( bArgList ){
+          realvalue = getDoubleArg(pArgList);
+        }else{
+          realvalue = va_arg(ap,double);
+        }
+#ifdef SQLITE_OMIT_FLOATING_POINT
+        length = 0;
+#else
+        if( precision<0 ) precision = 6;         /* Set default precision */
+#ifdef SQLITE_FP_PRECISION_LIMIT
+        if( precision>SQLITE_FP_PRECISION_LIMIT ){
+          precision = SQLITE_FP_PRECISION_LIMIT;
+        }
+#endif
+        if( realvalue<0.0 ){
+          realvalue = -realvalue;
+          prefix = '-';
+        }else{
+          prefix = flag_prefix;
+        }
+        if( xtype==etGENERIC && precision>0 ) precision--;
+        testcase( precision>0xfff );
+        idx = precision & 0xfff;
+        rounder = arRound[idx%10];
+        while( idx>=10 ){ rounder *= 1.0e-10; idx -= 10; }
+        if( xtype==etFLOAT ){
+          double rx = (double)realvalue;
+          sqlite3_uint64 u;
+          int ex;
+          memcpy(&u, &rx, sizeof(u));
+          ex = -1023 + (int)((u>>52)&0x7ff);
+          if( precision+(ex/3) < 15 ) rounder += realvalue*3e-16;
+          realvalue += rounder;
+        }
+        /* Normalize realvalue to within 10.0 > realvalue >= 1.0 */
+        exp = 0;
+        if( sqlite3IsNaN((double)realvalue) ){
+          bufpt = "NaN";
+          length = 3;
+          break;
+        }
+        if( realvalue>0.0 ){
+          LONGDOUBLE_TYPE scale = 1.0;
+          while( realvalue>=1e100*scale && exp<=350 ){ scale *= 1e100;exp+=100;}
+          while( realvalue>=1e10*scale && exp<=350 ){ scale *= 1e10; exp+=10; }
+          while( realvalue>=10.0*scale && exp<=350 ){ scale *= 10.0; exp++; }
+          realvalue /= scale;
+          while( realvalue<1e-8 ){ realvalue *= 1e8; exp-=8; }
+          while( realvalue<1.0 ){ realvalue *= 10.0; exp--; }
+          if( exp>350 ){
+            bufpt = buf;
+            buf[0] = prefix;
+            memcpy(buf+(prefix!=0),"Inf",4);
+            length = 3+(prefix!=0);
+            break;
+          }
+        }
+        bufpt = buf;
+        /*
+        ** If the field type is etGENERIC, then convert to either etEXP
+        ** or etFLOAT, as appropriate.
+        */
+        if( xtype!=etFLOAT ){
+          realvalue += rounder;
+          if( realvalue>=10.0 ){ realvalue *= 0.1; exp++; }
+        }
+        if( xtype==etGENERIC ){
+          flag_rtz = !flag_alternateform;
+          if( exp<-4 || exp>precision ){
+            xtype = etEXP;
+          }else{
+            precision = precision - exp;
+            xtype = etFLOAT;
+          }
+        }else{
+          flag_rtz = flag_altform2;
+        }
+        if( xtype==etEXP ){
+          e2 = 0;
+        }else{
+          e2 = exp;
+        }
+        {
+          i64 szBufNeeded;           /* Size of a temporary buffer needed */
+          szBufNeeded = MAX(e2,0)+(i64)precision+(i64)width+15;
+          if( szBufNeeded > etBUFSIZE ){
+            bufpt = zExtra = printfTempBuf(pAccum, szBufNeeded);
+            if( bufpt==0 ) return;
+          }
+        }
+        zOut = bufpt;
+        nsd = 16 + flag_altform2*10;
+        flag_dp = (precision>0 ?1:0) | flag_alternateform | flag_altform2;
+        /* The sign in front of the number */
+        if( prefix ){
+          *(bufpt++) = prefix;
+        }
+        /* Digits prior to the decimal point */
+        if( e2<0 ){
+          *(bufpt++) = '0';
+        }else{
+          for(; e2>=0; e2--){
+            *(bufpt++) = et_getdigit(&realvalue,&nsd);
+          }
+        }
+        /* The decimal point */
+        if( flag_dp ){
+          *(bufpt++) = '.';
+        }
+        /* "0" digits after the decimal point but before the first
+        ** significant digit of the number */
+        for(e2++; e2<0; precision--, e2++){
+          assert( precision>0 );
+          *(bufpt++) = '0';
+        }
+        /* Significant digits after the decimal point */
+        while( (precision--)>0 ){
+          *(bufpt++) = et_getdigit(&realvalue,&nsd);
+        }
+        /* Remove trailing zeros and the "." if no digits follow the "." */
+        if( flag_rtz && flag_dp ){
+          while( bufpt[-1]=='0' ) *(--bufpt) = 0;
+          assert( bufpt>zOut );
+          if( bufpt[-1]=='.' ){
+            if( flag_altform2 ){
+              *(bufpt++) = '0';
+            }else{
+              *(--bufpt) = 0;
+            }
+          }
+        }
+        /* Add the "eNNN" suffix */
+        if( xtype==etEXP ){
+          *(bufpt++) = aDigits[infop->charset];
+          if( exp<0 ){
+            *(bufpt++) = '-'; exp = -exp;
+          }else{
+            *(bufpt++) = '+';
+          }
+          if( exp>=100 ){
+            *(bufpt++) = (char)((exp/100)+'0');        /* 100's digit */
+            exp %= 100;
+          }
+          *(bufpt++) = (char)(exp/10+'0');             /* 10's digit */
+          *(bufpt++) = (char)(exp%10+'0');             /* 1's digit */
+        }
+        *bufpt = 0;
+
+        /* The converted number is in buf[] and zero terminated. Output it.
+        ** Note that the number is in the usual order, not reversed as with
+        ** integer conversions. */
+        length = (int)(bufpt-zOut);
+        bufpt = zOut;
+
+        /* Special case:  Add leading zeros if the flag_zeropad flag is
+        ** set and we are not left justified */
+        if( flag_zeropad && !flag_leftjustify && length < width){
+          int i;
+          int nPad = width - length;
+          for(i=width; i>=nPad; i--){
+            bufpt[i] = bufpt[i-nPad];
+          }
+          i = prefix!=0;
+          while( nPad-- ) bufpt[i++] = '0';
+          length = width;
+        }
+#endif /* !defined(SQLITE_OMIT_FLOATING_POINT) */
+        break;
+      case etSIZE:
+        if( !bArgList ){
+          *(va_arg(ap,int*)) = pAccum->nChar;
+        }
+        length = width = 0;
+        break;
+      case etPERCENT:
+        buf[0] = '%';
+        bufpt = buf;
+        length = 1;
+        break;
+      case etCHARX:
+        if( bArgList ){
+          bufpt = getTextArg(pArgList);
+          length = 1;
+          if( bufpt ){
+            buf[0] = c = *(bufpt++);
+            if( (c&0xc0)==0xc0 ){
+              while( length<4 && (bufpt[0]&0xc0)==0x80 ){
+                buf[length++] = *(bufpt++);
+              }
+            }
+          }else{
+            buf[0] = 0;
+          }
+        }else{
+          unsigned int ch = va_arg(ap,unsigned int);
+          if( ch<0x00080 ){
+            buf[0] = ch & 0xff;
+            length = 1;
+          }else if( ch<0x00800 ){
+            buf[0] = 0xc0 + (u8)((ch>>6)&0x1f);
+            buf[1] = 0x80 + (u8)(ch & 0x3f)
