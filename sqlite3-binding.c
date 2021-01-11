@@ -30766,4 +30766,234 @@ static sqlite3_str sqlite3OomStr = {
 */
 SQLITE_API char *sqlite3_str_finish(sqlite3_str *p){
   char *z;
-  if
+  if( p!=0 && p!=&sqlite3OomStr ){
+    z = sqlite3StrAccumFinish(p);
+    sqlite3_free(p);
+  }else{
+    z = 0;
+  }
+  return z;
+}
+
+/* Return any error code associated with p */
+SQLITE_API int sqlite3_str_errcode(sqlite3_str *p){
+  return p ? p->accError : SQLITE_NOMEM;
+}
+
+/* Return the current length of p in bytes */
+SQLITE_API int sqlite3_str_length(sqlite3_str *p){
+  return p ? p->nChar : 0;
+}
+
+/* Return the current value for p */
+SQLITE_API char *sqlite3_str_value(sqlite3_str *p){
+  if( p==0 || p->nChar==0 ) return 0;
+  p->zText[p->nChar] = 0;
+  return p->zText;
+}
+
+/*
+** Reset an StrAccum string.  Reclaim all malloced memory.
+*/
+SQLITE_API void sqlite3_str_reset(StrAccum *p){
+  if( isMalloced(p) ){
+    sqlite3DbFree(p->db, p->zText);
+    p->printfFlags &= ~SQLITE_PRINTF_MALLOCED;
+  }
+  p->nAlloc = 0;
+  p->nChar = 0;
+  p->zText = 0;
+}
+
+/*
+** Initialize a string accumulator.
+**
+** p:     The accumulator to be initialized.
+** db:    Pointer to a database connection.  May be NULL.  Lookaside
+**        memory is used if not NULL. db->mallocFailed is set appropriately
+**        when not NULL.
+** zBase: An initial buffer.  May be NULL in which case the initial buffer
+**        is malloced.
+** n:     Size of zBase in bytes.  If total space requirements never exceed
+**        n then no memory allocations ever occur.
+** mx:    Maximum number of bytes to accumulate.  If mx==0 then no memory
+**        allocations will ever occur.
+*/
+SQLITE_PRIVATE void sqlite3StrAccumInit(StrAccum *p, sqlite3 *db, char *zBase, int n, int mx){
+  p->zText = zBase;
+  p->db = db;
+  p->nAlloc = n;
+  p->mxAlloc = mx;
+  p->nChar = 0;
+  p->accError = 0;
+  p->printfFlags = 0;
+}
+
+/* Allocate and initialize a new dynamic string object */
+SQLITE_API sqlite3_str *sqlite3_str_new(sqlite3 *db){
+  sqlite3_str *p = sqlite3_malloc64(sizeof(*p));
+  if( p ){
+    sqlite3StrAccumInit(p, 0, 0, 0,
+            db ? db->aLimit[SQLITE_LIMIT_LENGTH] : SQLITE_MAX_LENGTH);
+  }else{
+    p = &sqlite3OomStr;
+  }
+  return p;
+}
+
+/*
+** Print into memory obtained from sqliteMalloc().  Use the internal
+** %-conversion extensions.
+*/
+SQLITE_PRIVATE char *sqlite3VMPrintf(sqlite3 *db, const char *zFormat, va_list ap){
+  char *z;
+  char zBase[SQLITE_PRINT_BUF_SIZE];
+  StrAccum acc;
+  assert( db!=0 );
+  sqlite3StrAccumInit(&acc, db, zBase, sizeof(zBase),
+                      db->aLimit[SQLITE_LIMIT_LENGTH]);
+  acc.printfFlags = SQLITE_PRINTF_INTERNAL;
+  sqlite3_str_vappendf(&acc, zFormat, ap);
+  z = sqlite3StrAccumFinish(&acc);
+  if( acc.accError==SQLITE_NOMEM ){
+    sqlite3OomFault(db);
+  }
+  return z;
+}
+
+/*
+** Print into memory obtained from sqliteMalloc().  Use the internal
+** %-conversion extensions.
+*/
+SQLITE_PRIVATE char *sqlite3MPrintf(sqlite3 *db, const char *zFormat, ...){
+  va_list ap;
+  char *z;
+  va_start(ap, zFormat);
+  z = sqlite3VMPrintf(db, zFormat, ap);
+  va_end(ap);
+  return z;
+}
+
+/*
+** Print into memory obtained from sqlite3_malloc().  Omit the internal
+** %-conversion extensions.
+*/
+SQLITE_API char *sqlite3_vmprintf(const char *zFormat, va_list ap){
+  char *z;
+  char zBase[SQLITE_PRINT_BUF_SIZE];
+  StrAccum acc;
+
+#ifdef SQLITE_ENABLE_API_ARMOR
+  if( zFormat==0 ){
+    (void)SQLITE_MISUSE_BKPT;
+    return 0;
+  }
+#endif
+#ifndef SQLITE_OMIT_AUTOINIT
+  if( sqlite3_initialize() ) return 0;
+#endif
+  sqlite3StrAccumInit(&acc, 0, zBase, sizeof(zBase), SQLITE_MAX_LENGTH);
+  sqlite3_str_vappendf(&acc, zFormat, ap);
+  z = sqlite3StrAccumFinish(&acc);
+  return z;
+}
+
+/*
+** Print into memory obtained from sqlite3_malloc()().  Omit the internal
+** %-conversion extensions.
+*/
+SQLITE_API char *sqlite3_mprintf(const char *zFormat, ...){
+  va_list ap;
+  char *z;
+#ifndef SQLITE_OMIT_AUTOINIT
+  if( sqlite3_initialize() ) return 0;
+#endif
+  va_start(ap, zFormat);
+  z = sqlite3_vmprintf(zFormat, ap);
+  va_end(ap);
+  return z;
+}
+
+/*
+** sqlite3_snprintf() works like snprintf() except that it ignores the
+** current locale settings.  This is important for SQLite because we
+** are not able to use a "," as the decimal point in place of "." as
+** specified by some locales.
+**
+** Oops:  The first two arguments of sqlite3_snprintf() are backwards
+** from the snprintf() standard.  Unfortunately, it is too late to change
+** this without breaking compatibility, so we just have to live with the
+** mistake.
+**
+** sqlite3_vsnprintf() is the varargs version.
+*/
+SQLITE_API char *sqlite3_vsnprintf(int n, char *zBuf, const char *zFormat, va_list ap){
+  StrAccum acc;
+  if( n<=0 ) return zBuf;
+#ifdef SQLITE_ENABLE_API_ARMOR
+  if( zBuf==0 || zFormat==0 ) {
+    (void)SQLITE_MISUSE_BKPT;
+    if( zBuf ) zBuf[0] = 0;
+    return zBuf;
+  }
+#endif
+  sqlite3StrAccumInit(&acc, 0, zBuf, n, 0);
+  sqlite3_str_vappendf(&acc, zFormat, ap);
+  zBuf[acc.nChar] = 0;
+  return zBuf;
+}
+SQLITE_API char *sqlite3_snprintf(int n, char *zBuf, const char *zFormat, ...){
+  char *z;
+  va_list ap;
+  va_start(ap,zFormat);
+  z = sqlite3_vsnprintf(n, zBuf, zFormat, ap);
+  va_end(ap);
+  return z;
+}
+
+/*
+** This is the routine that actually formats the sqlite3_log() message.
+** We house it in a separate routine from sqlite3_log() to avoid using
+** stack space on small-stack systems when logging is disabled.
+**
+** sqlite3_log() must render into a static buffer.  It cannot dynamically
+** allocate memory because it might be called while the memory allocator
+** mutex is held.
+**
+** sqlite3_str_vappendf() might ask for *temporary* memory allocations for
+** certain format characters (%q) or for very large precisions or widths.
+** Care must be taken that any sqlite3_log() calls that occur while the
+** memory mutex is held do not use these mechanisms.
+*/
+static void renderLogMsg(int iErrCode, const char *zFormat, va_list ap){
+  StrAccum acc;                          /* String accumulator */
+  char zMsg[SQLITE_PRINT_BUF_SIZE*3];    /* Complete log message */
+
+  sqlite3StrAccumInit(&acc, 0, zMsg, sizeof(zMsg), 0);
+  sqlite3_str_vappendf(&acc, zFormat, ap);
+  sqlite3GlobalConfig.xLog(sqlite3GlobalConfig.pLogArg, iErrCode,
+                           sqlite3StrAccumFinish(&acc));
+}
+
+/*
+** Format and write a message to the log if logging is enabled.
+*/
+SQLITE_API void sqlite3_log(int iErrCode, const char *zFormat, ...){
+  va_list ap;                             /* Vararg list */
+  if( sqlite3GlobalConfig.xLog ){
+    va_start(ap, zFormat);
+    renderLogMsg(iErrCode, zFormat, ap);
+    va_end(ap);
+  }
+}
+
+#if defined(SQLITE_DEBUG) || defined(SQLITE_HAVE_OS_TRACE)
+/*
+** A version of printf() that understands %lld.  Used for debugging.
+** The printf() built into some versions of windows does not understand %lld
+** and segfaults if you give it a long long int.
+*/
+SQLITE_PRIVATE void sqlite3DebugPrintf(const char *zFormat, ...){
+  va_list ap;
+  StrAccum acc;
+  char zBuf[SQ
