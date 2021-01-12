@@ -31442,4 +31442,201 @@ SQLITE_PRIVATE void sqlite3TreeViewWindow(TreeView *pView, const Window *pWin, u
   }else{
     sqlite3TreeViewLine(pView, "OVER (%p)", pWin);
   }
-  if( pWin->zBase )    nElement
+  if( pWin->zBase )    nElement++;
+  if( pWin->pOrderBy ) nElement++;
+  if( pWin->eFrmType ) nElement++;
+  if( pWin->eExclude ) nElement++;
+  if( pWin->zBase ){
+    sqlite3TreeViewPush(&pView, (--nElement)>0);
+    sqlite3TreeViewLine(pView, "window: %s", pWin->zBase);
+    sqlite3TreeViewPop(&pView);
+  }
+  if( pWin->pPartition ){
+    sqlite3TreeViewExprList(pView, pWin->pPartition, nElement>0,"PARTITION-BY");
+  }
+  if( pWin->pOrderBy ){
+    sqlite3TreeViewExprList(pView, pWin->pOrderBy, (--nElement)>0, "ORDER-BY");
+  }
+  if( pWin->eFrmType ){
+    char zBuf[30];
+    const char *zFrmType = "ROWS";
+    if( pWin->eFrmType==TK_RANGE ) zFrmType = "RANGE";
+    if( pWin->eFrmType==TK_GROUPS ) zFrmType = "GROUPS";
+    sqlite3_snprintf(sizeof(zBuf),zBuf,"%s%s",zFrmType,
+        pWin->bImplicitFrame ? " (implied)" : "");
+    sqlite3TreeViewItem(pView, zBuf, (--nElement)>0);
+    sqlite3TreeViewBound(pView, pWin->eStart, pWin->pStart, 1);
+    sqlite3TreeViewBound(pView, pWin->eEnd, pWin->pEnd, 0);
+    sqlite3TreeViewPop(&pView);
+  }
+  if( pWin->eExclude ){
+    char zBuf[30];
+    const char *zExclude;
+    switch( pWin->eExclude ){
+      case TK_NO:      zExclude = "NO OTHERS";   break;
+      case TK_CURRENT: zExclude = "CURRENT ROW"; break;
+      case TK_GROUP:   zExclude = "GROUP";       break;
+      case TK_TIES:    zExclude = "TIES";        break;
+      default:
+        sqlite3_snprintf(sizeof(zBuf),zBuf,"invalid(%d)", pWin->eExclude);
+        zExclude = zBuf;
+        break;
+    }
+    sqlite3TreeViewPush(&pView, 0);
+    sqlite3TreeViewLine(pView, "EXCLUDE %s", zExclude);
+    sqlite3TreeViewPop(&pView);
+  }
+  sqlite3TreeViewPop(&pView);
+}
+#endif /* SQLITE_OMIT_WINDOWFUNC */
+
+#ifndef SQLITE_OMIT_WINDOWFUNC
+/*
+** Generate a human-readable explanation for a Window Function object
+*/
+SQLITE_PRIVATE void sqlite3TreeViewWinFunc(TreeView *pView, const Window *pWin, u8 more){
+  if( pWin==0 ) return;
+  sqlite3TreeViewPush(&pView, more);
+  sqlite3TreeViewLine(pView, "WINFUNC %s(%d)",
+                       pWin->pWFunc->zName, pWin->pWFunc->nArg);
+  sqlite3TreeViewWindow(pView, pWin, 0);
+  sqlite3TreeViewPop(&pView);
+}
+#endif /* SQLITE_OMIT_WINDOWFUNC */
+
+/*
+** Generate a human-readable explanation of an expression tree.
+*/
+SQLITE_PRIVATE void sqlite3TreeViewExpr(TreeView *pView, const Expr *pExpr, u8 moreToFollow){
+  const char *zBinOp = 0;   /* Binary operator */
+  const char *zUniOp = 0;   /* Unary operator */
+  char zFlgs[200];
+  sqlite3TreeViewPush(&pView, moreToFollow);
+  if( pExpr==0 ){
+    sqlite3TreeViewLine(pView, "nil");
+    sqlite3TreeViewPop(&pView);
+    return;
+  }
+  if( pExpr->flags || pExpr->affExpr || pExpr->vvaFlags ){
+    StrAccum x;
+    sqlite3StrAccumInit(&x, 0, zFlgs, sizeof(zFlgs), 0);
+    sqlite3_str_appendf(&x, " fg.af=%x.%c",
+      pExpr->flags, pExpr->affExpr ? pExpr->affExpr : 'n');
+    if( ExprHasProperty(pExpr, EP_OuterON) ){
+      sqlite3_str_appendf(&x, " outer.iJoin=%d", pExpr->w.iJoin);
+    }
+    if( ExprHasProperty(pExpr, EP_InnerON) ){
+      sqlite3_str_appendf(&x, " inner.iJoin=%d", pExpr->w.iJoin);
+    }
+    if( ExprHasProperty(pExpr, EP_FromDDL) ){
+      sqlite3_str_appendf(&x, " DDL");
+    }
+    if( ExprHasVVAProperty(pExpr, EP_Immutable) ){
+      sqlite3_str_appendf(&x, " IMMUTABLE");
+    }
+    sqlite3StrAccumFinish(&x);
+  }else{
+    zFlgs[0] = 0;
+  }
+  switch( pExpr->op ){
+    case TK_AGG_COLUMN: {
+      sqlite3TreeViewLine(pView, "AGG{%d:%d}%s",
+            pExpr->iTable, pExpr->iColumn, zFlgs);
+      break;
+    }
+    case TK_COLUMN: {
+      if( pExpr->iTable<0 ){
+        /* This only happens when coding check constraints */
+        char zOp2[16];
+        if( pExpr->op2 ){
+          sqlite3_snprintf(sizeof(zOp2),zOp2," op2=0x%02x",pExpr->op2);
+        }else{
+          zOp2[0] = 0;
+        }
+        sqlite3TreeViewLine(pView, "COLUMN(%d)%s%s",
+                                    pExpr->iColumn, zFlgs, zOp2);
+      }else{
+        assert( ExprUseYTab(pExpr) );
+        sqlite3TreeViewLine(pView, "{%d:%d} pTab=%p%s",
+                        pExpr->iTable, pExpr->iColumn,
+                        pExpr->y.pTab, zFlgs);
+      }
+      if( ExprHasProperty(pExpr, EP_FixedCol) ){
+        sqlite3TreeViewExpr(pView, pExpr->pLeft, 0);
+      }
+      break;
+    }
+    case TK_INTEGER: {
+      if( pExpr->flags & EP_IntValue ){
+        sqlite3TreeViewLine(pView, "%d", pExpr->u.iValue);
+      }else{
+        sqlite3TreeViewLine(pView, "%s", pExpr->u.zToken);
+      }
+      break;
+    }
+#ifndef SQLITE_OMIT_FLOATING_POINT
+    case TK_FLOAT: {
+      assert( !ExprHasProperty(pExpr, EP_IntValue) );
+      sqlite3TreeViewLine(pView,"%s", pExpr->u.zToken);
+      break;
+    }
+#endif
+    case TK_STRING: {
+      assert( !ExprHasProperty(pExpr, EP_IntValue) );
+      sqlite3TreeViewLine(pView,"%Q", pExpr->u.zToken);
+      break;
+    }
+    case TK_NULL: {
+      sqlite3TreeViewLine(pView,"NULL");
+      break;
+    }
+    case TK_TRUEFALSE: {
+      sqlite3TreeViewLine(pView,"%s%s",
+         sqlite3ExprTruthValue(pExpr) ? "TRUE" : "FALSE", zFlgs);
+      break;
+    }
+#ifndef SQLITE_OMIT_BLOB_LITERAL
+    case TK_BLOB: {
+      assert( !ExprHasProperty(pExpr, EP_IntValue) );
+      sqlite3TreeViewLine(pView,"%s", pExpr->u.zToken);
+      break;
+    }
+#endif
+    case TK_VARIABLE: {
+      assert( !ExprHasProperty(pExpr, EP_IntValue) );
+      sqlite3TreeViewLine(pView,"VARIABLE(%s,%d)",
+                          pExpr->u.zToken, pExpr->iColumn);
+      break;
+    }
+    case TK_REGISTER: {
+      sqlite3TreeViewLine(pView,"REGISTER(%d)", pExpr->iTable);
+      break;
+    }
+    case TK_ID: {
+      assert( !ExprHasProperty(pExpr, EP_IntValue) );
+      sqlite3TreeViewLine(pView,"ID \"%w\"", pExpr->u.zToken);
+      break;
+    }
+#ifndef SQLITE_OMIT_CAST
+    case TK_CAST: {
+      /* Expressions of the form:   CAST(pLeft AS token) */
+      assert( !ExprHasProperty(pExpr, EP_IntValue) );
+      sqlite3TreeViewLine(pView,"CAST %Q", pExpr->u.zToken);
+      sqlite3TreeViewExpr(pView, pExpr->pLeft, 0);
+      break;
+    }
+#endif /* SQLITE_OMIT_CAST */
+    case TK_LT:      zBinOp = "LT";     break;
+    case TK_LE:      zBinOp = "LE";     break;
+    case TK_GT:      zBinOp = "GT";     break;
+    case TK_GE:      zBinOp = "GE";     break;
+    case TK_NE:      zBinOp = "NE";     break;
+    case TK_EQ:      zBinOp = "EQ";     break;
+    case TK_IS:      zBinOp = "IS";     break;
+    case TK_ISNOT:   zBinOp = "ISNOT";  break;
+    case TK_AND:     zBinOp = "AND";    break;
+    case TK_OR:      zBinOp = "OR";     break;
+    case TK_PLUS:    zBinOp = "ADD";    break;
+    case TK_STAR:    zBinOp = "MUL";    break;
+    case TK_MINUS:   zBinOp = "SUB";    break;
+    case TK_REM:     zBinOp = "RE
