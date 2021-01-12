@@ -31224,4 +31224,222 @@ SQLITE_PRIVATE void sqlite3TreeViewSrcList(TreeView *pView, const SrcList *pSrc)
     x.printfFlags |= SQLITE_PRINTF_INTERNAL;
     sqlite3_str_appendf(&x, "{%d:*} %!S", pItem->iCursor, pItem);
     if( pItem->pTab ){
-      sqlite3_str_appendf(&x, " tab=%Q nCol=%d ptr
+      sqlite3_str_appendf(&x, " tab=%Q nCol=%d ptr=%p used=%llx",
+           pItem->pTab->zName, pItem->pTab->nCol, pItem->pTab, pItem->colUsed);
+    }
+    if( (pItem->fg.jointype & (JT_LEFT|JT_RIGHT))==(JT_LEFT|JT_RIGHT) ){
+      sqlite3_str_appendf(&x, " FULL-OUTER-JOIN");
+    }else if( pItem->fg.jointype & JT_LEFT ){
+      sqlite3_str_appendf(&x, " LEFT-JOIN");
+    }else if( pItem->fg.jointype & JT_RIGHT ){
+      sqlite3_str_appendf(&x, " RIGHT-JOIN");
+    }else if( pItem->fg.jointype & JT_CROSS ){
+      sqlite3_str_appendf(&x, " CROSS-JOIN");
+    }
+    if( pItem->fg.jointype & JT_LTORJ ){
+      sqlite3_str_appendf(&x, " LTORJ");
+    }
+    if( pItem->fg.fromDDL ){
+      sqlite3_str_appendf(&x, " DDL");
+    }
+    if( pItem->fg.isCte ){
+      sqlite3_str_appendf(&x, " CteUse=0x%p", pItem->u2.pCteUse);
+    }
+    if( pItem->fg.isOn || (pItem->fg.isUsing==0 && pItem->u3.pOn!=0) ){
+      sqlite3_str_appendf(&x, " ON");
+    }
+    sqlite3StrAccumFinish(&x);
+    sqlite3TreeViewItem(pView, zLine, i<pSrc->nSrc-1);
+    n = 0;
+    if( pItem->pSelect ) n++;
+    if( pItem->fg.isTabFunc ) n++;
+    if( pItem->fg.isUsing ) n++;
+    if( pItem->fg.isUsing ){
+      sqlite3TreeViewIdList(pView, pItem->u3.pUsing, (--n)>0, "USING");
+    }
+    if( pItem->pSelect ){
+      if( pItem->pTab ){
+        Table *pTab = pItem->pTab;
+        sqlite3TreeViewColumnList(pView, pTab->aCol, pTab->nCol, 1);
+      }
+      assert( (int)pItem->fg.isNestedFrom == IsNestedFrom(pItem->pSelect) );
+      sqlite3TreeViewSelect(pView, pItem->pSelect, (--n)>0);
+    }
+    if( pItem->fg.isTabFunc ){
+      sqlite3TreeViewExprList(pView, pItem->u1.pFuncArg, 0, "func-args:");
+    }
+    sqlite3TreeViewPop(&pView);
+  }
+}
+
+/*
+** Generate a human-readable description of a Select object.
+*/
+SQLITE_PRIVATE void sqlite3TreeViewSelect(TreeView *pView, const Select *p, u8 moreToFollow){
+  int n = 0;
+  int cnt = 0;
+  if( p==0 ){
+    sqlite3TreeViewLine(pView, "nil-SELECT");
+    return;
+  }
+  sqlite3TreeViewPush(&pView, moreToFollow);
+  if( p->pWith ){
+    sqlite3TreeViewWith(pView, p->pWith, 1);
+    cnt = 1;
+    sqlite3TreeViewPush(&pView, 1);
+  }
+  do{
+    if( p->selFlags & SF_WhereBegin ){
+      sqlite3TreeViewLine(pView, "sqlite3WhereBegin()");
+    }else{
+      sqlite3TreeViewLine(pView,
+        "SELECT%s%s (%u/%p) selFlags=0x%x nSelectRow=%d",
+        ((p->selFlags & SF_Distinct) ? " DISTINCT" : ""),
+        ((p->selFlags & SF_Aggregate) ? " agg_flag" : ""),
+        p->selId, p, p->selFlags,
+        (int)p->nSelectRow
+      );
+    }
+    if( cnt++ ) sqlite3TreeViewPop(&pView);
+    if( p->pPrior ){
+      n = 1000;
+    }else{
+      n = 0;
+      if( p->pSrc && p->pSrc->nSrc ) n++;
+      if( p->pWhere ) n++;
+      if( p->pGroupBy ) n++;
+      if( p->pHaving ) n++;
+      if( p->pOrderBy ) n++;
+      if( p->pLimit ) n++;
+#ifndef SQLITE_OMIT_WINDOWFUNC
+      if( p->pWin ) n++;
+      if( p->pWinDefn ) n++;
+#endif
+    }
+    if( p->pEList ){
+      sqlite3TreeViewExprList(pView, p->pEList, n>0, "result-set");
+    }
+    n--;
+#ifndef SQLITE_OMIT_WINDOWFUNC
+    if( p->pWin ){
+      Window *pX;
+      sqlite3TreeViewPush(&pView, (n--)>0);
+      sqlite3TreeViewLine(pView, "window-functions");
+      for(pX=p->pWin; pX; pX=pX->pNextWin){
+        sqlite3TreeViewWinFunc(pView, pX, pX->pNextWin!=0);
+      }
+      sqlite3TreeViewPop(&pView);
+    }
+#endif
+    if( p->pSrc && p->pSrc->nSrc ){
+      sqlite3TreeViewPush(&pView, (n--)>0);
+      sqlite3TreeViewLine(pView, "FROM");
+      sqlite3TreeViewSrcList(pView, p->pSrc);
+      sqlite3TreeViewPop(&pView);
+    }
+    if( p->pWhere ){
+      sqlite3TreeViewItem(pView, "WHERE", (n--)>0);
+      sqlite3TreeViewExpr(pView, p->pWhere, 0);
+      sqlite3TreeViewPop(&pView);
+    }
+    if( p->pGroupBy ){
+      sqlite3TreeViewExprList(pView, p->pGroupBy, (n--)>0, "GROUPBY");
+    }
+    if( p->pHaving ){
+      sqlite3TreeViewItem(pView, "HAVING", (n--)>0);
+      sqlite3TreeViewExpr(pView, p->pHaving, 0);
+      sqlite3TreeViewPop(&pView);
+    }
+#ifndef SQLITE_OMIT_WINDOWFUNC
+    if( p->pWinDefn ){
+      Window *pX;
+      sqlite3TreeViewItem(pView, "WINDOW", (n--)>0);
+      for(pX=p->pWinDefn; pX; pX=pX->pNextWin){
+        sqlite3TreeViewWindow(pView, pX, pX->pNextWin!=0);
+      }
+      sqlite3TreeViewPop(&pView);
+    }
+#endif
+    if( p->pOrderBy ){
+      sqlite3TreeViewExprList(pView, p->pOrderBy, (n--)>0, "ORDERBY");
+    }
+    if( p->pLimit ){
+      sqlite3TreeViewItem(pView, "LIMIT", (n--)>0);
+      sqlite3TreeViewExpr(pView, p->pLimit->pLeft, p->pLimit->pRight!=0);
+      if( p->pLimit->pRight ){
+        sqlite3TreeViewItem(pView, "OFFSET", (n--)>0);
+        sqlite3TreeViewExpr(pView, p->pLimit->pRight, 0);
+        sqlite3TreeViewPop(&pView);
+      }
+      sqlite3TreeViewPop(&pView);
+    }
+    if( p->pPrior ){
+      const char *zOp = "UNION";
+      switch( p->op ){
+        case TK_ALL:         zOp = "UNION ALL";  break;
+        case TK_INTERSECT:   zOp = "INTERSECT";  break;
+        case TK_EXCEPT:      zOp = "EXCEPT";     break;
+      }
+      sqlite3TreeViewItem(pView, zOp, 1);
+    }
+    p = p->pPrior;
+  }while( p!=0 );
+  sqlite3TreeViewPop(&pView);
+}
+
+#ifndef SQLITE_OMIT_WINDOWFUNC
+/*
+** Generate a description of starting or stopping bounds
+*/
+SQLITE_PRIVATE void sqlite3TreeViewBound(
+  TreeView *pView,        /* View context */
+  u8 eBound,              /* UNBOUNDED, CURRENT, PRECEDING, FOLLOWING */
+  Expr *pExpr,            /* Value for PRECEDING or FOLLOWING */
+  u8 moreToFollow         /* True if more to follow */
+){
+  switch( eBound ){
+    case TK_UNBOUNDED: {
+      sqlite3TreeViewItem(pView, "UNBOUNDED", moreToFollow);
+      sqlite3TreeViewPop(&pView);
+      break;
+    }
+    case TK_CURRENT: {
+      sqlite3TreeViewItem(pView, "CURRENT", moreToFollow);
+      sqlite3TreeViewPop(&pView);
+      break;
+    }
+    case TK_PRECEDING: {
+      sqlite3TreeViewItem(pView, "PRECEDING", moreToFollow);
+      sqlite3TreeViewExpr(pView, pExpr, 0);
+      sqlite3TreeViewPop(&pView);
+      break;
+    }
+    case TK_FOLLOWING: {
+      sqlite3TreeViewItem(pView, "FOLLOWING", moreToFollow);
+      sqlite3TreeViewExpr(pView, pExpr, 0);
+      sqlite3TreeViewPop(&pView);
+      break;
+    }
+  }
+}
+#endif /* SQLITE_OMIT_WINDOWFUNC */
+
+#ifndef SQLITE_OMIT_WINDOWFUNC
+/*
+** Generate a human-readable explanation for a Window object
+*/
+SQLITE_PRIVATE void sqlite3TreeViewWindow(TreeView *pView, const Window *pWin, u8 more){
+  int nElement = 0;
+  if( pWin==0 ) return;
+  if( pWin->pFilter ){
+    sqlite3TreeViewItem(pView, "FILTER", 1);
+    sqlite3TreeViewExpr(pView, pWin->pFilter, 0);
+    sqlite3TreeViewPop(&pView);
+  }
+  sqlite3TreeViewPush(&pView, more);
+  if( pWin->zName ){
+    sqlite3TreeViewLine(pView, "OVER %s (%p)", pWin->zName, pWin);
+  }else{
+    sqlite3TreeViewLine(pView, "OVER (%p)", pWin);
+  }
+  if( pWin->zBase )    nElement
