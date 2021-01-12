@@ -30996,4 +30996,232 @@ SQLITE_API void sqlite3_log(int iErrCode, const char *zFormat, ...){
 SQLITE_PRIVATE void sqlite3DebugPrintf(const char *zFormat, ...){
   va_list ap;
   StrAccum acc;
-  char zBuf[SQ
+  char zBuf[SQLITE_PRINT_BUF_SIZE*10];
+  sqlite3StrAccumInit(&acc, 0, zBuf, sizeof(zBuf), 0);
+  va_start(ap,zFormat);
+  sqlite3_str_vappendf(&acc, zFormat, ap);
+  va_end(ap);
+  sqlite3StrAccumFinish(&acc);
+#ifdef SQLITE_OS_TRACE_PROC
+  {
+    extern void SQLITE_OS_TRACE_PROC(const char *zBuf, int nBuf);
+    SQLITE_OS_TRACE_PROC(zBuf, sizeof(zBuf));
+  }
+#else
+  fprintf(stdout,"%s", zBuf);
+  fflush(stdout);
+#endif
+}
+#endif
+
+
+/*
+** variable-argument wrapper around sqlite3_str_vappendf(). The bFlags argument
+** can contain the bit SQLITE_PRINTF_INTERNAL enable internal formats.
+*/
+SQLITE_API void sqlite3_str_appendf(StrAccum *p, const char *zFormat, ...){
+  va_list ap;
+  va_start(ap,zFormat);
+  sqlite3_str_vappendf(p, zFormat, ap);
+  va_end(ap);
+}
+
+/************** End of printf.c **********************************************/
+/************** Begin file treeview.c ****************************************/
+/*
+** 2015-06-08
+**
+** The author disclaims copyright to this source code.  In place of
+** a legal notice, here is a blessing:
+**
+**    May you do good and not evil.
+**    May you find forgiveness for yourself and forgive others.
+**    May you share freely, never taking more than you give.
+**
+*************************************************************************
+**
+** This file contains C code to implement the TreeView debugging routines.
+** These routines print a parse tree to standard output for debugging and
+** analysis.
+**
+** The interfaces in this file is only available when compiling
+** with SQLITE_DEBUG.
+*/
+/* #include "sqliteInt.h" */
+#ifdef SQLITE_DEBUG
+
+/*
+** Add a new subitem to the tree.  The moreToFollow flag indicates that this
+** is not the last item in the tree.
+*/
+static void sqlite3TreeViewPush(TreeView **pp, u8 moreToFollow){
+  TreeView *p = *pp;
+  if( p==0 ){
+    *pp = p = sqlite3_malloc64( sizeof(*p) );
+    if( p==0 ) return;
+    memset(p, 0, sizeof(*p));
+  }else{
+    p->iLevel++;
+  }
+  assert( moreToFollow==0 || moreToFollow==1 );
+  if( p->iLevel<(int)sizeof(p->bLine) ) p->bLine[p->iLevel] = moreToFollow;
+}
+
+/*
+** Finished with one layer of the tree
+*/
+static void sqlite3TreeViewPop(TreeView **pp){
+  TreeView *p = *pp;
+  if( p==0 ) return;
+  p->iLevel--;
+  if( p->iLevel<0 ){
+    sqlite3_free(p);
+    *pp = 0;
+  }
+}
+
+/*
+** Generate a single line of output for the tree, with a prefix that contains
+** all the appropriate tree lines
+*/
+SQLITE_PRIVATE void sqlite3TreeViewLine(TreeView *p, const char *zFormat, ...){
+  va_list ap;
+  int i;
+  StrAccum acc;
+  char zBuf[1000];
+  sqlite3StrAccumInit(&acc, 0, zBuf, sizeof(zBuf), 0);
+  if( p ){
+    for(i=0; i<p->iLevel && i<(int)sizeof(p->bLine)-1; i++){
+      sqlite3_str_append(&acc, p->bLine[i] ? "|   " : "    ", 4);
+    }
+    sqlite3_str_append(&acc, p->bLine[i] ? "|-- " : "'-- ", 4);
+  }
+  if( zFormat!=0 ){
+    va_start(ap, zFormat);
+    sqlite3_str_vappendf(&acc, zFormat, ap);
+    va_end(ap);
+    assert( acc.nChar>0 || acc.accError );
+    sqlite3_str_append(&acc, "\n", 1);
+  }
+  sqlite3StrAccumFinish(&acc);
+  fprintf(stdout,"%s", zBuf);
+  fflush(stdout);
+}
+
+/*
+** Shorthand for starting a new tree item that consists of a single label
+*/
+static void sqlite3TreeViewItem(TreeView *p, const char *zLabel,u8 moreFollows){
+  sqlite3TreeViewPush(&p, moreFollows);
+  sqlite3TreeViewLine(p, "%s", zLabel);
+}
+
+/*
+** Show a list of Column objects in tree format.
+*/
+SQLITE_PRIVATE void sqlite3TreeViewColumnList(
+  TreeView *pView,
+  const Column *aCol,
+  int nCol,
+  u8 moreToFollow
+){
+  int i;
+  sqlite3TreeViewPush(&pView, moreToFollow);
+  sqlite3TreeViewLine(pView, "COLUMNS");
+  for(i=0; i<nCol; i++){
+    u16 flg = aCol[i].colFlags;
+    int colMoreToFollow = i<(nCol - 1);
+    sqlite3TreeViewPush(&pView, colMoreToFollow);
+    sqlite3TreeViewLine(pView, 0);
+    printf(" %s", aCol[i].zCnName);
+    switch( aCol[i].eCType ){
+      case COLTYPE_ANY:      printf(" ANY");        break;
+      case COLTYPE_BLOB:     printf(" BLOB");       break;
+      case COLTYPE_INT:      printf(" INT");        break;
+      case COLTYPE_INTEGER:  printf(" INTEGER");    break;
+      case COLTYPE_REAL:     printf(" REAL");       break;
+      case COLTYPE_TEXT:     printf(" TEXT");       break;
+      case COLTYPE_CUSTOM: {
+        if( flg & COLFLAG_HASTYPE ){
+          const char *z = aCol[i].zCnName;
+          z += strlen(z)+1;
+          printf(" X-%s", z);
+          break;
+        }
+      }
+    }
+    if( flg & COLFLAG_PRIMKEY ) printf(" PRIMARY KEY");
+    if( flg & COLFLAG_HIDDEN ) printf(" HIDDEN");
+#ifdef COLFLAG_NOEXPAND
+    if( flg & COLFLAG_NOEXPAND ) printf(" NO-EXPAND");
+#endif
+    if( flg ) printf(" flags=%04x", flg);
+    printf("\n");
+    fflush(stdout);
+    sqlite3TreeViewPop(&pView);
+  }
+  sqlite3TreeViewPop(&pView);
+}
+
+/*
+** Generate a human-readable description of a WITH clause.
+*/
+SQLITE_PRIVATE void sqlite3TreeViewWith(TreeView *pView, const With *pWith, u8 moreToFollow){
+  int i;
+  if( pWith==0 ) return;
+  if( pWith->nCte==0 ) return;
+  if( pWith->pOuter ){
+    sqlite3TreeViewLine(pView, "WITH (0x%p, pOuter=0x%p)",pWith,pWith->pOuter);
+  }else{
+    sqlite3TreeViewLine(pView, "WITH (0x%p)", pWith);
+  }
+  if( pWith->nCte>0 ){
+    sqlite3TreeViewPush(&pView, moreToFollow);
+    for(i=0; i<pWith->nCte; i++){
+      StrAccum x;
+      char zLine[1000];
+      const struct Cte *pCte = &pWith->a[i];
+      sqlite3StrAccumInit(&x, 0, zLine, sizeof(zLine), 0);
+      sqlite3_str_appendf(&x, "%s", pCte->zName);
+      if( pCte->pCols && pCte->pCols->nExpr>0 ){
+        char cSep = '(';
+        int j;
+        for(j=0; j<pCte->pCols->nExpr; j++){
+          sqlite3_str_appendf(&x, "%c%s", cSep, pCte->pCols->a[j].zEName);
+          cSep = ',';
+        }
+        sqlite3_str_appendf(&x, ")");
+      }
+      if( pCte->eM10d!=M10d_Any ){
+        sqlite3_str_appendf(&x, " %sMATERIALIZED",
+           pCte->eM10d==M10d_No ? "NOT " : "");
+      }
+      if( pCte->pUse ){
+        sqlite3_str_appendf(&x, " (pUse=0x%p, nUse=%d)", pCte->pUse,
+                 pCte->pUse->nUse);
+      }
+      sqlite3StrAccumFinish(&x);
+      sqlite3TreeViewItem(pView, zLine, i<pWith->nCte-1);
+      sqlite3TreeViewSelect(pView, pCte->pSelect, 0);
+      sqlite3TreeViewPop(&pView);
+    }
+    sqlite3TreeViewPop(&pView);
+  }
+}
+
+/*
+** Generate a human-readable description of a SrcList object.
+*/
+SQLITE_PRIVATE void sqlite3TreeViewSrcList(TreeView *pView, const SrcList *pSrc){
+  int i;
+  if( pSrc==0 ) return;
+  for(i=0; i<pSrc->nSrc; i++){
+    const SrcItem *pItem = &pSrc->a[i];
+    StrAccum x;
+    int n = 0;
+    char zLine[1000];
+    sqlite3StrAccumInit(&x, 0, zLine, sizeof(zLine), 0);
+    x.printfFlags |= SQLITE_PRINTF_INTERNAL;
+    sqlite3_str_appendf(&x, "{%d:*} %!S", pItem->iCursor, pItem);
+    if( pItem->pTab ){
+      sqlite3_str_appendf(&x, " tab=%Q nCol=%d ptr
