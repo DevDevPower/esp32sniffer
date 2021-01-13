@@ -31639,4 +31639,189 @@ SQLITE_PRIVATE void sqlite3TreeViewExpr(TreeView *pView, const Expr *pExpr, u8 m
     case TK_PLUS:    zBinOp = "ADD";    break;
     case TK_STAR:    zBinOp = "MUL";    break;
     case TK_MINUS:   zBinOp = "SUB";    break;
-    case TK_REM:     zBinOp = "RE
+    case TK_REM:     zBinOp = "REM";    break;
+    case TK_BITAND:  zBinOp = "BITAND"; break;
+    case TK_BITOR:   zBinOp = "BITOR";  break;
+    case TK_SLASH:   zBinOp = "DIV";    break;
+    case TK_LSHIFT:  zBinOp = "LSHIFT"; break;
+    case TK_RSHIFT:  zBinOp = "RSHIFT"; break;
+    case TK_CONCAT:  zBinOp = "CONCAT"; break;
+    case TK_DOT:     zBinOp = "DOT";    break;
+    case TK_LIMIT:   zBinOp = "LIMIT";  break;
+
+    case TK_UMINUS:  zUniOp = "UMINUS"; break;
+    case TK_UPLUS:   zUniOp = "UPLUS";  break;
+    case TK_BITNOT:  zUniOp = "BITNOT"; break;
+    case TK_NOT:     zUniOp = "NOT";    break;
+    case TK_ISNULL:  zUniOp = "ISNULL"; break;
+    case TK_NOTNULL: zUniOp = "NOTNULL"; break;
+
+    case TK_TRUTH: {
+      int x;
+      const char *azOp[] = {
+         "IS-FALSE", "IS-TRUE", "IS-NOT-FALSE", "IS-NOT-TRUE"
+      };
+      assert( pExpr->op2==TK_IS || pExpr->op2==TK_ISNOT );
+      assert( pExpr->pRight );
+      assert( sqlite3ExprSkipCollate(pExpr->pRight)->op==TK_TRUEFALSE );
+      x = (pExpr->op2==TK_ISNOT)*2 + sqlite3ExprTruthValue(pExpr->pRight);
+      zUniOp = azOp[x];
+      break;
+    }
+
+    case TK_SPAN: {
+      assert( !ExprHasProperty(pExpr, EP_IntValue) );
+      sqlite3TreeViewLine(pView, "SPAN %Q", pExpr->u.zToken);
+      sqlite3TreeViewExpr(pView, pExpr->pLeft, 0);
+      break;
+    }
+
+    case TK_COLLATE: {
+      /* COLLATE operators without the EP_Collate flag are intended to
+      ** emulate collation associated with a table column.  These show
+      ** up in the treeview output as "SOFT-COLLATE".  Explicit COLLATE
+      ** operators that appear in the original SQL always have the
+      ** EP_Collate bit set and appear in treeview output as just "COLLATE" */
+      assert( !ExprHasProperty(pExpr, EP_IntValue) );
+      sqlite3TreeViewLine(pView, "%sCOLLATE %Q%s",
+        !ExprHasProperty(pExpr, EP_Collate) ? "SOFT-" : "",
+        pExpr->u.zToken, zFlgs);
+      sqlite3TreeViewExpr(pView, pExpr->pLeft, 0);
+      break;
+    }
+
+    case TK_AGG_FUNCTION:
+    case TK_FUNCTION: {
+      ExprList *pFarg;       /* List of function arguments */
+      Window *pWin;
+      if( ExprHasProperty(pExpr, EP_TokenOnly) ){
+        pFarg = 0;
+        pWin = 0;
+      }else{
+        assert( ExprUseXList(pExpr) );
+        pFarg = pExpr->x.pList;
+#ifndef SQLITE_OMIT_WINDOWFUNC
+        pWin = ExprHasProperty(pExpr, EP_WinFunc) ? pExpr->y.pWin : 0;
+#else
+        pWin = 0;
+#endif
+      }
+      assert( !ExprHasProperty(pExpr, EP_IntValue) );
+      if( pExpr->op==TK_AGG_FUNCTION ){
+        sqlite3TreeViewLine(pView, "AGG_FUNCTION%d %Q%s agg=%d[%d]/%p",
+                             pExpr->op2, pExpr->u.zToken, zFlgs,
+                             pExpr->pAggInfo ? pExpr->pAggInfo->selId : 0,
+                             pExpr->iAgg, pExpr->pAggInfo);
+      }else if( pExpr->op2!=0 ){
+        const char *zOp2;
+        char zBuf[8];
+        sqlite3_snprintf(sizeof(zBuf),zBuf,"0x%02x",pExpr->op2);
+        zOp2 = zBuf;
+        if( pExpr->op2==NC_IsCheck ) zOp2 = "NC_IsCheck";
+        if( pExpr->op2==NC_IdxExpr ) zOp2 = "NC_IdxExpr";
+        if( pExpr->op2==NC_PartIdx ) zOp2 = "NC_PartIdx";
+        if( pExpr->op2==NC_GenCol ) zOp2 = "NC_GenCol";
+        sqlite3TreeViewLine(pView, "FUNCTION %Q%s op2=%s",
+                            pExpr->u.zToken, zFlgs, zOp2);
+      }else{
+        sqlite3TreeViewLine(pView, "FUNCTION %Q%s", pExpr->u.zToken, zFlgs);
+      }
+      if( pFarg ){
+        sqlite3TreeViewExprList(pView, pFarg, pWin!=0, 0);
+      }
+#ifndef SQLITE_OMIT_WINDOWFUNC
+      if( pWin ){
+        sqlite3TreeViewWindow(pView, pWin, 0);
+      }
+#endif
+      break;
+    }
+#ifndef SQLITE_OMIT_SUBQUERY
+    case TK_EXISTS: {
+      assert( ExprUseXSelect(pExpr) );
+      sqlite3TreeViewLine(pView, "EXISTS-expr flags=0x%x", pExpr->flags);
+      sqlite3TreeViewSelect(pView, pExpr->x.pSelect, 0);
+      break;
+    }
+    case TK_SELECT: {
+      assert( ExprUseXSelect(pExpr) );
+      sqlite3TreeViewLine(pView, "subquery-expr flags=0x%x", pExpr->flags);
+      sqlite3TreeViewSelect(pView, pExpr->x.pSelect, 0);
+      break;
+    }
+    case TK_IN: {
+      sqlite3_str *pStr = sqlite3_str_new(0);
+      char *z;
+      sqlite3_str_appendf(pStr, "IN flags=0x%x", pExpr->flags);
+      if( pExpr->iTable ) sqlite3_str_appendf(pStr, " iTable=%d",pExpr->iTable);
+      if( ExprHasProperty(pExpr, EP_Subrtn) ){
+        sqlite3_str_appendf(pStr, " subrtn(%d,%d)",
+            pExpr->y.sub.regReturn, pExpr->y.sub.iAddr);
+      }
+      z = sqlite3_str_finish(pStr);
+      sqlite3TreeViewLine(pView, z);
+      sqlite3_free(z);
+      sqlite3TreeViewExpr(pView, pExpr->pLeft, 1);
+      if( ExprUseXSelect(pExpr) ){
+        sqlite3TreeViewSelect(pView, pExpr->x.pSelect, 0);
+      }else{
+        sqlite3TreeViewExprList(pView, pExpr->x.pList, 0, 0);
+      }
+      break;
+    }
+#endif /* SQLITE_OMIT_SUBQUERY */
+
+    /*
+    **    x BETWEEN y AND z
+    **
+    ** This is equivalent to
+    **
+    **    x>=y AND x<=z
+    **
+    ** X is stored in pExpr->pLeft.
+    ** Y is stored in pExpr->pList->a[0].pExpr.
+    ** Z is stored in pExpr->pList->a[1].pExpr.
+    */
+    case TK_BETWEEN: {
+      const Expr *pX, *pY, *pZ;
+      pX = pExpr->pLeft;
+      assert( ExprUseXList(pExpr) );
+      assert( pExpr->x.pList->nExpr==2 );
+      pY = pExpr->x.pList->a[0].pExpr;
+      pZ = pExpr->x.pList->a[1].pExpr;
+      sqlite3TreeViewLine(pView, "BETWEEN");
+      sqlite3TreeViewExpr(pView, pX, 1);
+      sqlite3TreeViewExpr(pView, pY, 1);
+      sqlite3TreeViewExpr(pView, pZ, 0);
+      break;
+    }
+    case TK_TRIGGER: {
+      /* If the opcode is TK_TRIGGER, then the expression is a reference
+      ** to a column in the new.* or old.* pseudo-tables available to
+      ** trigger programs. In this case Expr.iTable is set to 1 for the
+      ** new.* pseudo-table, or 0 for the old.* pseudo-table. Expr.iColumn
+      ** is set to the column of the pseudo-table to read, or to -1 to
+      ** read the rowid field.
+      */
+      sqlite3TreeViewLine(pView, "%s(%d)",
+          pExpr->iTable ? "NEW" : "OLD", pExpr->iColumn);
+      break;
+    }
+    case TK_CASE: {
+      sqlite3TreeViewLine(pView, "CASE");
+      sqlite3TreeViewExpr(pView, pExpr->pLeft, 1);
+      assert( ExprUseXList(pExpr) );
+      sqlite3TreeViewExprList(pView, pExpr->x.pList, 0, 0);
+      break;
+    }
+#ifndef SQLITE_OMIT_TRIGGER
+    case TK_RAISE: {
+      const char *zType = "unk";
+      switch( pExpr->affExpr ){
+        case OE_Rollback:   zType = "rollback";  break;
+        case OE_Abort:      zType = "abort";     break;
+        case OE_Fail:       zType = "fail";      break;
+        case OE_Ignore:     zType = "ignore";    break;
+      }
+      assert( !ExprHasProperty(pExpr, EP_IntValue) );
+      sqlite3TreeViewLine(pView, "RAISE %s(%Q)", zType, pExpr->u.zTok
