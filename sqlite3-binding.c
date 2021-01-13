@@ -31824,4 +31824,225 @@ SQLITE_PRIVATE void sqlite3TreeViewExpr(TreeView *pView, const Expr *pExpr, u8 m
         case OE_Ignore:     zType = "ignore";    break;
       }
       assert( !ExprHasProperty(pExpr, EP_IntValue) );
-      sqlite3TreeViewLine(pView, "RAISE %s(%Q)", zType, pExpr->u.zTok
+      sqlite3TreeViewLine(pView, "RAISE %s(%Q)", zType, pExpr->u.zToken);
+      break;
+    }
+#endif
+    case TK_MATCH: {
+      sqlite3TreeViewLine(pView, "MATCH {%d:%d}%s",
+                          pExpr->iTable, pExpr->iColumn, zFlgs);
+      sqlite3TreeViewExpr(pView, pExpr->pRight, 0);
+      break;
+    }
+    case TK_VECTOR: {
+      char *z = sqlite3_mprintf("VECTOR%s",zFlgs);
+      assert( ExprUseXList(pExpr) );
+      sqlite3TreeViewBareExprList(pView, pExpr->x.pList, z);
+      sqlite3_free(z);
+      break;
+    }
+    case TK_SELECT_COLUMN: {
+      sqlite3TreeViewLine(pView, "SELECT-COLUMN %d of [0..%d]%s",
+              pExpr->iColumn, pExpr->iTable-1,
+              pExpr->pRight==pExpr->pLeft ? " (SELECT-owner)" : "");
+      assert( ExprUseXSelect(pExpr->pLeft) );
+      sqlite3TreeViewSelect(pView, pExpr->pLeft->x.pSelect, 0);
+      break;
+    }
+    case TK_IF_NULL_ROW: {
+      sqlite3TreeViewLine(pView, "IF-NULL-ROW %d", pExpr->iTable);
+      sqlite3TreeViewExpr(pView, pExpr->pLeft, 0);
+      break;
+    }
+    case TK_ERROR: {
+      Expr tmp;
+      sqlite3TreeViewLine(pView, "ERROR");
+      tmp = *pExpr;
+      tmp.op = pExpr->op2;
+      sqlite3TreeViewExpr(pView, &tmp, 0);
+      break;
+    }
+    case TK_ROW: {
+      if( pExpr->iColumn<=0 ){
+        sqlite3TreeViewLine(pView, "First FROM table rowid");
+      }else{
+        sqlite3TreeViewLine(pView, "First FROM table column %d",
+            pExpr->iColumn-1);
+      }
+      break;
+    }
+    default: {
+      sqlite3TreeViewLine(pView, "op=%d", pExpr->op);
+      break;
+    }
+  }
+  if( zBinOp ){
+    sqlite3TreeViewLine(pView, "%s%s", zBinOp, zFlgs);
+    sqlite3TreeViewExpr(pView, pExpr->pLeft, 1);
+    sqlite3TreeViewExpr(pView, pExpr->pRight, 0);
+  }else if( zUniOp ){
+    sqlite3TreeViewLine(pView, "%s%s", zUniOp, zFlgs);
+   sqlite3TreeViewExpr(pView, pExpr->pLeft, 0);
+  }
+  sqlite3TreeViewPop(&pView);
+}
+
+
+/*
+** Generate a human-readable explanation of an expression list.
+*/
+SQLITE_PRIVATE void sqlite3TreeViewBareExprList(
+  TreeView *pView,
+  const ExprList *pList,
+  const char *zLabel
+){
+  if( zLabel==0 || zLabel[0]==0 ) zLabel = "LIST";
+  if( pList==0 ){
+    sqlite3TreeViewLine(pView, "%s (empty)", zLabel);
+  }else{
+    int i;
+    sqlite3TreeViewLine(pView, "%s", zLabel);
+    for(i=0; i<pList->nExpr; i++){
+      int j = pList->a[i].u.x.iOrderByCol;
+      char *zName = pList->a[i].zEName;
+      int moreToFollow = i<pList->nExpr - 1;
+      if( j || zName ){
+        sqlite3TreeViewPush(&pView, moreToFollow);
+        moreToFollow = 0;
+        sqlite3TreeViewLine(pView, 0);
+        if( zName ){
+          switch( pList->a[i].fg.eEName ){
+            default:
+              fprintf(stdout, "AS %s ", zName);
+              break;
+            case ENAME_TAB:
+              fprintf(stdout, "TABLE-ALIAS-NAME(\"%s\") ", zName);
+              if( pList->a[i].fg.bUsed ) fprintf(stdout, "(used) ");
+              if( pList->a[i].fg.bUsingTerm ) fprintf(stdout, "(USING-term) ");
+              if( pList->a[i].fg.bNoExpand ) fprintf(stdout, "(NoExpand) ");
+              break;
+            case ENAME_SPAN:
+              fprintf(stdout, "SPAN(\"%s\") ", zName);
+              break;
+          }
+        }
+        if( j ){
+          fprintf(stdout, "iOrderByCol=%d", j);
+        }
+        fprintf(stdout, "\n");
+        fflush(stdout);
+      }
+      sqlite3TreeViewExpr(pView, pList->a[i].pExpr, moreToFollow);
+      if( j || zName ){
+        sqlite3TreeViewPop(&pView);
+      }
+    }
+  }
+}
+SQLITE_PRIVATE void sqlite3TreeViewExprList(
+  TreeView *pView,
+  const ExprList *pList,
+  u8 moreToFollow,
+  const char *zLabel
+){
+  sqlite3TreeViewPush(&pView, moreToFollow);
+  sqlite3TreeViewBareExprList(pView, pList, zLabel);
+  sqlite3TreeViewPop(&pView);
+}
+
+/*
+** Generate a human-readable explanation of an id-list.
+*/
+SQLITE_PRIVATE void sqlite3TreeViewBareIdList(
+  TreeView *pView,
+  const IdList *pList,
+  const char *zLabel
+){
+  if( zLabel==0 || zLabel[0]==0 ) zLabel = "LIST";
+  if( pList==0 ){
+    sqlite3TreeViewLine(pView, "%s (empty)", zLabel);
+  }else{
+    int i;
+    sqlite3TreeViewLine(pView, "%s", zLabel);
+    for(i=0; i<pList->nId; i++){
+      char *zName = pList->a[i].zName;
+      int moreToFollow = i<pList->nId - 1;
+      if( zName==0 ) zName = "(null)";
+      sqlite3TreeViewPush(&pView, moreToFollow);
+      sqlite3TreeViewLine(pView, 0);
+      if( pList->eU4==EU4_NONE ){
+        fprintf(stdout, "%s\n", zName);
+      }else if( pList->eU4==EU4_IDX ){
+        fprintf(stdout, "%s (%d)\n", zName, pList->a[i].u4.idx);
+      }else{
+        assert( pList->eU4==EU4_EXPR );
+        if( pList->a[i].u4.pExpr==0 ){
+          fprintf(stdout, "%s (pExpr=NULL)\n", zName);
+        }else{
+          fprintf(stdout, "%s\n", zName);
+          sqlite3TreeViewPush(&pView, i<pList->nId-1);
+          sqlite3TreeViewExpr(pView, pList->a[i].u4.pExpr, 0);
+          sqlite3TreeViewPop(&pView);
+        }
+      }
+      sqlite3TreeViewPop(&pView);
+    }
+  }
+}
+SQLITE_PRIVATE void sqlite3TreeViewIdList(
+  TreeView *pView,
+  const IdList *pList,
+  u8 moreToFollow,
+  const char *zLabel
+){
+  sqlite3TreeViewPush(&pView, moreToFollow);
+  sqlite3TreeViewBareIdList(pView, pList, zLabel);
+  sqlite3TreeViewPop(&pView);
+}
+
+/*
+** Generate a human-readable explanation of a list of Upsert objects
+*/
+SQLITE_PRIVATE void sqlite3TreeViewUpsert(
+  TreeView *pView,
+  const Upsert *pUpsert,
+  u8 moreToFollow
+){
+  if( pUpsert==0 ) return;
+  sqlite3TreeViewPush(&pView, moreToFollow);
+  while( pUpsert ){
+    int n;
+    sqlite3TreeViewPush(&pView, pUpsert->pNextUpsert!=0 || moreToFollow);
+    sqlite3TreeViewLine(pView, "ON CONFLICT DO %s",
+         pUpsert->isDoUpdate ? "UPDATE" : "NOTHING");
+    n = (pUpsert->pUpsertSet!=0) + (pUpsert->pUpsertWhere!=0);
+    sqlite3TreeViewExprList(pView, pUpsert->pUpsertTarget, (n--)>0, "TARGET");
+    sqlite3TreeViewExprList(pView, pUpsert->pUpsertSet, (n--)>0, "SET");
+    if( pUpsert->pUpsertWhere ){
+      sqlite3TreeViewItem(pView, "WHERE", (n--)>0);
+      sqlite3TreeViewExpr(pView, pUpsert->pUpsertWhere, 0);
+      sqlite3TreeViewPop(&pView);
+    }
+    sqlite3TreeViewPop(&pView);
+    pUpsert = pUpsert->pNextUpsert;
+  }
+  sqlite3TreeViewPop(&pView);
+}
+
+#if TREETRACE_ENABLED
+/*
+** Generate a human-readable diagram of the data structure that go
+** into generating an DELETE statement.
+*/
+SQLITE_PRIVATE void sqlite3TreeViewDelete(
+  const With *pWith,
+  const SrcList *pTabList,
+  const Expr *pWhere,
+  const ExprList *pOrderBy,
+  const Expr *pLimit,
+  const Trigger *pTrigger
+){
+  int n = 0;
+  TreeView *pView = 0;
+  sqlite3TreeViewPush(&pView, 0);
+  
