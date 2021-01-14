@@ -32865,4 +32865,223 @@ static const unsigned char sqlite3Utf8Trans1[] = {
 **     If a multi-byte character attempts to encode a value between
 **     0xd800 and 0xe000 then it is rendered as 0xfffd.
 **
-**  *  Bytes in the range of 0x80 th
+**  *  Bytes in the range of 0x80 through 0xbf which occur as the first
+**     byte of a character are interpreted as single-byte characters
+**     and rendered as themselves even though they are technically
+**     invalid characters.
+**
+**  *  This routine accepts over-length UTF8 encodings
+**     for unicode values 0x80 and greater.  It does not change over-length
+**     encodings to 0xfffd as some systems recommend.
+*/
+#define READ_UTF8(zIn, zTerm, c)                           \
+  c = *(zIn++);                                            \
+  if( c>=0xc0 ){                                           \
+    c = sqlite3Utf8Trans1[c-0xc0];                         \
+    while( zIn!=zTerm && (*zIn & 0xc0)==0x80 ){            \
+      c = (c<<6) + (0x3f & *(zIn++));                      \
+    }                                                      \
+    if( c<0x80                                             \
+        || (c&0xFFFFF800)==0xD800                          \
+        || (c&0xFFFFFFFE)==0xFFFE ){  c = 0xFFFD; }        \
+  }
+SQLITE_PRIVATE u32 sqlite3Utf8Read(
+  const unsigned char **pz    /* Pointer to string from which to read char */
+){
+  unsigned int c;
+
+  /* Same as READ_UTF8() above but without the zTerm parameter.
+  ** For this routine, we assume the UTF8 string is always zero-terminated.
+  */
+  c = *((*pz)++);
+  if( c>=0xc0 ){
+    c = sqlite3Utf8Trans1[c-0xc0];
+    while( (*(*pz) & 0xc0)==0x80 ){
+      c = (c<<6) + (0x3f & *((*pz)++));
+    }
+    if( c<0x80
+        || (c&0xFFFFF800)==0xD800
+        || (c&0xFFFFFFFE)==0xFFFE ){  c = 0xFFFD; }
+  }
+  return c;
+}
+
+
+
+
+/*
+** If the TRANSLATE_TRACE macro is defined, the value of each Mem is
+** printed on stderr on the way into and out of sqlite3VdbeMemTranslate().
+*/
+/* #define TRANSLATE_TRACE 1 */
+
+#ifndef SQLITE_OMIT_UTF16
+/*
+** This routine transforms the internal text encoding used by pMem to
+** desiredEnc. It is an error if the string is already of the desired
+** encoding, or if *pMem does not contain a string value.
+*/
+SQLITE_PRIVATE SQLITE_NOINLINE int sqlite3VdbeMemTranslate(Mem *pMem, u8 desiredEnc){
+  sqlite3_int64 len;          /* Maximum length of output string in bytes */
+  unsigned char *zOut;        /* Output buffer */
+  unsigned char *zIn;         /* Input iterator */
+  unsigned char *zTerm;       /* End of input */
+  unsigned char *z;           /* Output iterator */
+  unsigned int c;
+
+  assert( pMem->db==0 || sqlite3_mutex_held(pMem->db->mutex) );
+  assert( pMem->flags&MEM_Str );
+  assert( pMem->enc!=desiredEnc );
+  assert( pMem->enc!=0 );
+  assert( pMem->n>=0 );
+
+#if defined(TRANSLATE_TRACE) && defined(SQLITE_DEBUG)
+  {
+    StrAccum acc;
+    char zBuf[1000];
+    sqlite3StrAccumInit(&acc, 0, zBuf, sizeof(zBuf), 0);
+    sqlite3VdbeMemPrettyPrint(pMem, &acc);
+    fprintf(stderr, "INPUT:  %s\n", sqlite3StrAccumFinish(&acc));
+  }
+#endif
+
+  /* If the translation is between UTF-16 little and big endian, then
+  ** all that is required is to swap the byte order. This case is handled
+  ** differently from the others.
+  */
+  if( pMem->enc!=SQLITE_UTF8 && desiredEnc!=SQLITE_UTF8 ){
+    u8 temp;
+    int rc;
+    rc = sqlite3VdbeMemMakeWriteable(pMem);
+    if( rc!=SQLITE_OK ){
+      assert( rc==SQLITE_NOMEM );
+      return SQLITE_NOMEM_BKPT;
+    }
+    zIn = (u8*)pMem->z;
+    zTerm = &zIn[pMem->n&~1];
+    while( zIn<zTerm ){
+      temp = *zIn;
+      *zIn = *(zIn+1);
+      zIn++;
+      *zIn++ = temp;
+    }
+    pMem->enc = desiredEnc;
+    goto translate_out;
+  }
+
+  /* Set len to the maximum number of bytes required in the output buffer. */
+  if( desiredEnc==SQLITE_UTF8 ){
+    /* When converting from UTF-16, the maximum growth results from
+    ** translating a 2-byte character to a 4-byte UTF-8 character.
+    ** A single byte is required for the output string
+    ** nul-terminator.
+    */
+    pMem->n &= ~1;
+    len = 2 * (sqlite3_int64)pMem->n + 1;
+  }else{
+    /* When converting from UTF-8 to UTF-16 the maximum growth is caused
+    ** when a 1-byte UTF-8 character is translated into a 2-byte UTF-16
+    ** character. Two bytes are required in the output buffer for the
+    ** nul-terminator.
+    */
+    len = 2 * (sqlite3_int64)pMem->n + 2;
+  }
+
+  /* Set zIn to point at the start of the input buffer and zTerm to point 1
+  ** byte past the end.
+  **
+  ** Variable zOut is set to point at the output buffer, space obtained
+  ** from sqlite3_malloc().
+  */
+  zIn = (u8*)pMem->z;
+  zTerm = &zIn[pMem->n];
+  zOut = sqlite3DbMallocRaw(pMem->db, len);
+  if( !zOut ){
+    return SQLITE_NOMEM_BKPT;
+  }
+  z = zOut;
+
+  if( pMem->enc==SQLITE_UTF8 ){
+    if( desiredEnc==SQLITE_UTF16LE ){
+      /* UTF-8 -> UTF-16 Little-endian */
+      while( zIn<zTerm ){
+        READ_UTF8(zIn, zTerm, c);
+        WRITE_UTF16LE(z, c);
+      }
+    }else{
+      assert( desiredEnc==SQLITE_UTF16BE );
+      /* UTF-8 -> UTF-16 Big-endian */
+      while( zIn<zTerm ){
+        READ_UTF8(zIn, zTerm, c);
+        WRITE_UTF16BE(z, c);
+      }
+    }
+    pMem->n = (int)(z - zOut);
+    *z++ = 0;
+  }else{
+    assert( desiredEnc==SQLITE_UTF8 );
+    if( pMem->enc==SQLITE_UTF16LE ){
+      /* UTF-16 Little-endian -> UTF-8 */
+      while( zIn<zTerm ){
+        c = *(zIn++);
+        c += (*(zIn++))<<8;
+        if( c>=0xd800 && c<0xe000 ){
+#ifdef SQLITE_REPLACE_INVALID_UTF
+          if( c>=0xdc00 || zIn>=zTerm ){
+            c = 0xfffd;
+          }else{
+            int c2 = *(zIn++);
+            c2 += (*(zIn++))<<8;
+            if( c2<0xdc00 || c2>=0xe000 ){
+              zIn -= 2;
+              c = 0xfffd;
+            }else{
+              c = ((c&0x3ff)<<10) + (c2&0x3ff) + 0x10000;
+            }
+          }
+#else
+          if( zIn<zTerm ){
+            int c2 = (*zIn++);
+            c2 += ((*zIn++)<<8);
+            c = (c2&0x03FF) + ((c&0x003F)<<10) + (((c&0x03C0)+0x0040)<<10);
+          }
+#endif
+        }
+        WRITE_UTF8(z, c);
+      }
+    }else{
+      /* UTF-16 Big-endian -> UTF-8 */
+      while( zIn<zTerm ){
+        c = (*(zIn++))<<8;
+        c += *(zIn++);
+        if( c>=0xd800 && c<0xe000 ){
+#ifdef SQLITE_REPLACE_INVALID_UTF
+          if( c>=0xdc00 || zIn>=zTerm ){
+            c = 0xfffd;
+          }else{
+            int c2 = (*(zIn++))<<8;
+            c2 += *(zIn++);
+            if( c2<0xdc00 || c2>=0xe000 ){
+              zIn -= 2;
+              c = 0xfffd;
+            }else{
+              c = ((c&0x3ff)<<10) + (c2&0x3ff) + 0x10000;
+            }
+          }
+#else
+          if( zIn<zTerm ){
+            int c2 = ((*zIn++)<<8);
+            c2 += (*zIn++);
+            c = (c2&0x03FF) + ((c&0x003F)<<10) + (((c&0x03C0)+0x0040)<<10);
+          }
+#endif
+        }
+        WRITE_UTF8(z, c);
+      }
+    }
+    pMem->n = (int)(z - zOut);
+  }
+  *z = 0;
+  assert( (pMem->n+(desiredEnc==SQLITE_UTF8?1:2))<=len );
+
+  c = MEM_Str|MEM
