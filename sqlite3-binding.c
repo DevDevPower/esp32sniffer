@@ -32045,4 +32045,238 @@ SQLITE_PRIVATE void sqlite3TreeViewDelete(
   int n = 0;
   TreeView *pView = 0;
   sqlite3TreeViewPush(&pView, 0);
-  
+  sqlite3TreeViewLine(pView, "DELETE");
+  if( pWith ) n++;
+  if( pTabList ) n++;
+  if( pWhere ) n++;
+  if( pOrderBy ) n++;
+  if( pLimit ) n++;
+  if( pTrigger ) n++;
+  if( pWith ){
+    sqlite3TreeViewPush(&pView, (--n)>0);
+    sqlite3TreeViewWith(pView, pWith, 0);
+    sqlite3TreeViewPop(&pView);
+  }
+  if( pTabList ){
+    sqlite3TreeViewPush(&pView, (--n)>0);
+    sqlite3TreeViewLine(pView, "FROM");
+    sqlite3TreeViewSrcList(pView, pTabList);
+    sqlite3TreeViewPop(&pView);
+  }
+  if( pWhere ){
+    sqlite3TreeViewPush(&pView, (--n)>0);
+    sqlite3TreeViewLine(pView, "WHERE");
+    sqlite3TreeViewExpr(pView, pWhere, 0);
+    sqlite3TreeViewPop(&pView);
+  }
+  if( pOrderBy ){
+    sqlite3TreeViewExprList(pView, pOrderBy, (--n)>0, "ORDER-BY");
+  }
+  if( pLimit ){
+    sqlite3TreeViewPush(&pView, (--n)>0);
+    sqlite3TreeViewLine(pView, "LIMIT");
+    sqlite3TreeViewExpr(pView, pLimit, 0);
+    sqlite3TreeViewPop(&pView);
+  }
+  if( pTrigger ){
+    sqlite3TreeViewTrigger(pView, pTrigger, (--n)>0, 1);
+  }
+  sqlite3TreeViewPop(&pView);
+}
+#endif /* TREETRACE_ENABLED */
+
+#if TREETRACE_ENABLED
+/*
+** Generate a human-readable diagram of the data structure that go
+** into generating an INSERT statement.
+*/
+SQLITE_PRIVATE void sqlite3TreeViewInsert(
+  const With *pWith,
+  const SrcList *pTabList,
+  const IdList *pColumnList,
+  const Select *pSelect,
+  const ExprList *pExprList,
+  int onError,
+  const Upsert *pUpsert,
+  const Trigger *pTrigger
+){
+  TreeView *pView = 0;
+  int n = 0;
+  const char *zLabel = "INSERT";
+  switch( onError ){
+    case OE_Replace:  zLabel = "REPLACE";             break;
+    case OE_Ignore:   zLabel = "INSERT OR IGNORE";    break;
+    case OE_Rollback: zLabel = "INSERT OR ROLLBACK";  break;
+    case OE_Abort:    zLabel = "INSERT OR ABORT";     break;
+    case OE_Fail:     zLabel = "INSERT OR FAIL";      break;
+  }
+  sqlite3TreeViewPush(&pView, 0);
+  sqlite3TreeViewLine(pView, zLabel);
+  if( pWith ) n++;
+  if( pTabList ) n++;
+  if( pColumnList ) n++;
+  if( pSelect ) n++;
+  if( pExprList ) n++;
+  if( pUpsert ) n++;
+  if( pTrigger ) n++;
+  if( pWith ){
+    sqlite3TreeViewPush(&pView, (--n)>0);
+    sqlite3TreeViewWith(pView, pWith, 0);
+    sqlite3TreeViewPop(&pView);
+  }
+  if( pTabList ){
+    sqlite3TreeViewPush(&pView, (--n)>0);
+    sqlite3TreeViewLine(pView, "INTO");
+    sqlite3TreeViewSrcList(pView, pTabList);
+    sqlite3TreeViewPop(&pView);
+  }
+  if( pColumnList ){
+    sqlite3TreeViewIdList(pView, pColumnList, (--n)>0, "COLUMNS");
+  }
+  if( pSelect ){
+    sqlite3TreeViewPush(&pView, (--n)>0);
+    sqlite3TreeViewLine(pView, "DATA-SOURCE");
+    sqlite3TreeViewSelect(pView, pSelect, 0);
+    sqlite3TreeViewPop(&pView);
+  }
+  if( pExprList ){
+    sqlite3TreeViewExprList(pView, pExprList, (--n)>0, "VALUES");
+  }
+  if( pUpsert ){
+    sqlite3TreeViewPush(&pView, (--n)>0);
+    sqlite3TreeViewLine(pView, "UPSERT");
+    sqlite3TreeViewUpsert(pView, pUpsert, 0);
+    sqlite3TreeViewPop(&pView);
+  }
+  if( pTrigger ){
+    sqlite3TreeViewTrigger(pView, pTrigger, (--n)>0, 1);
+  }
+  sqlite3TreeViewPop(&pView);
+}
+#endif /* TREETRACE_ENABLED */
+
+#if TREETRACE_ENABLED
+/*
+** Generate a human-readable diagram of the data structure that go
+** into generating an UPDATE statement.
+*/
+SQLITE_PRIVATE void sqlite3TreeViewUpdate(
+  const With *pWith,
+  const SrcList *pTabList,
+  const ExprList *pChanges,
+  const Expr *pWhere,
+  int onError,
+  const ExprList *pOrderBy,
+  const Expr *pLimit,
+  const Upsert *pUpsert,
+  const Trigger *pTrigger
+){
+  int n = 0;
+  TreeView *pView = 0;
+  const char *zLabel = "UPDATE";
+  switch( onError ){
+    case OE_Replace:  zLabel = "UPDATE OR REPLACE";   break;
+    case OE_Ignore:   zLabel = "UPDATE OR IGNORE";    break;
+    case OE_Rollback: zLabel = "UPDATE OR ROLLBACK";  break;
+    case OE_Abort:    zLabel = "UPDATE OR ABORT";     break;
+    case OE_Fail:     zLabel = "UPDATE OR FAIL";      break;
+  }
+  sqlite3TreeViewPush(&pView, 0);
+  sqlite3TreeViewLine(pView, zLabel);
+  if( pWith ) n++;
+  if( pTabList ) n++;
+  if( pChanges ) n++;
+  if( pWhere ) n++;
+  if( pOrderBy ) n++;
+  if( pLimit ) n++;
+  if( pUpsert ) n++;
+  if( pTrigger ) n++;
+  if( pWith ){
+    sqlite3TreeViewPush(&pView, (--n)>0);
+    sqlite3TreeViewWith(pView, pWith, 0);
+    sqlite3TreeViewPop(&pView);
+  }
+  if( pTabList ){
+    sqlite3TreeViewPush(&pView, (--n)>0);
+    sqlite3TreeViewLine(pView, "FROM");
+    sqlite3TreeViewSrcList(pView, pTabList);
+    sqlite3TreeViewPop(&pView);
+  }
+  if( pChanges ){
+    sqlite3TreeViewExprList(pView, pChanges, (--n)>0, "SET");
+  }
+  if( pWhere ){
+    sqlite3TreeViewPush(&pView, (--n)>0);
+    sqlite3TreeViewLine(pView, "WHERE");
+    sqlite3TreeViewExpr(pView, pWhere, 0);
+    sqlite3TreeViewPop(&pView);
+  }
+  if( pOrderBy ){
+    sqlite3TreeViewExprList(pView, pOrderBy, (--n)>0, "ORDER-BY");
+  }
+  if( pLimit ){
+    sqlite3TreeViewPush(&pView, (--n)>0);
+    sqlite3TreeViewLine(pView, "LIMIT");
+    sqlite3TreeViewExpr(pView, pLimit, 0);
+    sqlite3TreeViewPop(&pView);
+  }
+  if( pUpsert ){
+    sqlite3TreeViewPush(&pView, (--n)>0);
+    sqlite3TreeViewLine(pView, "UPSERT");
+    sqlite3TreeViewUpsert(pView, pUpsert, 0);
+    sqlite3TreeViewPop(&pView);
+  }
+  if( pTrigger ){
+    sqlite3TreeViewTrigger(pView, pTrigger, (--n)>0, 1);
+  }
+  sqlite3TreeViewPop(&pView);
+}
+#endif /* TREETRACE_ENABLED */
+
+#ifndef SQLITE_OMIT_TRIGGER
+/*
+** Show a human-readable graph of a TriggerStep
+*/
+SQLITE_PRIVATE void sqlite3TreeViewTriggerStep(
+  TreeView *pView,
+  const TriggerStep *pStep,
+  u8 moreToFollow,
+  u8 showFullList
+){
+  int cnt = 0;
+  if( pStep==0 ) return;
+  sqlite3TreeViewPush(&pView,
+      moreToFollow || (showFullList && pStep->pNext!=0));
+  do{
+    if( cnt++ && pStep->pNext==0 ){
+      sqlite3TreeViewPop(&pView);
+      sqlite3TreeViewPush(&pView, 0);
+    }
+    sqlite3TreeViewLine(pView, "%s", pStep->zSpan ? pStep->zSpan : "RETURNING");
+  }while( showFullList && (pStep = pStep->pNext)!=0 );
+  sqlite3TreeViewPop(&pView);
+}
+
+/*
+** Show a human-readable graph of a Trigger
+*/
+SQLITE_PRIVATE void sqlite3TreeViewTrigger(
+  TreeView *pView,
+  const Trigger *pTrigger,
+  u8 moreToFollow,
+  u8 showFullList
+){
+  int cnt = 0;
+  if( pTrigger==0 ) return;
+  sqlite3TreeViewPush(&pView,
+     moreToFollow || (showFullList && pTrigger->pNext!=0));
+  do{
+    if( cnt++ && pTrigger->pNext==0 ){
+      sqlite3TreeViewPop(&pView);
+      sqlite3TreeViewPush(&pView, 0);
+    }
+    sqlite3TreeViewLine(pView, "TRIGGER %s", pTrigger->zName);
+    sqlite3TreeViewPush(&pView, 0);
+    sqlite3TreeViewTriggerStep(pView, pTrigger->step_list, 0, 1);
+    sqlite3TreeViewPop(&pView);
+  }while( showFullList && (pTrigger = pTrigger->pNex
