@@ -32688,4 +32688,181 @@ struct SQLiteThread {
 };
 
 /* Create a new thread */
-SQLITE_PRIVATE int sqlite
+SQLITE_PRIVATE int sqlite3ThreadCreate(
+  SQLiteThread **ppThread,  /* OUT: Write the thread object here */
+  void *(*xTask)(void*),    /* Routine to run in a separate thread */
+  void *pIn                 /* Argument passed into xTask() */
+){
+  SQLiteThread *p;
+
+  assert( ppThread!=0 );
+  assert( xTask!=0 );
+  *ppThread = 0;
+  p = sqlite3Malloc(sizeof(*p));
+  if( p==0 ) return SQLITE_NOMEM_BKPT;
+  if( (SQLITE_PTR_TO_INT(p)/17)&1 ){
+    p->xTask = xTask;
+    p->pIn = pIn;
+  }else{
+    p->xTask = 0;
+    p->pResult = xTask(pIn);
+  }
+  *ppThread = p;
+  return SQLITE_OK;
+}
+
+/* Get the results of the thread */
+SQLITE_PRIVATE int sqlite3ThreadJoin(SQLiteThread *p, void **ppOut){
+
+  assert( ppOut!=0 );
+  if( NEVER(p==0) ) return SQLITE_NOMEM_BKPT;
+  if( p->xTask ){
+    *ppOut = p->xTask(p->pIn);
+  }else{
+    *ppOut = p->pResult;
+  }
+  sqlite3_free(p);
+
+#if defined(SQLITE_TEST)
+  {
+    void *pTstAlloc = sqlite3Malloc(10);
+    if (!pTstAlloc) return SQLITE_NOMEM_BKPT;
+    sqlite3_free(pTstAlloc);
+  }
+#endif
+
+  return SQLITE_OK;
+}
+
+#endif /* !defined(SQLITE_THREADS_IMPLEMENTED) */
+/****************************** End Single-Threaded *************************/
+#endif /* SQLITE_MAX_WORKER_THREADS>0 */
+
+/************** End of threads.c *********************************************/
+/************** Begin file utf.c *********************************************/
+/*
+** 2004 April 13
+**
+** The author disclaims copyright to this source code.  In place of
+** a legal notice, here is a blessing:
+**
+**    May you do good and not evil.
+**    May you find forgiveness for yourself and forgive others.
+**    May you share freely, never taking more than you give.
+**
+*************************************************************************
+** This file contains routines used to translate between UTF-8,
+** UTF-16, UTF-16BE, and UTF-16LE.
+**
+** Notes on UTF-8:
+**
+**   Byte-0    Byte-1    Byte-2    Byte-3    Value
+**  0xxxxxxx                                 00000000 00000000 0xxxxxxx
+**  110yyyyy  10xxxxxx                       00000000 00000yyy yyxxxxxx
+**  1110zzzz  10yyyyyy  10xxxxxx             00000000 zzzzyyyy yyxxxxxx
+**  11110uuu  10uuzzzz  10yyyyyy  10xxxxxx   000uuuuu zzzzyyyy yyxxxxxx
+**
+**
+** Notes on UTF-16:  (with wwww+1==uuuuu)
+**
+**      Word-0               Word-1          Value
+**  110110ww wwzzzzyy   110111yy yyxxxxxx    000uuuuu zzzzyyyy yyxxxxxx
+**  zzzzyyyy yyxxxxxx                        00000000 zzzzyyyy yyxxxxxx
+**
+**
+** BOM or Byte Order Mark:
+**     0xff 0xfe   little-endian utf-16 follows
+**     0xfe 0xff   big-endian utf-16 follows
+**
+*/
+/* #include "sqliteInt.h" */
+/* #include <assert.h> */
+/* #include "vdbeInt.h" */
+
+#if !defined(SQLITE_AMALGAMATION) && SQLITE_BYTEORDER==0
+/*
+** The following constant value is used by the SQLITE_BIGENDIAN and
+** SQLITE_LITTLEENDIAN macros.
+*/
+SQLITE_PRIVATE const int sqlite3one = 1;
+#endif /* SQLITE_AMALGAMATION && SQLITE_BYTEORDER==0 */
+
+/*
+** This lookup table is used to help decode the first byte of
+** a multi-byte UTF8 character.
+*/
+static const unsigned char sqlite3Utf8Trans1[] = {
+  0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07,
+  0x08, 0x09, 0x0a, 0x0b, 0x0c, 0x0d, 0x0e, 0x0f,
+  0x10, 0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17,
+  0x18, 0x19, 0x1a, 0x1b, 0x1c, 0x1d, 0x1e, 0x1f,
+  0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07,
+  0x08, 0x09, 0x0a, 0x0b, 0x0c, 0x0d, 0x0e, 0x0f,
+  0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07,
+  0x00, 0x01, 0x02, 0x03, 0x00, 0x01, 0x00, 0x00,
+};
+
+
+#define WRITE_UTF8(zOut, c) {                          \
+  if( c<0x00080 ){                                     \
+    *zOut++ = (u8)(c&0xFF);                            \
+  }                                                    \
+  else if( c<0x00800 ){                                \
+    *zOut++ = 0xC0 + (u8)((c>>6)&0x1F);                \
+    *zOut++ = 0x80 + (u8)(c & 0x3F);                   \
+  }                                                    \
+  else if( c<0x10000 ){                                \
+    *zOut++ = 0xE0 + (u8)((c>>12)&0x0F);               \
+    *zOut++ = 0x80 + (u8)((c>>6) & 0x3F);              \
+    *zOut++ = 0x80 + (u8)(c & 0x3F);                   \
+  }else{                                               \
+    *zOut++ = 0xF0 + (u8)((c>>18) & 0x07);             \
+    *zOut++ = 0x80 + (u8)((c>>12) & 0x3F);             \
+    *zOut++ = 0x80 + (u8)((c>>6) & 0x3F);              \
+    *zOut++ = 0x80 + (u8)(c & 0x3F);                   \
+  }                                                    \
+}
+
+#define WRITE_UTF16LE(zOut, c) {                                    \
+  if( c<=0xFFFF ){                                                  \
+    *zOut++ = (u8)(c&0x00FF);                                       \
+    *zOut++ = (u8)((c>>8)&0x00FF);                                  \
+  }else{                                                            \
+    *zOut++ = (u8)(((c>>10)&0x003F) + (((c-0x10000)>>10)&0x00C0));  \
+    *zOut++ = (u8)(0x00D8 + (((c-0x10000)>>18)&0x03));              \
+    *zOut++ = (u8)(c&0x00FF);                                       \
+    *zOut++ = (u8)(0x00DC + ((c>>8)&0x03));                         \
+  }                                                                 \
+}
+
+#define WRITE_UTF16BE(zOut, c) {                                    \
+  if( c<=0xFFFF ){                                                  \
+    *zOut++ = (u8)((c>>8)&0x00FF);                                  \
+    *zOut++ = (u8)(c&0x00FF);                                       \
+  }else{                                                            \
+    *zOut++ = (u8)(0x00D8 + (((c-0x10000)>>18)&0x03));              \
+    *zOut++ = (u8)(((c>>10)&0x003F) + (((c-0x10000)>>10)&0x00C0));  \
+    *zOut++ = (u8)(0x00DC + ((c>>8)&0x03));                         \
+    *zOut++ = (u8)(c&0x00FF);                                       \
+  }                                                                 \
+}
+
+/*
+** Translate a single UTF-8 character.  Return the unicode value.
+**
+** During translation, assume that the byte that zTerm points
+** is a 0x00.
+**
+** Write a pointer to the next unread byte back into *pzNext.
+**
+** Notes On Invalid UTF-8:
+**
+**  *  This routine never allows a 7-bit character (0x00 through 0x7f) to
+**     be encoded as a multi-byte character.  Any multi-byte character that
+**     attempts to encode a value between 0x00 and 0x7f is rendered as 0xfffd.
+**
+**  *  This routine never allows a UTF16 surrogate value to be encoded.
+**     If a multi-byte character attempts to encode a value between
+**     0xd800 and 0xe000 then it is rendered as 0xfffd.
+**
+**  *  Bytes in the range of 0x80 th
