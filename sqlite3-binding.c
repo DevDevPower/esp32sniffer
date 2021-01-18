@@ -33771,4 +33771,254 @@ SQLITE_PRIVATE int sqlite3AtoF(const char *z, double *pResult, int length, u8 en
     if( s>=((LARGEST_INT64-9)/10) ){
       /* skip non-significant significand digits
       ** (increase exponent by d to shift decimal left) */
-      while( z<zEnd && sqlite3Isdigi
+      while( z<zEnd && sqlite3Isdigit(*z) ){ z+=incr; d++; }
+    }
+  }
+  if( z>=zEnd ) goto do_atof_calc;
+
+  /* if decimal point is present */
+  if( *z=='.' ){
+    z+=incr;
+    eType++;
+    /* copy digits from after decimal to significand
+    ** (decrease exponent by d to shift decimal right) */
+    while( z<zEnd && sqlite3Isdigit(*z) ){
+      if( s<((LARGEST_INT64-9)/10) ){
+        s = s*10 + (*z - '0');
+        d--;
+        nDigit++;
+      }
+      z+=incr;
+    }
+  }
+  if( z>=zEnd ) goto do_atof_calc;
+
+  /* if exponent is present */
+  if( *z=='e' || *z=='E' ){
+    z+=incr;
+    eValid = 0;
+    eType++;
+
+    /* This branch is needed to avoid a (harmless) buffer overread.  The
+    ** special comment alerts the mutation tester that the correct answer
+    ** is obtained even if the branch is omitted */
+    if( z>=zEnd ) goto do_atof_calc;              /*PREVENTS-HARMLESS-OVERREAD*/
+
+    /* get sign of exponent */
+    if( *z=='-' ){
+      esign = -1;
+      z+=incr;
+    }else if( *z=='+' ){
+      z+=incr;
+    }
+    /* copy digits to exponent */
+    while( z<zEnd && sqlite3Isdigit(*z) ){
+      e = e<10000 ? (e*10 + (*z - '0')) : 10000;
+      z+=incr;
+      eValid = 1;
+    }
+  }
+
+  /* skip trailing spaces */
+  while( z<zEnd && sqlite3Isspace(*z) ) z+=incr;
+
+do_atof_calc:
+  /* adjust exponent by d, and update sign */
+  e = (e*esign) + d;
+  if( e<0 ) {
+    esign = -1;
+    e *= -1;
+  } else {
+    esign = 1;
+  }
+
+  if( s==0 ) {
+    /* In the IEEE 754 standard, zero is signed. */
+    result = sign<0 ? -(double)0 : (double)0;
+  } else {
+    /* Attempt to reduce exponent.
+    **
+    ** Branches that are not required for the correct answer but which only
+    ** help to obtain the correct answer faster are marked with special
+    ** comments, as a hint to the mutation tester.
+    */
+    while( e>0 ){                                       /*OPTIMIZATION-IF-TRUE*/
+      if( esign>0 ){
+        if( s>=(LARGEST_INT64/10) ) break;             /*OPTIMIZATION-IF-FALSE*/
+        s *= 10;
+      }else{
+        if( s%10!=0 ) break;                           /*OPTIMIZATION-IF-FALSE*/
+        s /= 10;
+      }
+      e--;
+    }
+
+    /* adjust the sign of significand */
+    s = sign<0 ? -s : s;
+
+    if( e==0 ){                                         /*OPTIMIZATION-IF-TRUE*/
+      result = (double)s;
+    }else{
+      /* attempt to handle extremely small/large numbers better */
+      if( e>307 ){                                      /*OPTIMIZATION-IF-TRUE*/
+        if( e<342 ){                                    /*OPTIMIZATION-IF-TRUE*/
+          LONGDOUBLE_TYPE scale = sqlite3Pow10(e-308);
+          if( esign<0 ){
+            result = s / scale;
+            result /= 1.0e+308;
+          }else{
+            result = s * scale;
+            result *= 1.0e+308;
+          }
+        }else{ assert( e>=342 );
+          if( esign<0 ){
+            result = 0.0*s;
+          }else{
+#ifdef INFINITY
+            result = INFINITY*s;
+#else
+            result = 1e308*1e308*s;  /* Infinity */
+#endif
+          }
+        }
+      }else{
+        LONGDOUBLE_TYPE scale = sqlite3Pow10(e);
+        if( esign<0 ){
+          result = s / scale;
+        }else{
+          result = s * scale;
+        }
+      }
+    }
+  }
+
+  /* store the result */
+  *pResult = result;
+
+  /* return true if number and no extra non-whitespace chracters after */
+  if( z==zEnd && nDigit>0 && eValid && eType>0 ){
+    return eType;
+  }else if( eType>=2 && (eType==3 || eValid) && nDigit>0 ){
+    return -1;
+  }else{
+    return 0;
+  }
+#else
+  return !sqlite3Atoi64(z, pResult, length, enc);
+#endif /* SQLITE_OMIT_FLOATING_POINT */
+}
+#if defined(_MSC_VER)
+#pragma warning(default : 4756)
+#endif
+
+/*
+** Render an signed 64-bit integer as text.  Store the result in zOut[].
+**
+** The caller must ensure that zOut[] is at least 21 bytes in size.
+*/
+SQLITE_PRIVATE void sqlite3Int64ToText(i64 v, char *zOut){
+  int i;
+  u64 x;
+  char zTemp[22];
+  if( v<0 ){
+    x = (v==SMALLEST_INT64) ? ((u64)1)<<63 : (u64)-v;
+  }else{
+    x = v;
+  }
+  i = sizeof(zTemp)-2;
+  zTemp[sizeof(zTemp)-1] = 0;
+  do{
+    zTemp[i--] = (x%10) + '0';
+    x = x/10;
+  }while( x );
+  if( v<0 ) zTemp[i--] = '-';
+  memcpy(zOut, &zTemp[i+1], sizeof(zTemp)-1-i);
+}
+
+/*
+** Compare the 19-character string zNum against the text representation
+** value 2^63:  9223372036854775808.  Return negative, zero, or positive
+** if zNum is less than, equal to, or greater than the string.
+** Note that zNum must contain exactly 19 characters.
+**
+** Unlike memcmp() this routine is guaranteed to return the difference
+** in the values of the last digit if the only difference is in the
+** last digit.  So, for example,
+**
+**      compare2pow63("9223372036854775800", 1)
+**
+** will return -8.
+*/
+static int compare2pow63(const char *zNum, int incr){
+  int c = 0;
+  int i;
+                    /* 012345678901234567 */
+  const char *pow63 = "922337203685477580";
+  for(i=0; c==0 && i<18; i++){
+    c = (zNum[i*incr]-pow63[i])*10;
+  }
+  if( c==0 ){
+    c = zNum[18*incr] - '8';
+    testcase( c==(-1) );
+    testcase( c==0 );
+    testcase( c==(+1) );
+  }
+  return c;
+}
+
+/*
+** Convert zNum to a 64-bit signed integer.  zNum must be decimal. This
+** routine does *not* accept hexadecimal notation.
+**
+** Returns:
+**
+**    -1    Not even a prefix of the input text looks like an integer
+**     0    Successful transformation.  Fits in a 64-bit signed integer.
+**     1    Excess non-space text after the integer value
+**     2    Integer too large for a 64-bit signed integer or is malformed
+**     3    Special case of 9223372036854775808
+**
+** length is the number of bytes in the string (bytes, not characters).
+** The string is not necessarily zero-terminated.  The encoding is
+** given by enc.
+*/
+SQLITE_PRIVATE int sqlite3Atoi64(const char *zNum, i64 *pNum, int length, u8 enc){
+  int incr;
+  u64 u = 0;
+  int neg = 0; /* assume positive */
+  int i;
+  int c = 0;
+  int nonNum = 0;  /* True if input contains UTF16 with high byte non-zero */
+  int rc;          /* Baseline return code */
+  const char *zStart;
+  const char *zEnd = zNum + length;
+  assert( enc==SQLITE_UTF8 || enc==SQLITE_UTF16LE || enc==SQLITE_UTF16BE );
+  if( enc==SQLITE_UTF8 ){
+    incr = 1;
+  }else{
+    incr = 2;
+    length &= ~1;
+    assert( SQLITE_UTF16LE==2 && SQLITE_UTF16BE==3 );
+    for(i=3-enc; i<length && zNum[i]==0; i+=2){}
+    nonNum = i<length;
+    zEnd = &zNum[i^1];
+    zNum += (enc&1);
+  }
+  while( zNum<zEnd && sqlite3Isspace(*zNum) ) zNum+=incr;
+  if( zNum<zEnd ){
+    if( *zNum=='-' ){
+      neg = 1;
+      zNum+=incr;
+    }else if( *zNum=='+' ){
+      zNum+=incr;
+    }
+  }
+  zStart = zNum;
+  while( zNum<zEnd && zNum[0]=='0' ){ zNum+=incr; } /* Skip leading zeros. */
+  for(i=0; &zNum[i]<zEnd && (c=zNum[i])>='0' && c<='9'; i+=incr){
+    u = u*10 + c - '0';
+  }
+  testcase( i==18*incr );
+  testcase( i==19*incr );
+  testcase( i==20*incr );
+  
