@@ -34021,4 +34021,254 @@ SQLITE_PRIVATE int sqlite3Atoi64(const char *zNum, i64 *pNum, int length, u8 enc
   testcase( i==18*incr );
   testcase( i==19*incr );
   testcase( i==20*incr );
-  
+  if( u>LARGEST_INT64 ){
+    /* This test and assignment is needed only to suppress UB warnings
+    ** from clang and -fsanitize=undefined.  This test and assignment make
+    ** the code a little larger and slower, and no harm comes from omitting
+    ** them, but we must appaise the undefined-behavior pharisees. */
+    *pNum = neg ? SMALLEST_INT64 : LARGEST_INT64;
+  }else if( neg ){
+    *pNum = -(i64)u;
+  }else{
+    *pNum = (i64)u;
+  }
+  rc = 0;
+  if( i==0 && zStart==zNum ){    /* No digits */
+    rc = -1;
+  }else if( nonNum ){            /* UTF16 with high-order bytes non-zero */
+    rc = 1;
+  }else if( &zNum[i]<zEnd ){     /* Extra bytes at the end */
+    int jj = i;
+    do{
+      if( !sqlite3Isspace(zNum[jj]) ){
+        rc = 1;          /* Extra non-space text after the integer */
+        break;
+      }
+      jj += incr;
+    }while( &zNum[jj]<zEnd );
+  }
+  if( i<19*incr ){
+    /* Less than 19 digits, so we know that it fits in 64 bits */
+    assert( u<=LARGEST_INT64 );
+    return rc;
+  }else{
+    /* zNum is a 19-digit numbers.  Compare it against 9223372036854775808. */
+    c = i>19*incr ? 1 : compare2pow63(zNum, incr);
+    if( c<0 ){
+      /* zNum is less than 9223372036854775808 so it fits */
+      assert( u<=LARGEST_INT64 );
+      return rc;
+    }else{
+      *pNum = neg ? SMALLEST_INT64 : LARGEST_INT64;
+      if( c>0 ){
+        /* zNum is greater than 9223372036854775808 so it overflows */
+        return 2;
+      }else{
+        /* zNum is exactly 9223372036854775808.  Fits if negative.  The
+        ** special case 2 overflow if positive */
+        assert( u-1==LARGEST_INT64 );
+        return neg ? rc : 3;
+      }
+    }
+  }
+}
+
+/*
+** Transform a UTF-8 integer literal, in either decimal or hexadecimal,
+** into a 64-bit signed integer.  This routine accepts hexadecimal literals,
+** whereas sqlite3Atoi64() does not.
+**
+** Returns:
+**
+**     0    Successful transformation.  Fits in a 64-bit signed integer.
+**     1    Excess text after the integer value
+**     2    Integer too large for a 64-bit signed integer or is malformed
+**     3    Special case of 9223372036854775808
+*/
+SQLITE_PRIVATE int sqlite3DecOrHexToI64(const char *z, i64 *pOut){
+#ifndef SQLITE_OMIT_HEX_INTEGER
+  if( z[0]=='0'
+   && (z[1]=='x' || z[1]=='X')
+  ){
+    u64 u = 0;
+    int i, k;
+    for(i=2; z[i]=='0'; i++){}
+    for(k=i; sqlite3Isxdigit(z[k]); k++){
+      u = u*16 + sqlite3HexToInt(z[k]);
+    }
+    memcpy(pOut, &u, 8);
+    return (z[k]==0 && k-i<=16) ? 0 : 2;
+  }else
+#endif /* SQLITE_OMIT_HEX_INTEGER */
+  {
+    return sqlite3Atoi64(z, pOut, sqlite3Strlen30(z), SQLITE_UTF8);
+  }
+}
+
+/*
+** If zNum represents an integer that will fit in 32-bits, then set
+** *pValue to that integer and return true.  Otherwise return false.
+**
+** This routine accepts both decimal and hexadecimal notation for integers.
+**
+** Any non-numeric characters that following zNum are ignored.
+** This is different from sqlite3Atoi64() which requires the
+** input number to be zero-terminated.
+*/
+SQLITE_PRIVATE int sqlite3GetInt32(const char *zNum, int *pValue){
+  sqlite_int64 v = 0;
+  int i, c;
+  int neg = 0;
+  if( zNum[0]=='-' ){
+    neg = 1;
+    zNum++;
+  }else if( zNum[0]=='+' ){
+    zNum++;
+  }
+#ifndef SQLITE_OMIT_HEX_INTEGER
+  else if( zNum[0]=='0'
+        && (zNum[1]=='x' || zNum[1]=='X')
+        && sqlite3Isxdigit(zNum[2])
+  ){
+    u32 u = 0;
+    zNum += 2;
+    while( zNum[0]=='0' ) zNum++;
+    for(i=0; sqlite3Isxdigit(zNum[i]) && i<8; i++){
+      u = u*16 + sqlite3HexToInt(zNum[i]);
+    }
+    if( (u&0x80000000)==0 && sqlite3Isxdigit(zNum[i])==0 ){
+      memcpy(pValue, &u, 4);
+      return 1;
+    }else{
+      return 0;
+    }
+  }
+#endif
+  if( !sqlite3Isdigit(zNum[0]) ) return 0;
+  while( zNum[0]=='0' ) zNum++;
+  for(i=0; i<11 && (c = zNum[i] - '0')>=0 && c<=9; i++){
+    v = v*10 + c;
+  }
+
+  /* The longest decimal representation of a 32 bit integer is 10 digits:
+  **
+  **             1234567890
+  **     2^31 -> 2147483648
+  */
+  testcase( i==10 );
+  if( i>10 ){
+    return 0;
+  }
+  testcase( v-neg==2147483647 );
+  if( v-neg>2147483647 ){
+    return 0;
+  }
+  if( neg ){
+    v = -v;
+  }
+  *pValue = (int)v;
+  return 1;
+}
+
+/*
+** Return a 32-bit integer value extracted from a string.  If the
+** string is not an integer, just return 0.
+*/
+SQLITE_PRIVATE int sqlite3Atoi(const char *z){
+  int x = 0;
+  sqlite3GetInt32(z, &x);
+  return x;
+}
+
+/*
+** Try to convert z into an unsigned 32-bit integer.  Return true on
+** success and false if there is an error.
+**
+** Only decimal notation is accepted.
+*/
+SQLITE_PRIVATE int sqlite3GetUInt32(const char *z, u32 *pI){
+  u64 v = 0;
+  int i;
+  for(i=0; sqlite3Isdigit(z[i]); i++){
+    v = v*10 + z[i] - '0';
+    if( v>4294967296LL ){ *pI = 0; return 0; }
+  }
+  if( i==0 || z[i]!=0 ){ *pI = 0; return 0; }
+  *pI = (u32)v;
+  return 1;
+}
+
+/*
+** The variable-length integer encoding is as follows:
+**
+** KEY:
+**         A = 0xxxxxxx    7 bits of data and one flag bit
+**         B = 1xxxxxxx    7 bits of data and one flag bit
+**         C = xxxxxxxx    8 bits of data
+**
+**  7 bits - A
+** 14 bits - BA
+** 21 bits - BBA
+** 28 bits - BBBA
+** 35 bits - BBBBA
+** 42 bits - BBBBBA
+** 49 bits - BBBBBBA
+** 56 bits - BBBBBBBA
+** 64 bits - BBBBBBBBC
+*/
+
+/*
+** Write a 64-bit variable-length integer to memory starting at p[0].
+** The length of data write will be between 1 and 9 bytes.  The number
+** of bytes written is returned.
+**
+** A variable-length integer consists of the lower 7 bits of each byte
+** for all bytes that have the 8th bit set and one byte with the 8th
+** bit clear.  Except, if we get to the 9th byte, it stores the full
+** 8 bits and is the last byte.
+*/
+static int SQLITE_NOINLINE putVarint64(unsigned char *p, u64 v){
+  int i, j, n;
+  u8 buf[10];
+  if( v & (((u64)0xff000000)<<32) ){
+    p[8] = (u8)v;
+    v >>= 8;
+    for(i=7; i>=0; i--){
+      p[i] = (u8)((v & 0x7f) | 0x80);
+      v >>= 7;
+    }
+    return 9;
+  }
+  n = 0;
+  do{
+    buf[n++] = (u8)((v & 0x7f) | 0x80);
+    v >>= 7;
+  }while( v!=0 );
+  buf[0] &= 0x7f;
+  assert( n<=9 );
+  for(i=0, j=n-1; j>=0; j--, i++){
+    p[i] = buf[j];
+  }
+  return n;
+}
+SQLITE_PRIVATE int sqlite3PutVarint(unsigned char *p, u64 v){
+  if( v<=0x7f ){
+    p[0] = v&0x7f;
+    return 1;
+  }
+  if( v<=0x3fff ){
+    p[0] = ((v>>7)&0x7f)|0x80;
+    p[1] = v&0x7f;
+    return 2;
+  }
+  return putVarint64(p,v);
+}
+
+/*
+** Bitmasks used by sqlite3GetVarint().  These precomputed constants
+** are defined here rather than simply putting the constant expressions
+** inline in order to work around bugs in the RVT compiler.
+**
+** SLOT_2_0     A mask for  (0x7f<<14) | 0x7f
+**
+** SLOT_4_2_0   A mask for  (0x7f<<28) | SL
