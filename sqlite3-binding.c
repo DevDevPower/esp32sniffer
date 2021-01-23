@@ -35728,4 +35728,198 @@ struct unixFile {
 #endif
 #ifdef SQLITE_DEBUG
   /* The next group of variables are used to track whether or not the
-  ** transaction counter in bytes 24-27 of database files are
+  ** transaction counter in bytes 24-27 of database files are updated
+  ** whenever any part of the database changes.  An assertion fault will
+  ** occur if a file is updated without also updating the transaction
+  ** counter.  This test is made to avoid new problems similar to the
+  ** one described by ticket #3584.
+  */
+  unsigned char transCntrChng;   /* True if the transaction counter changed */
+  unsigned char dbUpdate;        /* True if any part of database file changed */
+  unsigned char inNormalWrite;   /* True if in a normal write operation */
+
+#endif
+
+#ifdef SQLITE_TEST
+  /* In test mode, increase the size of this structure a bit so that
+  ** it is larger than the struct CrashFile defined in test6.c.
+  */
+  char aPadding[32];
+#endif
+};
+
+/* This variable holds the process id (pid) from when the xRandomness()
+** method was called.  If xOpen() is called from a different process id,
+** indicating that a fork() has occurred, the PRNG will be reset.
+*/
+static pid_t randomnessPid = 0;
+
+/*
+** Allowed values for the unixFile.ctrlFlags bitmask:
+*/
+#define UNIXFILE_EXCL        0x01     /* Connections from one process only */
+#define UNIXFILE_RDONLY      0x02     /* Connection is read only */
+#define UNIXFILE_PERSIST_WAL 0x04     /* Persistent WAL mode */
+#ifndef SQLITE_DISABLE_DIRSYNC
+# define UNIXFILE_DIRSYNC    0x08     /* Directory sync needed */
+#else
+# define UNIXFILE_DIRSYNC    0x00
+#endif
+#define UNIXFILE_PSOW        0x10     /* SQLITE_IOCAP_POWERSAFE_OVERWRITE */
+#define UNIXFILE_DELETE      0x20     /* Delete on close */
+#define UNIXFILE_URI         0x40     /* Filename might have query parameters */
+#define UNIXFILE_NOLOCK      0x80     /* Do no file locking */
+
+/*
+** Include code that is common to all os_*.c files
+*/
+/* #include "os_common.h" */
+
+/*
+** Define various macros that are missing from some systems.
+*/
+#ifndef O_LARGEFILE
+# define O_LARGEFILE 0
+#endif
+#ifdef SQLITE_DISABLE_LFS
+# undef O_LARGEFILE
+# define O_LARGEFILE 0
+#endif
+#ifndef O_NOFOLLOW
+# define O_NOFOLLOW 0
+#endif
+#ifndef O_BINARY
+# define O_BINARY 0
+#endif
+
+/*
+** The threadid macro resolves to the thread-id or to 0.  Used for
+** testing and debugging only.
+*/
+#if SQLITE_THREADSAFE
+#define threadid pthread_self()
+#else
+#define threadid 0
+#endif
+
+/*
+** HAVE_MREMAP defaults to true on Linux and false everywhere else.
+*/
+#if !defined(HAVE_MREMAP)
+# if defined(__linux__) && defined(_GNU_SOURCE)
+#  define HAVE_MREMAP 1
+# else
+#  define HAVE_MREMAP 0
+# endif
+#endif
+
+/*
+** Explicitly call the 64-bit version of lseek() on Android. Otherwise, lseek()
+** is the 32-bit version, even if _FILE_OFFSET_BITS=64 is defined.
+*/
+#ifdef __ANDROID__
+# define lseek lseek64
+#endif
+
+#ifdef __linux__
+/*
+** Linux-specific IOCTL magic numbers used for controlling F2FS
+*/
+#define F2FS_IOCTL_MAGIC        0xf5
+#define F2FS_IOC_START_ATOMIC_WRITE     _IO(F2FS_IOCTL_MAGIC, 1)
+#define F2FS_IOC_COMMIT_ATOMIC_WRITE    _IO(F2FS_IOCTL_MAGIC, 2)
+#define F2FS_IOC_START_VOLATILE_WRITE   _IO(F2FS_IOCTL_MAGIC, 3)
+#define F2FS_IOC_ABORT_VOLATILE_WRITE   _IO(F2FS_IOCTL_MAGIC, 5)
+#define F2FS_IOC_GET_FEATURES           _IOR(F2FS_IOCTL_MAGIC, 12, u32)
+#define F2FS_FEATURE_ATOMIC_WRITE 0x0004
+#endif /* __linux__ */
+
+
+/*
+** Different Unix systems declare open() in different ways.  Same use
+** open(const char*,int,mode_t).  Others use open(const char*,int,...).
+** The difference is important when using a pointer to the function.
+**
+** The safest way to deal with the problem is to always use this wrapper
+** which always has the same well-defined interface.
+*/
+static int posixOpen(const char *zFile, int flags, int mode){
+  return open(zFile, flags, mode);
+}
+
+/* Forward reference */
+static int openDirectory(const char*, int*);
+static int unixGetpagesize(void);
+
+/*
+** Many system calls are accessed through pointer-to-functions so that
+** they may be overridden at runtime to facilitate fault injection during
+** testing and sandboxing.  The following array holds the names and pointers
+** to all overrideable system calls.
+*/
+static struct unix_syscall {
+  const char *zName;            /* Name of the system call */
+  sqlite3_syscall_ptr pCurrent; /* Current value of the system call */
+  sqlite3_syscall_ptr pDefault; /* Default value */
+} aSyscall[] = {
+  { "open",         (sqlite3_syscall_ptr)posixOpen,  0  },
+#define osOpen      ((int(*)(const char*,int,int))aSyscall[0].pCurrent)
+
+  { "close",        (sqlite3_syscall_ptr)close,      0  },
+#define osClose     ((int(*)(int))aSyscall[1].pCurrent)
+
+  { "access",       (sqlite3_syscall_ptr)access,     0  },
+#define osAccess    ((int(*)(const char*,int))aSyscall[2].pCurrent)
+
+  { "getcwd",       (sqlite3_syscall_ptr)getcwd,     0  },
+#define osGetcwd    ((char*(*)(char*,size_t))aSyscall[3].pCurrent)
+
+  { "stat",         (sqlite3_syscall_ptr)stat,       0  },
+#define osStat      ((int(*)(const char*,struct stat*))aSyscall[4].pCurrent)
+
+/*
+** The DJGPP compiler environment looks mostly like Unix, but it
+** lacks the fcntl() system call.  So redefine fcntl() to be something
+** that always succeeds.  This means that locking does not occur under
+** DJGPP.  But it is DOS - what did you expect?
+*/
+#ifdef __DJGPP__
+  { "fstat",        0,                 0  },
+#define osFstat(a,b,c)    0
+#else
+  { "fstat",        (sqlite3_syscall_ptr)fstat,      0  },
+#define osFstat     ((int(*)(int,struct stat*))aSyscall[5].pCurrent)
+#endif
+
+  { "ftruncate",    (sqlite3_syscall_ptr)ftruncate,  0  },
+#define osFtruncate ((int(*)(int,off_t))aSyscall[6].pCurrent)
+
+  { "fcntl",        (sqlite3_syscall_ptr)fcntl,      0  },
+#define osFcntl     ((int(*)(int,int,...))aSyscall[7].pCurrent)
+
+  { "read",         (sqlite3_syscall_ptr)read,       0  },
+#define osRead      ((ssize_t(*)(int,void*,size_t))aSyscall[8].pCurrent)
+
+#if defined(USE_PREAD) || SQLITE_ENABLE_LOCKING_STYLE
+  { "pread",        (sqlite3_syscall_ptr)pread,      0  },
+#else
+  { "pread",        (sqlite3_syscall_ptr)0,          0  },
+#endif
+#define osPread     ((ssize_t(*)(int,void*,size_t,off_t))aSyscall[9].pCurrent)
+
+#if defined(USE_PREAD64)
+  { "pread64",      (sqlite3_syscall_ptr)pread64,    0  },
+#else
+  { "pread64",      (sqlite3_syscall_ptr)0,          0  },
+#endif
+#define osPread64 ((ssize_t(*)(int,void*,size_t,off64_t))aSyscall[10].pCurrent)
+
+  { "write",        (sqlite3_syscall_ptr)write,      0  },
+#define osWrite     ((ssize_t(*)(int,const void*,size_t))aSyscall[11].pCurrent)
+
+#if defined(USE_PREAD) || SQLITE_ENABLE_LOCKING_STYLE
+  { "pwrite",       (sqlite3_syscall_ptr)pwrite,     0  },
+#else
+  { "pwrite",       (sqlite3_syscall_ptr)0,          0  },
+#endif
+#define osPwrite    ((s
