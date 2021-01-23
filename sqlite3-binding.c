@@ -35523,4 +35523,209 @@ SQLITE_PRIVATE const char *sqlite3OpcodeName(int i){
 #if SQLITE_OS_UNIX              /* This file is used on unix only */
 
 /*
-** There are various methods for file lock
+** There are various methods for file locking used for concurrency
+** control:
+**
+**   1. POSIX locking (the default),
+**   2. No locking,
+**   3. Dot-file locking,
+**   4. flock() locking,
+**   5. AFP locking (OSX only),
+**   6. Named POSIX semaphores (VXWorks only),
+**   7. proxy locking. (OSX only)
+**
+** Styles 4, 5, and 7 are only available of SQLITE_ENABLE_LOCKING_STYLE
+** is defined to 1.  The SQLITE_ENABLE_LOCKING_STYLE also enables automatic
+** selection of the appropriate locking style based on the filesystem
+** where the database is located.
+*/
+#if !defined(SQLITE_ENABLE_LOCKING_STYLE)
+#  if defined(__APPLE__)
+#    define SQLITE_ENABLE_LOCKING_STYLE 1
+#  else
+#    define SQLITE_ENABLE_LOCKING_STYLE 0
+#  endif
+#endif
+
+/* Use pread() and pwrite() if they are available */
+#if defined(__APPLE__)
+# define HAVE_PREAD 1
+# define HAVE_PWRITE 1
+#endif
+#if defined(HAVE_PREAD64) && defined(HAVE_PWRITE64)
+# undef USE_PREAD
+# define USE_PREAD64 1
+#elif defined(HAVE_PREAD) && defined(HAVE_PWRITE)
+# undef USE_PREAD64
+# define USE_PREAD 1
+#endif
+
+/*
+** standard include files.
+*/
+#include <sys/types.h>
+#include <sys/stat.h>
+#include <fcntl.h>
+#include <sys/ioctl.h>
+#include <unistd.h>
+/* #include <time.h> */
+#include <sys/time.h>
+#include <errno.h>
+#if !defined(SQLITE_OMIT_WAL) || SQLITE_MAX_MMAP_SIZE>0
+# include <sys/mman.h>
+#endif
+
+#if SQLITE_ENABLE_LOCKING_STYLE
+/* # include <sys/ioctl.h> */
+# include <sys/file.h>
+# include <sys/param.h>
+#endif /* SQLITE_ENABLE_LOCKING_STYLE */
+
+/*
+** Try to determine if gethostuuid() is available based on standard
+** macros.  This might sometimes compute the wrong value for some
+** obscure platforms.  For those cases, simply compile with one of
+** the following:
+**
+**    -DHAVE_GETHOSTUUID=0
+**    -DHAVE_GETHOSTUUID=1
+**
+** None if this matters except when building on Apple products with
+** -DSQLITE_ENABLE_LOCKING_STYLE.
+*/
+#ifndef HAVE_GETHOSTUUID
+# define HAVE_GETHOSTUUID 0
+# if defined(__APPLE__) && ((__MAC_OS_X_VERSION_MIN_REQUIRED > 1050) || \
+                            (__IPHONE_OS_VERSION_MIN_REQUIRED > 2000))
+#    if (!defined(TARGET_OS_EMBEDDED) || (TARGET_OS_EMBEDDED==0)) \
+        && (!defined(TARGET_IPHONE_SIMULATOR) || (TARGET_IPHONE_SIMULATOR==0))\
+        && (!defined(TARGET_OS_MACCATALYST) || (TARGET_OS_MACCATALYST==0))
+#      undef HAVE_GETHOSTUUID
+#      define HAVE_GETHOSTUUID 1
+#    else
+#      warning "gethostuuid() is disabled."
+#    endif
+#  endif
+#endif
+
+
+#if OS_VXWORKS
+/* # include <sys/ioctl.h> */
+# include <semaphore.h>
+# include <limits.h>
+#endif /* OS_VXWORKS */
+
+#if defined(__APPLE__) || SQLITE_ENABLE_LOCKING_STYLE
+# include <sys/mount.h>
+#endif
+
+#ifdef HAVE_UTIME
+# include <utime.h>
+#endif
+
+/*
+** Allowed values of unixFile.fsFlags
+*/
+#define SQLITE_FSFLAGS_IS_MSDOS     0x1
+
+/*
+** If we are to be thread-safe, include the pthreads header.
+*/
+#if SQLITE_THREADSAFE
+/* # include <pthread.h> */
+#endif
+
+/*
+** Default permissions when creating a new file
+*/
+#ifndef SQLITE_DEFAULT_FILE_PERMISSIONS
+# define SQLITE_DEFAULT_FILE_PERMISSIONS 0644
+#endif
+
+/*
+** Default permissions when creating auto proxy dir
+*/
+#ifndef SQLITE_DEFAULT_PROXYDIR_PERMISSIONS
+# define SQLITE_DEFAULT_PROXYDIR_PERMISSIONS 0755
+#endif
+
+/*
+** Maximum supported path-length.
+*/
+#define MAX_PATHNAME 512
+
+/*
+** Maximum supported symbolic links
+*/
+#define SQLITE_MAX_SYMLINKS 100
+
+/* Always cast the getpid() return type for compatibility with
+** kernel modules in VxWorks. */
+#define osGetpid(X) (pid_t)getpid()
+
+/*
+** Only set the lastErrno if the error code is a real error and not
+** a normal expected return code of SQLITE_BUSY or SQLITE_OK
+*/
+#define IS_LOCK_ERROR(x)  ((x != SQLITE_OK) && (x != SQLITE_BUSY))
+
+/* Forward references */
+typedef struct unixShm unixShm;               /* Connection shared memory */
+typedef struct unixShmNode unixShmNode;       /* Shared memory instance */
+typedef struct unixInodeInfo unixInodeInfo;   /* An i-node */
+typedef struct UnixUnusedFd UnixUnusedFd;     /* An unused file descriptor */
+
+/*
+** Sometimes, after a file handle is closed by SQLite, the file descriptor
+** cannot be closed immediately. In these cases, instances of the following
+** structure are used to store the file descriptor while waiting for an
+** opportunity to either close or reuse it.
+*/
+struct UnixUnusedFd {
+  int fd;                   /* File descriptor to close */
+  int flags;                /* Flags this file descriptor was opened with */
+  UnixUnusedFd *pNext;      /* Next unused file descriptor on same file */
+};
+
+/*
+** The unixFile structure is subclass of sqlite3_file specific to the unix
+** VFS implementations.
+*/
+typedef struct unixFile unixFile;
+struct unixFile {
+  sqlite3_io_methods const *pMethod;  /* Always the first entry */
+  sqlite3_vfs *pVfs;                  /* The VFS that created this unixFile */
+  unixInodeInfo *pInode;              /* Info about locks on this inode */
+  int h;                              /* The file descriptor */
+  unsigned char eFileLock;            /* The type of lock held on this fd */
+  unsigned short int ctrlFlags;       /* Behavioral bits.  UNIXFILE_* flags */
+  int lastErrno;                      /* The unix errno from last I/O error */
+  void *lockingContext;               /* Locking style specific state */
+  UnixUnusedFd *pPreallocatedUnused;  /* Pre-allocated UnixUnusedFd */
+  const char *zPath;                  /* Name of the file */
+  unixShm *pShm;                      /* Shared memory segment information */
+  int szChunk;                        /* Configured by FCNTL_CHUNK_SIZE */
+#if SQLITE_MAX_MMAP_SIZE>0
+  int nFetchOut;                      /* Number of outstanding xFetch refs */
+  sqlite3_int64 mmapSize;             /* Usable size of mapping at pMapRegion */
+  sqlite3_int64 mmapSizeActual;       /* Actual size of mapping at pMapRegion */
+  sqlite3_int64 mmapSizeMax;          /* Configured FCNTL_MMAP_SIZE value */
+  void *pMapRegion;                   /* Memory mapped region */
+#endif
+  int sectorSize;                     /* Device sector size */
+  int deviceCharacteristics;          /* Precomputed device characteristics */
+#if SQLITE_ENABLE_LOCKING_STYLE
+  int openFlags;                      /* The flags specified at open() */
+#endif
+#if SQLITE_ENABLE_LOCKING_STYLE || defined(__APPLE__)
+  unsigned fsFlags;                   /* cached details from statfs() */
+#endif
+#ifdef SQLITE_ENABLE_SETLK_TIMEOUT
+  unsigned iBusyTimeout;              /* Wait this many millisec on locks */
+#endif
+#if OS_VXWORKS
+  struct vxworksFileId *pId;          /* Unique file ID */
+#endif
+#ifdef SQLITE_DEBUG
+  /* The next group of variables are used to track whether or not the
+  ** transaction counter in bytes 24-27 of database files are
