@@ -35389,4 +35389,138 @@ SQLITE_PRIVATE const char *sqlite3OpcodeName(int i){
     /* 106 */ "Add"              OpHelp("r[P3]=r[P1]+r[P2]"),
     /* 107 */ "Subtract"         OpHelp("r[P3]=r[P2]-r[P1]"),
     /* 108 */ "Multiply"         OpHelp("r[P3]=r[P1]*r[P2]"),
-    /* 109 */ "Divid
+    /* 109 */ "Divide"           OpHelp("r[P3]=r[P2]/r[P1]"),
+    /* 110 */ "Remainder"        OpHelp("r[P3]=r[P2]%r[P1]"),
+    /* 111 */ "Concat"           OpHelp("r[P3]=r[P2]+r[P1]"),
+    /* 112 */ "OpenRead"         OpHelp("root=P2 iDb=P3"),
+    /* 113 */ "OpenWrite"        OpHelp("root=P2 iDb=P3"),
+    /* 114 */ "BitNot"           OpHelp("r[P2]= ~r[P1]"),
+    /* 115 */ "OpenDup"          OpHelp(""),
+    /* 116 */ "OpenAutoindex"    OpHelp("nColumn=P2"),
+    /* 117 */ "String8"          OpHelp("r[P2]='P4'"),
+    /* 118 */ "OpenEphemeral"    OpHelp("nColumn=P2"),
+    /* 119 */ "SorterOpen"       OpHelp(""),
+    /* 120 */ "SequenceTest"     OpHelp("if( cursor[P1].ctr++ ) pc = P2"),
+    /* 121 */ "OpenPseudo"       OpHelp("P3 columns in r[P2]"),
+    /* 122 */ "Close"            OpHelp(""),
+    /* 123 */ "ColumnsUsed"      OpHelp(""),
+    /* 124 */ "SeekScan"         OpHelp("Scan-ahead up to P1 rows"),
+    /* 125 */ "SeekHit"          OpHelp("set P2<=seekHit<=P3"),
+    /* 126 */ "Sequence"         OpHelp("r[P2]=cursor[P1].ctr++"),
+    /* 127 */ "NewRowid"         OpHelp("r[P2]=rowid"),
+    /* 128 */ "Insert"           OpHelp("intkey=r[P3] data=r[P2]"),
+    /* 129 */ "RowCell"          OpHelp(""),
+    /* 130 */ "Delete"           OpHelp(""),
+    /* 131 */ "ResetCount"       OpHelp(""),
+    /* 132 */ "SorterCompare"    OpHelp("if key(P1)!=trim(r[P3],P4) goto P2"),
+    /* 133 */ "SorterData"       OpHelp("r[P2]=data"),
+    /* 134 */ "RowData"          OpHelp("r[P2]=data"),
+    /* 135 */ "Rowid"            OpHelp("r[P2]=PX rowid of P1"),
+    /* 136 */ "NullRow"          OpHelp(""),
+    /* 137 */ "SeekEnd"          OpHelp(""),
+    /* 138 */ "IdxInsert"        OpHelp("key=r[P2]"),
+    /* 139 */ "SorterInsert"     OpHelp("key=r[P2]"),
+    /* 140 */ "IdxDelete"        OpHelp("key=r[P2@P3]"),
+    /* 141 */ "DeferredSeek"     OpHelp("Move P3 to P1.rowid if needed"),
+    /* 142 */ "IdxRowid"         OpHelp("r[P2]=rowid"),
+    /* 143 */ "FinishSeek"       OpHelp(""),
+    /* 144 */ "Destroy"          OpHelp(""),
+    /* 145 */ "Clear"            OpHelp(""),
+    /* 146 */ "ResetSorter"      OpHelp(""),
+    /* 147 */ "CreateBtree"      OpHelp("r[P2]=root iDb=P1 flags=P3"),
+    /* 148 */ "SqlExec"          OpHelp(""),
+    /* 149 */ "ParseSchema"      OpHelp(""),
+    /* 150 */ "LoadAnalysis"     OpHelp(""),
+    /* 151 */ "DropTable"        OpHelp(""),
+    /* 152 */ "DropIndex"        OpHelp(""),
+    /* 153 */ "Real"             OpHelp("r[P2]=P4"),
+    /* 154 */ "DropTrigger"      OpHelp(""),
+    /* 155 */ "IntegrityCk"      OpHelp(""),
+    /* 156 */ "RowSetAdd"        OpHelp("rowset(P1)=r[P2]"),
+    /* 157 */ "Param"            OpHelp(""),
+    /* 158 */ "FkCounter"        OpHelp("fkctr[P1]+=P2"),
+    /* 159 */ "MemMax"           OpHelp("r[P1]=max(r[P1],r[P2])"),
+    /* 160 */ "OffsetLimit"      OpHelp("if r[P1]>0 then r[P2]=r[P1]+max(0,r[P3]) else r[P2]=(-1)"),
+    /* 161 */ "AggInverse"       OpHelp("accum=r[P3] inverse(r[P2@P5])"),
+    /* 162 */ "AggStep"          OpHelp("accum=r[P3] step(r[P2@P5])"),
+    /* 163 */ "AggStep1"         OpHelp("accum=r[P3] step(r[P2@P5])"),
+    /* 164 */ "AggValue"         OpHelp("r[P3]=value N=P2"),
+    /* 165 */ "AggFinal"         OpHelp("accum=r[P1] N=P2"),
+    /* 166 */ "Expire"           OpHelp(""),
+    /* 167 */ "CursorLock"       OpHelp(""),
+    /* 168 */ "CursorUnlock"     OpHelp(""),
+    /* 169 */ "TableLock"        OpHelp("iDb=P1 root=P2 write=P3"),
+    /* 170 */ "VBegin"           OpHelp(""),
+    /* 171 */ "VCreate"          OpHelp(""),
+    /* 172 */ "VDestroy"         OpHelp(""),
+    /* 173 */ "VOpen"            OpHelp(""),
+    /* 174 */ "VInitIn"          OpHelp("r[P2]=ValueList(P1,P3)"),
+    /* 175 */ "VColumn"          OpHelp("r[P3]=vcolumn(P2)"),
+    /* 176 */ "VRename"          OpHelp(""),
+    /* 177 */ "Pagecount"        OpHelp(""),
+    /* 178 */ "MaxPgcnt"         OpHelp(""),
+    /* 179 */ "ClrSubtype"       OpHelp("r[P1].subtype = 0"),
+    /* 180 */ "FilterAdd"        OpHelp("filter(P1) += key(P3@P4)"),
+    /* 181 */ "Trace"            OpHelp(""),
+    /* 182 */ "CursorHint"       OpHelp(""),
+    /* 183 */ "ReleaseReg"       OpHelp("release r[P1@P2] mask P3"),
+    /* 184 */ "Noop"             OpHelp(""),
+    /* 185 */ "Explain"          OpHelp(""),
+    /* 186 */ "Abortable"        OpHelp(""),
+  };
+  return azName[i];
+}
+#endif
+
+/************** End of opcodes.c *********************************************/
+/************** Begin file os_unix.c *****************************************/
+/*
+** 2004 May 22
+**
+** The author disclaims copyright to this source code.  In place of
+** a legal notice, here is a blessing:
+**
+**    May you do good and not evil.
+**    May you find forgiveness for yourself and forgive others.
+**    May you share freely, never taking more than you give.
+**
+******************************************************************************
+**
+** This file contains the VFS implementation for unix-like operating systems
+** include Linux, MacOSX, *BSD, QNX, VxWorks, AIX, HPUX, and others.
+**
+** There are actually several different VFS implementations in this file.
+** The differences are in the way that file locking is done.  The default
+** implementation uses Posix Advisory Locks.  Alternative implementations
+** use flock(), dot-files, various proprietary locking schemas, or simply
+** skip locking all together.
+**
+** This source file is organized into divisions where the logic for various
+** subfunctions is contained within the appropriate division.  PLEASE
+** KEEP THE STRUCTURE OF THIS FILE INTACT.  New code should be placed
+** in the correct division and should be clearly labeled.
+**
+** The layout of divisions is as follows:
+**
+**   *  General-purpose declarations and utility functions.
+**   *  Unique file ID logic used by VxWorks.
+**   *  Various locking primitive implementations (all except proxy locking):
+**      + for Posix Advisory Locks
+**      + for no-op locks
+**      + for dot-file locks
+**      + for flock() locking
+**      + for named semaphore locks (VxWorks only)
+**      + for AFP filesystem locks (MacOSX only)
+**   *  sqlite3_file methods not associated with locking.
+**   *  Definitions of sqlite3_io_methods objects for all locking
+**      methods plus "finder" functions for each locking method.
+**   *  sqlite3_vfs method implementations.
+**   *  Locking primitives for the proxy uber-locking-method. (MacOSX only)
+**   *  Definitions of sqlite3_vfs objects for all locking methods
+**      plus implementations of sqlite3_os_init() and sqlite3_os_end().
+*/
+/* #include "sqliteInt.h" */
+#if SQLITE_OS_UNIX              /* This file is used on unix only */
+
+/*
+** There are various methods for file lock
