@@ -36338,4 +36338,194 @@ static int robust_ftruncate(int h, sqlite3_int64 sz){
 */
 static int sqliteErrorFromPosixError(int posixError, int sqliteIOErr) {
   assert( (sqliteIOErr == SQLITE_IOERR_LOCK) ||
-      
+          (sqliteIOErr == SQLITE_IOERR_UNLOCK) ||
+          (sqliteIOErr == SQLITE_IOERR_RDLOCK) ||
+          (sqliteIOErr == SQLITE_IOERR_CHECKRESERVEDLOCK) );
+  switch (posixError) {
+  case EACCES:
+  case EAGAIN:
+  case ETIMEDOUT:
+  case EBUSY:
+  case EINTR:
+  case ENOLCK:
+    /* random NFS retry error, unless during file system support
+     * introspection, in which it actually means what it says */
+    return SQLITE_BUSY;
+
+  case EPERM:
+    return SQLITE_PERM;
+
+  default:
+    return sqliteIOErr;
+  }
+}
+
+
+/******************************************************************************
+****************** Begin Unique File ID Utility Used By VxWorks ***************
+**
+** On most versions of unix, we can get a unique ID for a file by concatenating
+** the device number and the inode number.  But this does not work on VxWorks.
+** On VxWorks, a unique file id must be based on the canonical filename.
+**
+** A pointer to an instance of the following structure can be used as a
+** unique file ID in VxWorks.  Each instance of this structure contains
+** a copy of the canonical filename.  There is also a reference count.
+** The structure is reclaimed when the number of pointers to it drops to
+** zero.
+**
+** There are never very many files open at one time and lookups are not
+** a performance-critical path, so it is sufficient to put these
+** structures on a linked list.
+*/
+struct vxworksFileId {
+  struct vxworksFileId *pNext;  /* Next in a list of them all */
+  int nRef;                     /* Number of references to this one */
+  int nName;                    /* Length of the zCanonicalName[] string */
+  char *zCanonicalName;         /* Canonical filename */
+};
+
+#if OS_VXWORKS
+/*
+** All unique filenames are held on a linked list headed by this
+** variable:
+*/
+static struct vxworksFileId *vxworksFileList = 0;
+
+/*
+** Simplify a filename into its canonical form
+** by making the following changes:
+**
+**  * removing any trailing and duplicate /
+**  * convert /./ into just /
+**  * convert /A/../ where A is any simple name into just /
+**
+** Changes are made in-place.  Return the new name length.
+**
+** The original filename is in z[0..n-1].  Return the number of
+** characters in the simplified name.
+*/
+static int vxworksSimplifyName(char *z, int n){
+  int i, j;
+  while( n>1 && z[n-1]=='/' ){ n--; }
+  for(i=j=0; i<n; i++){
+    if( z[i]=='/' ){
+      if( z[i+1]=='/' ) continue;
+      if( z[i+1]=='.' && i+2<n && z[i+2]=='/' ){
+        i += 1;
+        continue;
+      }
+      if( z[i+1]=='.' && i+3<n && z[i+2]=='.' && z[i+3]=='/' ){
+        while( j>0 && z[j-1]!='/' ){ j--; }
+        if( j>0 ){ j--; }
+        i += 2;
+        continue;
+      }
+    }
+    z[j++] = z[i];
+  }
+  z[j] = 0;
+  return j;
+}
+
+/*
+** Find a unique file ID for the given absolute pathname.  Return
+** a pointer to the vxworksFileId object.  This pointer is the unique
+** file ID.
+**
+** The nRef field of the vxworksFileId object is incremented before
+** the object is returned.  A new vxworksFileId object is created
+** and added to the global list if necessary.
+**
+** If a memory allocation error occurs, return NULL.
+*/
+static struct vxworksFileId *vxworksFindFileId(const char *zAbsoluteName){
+  struct vxworksFileId *pNew;         /* search key and new file ID */
+  struct vxworksFileId *pCandidate;   /* For looping over existing file IDs */
+  int n;                              /* Length of zAbsoluteName string */
+
+  assert( zAbsoluteName[0]=='/' );
+  n = (int)strlen(zAbsoluteName);
+  pNew = sqlite3_malloc64( sizeof(*pNew) + (n+1) );
+  if( pNew==0 ) return 0;
+  pNew->zCanonicalName = (char*)&pNew[1];
+  memcpy(pNew->zCanonicalName, zAbsoluteName, n+1);
+  n = vxworksSimplifyName(pNew->zCanonicalName, n);
+
+  /* Search for an existing entry that matching the canonical name.
+  ** If found, increment the reference count and return a pointer to
+  ** the existing file ID.
+  */
+  unixEnterMutex();
+  for(pCandidate=vxworksFileList; pCandidate; pCandidate=pCandidate->pNext){
+    if( pCandidate->nName==n
+     && memcmp(pCandidate->zCanonicalName, pNew->zCanonicalName, n)==0
+    ){
+       sqlite3_free(pNew);
+       pCandidate->nRef++;
+       unixLeaveMutex();
+       return pCandidate;
+    }
+  }
+
+  /* No match was found.  We will make a new file ID */
+  pNew->nRef = 1;
+  pNew->nName = n;
+  pNew->pNext = vxworksFileList;
+  vxworksFileList = pNew;
+  unixLeaveMutex();
+  return pNew;
+}
+
+/*
+** Decrement the reference count on a vxworksFileId object.  Free
+** the object when the reference count reaches zero.
+*/
+static void vxworksReleaseFileId(struct vxworksFileId *pId){
+  unixEnterMutex();
+  assert( pId->nRef>0 );
+  pId->nRef--;
+  if( pId->nRef==0 ){
+    struct vxworksFileId **pp;
+    for(pp=&vxworksFileList; *pp && *pp!=pId; pp = &((*pp)->pNext)){}
+    assert( *pp==pId );
+    *pp = pId->pNext;
+    sqlite3_free(pId);
+  }
+  unixLeaveMutex();
+}
+#endif /* OS_VXWORKS */
+/*************** End of Unique File ID Utility Used By VxWorks ****************
+******************************************************************************/
+
+
+/******************************************************************************
+*************************** Posix Advisory Locking ****************************
+**
+** POSIX advisory locks are broken by design.  ANSI STD 1003.1 (1996)
+** section 6.5.2.2 lines 483 through 490 specify that when a process
+** sets or clears a lock, that operation overrides any prior locks set
+** by the same process.  It does not explicitly say so, but this implies
+** that it overrides locks set by the same process using a different
+** file descriptor.  Consider this test case:
+**
+**       int fd1 = open("./file1", O_RDWR|O_CREAT, 0644);
+**       int fd2 = open("./file2", O_RDWR|O_CREAT, 0644);
+**
+** Suppose ./file1 and ./file2 are really the same file (because
+** one is a hard or symbolic link to the other) then if you set
+** an exclusive lock on fd1, then try to get an exclusive lock
+** on fd2, it works.  I would have expected the second lock to
+** fail since there was already a lock on the file due to fd1.
+** But not so.  Since both locks came from the same process, the
+** second overrides the first, even though they were on different
+** file descriptors opened on different file names.
+**
+** This means that we cannot use POSIX locks to synchronize file access
+** among competing threads of the same process.  POSIX locks will work fine
+** to synchronize access for threads in separate processes, but not
+** threads within the same process.
+**
+** To work around the problem, SQLite has to manage file locks internally
+** on its own.  Whenever a new database is opened, we have to find the
+** specific inode of the database file (the inode is determined b
