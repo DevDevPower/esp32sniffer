@@ -36123,4 +36123,219 @@ static const char *unixNextSystemCall(sqlite3_vfs *p, const char *zName){
 }
 
 /*
-** Do not accep
+** Do not accept any file descriptor less than this value, in order to avoid
+** opening database file using file descriptors that are commonly used for
+** standard input, output, and error.
+*/
+#ifndef SQLITE_MINIMUM_FILE_DESCRIPTOR
+# define SQLITE_MINIMUM_FILE_DESCRIPTOR 3
+#endif
+
+/*
+** Invoke open().  Do so multiple times, until it either succeeds or
+** fails for some reason other than EINTR.
+**
+** If the file creation mode "m" is 0 then set it to the default for
+** SQLite.  The default is SQLITE_DEFAULT_FILE_PERMISSIONS (normally
+** 0644) as modified by the system umask.  If m is not 0, then
+** make the file creation mode be exactly m ignoring the umask.
+**
+** The m parameter will be non-zero only when creating -wal, -journal,
+** and -shm files.  We want those files to have *exactly* the same
+** permissions as their original database, unadulterated by the umask.
+** In that way, if a database file is -rw-rw-rw or -rw-rw-r-, and a
+** transaction crashes and leaves behind hot journals, then any
+** process that is able to write to the database will also be able to
+** recover the hot journals.
+*/
+static int robust_open(const char *z, int f, mode_t m){
+  int fd;
+  mode_t m2 = m ? m : SQLITE_DEFAULT_FILE_PERMISSIONS;
+  while(1){
+#if defined(O_CLOEXEC)
+    fd = osOpen(z,f|O_CLOEXEC,m2);
+#else
+    fd = osOpen(z,f,m2);
+#endif
+    if( fd<0 ){
+      if( errno==EINTR ) continue;
+      break;
+    }
+    if( fd>=SQLITE_MINIMUM_FILE_DESCRIPTOR ) break;
+    osClose(fd);
+    sqlite3_log(SQLITE_WARNING,
+                "attempt to open \"%s\" as file descriptor %d", z, fd);
+    fd = -1;
+    if( osOpen("/dev/null", O_RDONLY, m)<0 ) break;
+  }
+  if( fd>=0 ){
+    if( m!=0 ){
+      struct stat statbuf;
+      if( osFstat(fd, &statbuf)==0
+       && statbuf.st_size==0
+       && (statbuf.st_mode&0777)!=m
+      ){
+        osFchmod(fd, m);
+      }
+    }
+#if defined(FD_CLOEXEC) && (!defined(O_CLOEXEC) || O_CLOEXEC==0)
+    osFcntl(fd, F_SETFD, osFcntl(fd, F_GETFD, 0) | FD_CLOEXEC);
+#endif
+  }
+  return fd;
+}
+
+/*
+** Helper functions to obtain and relinquish the global mutex. The
+** global mutex is used to protect the unixInodeInfo and
+** vxworksFileId objects used by this file, all of which may be
+** shared by multiple threads.
+**
+** Function unixMutexHeld() is used to assert() that the global mutex
+** is held when required. This function is only used as part of assert()
+** statements. e.g.
+**
+**   unixEnterMutex()
+**     assert( unixMutexHeld() );
+**   unixEnterLeave()
+**
+** To prevent deadlock, the global unixBigLock must must be acquired
+** before the unixInodeInfo.pLockMutex mutex, if both are held.  It is
+** OK to get the pLockMutex without holding unixBigLock first, but if
+** that happens, the unixBigLock mutex must not be acquired until after
+** pLockMutex is released.
+**
+**      OK:     enter(unixBigLock),  enter(pLockInfo)
+**      OK:     enter(unixBigLock)
+**      OK:     enter(pLockInfo)
+**   ERROR:     enter(pLockInfo), enter(unixBigLock)
+*/
+static sqlite3_mutex *unixBigLock = 0;
+static void unixEnterMutex(void){
+  assert( sqlite3_mutex_notheld(unixBigLock) );  /* Not a recursive mutex */
+  sqlite3_mutex_enter(unixBigLock);
+}
+static void unixLeaveMutex(void){
+  assert( sqlite3_mutex_held(unixBigLock) );
+  sqlite3_mutex_leave(unixBigLock);
+}
+#ifdef SQLITE_DEBUG
+static int unixMutexHeld(void) {
+  return sqlite3_mutex_held(unixBigLock);
+}
+#endif
+
+
+#ifdef SQLITE_HAVE_OS_TRACE
+/*
+** Helper function for printing out trace information from debugging
+** binaries. This returns the string representation of the supplied
+** integer lock-type.
+*/
+static const char *azFileLock(int eFileLock){
+  switch( eFileLock ){
+    case NO_LOCK: return "NONE";
+    case SHARED_LOCK: return "SHARED";
+    case RESERVED_LOCK: return "RESERVED";
+    case PENDING_LOCK: return "PENDING";
+    case EXCLUSIVE_LOCK: return "EXCLUSIVE";
+  }
+  return "ERROR";
+}
+#endif
+
+#ifdef SQLITE_LOCK_TRACE
+/*
+** Print out information about all locking operations.
+**
+** This routine is used for troubleshooting locks on multithreaded
+** platforms.  Enable by compiling with the -DSQLITE_LOCK_TRACE
+** command-line option on the compiler.  This code is normally
+** turned off.
+*/
+static int lockTrace(int fd, int op, struct flock *p){
+  char *zOpName, *zType;
+  int s;
+  int savedErrno;
+  if( op==F_GETLK ){
+    zOpName = "GETLK";
+  }else if( op==F_SETLK ){
+    zOpName = "SETLK";
+  }else{
+    s = osFcntl(fd, op, p);
+    sqlite3DebugPrintf("fcntl unknown %d %d %d\n", fd, op, s);
+    return s;
+  }
+  if( p->l_type==F_RDLCK ){
+    zType = "RDLCK";
+  }else if( p->l_type==F_WRLCK ){
+    zType = "WRLCK";
+  }else if( p->l_type==F_UNLCK ){
+    zType = "UNLCK";
+  }else{
+    assert( 0 );
+  }
+  assert( p->l_whence==SEEK_SET );
+  s = osFcntl(fd, op, p);
+  savedErrno = errno;
+  sqlite3DebugPrintf("fcntl %d %d %s %s %d %d %d %d\n",
+     threadid, fd, zOpName, zType, (int)p->l_start, (int)p->l_len,
+     (int)p->l_pid, s);
+  if( s==(-1) && op==F_SETLK && (p->l_type==F_RDLCK || p->l_type==F_WRLCK) ){
+    struct flock l2;
+    l2 = *p;
+    osFcntl(fd, F_GETLK, &l2);
+    if( l2.l_type==F_RDLCK ){
+      zType = "RDLCK";
+    }else if( l2.l_type==F_WRLCK ){
+      zType = "WRLCK";
+    }else if( l2.l_type==F_UNLCK ){
+      zType = "UNLCK";
+    }else{
+      assert( 0 );
+    }
+    sqlite3DebugPrintf("fcntl-failure-reason: %s %d %d %d\n",
+       zType, (int)l2.l_start, (int)l2.l_len, (int)l2.l_pid);
+  }
+  errno = savedErrno;
+  return s;
+}
+#undef osFcntl
+#define osFcntl lockTrace
+#endif /* SQLITE_LOCK_TRACE */
+
+/*
+** Retry ftruncate() calls that fail due to EINTR
+**
+** All calls to ftruncate() within this file should be made through
+** this wrapper.  On the Android platform, bypassing the logic below
+** could lead to a corrupt database.
+*/
+static int robust_ftruncate(int h, sqlite3_int64 sz){
+  int rc;
+#ifdef __ANDROID__
+  /* On Android, ftruncate() always uses 32-bit offsets, even if
+  ** _FILE_OFFSET_BITS=64 is defined. This means it is unsafe to attempt to
+  ** truncate a file to any size larger than 2GiB. Silently ignore any
+  ** such attempts.  */
+  if( sz>(sqlite3_int64)0x7FFFFFFF ){
+    rc = SQLITE_OK;
+  }else
+#endif
+  do{ rc = osFtruncate(h,sz); }while( rc<0 && errno==EINTR );
+  return rc;
+}
+
+/*
+** This routine translates a standard POSIX errno code into something
+** useful to the clients of the sqlite3 functions.  Specifically, it is
+** intended to translate a variety of "try again" errors into SQLITE_BUSY
+** and a variety of "please close the file descriptor NOW" errors into
+** SQLITE_IOERR
+**
+** Errors during initialization of locks, or file system support for locks,
+** should handle ENOLCK, ENOTSUP, EOPNOTSUPP separately.
+*/
+static int sqliteErrorFromPosixError(int posixError, int sqliteIOErr) {
+  assert( (sqliteIOErr == SQLITE_IOERR_LOCK) ||
+      
