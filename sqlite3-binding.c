@@ -35922,4 +35922,205 @@ static struct unix_syscall {
 #else
   { "pwrite",       (sqlite3_syscall_ptr)0,          0  },
 #endif
-#define osPwrite    ((s
+#define osPwrite    ((ssize_t(*)(int,const void*,size_t,off_t))\
+                    aSyscall[12].pCurrent)
+
+#if defined(USE_PREAD64)
+  { "pwrite64",     (sqlite3_syscall_ptr)pwrite64,   0  },
+#else
+  { "pwrite64",     (sqlite3_syscall_ptr)0,          0  },
+#endif
+#define osPwrite64  ((ssize_t(*)(int,const void*,size_t,off64_t))\
+                    aSyscall[13].pCurrent)
+
+  { "fchmod",       (sqlite3_syscall_ptr)fchmod,          0  },
+#define osFchmod    ((int(*)(int,mode_t))aSyscall[14].pCurrent)
+
+#if defined(HAVE_POSIX_FALLOCATE) && HAVE_POSIX_FALLOCATE
+  { "fallocate",    (sqlite3_syscall_ptr)posix_fallocate,  0 },
+#else
+  { "fallocate",    (sqlite3_syscall_ptr)0,                0 },
+#endif
+#define osFallocate ((int(*)(int,off_t,off_t))aSyscall[15].pCurrent)
+
+  { "unlink",       (sqlite3_syscall_ptr)unlink,           0 },
+#define osUnlink    ((int(*)(const char*))aSyscall[16].pCurrent)
+
+  { "openDirectory",    (sqlite3_syscall_ptr)openDirectory,      0 },
+#define osOpenDirectory ((int(*)(const char*,int*))aSyscall[17].pCurrent)
+
+  { "mkdir",        (sqlite3_syscall_ptr)mkdir,           0 },
+#define osMkdir     ((int(*)(const char*,mode_t))aSyscall[18].pCurrent)
+
+  { "rmdir",        (sqlite3_syscall_ptr)rmdir,           0 },
+#define osRmdir     ((int(*)(const char*))aSyscall[19].pCurrent)
+
+#if defined(HAVE_FCHOWN)
+  { "fchown",       (sqlite3_syscall_ptr)fchown,          0 },
+#else
+  { "fchown",       (sqlite3_syscall_ptr)0,               0 },
+#endif
+#define osFchown    ((int(*)(int,uid_t,gid_t))aSyscall[20].pCurrent)
+
+#if defined(HAVE_FCHOWN)
+  { "geteuid",      (sqlite3_syscall_ptr)geteuid,         0 },
+#else
+  { "geteuid",      (sqlite3_syscall_ptr)0,               0 },
+#endif
+#define osGeteuid   ((uid_t(*)(void))aSyscall[21].pCurrent)
+
+#if !defined(SQLITE_OMIT_WAL) || SQLITE_MAX_MMAP_SIZE>0
+  { "mmap",         (sqlite3_syscall_ptr)mmap,            0 },
+#else
+  { "mmap",         (sqlite3_syscall_ptr)0,               0 },
+#endif
+#define osMmap ((void*(*)(void*,size_t,int,int,int,off_t))aSyscall[22].pCurrent)
+
+#if !defined(SQLITE_OMIT_WAL) || SQLITE_MAX_MMAP_SIZE>0
+  { "munmap",       (sqlite3_syscall_ptr)munmap,          0 },
+#else
+  { "munmap",       (sqlite3_syscall_ptr)0,               0 },
+#endif
+#define osMunmap ((int(*)(void*,size_t))aSyscall[23].pCurrent)
+
+#if HAVE_MREMAP && (!defined(SQLITE_OMIT_WAL) || SQLITE_MAX_MMAP_SIZE>0)
+  { "mremap",       (sqlite3_syscall_ptr)mremap,          0 },
+#else
+  { "mremap",       (sqlite3_syscall_ptr)0,               0 },
+#endif
+#define osMremap ((void*(*)(void*,size_t,size_t,int,...))aSyscall[24].pCurrent)
+
+#if !defined(SQLITE_OMIT_WAL) || SQLITE_MAX_MMAP_SIZE>0
+  { "getpagesize",  (sqlite3_syscall_ptr)unixGetpagesize, 0 },
+#else
+  { "getpagesize",  (sqlite3_syscall_ptr)0,               0 },
+#endif
+#define osGetpagesize ((int(*)(void))aSyscall[25].pCurrent)
+
+#if defined(HAVE_READLINK)
+  { "readlink",     (sqlite3_syscall_ptr)readlink,        0 },
+#else
+  { "readlink",     (sqlite3_syscall_ptr)0,               0 },
+#endif
+#define osReadlink ((ssize_t(*)(const char*,char*,size_t))aSyscall[26].pCurrent)
+
+#if defined(HAVE_LSTAT)
+  { "lstat",         (sqlite3_syscall_ptr)lstat,          0 },
+#else
+  { "lstat",         (sqlite3_syscall_ptr)0,              0 },
+#endif
+#define osLstat      ((int(*)(const char*,struct stat*))aSyscall[27].pCurrent)
+
+#if defined(__linux__) && defined(SQLITE_ENABLE_BATCH_ATOMIC_WRITE)
+# ifdef __ANDROID__
+  { "ioctl", (sqlite3_syscall_ptr)(int(*)(int, int, ...))ioctl, 0 },
+#define osIoctl ((int(*)(int,int,...))aSyscall[28].pCurrent)
+# else
+  { "ioctl",         (sqlite3_syscall_ptr)ioctl,          0 },
+#define osIoctl ((int(*)(int,unsigned long,...))aSyscall[28].pCurrent)
+# endif
+#else
+  { "ioctl",         (sqlite3_syscall_ptr)0,              0 },
+#endif
+
+}; /* End of the overrideable system calls */
+
+
+/*
+** On some systems, calls to fchown() will trigger a message in a security
+** log if they come from non-root processes.  So avoid calling fchown() if
+** we are not running as root.
+*/
+static int robustFchown(int fd, uid_t uid, gid_t gid){
+#if defined(HAVE_FCHOWN)
+  return osGeteuid() ? 0 : osFchown(fd,uid,gid);
+#else
+  return 0;
+#endif
+}
+
+/*
+** This is the xSetSystemCall() method of sqlite3_vfs for all of the
+** "unix" VFSes.  Return SQLITE_OK opon successfully updating the
+** system call pointer, or SQLITE_NOTFOUND if there is no configurable
+** system call named zName.
+*/
+static int unixSetSystemCall(
+  sqlite3_vfs *pNotUsed,        /* The VFS pointer.  Not used */
+  const char *zName,            /* Name of system call to override */
+  sqlite3_syscall_ptr pNewFunc  /* Pointer to new system call value */
+){
+  unsigned int i;
+  int rc = SQLITE_NOTFOUND;
+
+  UNUSED_PARAMETER(pNotUsed);
+  if( zName==0 ){
+    /* If no zName is given, restore all system calls to their default
+    ** settings and return NULL
+    */
+    rc = SQLITE_OK;
+    for(i=0; i<sizeof(aSyscall)/sizeof(aSyscall[0]); i++){
+      if( aSyscall[i].pDefault ){
+        aSyscall[i].pCurrent = aSyscall[i].pDefault;
+      }
+    }
+  }else{
+    /* If zName is specified, operate on only the one system call
+    ** specified.
+    */
+    for(i=0; i<sizeof(aSyscall)/sizeof(aSyscall[0]); i++){
+      if( strcmp(zName, aSyscall[i].zName)==0 ){
+        if( aSyscall[i].pDefault==0 ){
+          aSyscall[i].pDefault = aSyscall[i].pCurrent;
+        }
+        rc = SQLITE_OK;
+        if( pNewFunc==0 ) pNewFunc = aSyscall[i].pDefault;
+        aSyscall[i].pCurrent = pNewFunc;
+        break;
+      }
+    }
+  }
+  return rc;
+}
+
+/*
+** Return the value of a system call.  Return NULL if zName is not a
+** recognized system call name.  NULL is also returned if the system call
+** is currently undefined.
+*/
+static sqlite3_syscall_ptr unixGetSystemCall(
+  sqlite3_vfs *pNotUsed,
+  const char *zName
+){
+  unsigned int i;
+
+  UNUSED_PARAMETER(pNotUsed);
+  for(i=0; i<sizeof(aSyscall)/sizeof(aSyscall[0]); i++){
+    if( strcmp(zName, aSyscall[i].zName)==0 ) return aSyscall[i].pCurrent;
+  }
+  return 0;
+}
+
+/*
+** Return the name of the first system call after zName.  If zName==NULL
+** then return the name of the first system call.  Return NULL if zName
+** is the last system call or if zName is not the name of a valid
+** system call.
+*/
+static const char *unixNextSystemCall(sqlite3_vfs *p, const char *zName){
+  int i = -1;
+
+  UNUSED_PARAMETER(p);
+  if( zName ){
+    for(i=0; i<ArraySize(aSyscall)-1; i++){
+      if( strcmp(zName, aSyscall[i].zName)==0 ) break;
+    }
+  }
+  for(i++; i<ArraySize(aSyscall); i++){
+    if( aSyscall[i].pCurrent!=0 ) return aSyscall[i].zName;
+  }
+  return 0;
+}
+
+/*
+** Do not accep
