@@ -36528,4 +36528,160 @@ static void vxworksReleaseFileId(struct vxworksFileId *pId){
 **
 ** To work around the problem, SQLite has to manage file locks internally
 ** on its own.  Whenever a new database is opened, we have to find the
-** specific inode of the database file (the inode is determined b
+** specific inode of the database file (the inode is determined by the
+** st_dev and st_ino fields of the stat structure that fstat() fills in)
+** and check for locks already existing on that inode.  When locks are
+** created or removed, we have to look at our own internal record of the
+** locks to see if another thread has previously set a lock on that same
+** inode.
+**
+** (Aside: The use of inode numbers as unique IDs does not work on VxWorks.
+** For VxWorks, we have to use the alternative unique ID system based on
+** canonical filename and implemented in the previous division.)
+**
+** The sqlite3_file structure for POSIX is no longer just an integer file
+** descriptor.  It is now a structure that holds the integer file
+** descriptor and a pointer to a structure that describes the internal
+** locks on the corresponding inode.  There is one locking structure
+** per inode, so if the same inode is opened twice, both unixFile structures
+** point to the same locking structure.  The locking structure keeps
+** a reference count (so we will know when to delete it) and a "cnt"
+** field that tells us its internal lock status.  cnt==0 means the
+** file is unlocked.  cnt==-1 means the file has an exclusive lock.
+** cnt>0 means there are cnt shared locks on the file.
+**
+** Any attempt to lock or unlock a file first checks the locking
+** structure.  The fcntl() system call is only invoked to set a
+** POSIX lock if the internal lock structure transitions between
+** a locked and an unlocked state.
+**
+** But wait:  there are yet more problems with POSIX advisory locks.
+**
+** If you close a file descriptor that points to a file that has locks,
+** all locks on that file that are owned by the current process are
+** released.  To work around this problem, each unixInodeInfo object
+** maintains a count of the number of pending locks on tha inode.
+** When an attempt is made to close an unixFile, if there are
+** other unixFile open on the same inode that are holding locks, the call
+** to close() the file descriptor is deferred until all of the locks clear.
+** The unixInodeInfo structure keeps a list of file descriptors that need to
+** be closed and that list is walked (and cleared) when the last lock
+** clears.
+**
+** Yet another problem:  LinuxThreads do not play well with posix locks.
+**
+** Many older versions of linux use the LinuxThreads library which is
+** not posix compliant.  Under LinuxThreads, a lock created by thread
+** A cannot be modified or overridden by a different thread B.
+** Only thread A can modify the lock.  Locking behavior is correct
+** if the appliation uses the newer Native Posix Thread Library (NPTL)
+** on linux - with NPTL a lock created by thread A can override locks
+** in thread B.  But there is no way to know at compile-time which
+** threading library is being used.  So there is no way to know at
+** compile-time whether or not thread A can override locks on thread B.
+** One has to do a run-time check to discover the behavior of the
+** current process.
+**
+** SQLite used to support LinuxThreads.  But support for LinuxThreads
+** was dropped beginning with version 3.7.0.  SQLite will still work with
+** LinuxThreads provided that (1) there is no more than one connection
+** per database file in the same process and (2) database connections
+** do not move across threads.
+*/
+
+/*
+** An instance of the following structure serves as the key used
+** to locate a particular unixInodeInfo object.
+*/
+struct unixFileId {
+  dev_t dev;                  /* Device number */
+#if OS_VXWORKS
+  struct vxworksFileId *pId;  /* Unique file ID for vxworks. */
+#else
+  /* We are told that some versions of Android contain a bug that
+  ** sizes ino_t at only 32-bits instead of 64-bits. (See
+  ** https://android-review.googlesource.com/#/c/115351/3/dist/sqlite3.c)
+  ** To work around this, always allocate 64-bits for the inode number.
+  ** On small machines that only have 32-bit inodes, this wastes 4 bytes,
+  ** but that should not be a big deal. */
+  /* WAS:  ino_t ino;   */
+  u64 ino;                   /* Inode number */
+#endif
+};
+
+/*
+** An instance of the following structure is allocated for each open
+** inode.
+**
+** A single inode can have multiple file descriptors, so each unixFile
+** structure contains a pointer to an instance of this object and this
+** object keeps a count of the number of unixFile pointing to it.
+**
+** Mutex rules:
+**
+**  (1) Only the pLockMutex mutex must be held in order to read or write
+**      any of the locking fields:
+**          nShared, nLock, eFileLock, bProcessLock, pUnused
+**
+**  (2) When nRef>0, then the following fields are unchanging and can
+**      be read (but not written) without holding any mutex:
+**          fileId, pLockMutex
+**
+**  (3) With the exceptions above, all the fields may only be read
+**      or written while holding the global unixBigLock mutex.
+**
+** Deadlock prevention:  The global unixBigLock mutex may not
+** be acquired while holding the pLockMutex mutex.  If both unixBigLock
+** and pLockMutex are needed, then unixBigLock must be acquired first.
+*/
+struct unixInodeInfo {
+  struct unixFileId fileId;       /* The lookup key */
+  sqlite3_mutex *pLockMutex;      /* Hold this mutex for... */
+  int nShared;                      /* Number of SHARED locks held */
+  int nLock;                        /* Number of outstanding file locks */
+  unsigned char eFileLock;          /* One of SHARED_LOCK, RESERVED_LOCK etc. */
+  unsigned char bProcessLock;       /* An exclusive process lock is held */
+  UnixUnusedFd *pUnused;            /* Unused file descriptors to close */
+  int nRef;                       /* Number of pointers to this structure */
+  unixShmNode *pShmNode;          /* Shared memory associated with this inode */
+  unixInodeInfo *pNext;           /* List of all unixInodeInfo objects */
+  unixInodeInfo *pPrev;           /*    .... doubly linked */
+#if SQLITE_ENABLE_LOCKING_STYLE
+  unsigned long long sharedByte;  /* for AFP simulated shared lock */
+#endif
+#if OS_VXWORKS
+  sem_t *pSem;                    /* Named POSIX semaphore */
+  char aSemName[MAX_PATHNAME+2];  /* Name of that semaphore */
+#endif
+};
+
+/*
+** A lists of all unixInodeInfo objects.
+**
+** Must hold unixBigLock in order to read or write this variable.
+*/
+static unixInodeInfo *inodeList = 0;  /* All unixInodeInfo objects */
+
+#ifdef SQLITE_DEBUG
+/*
+** True if the inode mutex (on the unixFile.pFileMutex field) is held, or not.
+** This routine is used only within assert() to help verify correct mutex
+** usage.
+*/
+int unixFileMutexHeld(unixFile *pFile){
+  assert( pFile->pInode );
+  return sqlite3_mutex_held(pFile->pInode->pLockMutex);
+}
+int unixFileMutexNotheld(unixFile *pFile){
+  assert( pFile->pInode );
+  return sqlite3_mutex_notheld(pFile->pInode->pLockMutex);
+}
+#endif
+
+/*
+**
+** This function - unixLogErrorAtLine(), is only ever called via the macro
+** unixLogError().
+**
+** It is invoked after an error occurs in an OS function and errno has been
+** set. It logs a message u
