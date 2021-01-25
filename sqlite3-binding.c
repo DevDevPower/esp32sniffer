@@ -36684,4 +36684,193 @@ int unixFileMutexNotheld(unixFile *pFile){
 ** unixLogError().
 **
 ** It is invoked after an error occurs in an OS function and errno has been
-** set. It logs a message u
+** set. It logs a message using sqlite3_log() containing the current value of
+** errno and, if possible, the human-readable equivalent from strerror() or
+** strerror_r().
+**
+** The first argument passed to the macro should be the error code that
+** will be returned to SQLite (e.g. SQLITE_IOERR_DELETE, SQLITE_CANTOPEN).
+** The two subsequent arguments should be the name of the OS function that
+** failed (e.g. "unlink", "open") and the associated file-system path,
+** if any.
+*/
+#define unixLogError(a,b,c)     unixLogErrorAtLine(a,b,c,__LINE__)
+static int unixLogErrorAtLine(
+  int errcode,                    /* SQLite error code */
+  const char *zFunc,              /* Name of OS function that failed */
+  const char *zPath,              /* File path associated with error */
+  int iLine                       /* Source line number where error occurred */
+){
+  char *zErr;                     /* Message from strerror() or equivalent */
+  int iErrno = errno;             /* Saved syscall error number */
+
+  /* If this is not a threadsafe build (SQLITE_THREADSAFE==0), then use
+  ** the strerror() function to obtain the human-readable error message
+  ** equivalent to errno. Otherwise, use strerror_r().
+  */
+#if SQLITE_THREADSAFE && defined(HAVE_STRERROR_R)
+  char aErr[80];
+  memset(aErr, 0, sizeof(aErr));
+  zErr = aErr;
+
+  /* If STRERROR_R_CHAR_P (set by autoconf scripts) or __USE_GNU is defined,
+  ** assume that the system provides the GNU version of strerror_r() that
+  ** returns a pointer to a buffer containing the error message. That pointer
+  ** may point to aErr[], or it may point to some static storage somewhere.
+  ** Otherwise, assume that the system provides the POSIX version of
+  ** strerror_r(), which always writes an error message into aErr[].
+  **
+  ** If the code incorrectly assumes that it is the POSIX version that is
+  ** available, the error message will often be an empty string. Not a
+  ** huge problem. Incorrectly concluding that the GNU version is available
+  ** could lead to a segfault though.
+  */
+#if defined(STRERROR_R_CHAR_P) || defined(__USE_GNU)
+  zErr =
+# endif
+  strerror_r(iErrno, aErr, sizeof(aErr)-1);
+
+#elif SQLITE_THREADSAFE
+  /* This is a threadsafe build, but strerror_r() is not available. */
+  zErr = "";
+#else
+  /* Non-threadsafe build, use strerror(). */
+  zErr = strerror(iErrno);
+#endif
+
+  if( zPath==0 ) zPath = "";
+  sqlite3_log(errcode,
+      "os_unix.c:%d: (%d) %s(%s) - %s",
+      iLine, iErrno, zFunc, zPath, zErr
+  );
+
+  return errcode;
+}
+
+/*
+** Close a file descriptor.
+**
+** We assume that close() almost always works, since it is only in a
+** very sick application or on a very sick platform that it might fail.
+** If it does fail, simply leak the file descriptor, but do log the
+** error.
+**
+** Note that it is not safe to retry close() after EINTR since the
+** file descriptor might have already been reused by another thread.
+** So we don't even try to recover from an EINTR.  Just log the error
+** and move on.
+*/
+static void robust_close(unixFile *pFile, int h, int lineno){
+  if( osClose(h) ){
+    unixLogErrorAtLine(SQLITE_IOERR_CLOSE, "close",
+                       pFile ? pFile->zPath : 0, lineno);
+  }
+}
+
+/*
+** Set the pFile->lastErrno.  Do this in a subroutine as that provides
+** a convenient place to set a breakpoint.
+*/
+static void storeLastErrno(unixFile *pFile, int error){
+  pFile->lastErrno = error;
+}
+
+/*
+** Close all file descriptors accumuated in the unixInodeInfo->pUnused list.
+*/
+static void closePendingFds(unixFile *pFile){
+  unixInodeInfo *pInode = pFile->pInode;
+  UnixUnusedFd *p;
+  UnixUnusedFd *pNext;
+  assert( unixFileMutexHeld(pFile) );
+  for(p=pInode->pUnused; p; p=pNext){
+    pNext = p->pNext;
+    robust_close(pFile, p->fd, __LINE__);
+    sqlite3_free(p);
+  }
+  pInode->pUnused = 0;
+}
+
+/*
+** Release a unixInodeInfo structure previously allocated by findInodeInfo().
+**
+** The global mutex must be held when this routine is called, but the mutex
+** on the inode being deleted must NOT be held.
+*/
+static void releaseInodeInfo(unixFile *pFile){
+  unixInodeInfo *pInode = pFile->pInode;
+  assert( unixMutexHeld() );
+  assert( unixFileMutexNotheld(pFile) );
+  if( ALWAYS(pInode) ){
+    pInode->nRef--;
+    if( pInode->nRef==0 ){
+      assert( pInode->pShmNode==0 );
+      sqlite3_mutex_enter(pInode->pLockMutex);
+      closePendingFds(pFile);
+      sqlite3_mutex_leave(pInode->pLockMutex);
+      if( pInode->pPrev ){
+        assert( pInode->pPrev->pNext==pInode );
+        pInode->pPrev->pNext = pInode->pNext;
+      }else{
+        assert( inodeList==pInode );
+        inodeList = pInode->pNext;
+      }
+      if( pInode->pNext ){
+        assert( pInode->pNext->pPrev==pInode );
+        pInode->pNext->pPrev = pInode->pPrev;
+      }
+      sqlite3_mutex_free(pInode->pLockMutex);
+      sqlite3_free(pInode);
+    }
+  }
+}
+
+/*
+** Given a file descriptor, locate the unixInodeInfo object that
+** describes that file descriptor.  Create a new one if necessary.  The
+** return value might be uninitialized if an error occurs.
+**
+** The global mutex must held when calling this routine.
+**
+** Return an appropriate error code.
+*/
+static int findInodeInfo(
+  unixFile *pFile,               /* Unix file with file desc used in the key */
+  unixInodeInfo **ppInode        /* Return the unixInodeInfo object here */
+){
+  int rc;                        /* System call return code */
+  int fd;                        /* The file descriptor for pFile */
+  struct unixFileId fileId;      /* Lookup key for the unixInodeInfo */
+  struct stat statbuf;           /* Low-level file information */
+  unixInodeInfo *pInode = 0;     /* Candidate unixInodeInfo object */
+
+  assert( unixMutexHeld() );
+
+  /* Get low-level information about the file that we can used to
+  ** create a unique name for the file.
+  */
+  fd = pFile->h;
+  rc = osFstat(fd, &statbuf);
+  if( rc!=0 ){
+    storeLastErrno(pFile, errno);
+#if defined(EOVERFLOW) && defined(SQLITE_DISABLE_LFS)
+    if( pFile->lastErrno==EOVERFLOW ) return SQLITE_NOLFS;
+#endif
+    return SQLITE_IOERR;
+  }
+
+#ifdef __APPLE__
+  /* On OS X on an msdos filesystem, the inode number is reported
+  ** incorrectly for zero-size files.  See ticket #3260.  To work
+  ** around this problem (we consider it a bug in OS X, not SQLite)
+  ** we always increase the file size to 1 by writing a single byte
+  ** prior to accessing the inode number.  The one byte written is
+  ** an ASCII 'S' character which also happens to be the first byte
+  ** in the header of every SQLite database.  In this way, if there
+  ** is a race condition such that another thread has already populated
+  ** the first page of the database, no damage is done.
+  */
+  if( statbuf.st_size==0 && (pFile->fsFlags & SQLITE_FSFLAGS_IS_MSDOS)!=0 ){
+    do{ rc = osWrite(fd, "S", 1); }while( rc<0 && errno==EINTR );
+    if( rc!=1 ){
+     
