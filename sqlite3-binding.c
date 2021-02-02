@@ -37475,4 +37475,211 @@ static int posixUnlock(sqlite3_file *id, int eFileLock, int handleNFSUnlock){
         if( unixFileLock(pFile, &lock) ){
           /* In theory, the call to unixFileLock() cannot fail because another
           ** process is holding an incompatible lock. If it does, this
-          ** indicates that the other process is not following the loc
+          ** indicates that the other process is not following the locking
+          ** protocol. If this happens, return SQLITE_IOERR_RDLOCK. Returning
+          ** SQLITE_BUSY would confuse the upper layer (in practice it causes
+          ** an assert to fail). */
+          rc = SQLITE_IOERR_RDLOCK;
+          storeLastErrno(pFile, errno);
+          goto end_unlock;
+        }
+      }
+    }
+    lock.l_type = F_UNLCK;
+    lock.l_whence = SEEK_SET;
+    lock.l_start = PENDING_BYTE;
+    lock.l_len = 2L;  assert( PENDING_BYTE+1==RESERVED_BYTE );
+    if( unixFileLock(pFile, &lock)==0 ){
+      pInode->eFileLock = SHARED_LOCK;
+    }else{
+      rc = SQLITE_IOERR_UNLOCK;
+      storeLastErrno(pFile, errno);
+      goto end_unlock;
+    }
+  }
+  if( eFileLock==NO_LOCK ){
+    /* Decrement the shared lock counter.  Release the lock using an
+    ** OS call only when all threads in this same process have released
+    ** the lock.
+    */
+    pInode->nShared--;
+    if( pInode->nShared==0 ){
+      lock.l_type = F_UNLCK;
+      lock.l_whence = SEEK_SET;
+      lock.l_start = lock.l_len = 0L;
+      if( unixFileLock(pFile, &lock)==0 ){
+        pInode->eFileLock = NO_LOCK;
+      }else{
+        rc = SQLITE_IOERR_UNLOCK;
+        storeLastErrno(pFile, errno);
+        pInode->eFileLock = NO_LOCK;
+        pFile->eFileLock = NO_LOCK;
+      }
+    }
+
+    /* Decrement the count of locks against this same file.  When the
+    ** count reaches zero, close any other file descriptors whose close
+    ** was deferred because of outstanding locks.
+    */
+    pInode->nLock--;
+    assert( pInode->nLock>=0 );
+    if( pInode->nLock==0 ) closePendingFds(pFile);
+  }
+
+end_unlock:
+  sqlite3_mutex_leave(pInode->pLockMutex);
+  if( rc==SQLITE_OK ){
+    pFile->eFileLock = eFileLock;
+  }
+  return rc;
+}
+
+/*
+** Lower the locking level on file descriptor pFile to eFileLock.  eFileLock
+** must be either NO_LOCK or SHARED_LOCK.
+**
+** If the locking level of the file descriptor is already at or below
+** the requested locking level, this routine is a no-op.
+*/
+static int unixUnlock(sqlite3_file *id, int eFileLock){
+#if SQLITE_MAX_MMAP_SIZE>0
+  assert( eFileLock==SHARED_LOCK || ((unixFile *)id)->nFetchOut==0 );
+#endif
+  return posixUnlock(id, eFileLock, 0);
+}
+
+#if SQLITE_MAX_MMAP_SIZE>0
+static int unixMapfile(unixFile *pFd, i64 nByte);
+static void unixUnmapfile(unixFile *pFd);
+#endif
+
+/*
+** This function performs the parts of the "close file" operation
+** common to all locking schemes. It closes the directory and file
+** handles, if they are valid, and sets all fields of the unixFile
+** structure to 0.
+**
+** It is *not* necessary to hold the mutex when this routine is called,
+** even on VxWorks.  A mutex will be acquired on VxWorks by the
+** vxworksReleaseFileId() routine.
+*/
+static int closeUnixFile(sqlite3_file *id){
+  unixFile *pFile = (unixFile*)id;
+#if SQLITE_MAX_MMAP_SIZE>0
+  unixUnmapfile(pFile);
+#endif
+  if( pFile->h>=0 ){
+    robust_close(pFile, pFile->h, __LINE__);
+    pFile->h = -1;
+  }
+#if OS_VXWORKS
+  if( pFile->pId ){
+    if( pFile->ctrlFlags & UNIXFILE_DELETE ){
+      osUnlink(pFile->pId->zCanonicalName);
+    }
+    vxworksReleaseFileId(pFile->pId);
+    pFile->pId = 0;
+  }
+#endif
+#ifdef SQLITE_UNLINK_AFTER_CLOSE
+  if( pFile->ctrlFlags & UNIXFILE_DELETE ){
+    osUnlink(pFile->zPath);
+    sqlite3_free(*(char**)&pFile->zPath);
+    pFile->zPath = 0;
+  }
+#endif
+  OSTRACE(("CLOSE   %-3d\n", pFile->h));
+  OpenCounter(-1);
+  sqlite3_free(pFile->pPreallocatedUnused);
+  memset(pFile, 0, sizeof(unixFile));
+  return SQLITE_OK;
+}
+
+/*
+** Close a file.
+*/
+static int unixClose(sqlite3_file *id){
+  int rc = SQLITE_OK;
+  unixFile *pFile = (unixFile *)id;
+  unixInodeInfo *pInode = pFile->pInode;
+
+  assert( pInode!=0 );
+  verifyDbFile(pFile);
+  unixUnlock(id, NO_LOCK);
+  assert( unixFileMutexNotheld(pFile) );
+  unixEnterMutex();
+
+  /* unixFile.pInode is always valid here. Otherwise, a different close
+  ** routine (e.g. nolockClose()) would be called instead.
+  */
+  assert( pFile->pInode->nLock>0 || pFile->pInode->bProcessLock==0 );
+  sqlite3_mutex_enter(pInode->pLockMutex);
+  if( pInode->nLock ){
+    /* If there are outstanding locks, do not actually close the file just
+    ** yet because that would clear those locks.  Instead, add the file
+    ** descriptor to pInode->pUnused list.  It will be automatically closed
+    ** when the last lock is cleared.
+    */
+    setPendingFd(pFile);
+  }
+  sqlite3_mutex_leave(pInode->pLockMutex);
+  releaseInodeInfo(pFile);
+  assert( pFile->pShm==0 );
+  rc = closeUnixFile(id);
+  unixLeaveMutex();
+  return rc;
+}
+
+/************** End of the posix advisory lock implementation *****************
+******************************************************************************/
+
+/******************************************************************************
+****************************** No-op Locking **********************************
+**
+** Of the various locking implementations available, this is by far the
+** simplest:  locking is ignored.  No attempt is made to lock the database
+** file for reading or writing.
+**
+** This locking mode is appropriate for use on read-only databases
+** (ex: databases that are burned into CD-ROM, for example.)  It can
+** also be used if the application employs some external mechanism to
+** prevent simultaneous access of the same database by two or more
+** database connections.  But there is a serious risk of database
+** corruption if this locking mode is used in situations where multiple
+** database connections are accessing the same database file at the same
+** time and one or more of those connections are writing.
+*/
+
+static int nolockCheckReservedLock(sqlite3_file *NotUsed, int *pResOut){
+  UNUSED_PARAMETER(NotUsed);
+  *pResOut = 0;
+  return SQLITE_OK;
+}
+static int nolockLock(sqlite3_file *NotUsed, int NotUsed2){
+  UNUSED_PARAMETER2(NotUsed, NotUsed2);
+  return SQLITE_OK;
+}
+static int nolockUnlock(sqlite3_file *NotUsed, int NotUsed2){
+  UNUSED_PARAMETER2(NotUsed, NotUsed2);
+  return SQLITE_OK;
+}
+
+/*
+** Close the file.
+*/
+static int nolockClose(sqlite3_file *id) {
+  return closeUnixFile(id);
+}
+
+/******************* End of the no-op lock implementation *********************
+******************************************************************************/
+
+/******************************************************************************
+************************* Begin dot-file Locking ******************************
+**
+** The dotfile locking implementation uses the existence of separate lock
+** files (really a directory) to control access to the database.  This works
+** on just about every filesystem imaginable.  But there are serious downsides:
+**
+**    (1)  There is zero concurrency.  A single reader blocks all other
+**         connections from reading or writing 
