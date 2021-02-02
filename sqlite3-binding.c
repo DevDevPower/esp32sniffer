@@ -37682,4 +37682,219 @@ static int nolockClose(sqlite3_file *id) {
 ** on just about every filesystem imaginable.  But there are serious downsides:
 **
 **    (1)  There is zero concurrency.  A single reader blocks all other
-**         connections from reading or writing 
+**         connections from reading or writing the database.
+**
+**    (2)  An application crash or power loss can leave stale lock files
+**         sitting around that need to be cleared manually.
+**
+** Nevertheless, a dotlock is an appropriate locking mode for use if no
+** other locking strategy is available.
+**
+** Dotfile locking works by creating a subdirectory in the same directory as
+** the database and with the same name but with a ".lock" extension added.
+** The existence of a lock directory implies an EXCLUSIVE lock.  All other
+** lock types (SHARED, RESERVED, PENDING) are mapped into EXCLUSIVE.
+*/
+
+/*
+** The file suffix added to the data base filename in order to create the
+** lock directory.
+*/
+#define DOTLOCK_SUFFIX ".lock"
+
+/*
+** This routine checks if there is a RESERVED lock held on the specified
+** file by this or any other process. If such a lock is held, set *pResOut
+** to a non-zero value otherwise *pResOut is set to zero.  The return value
+** is set to SQLITE_OK unless an I/O error occurs during lock checking.
+**
+** In dotfile locking, either a lock exists or it does not.  So in this
+** variation of CheckReservedLock(), *pResOut is set to true if any lock
+** is held on the file and false if the file is unlocked.
+*/
+static int dotlockCheckReservedLock(sqlite3_file *id, int *pResOut) {
+  int rc = SQLITE_OK;
+  int reserved = 0;
+  unixFile *pFile = (unixFile*)id;
+
+  SimulateIOError( return SQLITE_IOERR_CHECKRESERVEDLOCK; );
+
+  assert( pFile );
+  reserved = osAccess((const char*)pFile->lockingContext, 0)==0;
+  OSTRACE(("TEST WR-LOCK %d %d %d (dotlock)\n", pFile->h, rc, reserved));
+  *pResOut = reserved;
+  return rc;
+}
+
+/*
+** Lock the file with the lock specified by parameter eFileLock - one
+** of the following:
+**
+**     (1) SHARED_LOCK
+**     (2) RESERVED_LOCK
+**     (3) PENDING_LOCK
+**     (4) EXCLUSIVE_LOCK
+**
+** Sometimes when requesting one lock state, additional lock states
+** are inserted in between.  The locking might fail on one of the later
+** transitions leaving the lock state different from what it started but
+** still short of its goal.  The following chart shows the allowed
+** transitions and the inserted intermediate states:
+**
+**    UNLOCKED -> SHARED
+**    SHARED -> RESERVED
+**    SHARED -> (PENDING) -> EXCLUSIVE
+**    RESERVED -> (PENDING) -> EXCLUSIVE
+**    PENDING -> EXCLUSIVE
+**
+** This routine will only increase a lock.  Use the sqlite3OsUnlock()
+** routine to lower a locking level.
+**
+** With dotfile locking, we really only support state (4): EXCLUSIVE.
+** But we track the other locking levels internally.
+*/
+static int dotlockLock(sqlite3_file *id, int eFileLock) {
+  unixFile *pFile = (unixFile*)id;
+  char *zLockFile = (char *)pFile->lockingContext;
+  int rc = SQLITE_OK;
+
+
+  /* If we have any lock, then the lock file already exists.  All we have
+  ** to do is adjust our internal record of the lock level.
+  */
+  if( pFile->eFileLock > NO_LOCK ){
+    pFile->eFileLock = eFileLock;
+    /* Always update the timestamp on the old file */
+#ifdef HAVE_UTIME
+    utime(zLockFile, NULL);
+#else
+    utimes(zLockFile, NULL);
+#endif
+    return SQLITE_OK;
+  }
+
+  /* grab an exclusive lock */
+  rc = osMkdir(zLockFile, 0777);
+  if( rc<0 ){
+    /* failed to open/create the lock directory */
+    int tErrno = errno;
+    if( EEXIST == tErrno ){
+      rc = SQLITE_BUSY;
+    } else {
+      rc = sqliteErrorFromPosixError(tErrno, SQLITE_IOERR_LOCK);
+      if( rc!=SQLITE_BUSY ){
+        storeLastErrno(pFile, tErrno);
+      }
+    }
+    return rc;
+  }
+
+  /* got it, set the type and return ok */
+  pFile->eFileLock = eFileLock;
+  return rc;
+}
+
+/*
+** Lower the locking level on file descriptor pFile to eFileLock.  eFileLock
+** must be either NO_LOCK or SHARED_LOCK.
+**
+** If the locking level of the file descriptor is already at or below
+** the requested locking level, this routine is a no-op.
+**
+** When the locking level reaches NO_LOCK, delete the lock file.
+*/
+static int dotlockUnlock(sqlite3_file *id, int eFileLock) {
+  unixFile *pFile = (unixFile*)id;
+  char *zLockFile = (char *)pFile->lockingContext;
+  int rc;
+
+  assert( pFile );
+  OSTRACE(("UNLOCK  %d %d was %d pid=%d (dotlock)\n", pFile->h, eFileLock,
+           pFile->eFileLock, osGetpid(0)));
+  assert( eFileLock<=SHARED_LOCK );
+
+  /* no-op if possible */
+  if( pFile->eFileLock==eFileLock ){
+    return SQLITE_OK;
+  }
+
+  /* To downgrade to shared, simply update our internal notion of the
+  ** lock state.  No need to mess with the file on disk.
+  */
+  if( eFileLock==SHARED_LOCK ){
+    pFile->eFileLock = SHARED_LOCK;
+    return SQLITE_OK;
+  }
+
+  /* To fully unlock the database, delete the lock file */
+  assert( eFileLock==NO_LOCK );
+  rc = osRmdir(zLockFile);
+  if( rc<0 ){
+    int tErrno = errno;
+    if( tErrno==ENOENT ){
+      rc = SQLITE_OK;
+    }else{
+      rc = SQLITE_IOERR_UNLOCK;
+      storeLastErrno(pFile, tErrno);
+    }
+    return rc;
+  }
+  pFile->eFileLock = NO_LOCK;
+  return SQLITE_OK;
+}
+
+/*
+** Close a file.  Make sure the lock has been released before closing.
+*/
+static int dotlockClose(sqlite3_file *id) {
+  unixFile *pFile = (unixFile*)id;
+  assert( id!=0 );
+  dotlockUnlock(id, NO_LOCK);
+  sqlite3_free(pFile->lockingContext);
+  return closeUnixFile(id);
+}
+/****************** End of the dot-file lock implementation *******************
+******************************************************************************/
+
+/******************************************************************************
+************************** Begin flock Locking ********************************
+**
+** Use the flock() system call to do file locking.
+**
+** flock() locking is like dot-file locking in that the various
+** fine-grain locking levels supported by SQLite are collapsed into
+** a single exclusive lock.  In other words, SHARED, RESERVED, and
+** PENDING locks are the same thing as an EXCLUSIVE lock.  SQLite
+** still works when you do this, but concurrency is reduced since
+** only a single process can be reading the database at a time.
+**
+** Omit this section if SQLITE_ENABLE_LOCKING_STYLE is turned off
+*/
+#if SQLITE_ENABLE_LOCKING_STYLE
+
+/*
+** Retry flock() calls that fail with EINTR
+*/
+#ifdef EINTR
+static int robust_flock(int fd, int op){
+  int rc;
+  do{ rc = flock(fd,op); }while( rc<0 && errno==EINTR );
+  return rc;
+}
+#else
+# define robust_flock(a,b) flock(a,b)
+#endif
+
+
+/*
+** This routine checks if there is a RESERVED lock held on the specified
+** file by this or any other process. If such a lock is held, set *pResOut
+** to a non-zero value otherwise *pResOut is set to zero.  The return value
+** is set to SQLITE_OK unless an I/O error occurs during lock checking.
+*/
+static int flockCheckReservedLock(sqlite3_file *id, int *pResOut){
+  int rc = SQLITE_OK;
+  int reserved = 0;
+  unixFile *pFile = (unixFile*)id;
+
+  SimulateIOError( return SQLITE_IOERR_CHECKRESERVEDLOCK;
