@@ -39361,4 +39361,217 @@ static int fcntlSizeHint(unixFile *pFile, i64 nByte){
 #if defined(HAVE_POSIX_FALLOCATE) && HAVE_POSIX_FALLOCATE
       /* The code below is handling the return value of osFallocate()
       ** correctly. posix_fallocate() is defined to "returns zero on success,
-      ** or an error number on  failure". See the 
+      ** or an error number on  failure". See the manpage for details. */
+      int err;
+      do{
+        err = osFallocate(pFile->h, buf.st_size, nSize-buf.st_size);
+      }while( err==EINTR );
+      if( err && err!=EINVAL ) return SQLITE_IOERR_WRITE;
+#else
+      /* If the OS does not have posix_fallocate(), fake it. Write a
+      ** single byte to the last byte in each block that falls entirely
+      ** within the extended region. Then, if required, a single byte
+      ** at offset (nSize-1), to set the size of the file correctly.
+      ** This is a similar technique to that used by glibc on systems
+      ** that do not have a real fallocate() call.
+      */
+      int nBlk = buf.st_blksize;  /* File-system block size */
+      int nWrite = 0;             /* Number of bytes written by seekAndWrite */
+      i64 iWrite;                 /* Next offset to write to */
+
+      iWrite = (buf.st_size/nBlk)*nBlk + nBlk - 1;
+      assert( iWrite>=buf.st_size );
+      assert( ((iWrite+1)%nBlk)==0 );
+      for(/*no-op*/; iWrite<nSize+nBlk-1; iWrite+=nBlk ){
+        if( iWrite>=nSize ) iWrite = nSize - 1;
+        nWrite = seekAndWrite(pFile, iWrite, "", 1);
+        if( nWrite!=1 ) return SQLITE_IOERR_WRITE;
+      }
+#endif
+    }
+  }
+
+#if SQLITE_MAX_MMAP_SIZE>0
+  if( pFile->mmapSizeMax>0 && nByte>pFile->mmapSize ){
+    int rc;
+    if( pFile->szChunk<=0 ){
+      if( robust_ftruncate(pFile->h, nByte) ){
+        storeLastErrno(pFile, errno);
+        return unixLogError(SQLITE_IOERR_TRUNCATE, "ftruncate", pFile->zPath);
+      }
+    }
+
+    rc = unixMapfile(pFile, nByte);
+    return rc;
+  }
+#endif
+
+  return SQLITE_OK;
+}
+
+/*
+** If *pArg is initially negative then this is a query.  Set *pArg to
+** 1 or 0 depending on whether or not bit mask of pFile->ctrlFlags is set.
+**
+** If *pArg is 0 or 1, then clear or set the mask bit of pFile->ctrlFlags.
+*/
+static void unixModeBit(unixFile *pFile, unsigned char mask, int *pArg){
+  if( *pArg<0 ){
+    *pArg = (pFile->ctrlFlags & mask)!=0;
+  }else if( (*pArg)==0 ){
+    pFile->ctrlFlags &= ~mask;
+  }else{
+    pFile->ctrlFlags |= mask;
+  }
+}
+
+/* Forward declaration */
+static int unixGetTempname(int nBuf, char *zBuf);
+#ifndef SQLITE_OMIT_WAL
+ static int unixFcntlExternalReader(unixFile*, int*);
+#endif
+
+/*
+** Information and control of an open file handle.
+*/
+static int unixFileControl(sqlite3_file *id, int op, void *pArg){
+  unixFile *pFile = (unixFile*)id;
+  switch( op ){
+#if defined(__linux__) && defined(SQLITE_ENABLE_BATCH_ATOMIC_WRITE)
+    case SQLITE_FCNTL_BEGIN_ATOMIC_WRITE: {
+      int rc = osIoctl(pFile->h, F2FS_IOC_START_ATOMIC_WRITE);
+      return rc ? SQLITE_IOERR_BEGIN_ATOMIC : SQLITE_OK;
+    }
+    case SQLITE_FCNTL_COMMIT_ATOMIC_WRITE: {
+      int rc = osIoctl(pFile->h, F2FS_IOC_COMMIT_ATOMIC_WRITE);
+      return rc ? SQLITE_IOERR_COMMIT_ATOMIC : SQLITE_OK;
+    }
+    case SQLITE_FCNTL_ROLLBACK_ATOMIC_WRITE: {
+      int rc = osIoctl(pFile->h, F2FS_IOC_ABORT_VOLATILE_WRITE);
+      return rc ? SQLITE_IOERR_ROLLBACK_ATOMIC : SQLITE_OK;
+    }
+#endif /* __linux__ && SQLITE_ENABLE_BATCH_ATOMIC_WRITE */
+
+    case SQLITE_FCNTL_LOCKSTATE: {
+      *(int*)pArg = pFile->eFileLock;
+      return SQLITE_OK;
+    }
+    case SQLITE_FCNTL_LAST_ERRNO: {
+      *(int*)pArg = pFile->lastErrno;
+      return SQLITE_OK;
+    }
+    case SQLITE_FCNTL_CHUNK_SIZE: {
+      pFile->szChunk = *(int *)pArg;
+      return SQLITE_OK;
+    }
+    case SQLITE_FCNTL_SIZE_HINT: {
+      int rc;
+      SimulateIOErrorBenign(1);
+      rc = fcntlSizeHint(pFile, *(i64 *)pArg);
+      SimulateIOErrorBenign(0);
+      return rc;
+    }
+    case SQLITE_FCNTL_PERSIST_WAL: {
+      unixModeBit(pFile, UNIXFILE_PERSIST_WAL, (int*)pArg);
+      return SQLITE_OK;
+    }
+    case SQLITE_FCNTL_POWERSAFE_OVERWRITE: {
+      unixModeBit(pFile, UNIXFILE_PSOW, (int*)pArg);
+      return SQLITE_OK;
+    }
+    case SQLITE_FCNTL_VFSNAME: {
+      *(char**)pArg = sqlite3_mprintf("%s", pFile->pVfs->zName);
+      return SQLITE_OK;
+    }
+    case SQLITE_FCNTL_TEMPFILENAME: {
+      char *zTFile = sqlite3_malloc64( pFile->pVfs->mxPathname );
+      if( zTFile ){
+        unixGetTempname(pFile->pVfs->mxPathname, zTFile);
+        *(char**)pArg = zTFile;
+      }
+      return SQLITE_OK;
+    }
+    case SQLITE_FCNTL_HAS_MOVED: {
+      *(int*)pArg = fileHasMoved(pFile);
+      return SQLITE_OK;
+    }
+#ifdef SQLITE_ENABLE_SETLK_TIMEOUT
+    case SQLITE_FCNTL_LOCK_TIMEOUT: {
+      int iOld = pFile->iBusyTimeout;
+      pFile->iBusyTimeout = *(int*)pArg;
+      *(int*)pArg = iOld;
+      return SQLITE_OK;
+    }
+#endif
+#if SQLITE_MAX_MMAP_SIZE>0
+    case SQLITE_FCNTL_MMAP_SIZE: {
+      i64 newLimit = *(i64*)pArg;
+      int rc = SQLITE_OK;
+      if( newLimit>sqlite3GlobalConfig.mxMmap ){
+        newLimit = sqlite3GlobalConfig.mxMmap;
+      }
+
+      /* The value of newLimit may be eventually cast to (size_t) and passed
+      ** to mmap(). Restrict its value to 2GB if (size_t) is not at least a
+      ** 64-bit type. */
+      if( newLimit>0 && sizeof(size_t)<8 ){
+        newLimit = (newLimit & 0x7FFFFFFF);
+      }
+
+      *(i64*)pArg = pFile->mmapSizeMax;
+      if( newLimit>=0 && newLimit!=pFile->mmapSizeMax && pFile->nFetchOut==0 ){
+        pFile->mmapSizeMax = newLimit;
+        if( pFile->mmapSize>0 ){
+          unixUnmapfile(pFile);
+          rc = unixMapfile(pFile, -1);
+        }
+      }
+      return rc;
+    }
+#endif
+#ifdef SQLITE_DEBUG
+    /* The pager calls this method to signal that it has done
+    ** a rollback and that the database is therefore unchanged and
+    ** it hence it is OK for the transaction change counter to be
+    ** unchanged.
+    */
+    case SQLITE_FCNTL_DB_UNCHANGED: {
+      ((unixFile*)id)->dbUpdate = 0;
+      return SQLITE_OK;
+    }
+#endif
+#if SQLITE_ENABLE_LOCKING_STYLE && defined(__APPLE__)
+    case SQLITE_FCNTL_SET_LOCKPROXYFILE:
+    case SQLITE_FCNTL_GET_LOCKPROXYFILE: {
+      return proxyFileControl(id,op,pArg);
+    }
+#endif /* SQLITE_ENABLE_LOCKING_STYLE && defined(__APPLE__) */
+
+    case SQLITE_FCNTL_EXTERNAL_READER: {
+#ifndef SQLITE_OMIT_WAL
+      return unixFcntlExternalReader((unixFile*)id, (int*)pArg);
+#else
+      *(int*)pArg = 0;
+      return SQLITE_OK;
+#endif
+    }
+  }
+  return SQLITE_NOTFOUND;
+}
+
+/*
+** If pFd->sectorSize is non-zero when this function is called, it is a
+** no-op. Otherwise, the values of pFd->sectorSize and
+** pFd->deviceCharacteristics are set according to the file-system
+** characteristics.
+**
+** There are two versions of this function. One for QNX and one for all
+** other systems.
+*/
+#ifndef __QNXNTO__
+static void setDeviceCharacteristics(unixFile *pFd){
+  assert( pFd->deviceCharacteristics==0 || pFd->sectorSize!=0 );
+  if( pFd->sectorSize==0 ){
+#if defined(__linux__) && defined(SQLITE_ENABLE_BATCH_ATOMIC_WRITE)
+    int res;
+    u32 
