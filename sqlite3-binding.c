@@ -38533,4 +38533,206 @@ static int afpLock(sqlite3_file *id, int eFileLock){
         /* now attemmpt to get the exclusive lock range */
         failed = afpSetLock(context->dbPath, pFile, SHARED_FIRST,
                                SHARED_SIZE, 1);
-        if( failed && (fa
+        if( failed && (failed2 = afpSetLock(context->dbPath, pFile,
+                       SHARED_FIRST + pInode->sharedByte, 1, 1)) ){
+          /* Can't reestablish the shared lock.  Sqlite can't deal, this is
+          ** a critical I/O error
+          */
+          rc = ((failed & 0xff) == SQLITE_IOERR) ? failed2 :
+               SQLITE_IOERR_LOCK;
+          goto afp_end_lock;
+        }
+      }else{
+        rc = failed;
+      }
+    }
+    if( failed ){
+      rc = failed;
+    }
+  }
+
+  if( rc==SQLITE_OK ){
+    pFile->eFileLock = eFileLock;
+    pInode->eFileLock = eFileLock;
+  }else if( eFileLock==EXCLUSIVE_LOCK ){
+    pFile->eFileLock = PENDING_LOCK;
+    pInode->eFileLock = PENDING_LOCK;
+  }
+
+afp_end_lock:
+  sqlite3_mutex_leave(pInode->pLockMutex);
+  OSTRACE(("LOCK    %d %s %s (afp)\n", pFile->h, azFileLock(eFileLock),
+         rc==SQLITE_OK ? "ok" : "failed"));
+  return rc;
+}
+
+/*
+** Lower the locking level on file descriptor pFile to eFileLock.  eFileLock
+** must be either NO_LOCK or SHARED_LOCK.
+**
+** If the locking level of the file descriptor is already at or below
+** the requested locking level, this routine is a no-op.
+*/
+static int afpUnlock(sqlite3_file *id, int eFileLock) {
+  int rc = SQLITE_OK;
+  unixFile *pFile = (unixFile*)id;
+  unixInodeInfo *pInode;
+  afpLockingContext *context = (afpLockingContext *) pFile->lockingContext;
+  int skipShared = 0;
+#ifdef SQLITE_TEST
+  int h = pFile->h;
+#endif
+
+  assert( pFile );
+  OSTRACE(("UNLOCK  %d %d was %d(%d,%d) pid=%d (afp)\n", pFile->h, eFileLock,
+           pFile->eFileLock, pFile->pInode->eFileLock, pFile->pInode->nShared,
+           osGetpid(0)));
+
+  assert( eFileLock<=SHARED_LOCK );
+  if( pFile->eFileLock<=eFileLock ){
+    return SQLITE_OK;
+  }
+  pInode = pFile->pInode;
+  sqlite3_mutex_enter(pInode->pLockMutex);
+  assert( pInode->nShared!=0 );
+  if( pFile->eFileLock>SHARED_LOCK ){
+    assert( pInode->eFileLock==pFile->eFileLock );
+    SimulateIOErrorBenign(1);
+    SimulateIOError( h=(-1) )
+    SimulateIOErrorBenign(0);
+
+#ifdef SQLITE_DEBUG
+    /* When reducing a lock such that other processes can start
+    ** reading the database file again, make sure that the
+    ** transaction counter was updated if any part of the database
+    ** file changed.  If the transaction counter is not updated,
+    ** other connections to the same file might not realize that
+    ** the file has changed and hence might not know to flush their
+    ** cache.  The use of a stale cache can lead to database corruption.
+    */
+    assert( pFile->inNormalWrite==0
+           || pFile->dbUpdate==0
+           || pFile->transCntrChng==1 );
+    pFile->inNormalWrite = 0;
+#endif
+
+    if( pFile->eFileLock==EXCLUSIVE_LOCK ){
+      rc = afpSetLock(context->dbPath, pFile, SHARED_FIRST, SHARED_SIZE, 0);
+      if( rc==SQLITE_OK && (eFileLock==SHARED_LOCK || pInode->nShared>1) ){
+        /* only re-establish the shared lock if necessary */
+        int sharedLockByte = SHARED_FIRST+pInode->sharedByte;
+        rc = afpSetLock(context->dbPath, pFile, sharedLockByte, 1, 1);
+      } else {
+        skipShared = 1;
+      }
+    }
+    if( rc==SQLITE_OK && pFile->eFileLock>=PENDING_LOCK ){
+      rc = afpSetLock(context->dbPath, pFile, PENDING_BYTE, 1, 0);
+    }
+    if( rc==SQLITE_OK && pFile->eFileLock>=RESERVED_LOCK && context->reserved ){
+      rc = afpSetLock(context->dbPath, pFile, RESERVED_BYTE, 1, 0);
+      if( !rc ){
+        context->reserved = 0;
+      }
+    }
+    if( rc==SQLITE_OK && (eFileLock==SHARED_LOCK || pInode->nShared>1)){
+      pInode->eFileLock = SHARED_LOCK;
+    }
+  }
+  if( rc==SQLITE_OK && eFileLock==NO_LOCK ){
+
+    /* Decrement the shared lock counter.  Release the lock using an
+    ** OS call only when all threads in this same process have released
+    ** the lock.
+    */
+    unsigned long long sharedLockByte = SHARED_FIRST+pInode->sharedByte;
+    pInode->nShared--;
+    if( pInode->nShared==0 ){
+      SimulateIOErrorBenign(1);
+      SimulateIOError( h=(-1) )
+      SimulateIOErrorBenign(0);
+      if( !skipShared ){
+        rc = afpSetLock(context->dbPath, pFile, sharedLockByte, 1, 0);
+      }
+      if( !rc ){
+        pInode->eFileLock = NO_LOCK;
+        pFile->eFileLock = NO_LOCK;
+      }
+    }
+    if( rc==SQLITE_OK ){
+      pInode->nLock--;
+      assert( pInode->nLock>=0 );
+      if( pInode->nLock==0 ) closePendingFds(pFile);
+    }
+  }
+
+  sqlite3_mutex_leave(pInode->pLockMutex);
+  if( rc==SQLITE_OK ){
+    pFile->eFileLock = eFileLock;
+  }
+  return rc;
+}
+
+/*
+** Close a file & cleanup AFP specific locking context
+*/
+static int afpClose(sqlite3_file *id) {
+  int rc = SQLITE_OK;
+  unixFile *pFile = (unixFile*)id;
+  assert( id!=0 );
+  afpUnlock(id, NO_LOCK);
+  assert( unixFileMutexNotheld(pFile) );
+  unixEnterMutex();
+  if( pFile->pInode ){
+    unixInodeInfo *pInode = pFile->pInode;
+    sqlite3_mutex_enter(pInode->pLockMutex);
+    if( pInode->nLock ){
+      /* If there are outstanding locks, do not actually close the file just
+      ** yet because that would clear those locks.  Instead, add the file
+      ** descriptor to pInode->aPending.  It will be automatically closed when
+      ** the last lock is cleared.
+      */
+      setPendingFd(pFile);
+    }
+    sqlite3_mutex_leave(pInode->pLockMutex);
+  }
+  releaseInodeInfo(pFile);
+  sqlite3_free(pFile->lockingContext);
+  rc = closeUnixFile(id);
+  unixLeaveMutex();
+  return rc;
+}
+
+#endif /* defined(__APPLE__) && SQLITE_ENABLE_LOCKING_STYLE */
+/*
+** The code above is the AFP lock implementation.  The code is specific
+** to MacOSX and does not work on other unix platforms.  No alternative
+** is available.  If you don't compile for a mac, then the "unix-afp"
+** VFS is not available.
+**
+********************* End of the AFP lock implementation **********************
+******************************************************************************/
+
+/******************************************************************************
+*************************** Begin NFS Locking ********************************/
+
+#if defined(__APPLE__) && SQLITE_ENABLE_LOCKING_STYLE
+/*
+ ** Lower the locking level on file descriptor pFile to eFileLock.  eFileLock
+ ** must be either NO_LOCK or SHARED_LOCK.
+ **
+ ** If the locking level of the file descriptor is already at or below
+ ** the requested locking level, this routine is a no-op.
+ */
+static int nfsUnlock(sqlite3_file *id, int eFileLock){
+  return posixUnlock(id, eFileLock, 1);
+}
+
+#endif /* defined(__APPLE__) && SQLITE_ENABLE_LOCKING_STYLE */
+/*
+** The code above is the NFS lock implementation.  The code is specific
+** to MacOSX and does not work on other unix platforms.  No alternative
+** is available.
+**
+********************* End of the NFS lock implementation **********************
+************************
