@@ -38735,4 +38735,230 @@ static int nfsUnlock(sqlite3_file *id, int eFileLock){
 ** is available.
 **
 ********************* End of the NFS lock implementation **********************
-************************
+******************************************************************************/
+
+/******************************************************************************
+**************** Non-locking sqlite3_file methods *****************************
+**
+** The next division contains implementations for all methods of the
+** sqlite3_file object other than the locking methods.  The locking
+** methods were defined in divisions above (one locking method per
+** division).  Those methods that are common to all locking modes
+** are gather together into this division.
+*/
+
+/*
+** Seek to the offset passed as the second argument, then read cnt
+** bytes into pBuf. Return the number of bytes actually read.
+**
+** NB:  If you define USE_PREAD or USE_PREAD64, then it might also
+** be necessary to define _XOPEN_SOURCE to be 500.  This varies from
+** one system to another.  Since SQLite does not define USE_PREAD
+** in any form by default, we will not attempt to define _XOPEN_SOURCE.
+** See tickets #2741 and #2681.
+**
+** To avoid stomping the errno value on a failed read the lastErrno value
+** is set before returning.
+*/
+static int seekAndRead(unixFile *id, sqlite3_int64 offset, void *pBuf, int cnt){
+  int got;
+  int prior = 0;
+#if (!defined(USE_PREAD) && !defined(USE_PREAD64))
+  i64 newOffset;
+#endif
+  TIMER_START;
+  assert( cnt==(cnt&0x1ffff) );
+  assert( id->h>2 );
+  do{
+#if defined(USE_PREAD)
+    got = osPread(id->h, pBuf, cnt, offset);
+    SimulateIOError( got = -1 );
+#elif defined(USE_PREAD64)
+    got = osPread64(id->h, pBuf, cnt, offset);
+    SimulateIOError( got = -1 );
+#else
+    newOffset = lseek(id->h, offset, SEEK_SET);
+    SimulateIOError( newOffset = -1 );
+    if( newOffset<0 ){
+      storeLastErrno((unixFile*)id, errno);
+      return -1;
+    }
+    got = osRead(id->h, pBuf, cnt);
+#endif
+    if( got==cnt ) break;
+    if( got<0 ){
+      if( errno==EINTR ){ got = 1; continue; }
+      prior = 0;
+      storeLastErrno((unixFile*)id,  errno);
+      break;
+    }else if( got>0 ){
+      cnt -= got;
+      offset += got;
+      prior += got;
+      pBuf = (void*)(got + (char*)pBuf);
+    }
+  }while( got>0 );
+  TIMER_END;
+  OSTRACE(("READ    %-3d %5d %7lld %llu\n",
+            id->h, got+prior, offset-prior, TIMER_ELAPSED));
+  return got+prior;
+}
+
+/*
+** Read data from a file into a buffer.  Return SQLITE_OK if all
+** bytes were read successfully and SQLITE_IOERR if anything goes
+** wrong.
+*/
+static int unixRead(
+  sqlite3_file *id,
+  void *pBuf,
+  int amt,
+  sqlite3_int64 offset
+){
+  unixFile *pFile = (unixFile *)id;
+  int got;
+  assert( id );
+  assert( offset>=0 );
+  assert( amt>0 );
+
+  /* If this is a database file (not a journal, super-journal or temp
+  ** file), the bytes in the locking range should never be read or written. */
+#if 0
+  assert( pFile->pPreallocatedUnused==0
+       || offset>=PENDING_BYTE+512
+       || offset+amt<=PENDING_BYTE
+  );
+#endif
+
+#if SQLITE_MAX_MMAP_SIZE>0
+  /* Deal with as much of this read request as possible by transfering
+  ** data from the memory mapping using memcpy().  */
+  if( offset<pFile->mmapSize ){
+    if( offset+amt <= pFile->mmapSize ){
+      memcpy(pBuf, &((u8 *)(pFile->pMapRegion))[offset], amt);
+      return SQLITE_OK;
+    }else{
+      int nCopy = pFile->mmapSize - offset;
+      memcpy(pBuf, &((u8 *)(pFile->pMapRegion))[offset], nCopy);
+      pBuf = &((u8 *)pBuf)[nCopy];
+      amt -= nCopy;
+      offset += nCopy;
+    }
+  }
+#endif
+
+  got = seekAndRead(pFile, offset, pBuf, amt);
+  if( got==amt ){
+    return SQLITE_OK;
+  }else if( got<0 ){
+    /* pFile->lastErrno has been set by seekAndRead().
+    ** Usually we return SQLITE_IOERR_READ here, though for some
+    ** kinds of errors we return SQLITE_IOERR_CORRUPTFS.  The
+    ** SQLITE_IOERR_CORRUPTFS will be converted into SQLITE_CORRUPT
+    ** prior to returning to the application by the sqlite3ApiExit()
+    ** routine.
+    */
+    switch( pFile->lastErrno ){
+      case ERANGE:
+      case EIO:
+#ifdef ENXIO
+      case ENXIO:
+#endif
+#ifdef EDEVERR
+      case EDEVERR:
+#endif
+        return SQLITE_IOERR_CORRUPTFS;
+    }
+    return SQLITE_IOERR_READ;
+  }else{
+    storeLastErrno(pFile, 0);   /* not a system error */
+    /* Unread parts of the buffer must be zero-filled */
+    memset(&((char*)pBuf)[got], 0, amt-got);
+    return SQLITE_IOERR_SHORT_READ;
+  }
+}
+
+/*
+** Attempt to seek the file-descriptor passed as the first argument to
+** absolute offset iOff, then attempt to write nBuf bytes of data from
+** pBuf to it. If an error occurs, return -1 and set *piErrno. Otherwise,
+** return the actual number of bytes written (which may be less than
+** nBuf).
+*/
+static int seekAndWriteFd(
+  int fd,                         /* File descriptor to write to */
+  i64 iOff,                       /* File offset to begin writing at */
+  const void *pBuf,               /* Copy data from this buffer to the file */
+  int nBuf,                       /* Size of buffer pBuf in bytes */
+  int *piErrno                    /* OUT: Error number if error occurs */
+){
+  int rc = 0;                     /* Value returned by system call */
+
+  assert( nBuf==(nBuf&0x1ffff) );
+  assert( fd>2 );
+  assert( piErrno!=0 );
+  nBuf &= 0x1ffff;
+  TIMER_START;
+
+#if defined(USE_PREAD)
+  do{ rc = (int)osPwrite(fd, pBuf, nBuf, iOff); }while( rc<0 && errno==EINTR );
+#elif defined(USE_PREAD64)
+  do{ rc = (int)osPwrite64(fd, pBuf, nBuf, iOff);}while( rc<0 && errno==EINTR);
+#else
+  do{
+    i64 iSeek = lseek(fd, iOff, SEEK_SET);
+    SimulateIOError( iSeek = -1 );
+    if( iSeek<0 ){
+      rc = -1;
+      break;
+    }
+    rc = osWrite(fd, pBuf, nBuf);
+  }while( rc<0 && errno==EINTR );
+#endif
+
+  TIMER_END;
+  OSTRACE(("WRITE   %-3d %5d %7lld %llu\n", fd, rc, iOff, TIMER_ELAPSED));
+
+  if( rc<0 ) *piErrno = errno;
+  return rc;
+}
+
+
+/*
+** Seek to the offset in id->offset then read cnt bytes into pBuf.
+** Return the number of bytes actually read.  Update the offset.
+**
+** To avoid stomping the errno value on a failed write the lastErrno value
+** is set before returning.
+*/
+static int seekAndWrite(unixFile *id, i64 offset, const void *pBuf, int cnt){
+  return seekAndWriteFd(id->h, offset, pBuf, cnt, &id->lastErrno);
+}
+
+
+/*
+** Write data from a buffer into a file.  Return SQLITE_OK on success
+** or some other error code on failure.
+*/
+static int unixWrite(
+  sqlite3_file *id,
+  const void *pBuf,
+  int amt,
+  sqlite3_int64 offset
+){
+  unixFile *pFile = (unixFile*)id;
+  int wrote = 0;
+  assert( id );
+  assert( amt>0 );
+
+  /* If this is a database file (not a journal, super-journal or temp
+  ** file), the bytes in the locking range should never be read or written. */
+#if 0
+  assert( pFile->pPreallocatedUnused==0
+       || offset>=PENDING_BYTE+512
+       || offset+amt<=PENDING_BYTE
+  );
+#endif
+
+#ifdef SQLITE_DEBUG
+  /* If we are 
