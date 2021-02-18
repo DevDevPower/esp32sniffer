@@ -39574,4 +39574,168 @@ static void setDeviceCharacteristics(unixFile *pFd){
   if( pFd->sectorSize==0 ){
 #if defined(__linux__) && defined(SQLITE_ENABLE_BATCH_ATOMIC_WRITE)
     int res;
-    u32 
+    u32 f = 0;
+
+    /* Check for support for F2FS atomic batch writes. */
+    res = osIoctl(pFd->h, F2FS_IOC_GET_FEATURES, &f);
+    if( res==0 && (f & F2FS_FEATURE_ATOMIC_WRITE) ){
+      pFd->deviceCharacteristics = SQLITE_IOCAP_BATCH_ATOMIC;
+    }
+#endif /* __linux__ && SQLITE_ENABLE_BATCH_ATOMIC_WRITE */
+
+    /* Set the POWERSAFE_OVERWRITE flag if requested. */
+    if( pFd->ctrlFlags & UNIXFILE_PSOW ){
+      pFd->deviceCharacteristics |= SQLITE_IOCAP_POWERSAFE_OVERWRITE;
+    }
+
+    pFd->sectorSize = SQLITE_DEFAULT_SECTOR_SIZE;
+  }
+}
+#else
+#include <sys/dcmd_blk.h>
+#include <sys/statvfs.h>
+static void setDeviceCharacteristics(unixFile *pFile){
+  if( pFile->sectorSize == 0 ){
+    struct statvfs fsInfo;
+
+    /* Set defaults for non-supported filesystems */
+    pFile->sectorSize = SQLITE_DEFAULT_SECTOR_SIZE;
+    pFile->deviceCharacteristics = 0;
+    if( fstatvfs(pFile->h, &fsInfo) == -1 ) {
+      return;
+    }
+
+    if( !strcmp(fsInfo.f_basetype, "tmp") ) {
+      pFile->sectorSize = fsInfo.f_bsize;
+      pFile->deviceCharacteristics =
+        SQLITE_IOCAP_ATOMIC4K |       /* All ram filesystem writes are atomic */
+        SQLITE_IOCAP_SAFE_APPEND |    /* growing the file does not occur until
+                                      ** the write succeeds */
+        SQLITE_IOCAP_SEQUENTIAL |     /* The ram filesystem has no write behind
+                                      ** so it is ordered */
+        0;
+    }else if( strstr(fsInfo.f_basetype, "etfs") ){
+      pFile->sectorSize = fsInfo.f_bsize;
+      pFile->deviceCharacteristics =
+        /* etfs cluster size writes are atomic */
+        (pFile->sectorSize / 512 * SQLITE_IOCAP_ATOMIC512) |
+        SQLITE_IOCAP_SAFE_APPEND |    /* growing the file does not occur until
+                                      ** the write succeeds */
+        SQLITE_IOCAP_SEQUENTIAL |     /* The ram filesystem has no write behind
+                                      ** so it is ordered */
+        0;
+    }else if( !strcmp(fsInfo.f_basetype, "qnx6") ){
+      pFile->sectorSize = fsInfo.f_bsize;
+      pFile->deviceCharacteristics =
+        SQLITE_IOCAP_ATOMIC |         /* All filesystem writes are atomic */
+        SQLITE_IOCAP_SAFE_APPEND |    /* growing the file does not occur until
+                                      ** the write succeeds */
+        SQLITE_IOCAP_SEQUENTIAL |     /* The ram filesystem has no write behind
+                                      ** so it is ordered */
+        0;
+    }else if( !strcmp(fsInfo.f_basetype, "qnx4") ){
+      pFile->sectorSize = fsInfo.f_bsize;
+      pFile->deviceCharacteristics =
+        /* full bitset of atomics from max sector size and smaller */
+        ((pFile->sectorSize / 512 * SQLITE_IOCAP_ATOMIC512) << 1) - 2 |
+        SQLITE_IOCAP_SEQUENTIAL |     /* The ram filesystem has no write behind
+                                      ** so it is ordered */
+        0;
+    }else if( strstr(fsInfo.f_basetype, "dos") ){
+      pFile->sectorSize = fsInfo.f_bsize;
+      pFile->deviceCharacteristics =
+        /* full bitset of atomics from max sector size and smaller */
+        ((pFile->sectorSize / 512 * SQLITE_IOCAP_ATOMIC512) << 1) - 2 |
+        SQLITE_IOCAP_SEQUENTIAL |     /* The ram filesystem has no write behind
+                                      ** so it is ordered */
+        0;
+    }else{
+      pFile->deviceCharacteristics =
+        SQLITE_IOCAP_ATOMIC512 |      /* blocks are atomic */
+        SQLITE_IOCAP_SAFE_APPEND |    /* growing the file does not occur until
+                                      ** the write succeeds */
+        0;
+    }
+  }
+  /* Last chance verification.  If the sector size isn't a multiple of 512
+  ** then it isn't valid.*/
+  if( pFile->sectorSize % 512 != 0 ){
+    pFile->deviceCharacteristics = 0;
+    pFile->sectorSize = SQLITE_DEFAULT_SECTOR_SIZE;
+  }
+}
+#endif
+
+/*
+** Return the sector size in bytes of the underlying block device for
+** the specified file. This is almost always 512 bytes, but may be
+** larger for some devices.
+**
+** SQLite code assumes this function cannot fail. It also assumes that
+** if two files are created in the same file-system directory (i.e.
+** a database and its journal file) that the sector size will be the
+** same for both.
+*/
+static int unixSectorSize(sqlite3_file *id){
+  unixFile *pFd = (unixFile*)id;
+  setDeviceCharacteristics(pFd);
+  return pFd->sectorSize;
+}
+
+/*
+** Return the device characteristics for the file.
+**
+** This VFS is set up to return SQLITE_IOCAP_POWERSAFE_OVERWRITE by default.
+** However, that choice is controversial since technically the underlying
+** file system does not always provide powersafe overwrites.  (In other
+** words, after a power-loss event, parts of the file that were never
+** written might end up being altered.)  However, non-PSOW behavior is very,
+** very rare.  And asserting PSOW makes a large reduction in the amount
+** of required I/O for journaling, since a lot of padding is eliminated.
+**  Hence, while POWERSAFE_OVERWRITE is on by default, there is a file-control
+** available to turn it off and URI query parameter available to turn it off.
+*/
+static int unixDeviceCharacteristics(sqlite3_file *id){
+  unixFile *pFd = (unixFile*)id;
+  setDeviceCharacteristics(pFd);
+  return pFd->deviceCharacteristics;
+}
+
+#if !defined(SQLITE_OMIT_WAL) || SQLITE_MAX_MMAP_SIZE>0
+
+/*
+** Return the system page size.
+**
+** This function should not be called directly by other code in this file.
+** Instead, it should be called via macro osGetpagesize().
+*/
+static int unixGetpagesize(void){
+#if OS_VXWORKS
+  return 1024;
+#elif defined(_BSD_SOURCE)
+  return getpagesize();
+#else
+  return (int)sysconf(_SC_PAGESIZE);
+#endif
+}
+
+#endif /* !defined(SQLITE_OMIT_WAL) || SQLITE_MAX_MMAP_SIZE>0 */
+
+#ifndef SQLITE_OMIT_WAL
+
+/*
+** Object used to represent an shared memory buffer.
+**
+** When multiple threads all reference the same wal-index, each thread
+** has its own unixShm object, but they all point to a single instance
+** of this unixShmNode object.  In other words, each wal-index is opened
+** only once per process.
+**
+** Each unixShmNode object is connected to a single unixInodeInfo object.
+** We could coalesce this object into unixInodeInfo, but that would mean
+** every open file that does not use shared memory (in other words, most
+** open files) would have to carry around this extra information.  So
+** the unixInodeInfo object contains a pointer to this unixShmNode object
+** and the unixShmNode object is created only when needed.
+**
+** unixMutexHeld() must be true whe
