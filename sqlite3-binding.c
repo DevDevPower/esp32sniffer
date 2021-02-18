@@ -39940,4 +39940,167 @@ static int unixShmRegionPerMap(void){
 ** by VFS shared-memory methods.
 */
 static void unixShmPurge(unixFile *pFd){
-  unixShmNode *p =
+  unixShmNode *p = pFd->pInode->pShmNode;
+  assert( unixMutexHeld() );
+  if( p && ALWAYS(p->nRef==0) ){
+    int nShmPerMap = unixShmRegionPerMap();
+    int i;
+    assert( p->pInode==pFd->pInode );
+    sqlite3_mutex_free(p->pShmMutex);
+    for(i=0; i<p->nRegion; i+=nShmPerMap){
+      if( p->hShm>=0 ){
+        osMunmap(p->apRegion[i], p->szRegion);
+      }else{
+        sqlite3_free(p->apRegion[i]);
+      }
+    }
+    sqlite3_free(p->apRegion);
+    if( p->hShm>=0 ){
+      robust_close(pFd, p->hShm, __LINE__);
+      p->hShm = -1;
+    }
+    p->pInode->pShmNode = 0;
+    sqlite3_free(p);
+  }
+}
+
+/*
+** The DMS lock has not yet been taken on shm file pShmNode. Attempt to
+** take it now. Return SQLITE_OK if successful, or an SQLite error
+** code otherwise.
+**
+** If the DMS cannot be locked because this is a readonly_shm=1
+** connection and no other process already holds a lock, return
+** SQLITE_READONLY_CANTINIT and set pShmNode->isUnlocked=1.
+*/
+static int unixLockSharedMemory(unixFile *pDbFd, unixShmNode *pShmNode){
+  struct flock lock;
+  int rc = SQLITE_OK;
+
+  /* Use F_GETLK to determine the locks other processes are holding
+  ** on the DMS byte. If it indicates that another process is holding
+  ** a SHARED lock, then this process may also take a SHARED lock
+  ** and proceed with opening the *-shm file.
+  **
+  ** Or, if no other process is holding any lock, then this process
+  ** is the first to open it. In this case take an EXCLUSIVE lock on the
+  ** DMS byte and truncate the *-shm file to zero bytes in size. Then
+  ** downgrade to a SHARED lock on the DMS byte.
+  **
+  ** If another process is holding an EXCLUSIVE lock on the DMS byte,
+  ** return SQLITE_BUSY to the caller (it will try again). An earlier
+  ** version of this code attempted the SHARED lock at this point. But
+  ** this introduced a subtle race condition: if the process holding
+  ** EXCLUSIVE failed just before truncating the *-shm file, then this
+  ** process might open and use the *-shm file without truncating it.
+  ** And if the *-shm file has been corrupted by a power failure or
+  ** system crash, the database itself may also become corrupt.  */
+  lock.l_whence = SEEK_SET;
+  lock.l_start = UNIX_SHM_DMS;
+  lock.l_len = 1;
+  lock.l_type = F_WRLCK;
+  if( osFcntl(pShmNode->hShm, F_GETLK, &lock)!=0 ) {
+    rc = SQLITE_IOERR_LOCK;
+  }else if( lock.l_type==F_UNLCK ){
+    if( pShmNode->isReadonly ){
+      pShmNode->isUnlocked = 1;
+      rc = SQLITE_READONLY_CANTINIT;
+    }else{
+      rc = unixShmSystemLock(pDbFd, F_WRLCK, UNIX_SHM_DMS, 1);
+      /* The first connection to attach must truncate the -shm file.  We
+      ** truncate to 3 bytes (an arbitrary small number, less than the
+      ** -shm header size) rather than 0 as a system debugging aid, to
+      ** help detect if a -shm file truncation is legitimate or is the work
+      ** or a rogue process. */
+      if( rc==SQLITE_OK && robust_ftruncate(pShmNode->hShm, 3) ){
+        rc = unixLogError(SQLITE_IOERR_SHMOPEN,"ftruncate",pShmNode->zFilename);
+      }
+    }
+  }else if( lock.l_type==F_WRLCK ){
+    rc = SQLITE_BUSY;
+  }
+
+  if( rc==SQLITE_OK ){
+    assert( lock.l_type==F_UNLCK || lock.l_type==F_RDLCK );
+    rc = unixShmSystemLock(pDbFd, F_RDLCK, UNIX_SHM_DMS, 1);
+  }
+  return rc;
+}
+
+/*
+** Open a shared-memory area associated with open database file pDbFd.
+** This particular implementation uses mmapped files.
+**
+** The file used to implement shared-memory is in the same directory
+** as the open database file and has the same name as the open database
+** file with the "-shm" suffix added.  For example, if the database file
+** is "/home/user1/config.db" then the file that is created and mmapped
+** for shared memory will be called "/home/user1/config.db-shm".
+**
+** Another approach to is to use files in /dev/shm or /dev/tmp or an
+** some other tmpfs mount. But if a file in a different directory
+** from the database file is used, then differing access permissions
+** or a chroot() might cause two different processes on the same
+** database to end up using different files for shared memory -
+** meaning that their memory would not really be shared - resulting
+** in database corruption.  Nevertheless, this tmpfs file usage
+** can be enabled at compile-time using -DSQLITE_SHM_DIRECTORY="/dev/shm"
+** or the equivalent.  The use of the SQLITE_SHM_DIRECTORY compile-time
+** option results in an incompatible build of SQLite;  builds of SQLite
+** that with differing SQLITE_SHM_DIRECTORY settings attempt to use the
+** same database file at the same time, database corruption will likely
+** result. The SQLITE_SHM_DIRECTORY compile-time option is considered
+** "unsupported" and may go away in a future SQLite release.
+**
+** When opening a new shared-memory file, if no other instances of that
+** file are currently open, in this process or in other processes, then
+** the file must be truncated to zero length or have its header cleared.
+**
+** If the original database file (pDbFd) is using the "unix-excl" VFS
+** that means that an exclusive lock is held on the database file and
+** that no other processes are able to read or write the database.  In
+** that case, we do not really need shared memory.  No shared memory
+** file is created.  The shared memory will be simulated with heap memory.
+*/
+static int unixOpenSharedMemory(unixFile *pDbFd){
+  struct unixShm *p = 0;          /* The connection to be opened */
+  struct unixShmNode *pShmNode;   /* The underlying mmapped file */
+  int rc = SQLITE_OK;             /* Result code */
+  unixInodeInfo *pInode;          /* The inode of fd */
+  char *zShm;             /* Name of the file used for SHM */
+  int nShmFilename;               /* Size of the SHM filename in bytes */
+
+  /* Allocate space for the new unixShm object. */
+  p = sqlite3_malloc64( sizeof(*p) );
+  if( p==0 ) return SQLITE_NOMEM_BKPT;
+  memset(p, 0, sizeof(*p));
+  assert( pDbFd->pShm==0 );
+
+  /* Check to see if a unixShmNode object already exists. Reuse an existing
+  ** one if present. Create a new one if necessary.
+  */
+  assert( unixFileMutexNotheld(pDbFd) );
+  unixEnterMutex();
+  pInode = pDbFd->pInode;
+  pShmNode = pInode->pShmNode;
+  if( pShmNode==0 ){
+    struct stat sStat;                 /* fstat() info for database file */
+#ifndef SQLITE_SHM_DIRECTORY
+    const char *zBasePath = pDbFd->zPath;
+#endif
+
+    /* Call fstat() to figure out the permissions on the database file. If
+    ** a new *-shm file is created, an attempt will be made to create it
+    ** with the same permissions.
+    */
+    if( osFstat(pDbFd->h, &sStat) ){
+      rc = SQLITE_IOERR_FSTAT;
+      goto shm_open_err;
+    }
+
+#ifdef SQLITE_SHM_DIRECTORY
+    nShmFilename = sizeof(SQLITE_SHM_DIRECTORY) + 31;
+#else
+    nShmFilename = 6 + (int)strlen(zBasePath);
+#endif
+    pShmNode = sqlite3_malloc64( sizeof(*pShmNode) + nShm
