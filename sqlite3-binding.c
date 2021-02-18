@@ -39738,4 +39738,206 @@ static int unixGetpagesize(void){
 ** the unixInodeInfo object contains a pointer to this unixShmNode object
 ** and the unixShmNode object is created only when needed.
 **
-** unixMutexHeld() must be true whe
+** unixMutexHeld() must be true when creating or destroying
+** this object or while reading or writing the following fields:
+**
+**      nRef
+**
+** The following fields are read-only after the object is created:
+**
+**      hShm
+**      zFilename
+**
+** Either unixShmNode.pShmMutex must be held or unixShmNode.nRef==0 and
+** unixMutexHeld() is true when reading or writing any other field
+** in this structure.
+*/
+struct unixShmNode {
+  unixInodeInfo *pInode;     /* unixInodeInfo that owns this SHM node */
+  sqlite3_mutex *pShmMutex;  /* Mutex to access this object */
+  char *zFilename;           /* Name of the mmapped file */
+  int hShm;                  /* Open file descriptor */
+  int szRegion;              /* Size of shared-memory regions */
+  u16 nRegion;               /* Size of array apRegion */
+  u8 isReadonly;             /* True if read-only */
+  u8 isUnlocked;             /* True if no DMS lock held */
+  char **apRegion;           /* Array of mapped shared-memory regions */
+  int nRef;                  /* Number of unixShm objects pointing to this */
+  unixShm *pFirst;           /* All unixShm objects pointing to this */
+  int aLock[SQLITE_SHM_NLOCK];  /* # shared locks on slot, -1==excl lock */
+#ifdef SQLITE_DEBUG
+  u8 exclMask;               /* Mask of exclusive locks held */
+  u8 sharedMask;             /* Mask of shared locks held */
+  u8 nextShmId;              /* Next available unixShm.id value */
+#endif
+};
+
+/*
+** Structure used internally by this VFS to record the state of an
+** open shared memory connection.
+**
+** The following fields are initialized when this object is created and
+** are read-only thereafter:
+**
+**    unixShm.pShmNode
+**    unixShm.id
+**
+** All other fields are read/write.  The unixShm.pShmNode->pShmMutex must
+** be held while accessing any read/write fields.
+*/
+struct unixShm {
+  unixShmNode *pShmNode;     /* The underlying unixShmNode object */
+  unixShm *pNext;            /* Next unixShm with the same unixShmNode */
+  u8 hasMutex;               /* True if holding the unixShmNode->pShmMutex */
+  u8 id;                     /* Id of this connection within its unixShmNode */
+  u16 sharedMask;            /* Mask of shared locks held */
+  u16 exclMask;              /* Mask of exclusive locks held */
+};
+
+/*
+** Constants used for locking
+*/
+#define UNIX_SHM_BASE   ((22+SQLITE_SHM_NLOCK)*4)         /* first lock byte */
+#define UNIX_SHM_DMS    (UNIX_SHM_BASE+SQLITE_SHM_NLOCK)  /* deadman switch */
+
+/*
+** Use F_GETLK to check whether or not there are any readers with open
+** wal-mode transactions in other processes on database file pFile. If
+** no error occurs, return SQLITE_OK and set (*piOut) to 1 if there are
+** such transactions, or 0 otherwise. If an error occurs, return an
+** SQLite error code. The final value of *piOut is undefined in this
+** case.
+*/
+static int unixFcntlExternalReader(unixFile *pFile, int *piOut){
+  int rc = SQLITE_OK;
+  *piOut = 0;
+  if( pFile->pShm){
+    unixShmNode *pShmNode = pFile->pShm->pShmNode;
+    struct flock f;
+
+    memset(&f, 0, sizeof(f));
+    f.l_type = F_WRLCK;
+    f.l_whence = SEEK_SET;
+    f.l_start = UNIX_SHM_BASE + 3;
+    f.l_len = SQLITE_SHM_NLOCK - 3;
+
+    sqlite3_mutex_enter(pShmNode->pShmMutex);
+    if( osFcntl(pShmNode->hShm, F_GETLK, &f)<0 ){
+      rc = SQLITE_IOERR_LOCK;
+    }else{
+      *piOut = (f.l_type!=F_UNLCK);
+    }
+    sqlite3_mutex_leave(pShmNode->pShmMutex);
+  }
+
+  return rc;
+}
+
+
+/*
+** Apply posix advisory locks for all bytes from ofst through ofst+n-1.
+**
+** Locks block if the mask is exactly UNIX_SHM_C and are non-blocking
+** otherwise.
+*/
+static int unixShmSystemLock(
+  unixFile *pFile,       /* Open connection to the WAL file */
+  int lockType,          /* F_UNLCK, F_RDLCK, or F_WRLCK */
+  int ofst,              /* First byte of the locking range */
+  int n                  /* Number of bytes to lock */
+){
+  unixShmNode *pShmNode; /* Apply locks to this open shared-memory segment */
+  struct flock f;        /* The posix advisory locking structure */
+  int rc = SQLITE_OK;    /* Result code form fcntl() */
+
+  /* Access to the unixShmNode object is serialized by the caller */
+  pShmNode = pFile->pInode->pShmNode;
+  assert( pShmNode->nRef==0 || sqlite3_mutex_held(pShmNode->pShmMutex) );
+  assert( pShmNode->nRef>0 || unixMutexHeld() );
+
+  /* Shared locks never span more than one byte */
+  assert( n==1 || lockType!=F_RDLCK );
+
+  /* Locks are within range */
+  assert( n>=1 && n<=SQLITE_SHM_NLOCK );
+
+  if( pShmNode->hShm>=0 ){
+    int res;
+    /* Initialize the locking parameters */
+    f.l_type = lockType;
+    f.l_whence = SEEK_SET;
+    f.l_start = ofst;
+    f.l_len = n;
+    res = osSetPosixAdvisoryLock(pShmNode->hShm, &f, pFile);
+    if( res==-1 ){
+#ifdef SQLITE_ENABLE_SETLK_TIMEOUT
+      rc = (pFile->iBusyTimeout ? SQLITE_BUSY_TIMEOUT : SQLITE_BUSY);
+#else
+      rc = SQLITE_BUSY;
+#endif
+    }
+  }
+
+  /* Update the global lock state and do debug tracing */
+#ifdef SQLITE_DEBUG
+  { u16 mask;
+  OSTRACE(("SHM-LOCK "));
+  mask = ofst>31 ? 0xffff : (1<<(ofst+n)) - (1<<ofst);
+  if( rc==SQLITE_OK ){
+    if( lockType==F_UNLCK ){
+      OSTRACE(("unlock %d ok", ofst));
+      pShmNode->exclMask &= ~mask;
+      pShmNode->sharedMask &= ~mask;
+    }else if( lockType==F_RDLCK ){
+      OSTRACE(("read-lock %d ok", ofst));
+      pShmNode->exclMask &= ~mask;
+      pShmNode->sharedMask |= mask;
+    }else{
+      assert( lockType==F_WRLCK );
+      OSTRACE(("write-lock %d ok", ofst));
+      pShmNode->exclMask |= mask;
+      pShmNode->sharedMask &= ~mask;
+    }
+  }else{
+    if( lockType==F_UNLCK ){
+      OSTRACE(("unlock %d failed", ofst));
+    }else if( lockType==F_RDLCK ){
+      OSTRACE(("read-lock failed"));
+    }else{
+      assert( lockType==F_WRLCK );
+      OSTRACE(("write-lock %d failed", ofst));
+    }
+  }
+  OSTRACE((" - afterwards %03x,%03x\n",
+           pShmNode->sharedMask, pShmNode->exclMask));
+  }
+#endif
+
+  return rc;
+}
+
+/*
+** Return the minimum number of 32KB shm regions that should be mapped at
+** a time, assuming that each mapping must be an integer multiple of the
+** current system page-size.
+**
+** Usually, this is 1. The exception seems to be systems that are configured
+** to use 64KB pages - in this case each mapping must cover at least two
+** shm regions.
+*/
+static int unixShmRegionPerMap(void){
+  int shmsz = 32*1024;            /* SHM region size */
+  int pgsz = osGetpagesize();   /* System page size */
+  assert( ((pgsz-1)&pgsz)==0 );   /* Page size must be a power of 2 */
+  if( pgsz<shmsz ) return 1;
+  return pgsz/shmsz;
+}
+
+/*
+** Purge the unixShmNodeList list of all entries with unixShmNode.nRef==0.
+**
+** This is not a VFS shared-memory method; it is a utility function called
+** by VFS shared-memory methods.
+*/
+static void unixShmPurge(unixFile *pFd){
+  unixShmNode *p =
