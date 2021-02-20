@@ -40103,4 +40103,183 @@ static int unixOpenSharedMemory(unixFile *pDbFd){
 #else
     nShmFilename = 6 + (int)strlen(zBasePath);
 #endif
-    pShmNode = sqlite3_malloc64( sizeof(*pShmNode) + nShm
+    pShmNode = sqlite3_malloc64( sizeof(*pShmNode) + nShmFilename );
+    if( pShmNode==0 ){
+      rc = SQLITE_NOMEM_BKPT;
+      goto shm_open_err;
+    }
+    memset(pShmNode, 0, sizeof(*pShmNode)+nShmFilename);
+    zShm = pShmNode->zFilename = (char*)&pShmNode[1];
+#ifdef SQLITE_SHM_DIRECTORY
+    sqlite3_snprintf(nShmFilename, zShm,
+                     SQLITE_SHM_DIRECTORY "/sqlite-shm-%x-%x",
+                     (u32)sStat.st_ino, (u32)sStat.st_dev);
+#else
+    sqlite3_snprintf(nShmFilename, zShm, "%s-shm", zBasePath);
+    sqlite3FileSuffix3(pDbFd->zPath, zShm);
+#endif
+    pShmNode->hShm = -1;
+    pDbFd->pInode->pShmNode = pShmNode;
+    pShmNode->pInode = pDbFd->pInode;
+    if( sqlite3GlobalConfig.bCoreMutex ){
+      pShmNode->pShmMutex = sqlite3_mutex_alloc(SQLITE_MUTEX_FAST);
+      if( pShmNode->pShmMutex==0 ){
+        rc = SQLITE_NOMEM_BKPT;
+        goto shm_open_err;
+      }
+    }
+
+    if( pInode->bProcessLock==0 ){
+      if( 0==sqlite3_uri_boolean(pDbFd->zPath, "readonly_shm", 0) ){
+        pShmNode->hShm = robust_open(zShm, O_RDWR|O_CREAT|O_NOFOLLOW,
+                                     (sStat.st_mode&0777));
+      }
+      if( pShmNode->hShm<0 ){
+        pShmNode->hShm = robust_open(zShm, O_RDONLY|O_NOFOLLOW,
+                                     (sStat.st_mode&0777));
+        if( pShmNode->hShm<0 ){
+          rc = unixLogError(SQLITE_CANTOPEN_BKPT, "open", zShm);
+          goto shm_open_err;
+        }
+        pShmNode->isReadonly = 1;
+      }
+
+      /* If this process is running as root, make sure that the SHM file
+      ** is owned by the same user that owns the original database.  Otherwise,
+      ** the original owner will not be able to connect.
+      */
+      robustFchown(pShmNode->hShm, sStat.st_uid, sStat.st_gid);
+
+      rc = unixLockSharedMemory(pDbFd, pShmNode);
+      if( rc!=SQLITE_OK && rc!=SQLITE_READONLY_CANTINIT ) goto shm_open_err;
+    }
+  }
+
+  /* Make the new connection a child of the unixShmNode */
+  p->pShmNode = pShmNode;
+#ifdef SQLITE_DEBUG
+  p->id = pShmNode->nextShmId++;
+#endif
+  pShmNode->nRef++;
+  pDbFd->pShm = p;
+  unixLeaveMutex();
+
+  /* The reference count on pShmNode has already been incremented under
+  ** the cover of the unixEnterMutex() mutex and the pointer from the
+  ** new (struct unixShm) object to the pShmNode has been set. All that is
+  ** left to do is to link the new object into the linked list starting
+  ** at pShmNode->pFirst. This must be done while holding the
+  ** pShmNode->pShmMutex.
+  */
+  sqlite3_mutex_enter(pShmNode->pShmMutex);
+  p->pNext = pShmNode->pFirst;
+  pShmNode->pFirst = p;
+  sqlite3_mutex_leave(pShmNode->pShmMutex);
+  return rc;
+
+  /* Jump here on any error */
+shm_open_err:
+  unixShmPurge(pDbFd);       /* This call frees pShmNode if required */
+  sqlite3_free(p);
+  unixLeaveMutex();
+  return rc;
+}
+
+/*
+** This function is called to obtain a pointer to region iRegion of the
+** shared-memory associated with the database file fd. Shared-memory regions
+** are numbered starting from zero. Each shared-memory region is szRegion
+** bytes in size.
+**
+** If an error occurs, an error code is returned and *pp is set to NULL.
+**
+** Otherwise, if the bExtend parameter is 0 and the requested shared-memory
+** region has not been allocated (by any client, including one running in a
+** separate process), then *pp is set to NULL and SQLITE_OK returned. If
+** bExtend is non-zero and the requested shared-memory region has not yet
+** been allocated, it is allocated by this function.
+**
+** If the shared-memory region has already been allocated or is allocated by
+** this call as described above, then it is mapped into this processes
+** address space (if it is not already), *pp is set to point to the mapped
+** memory and SQLITE_OK returned.
+*/
+static int unixShmMap(
+  sqlite3_file *fd,               /* Handle open on database file */
+  int iRegion,                    /* Region to retrieve */
+  int szRegion,                   /* Size of regions */
+  int bExtend,                    /* True to extend file if necessary */
+  void volatile **pp              /* OUT: Mapped memory */
+){
+  unixFile *pDbFd = (unixFile*)fd;
+  unixShm *p;
+  unixShmNode *pShmNode;
+  int rc = SQLITE_OK;
+  int nShmPerMap = unixShmRegionPerMap();
+  int nReqRegion;
+
+  /* If the shared-memory file has not yet been opened, open it now. */
+  if( pDbFd->pShm==0 ){
+    rc = unixOpenSharedMemory(pDbFd);
+    if( rc!=SQLITE_OK ) return rc;
+  }
+
+  p = pDbFd->pShm;
+  pShmNode = p->pShmNode;
+  sqlite3_mutex_enter(pShmNode->pShmMutex);
+  if( pShmNode->isUnlocked ){
+    rc = unixLockSharedMemory(pDbFd, pShmNode);
+    if( rc!=SQLITE_OK ) goto shmpage_out;
+    pShmNode->isUnlocked = 0;
+  }
+  assert( szRegion==pShmNode->szRegion || pShmNode->nRegion==0 );
+  assert( pShmNode->pInode==pDbFd->pInode );
+  assert( pShmNode->hShm>=0 || pDbFd->pInode->bProcessLock==1 );
+  assert( pShmNode->hShm<0 || pDbFd->pInode->bProcessLock==0 );
+
+  /* Minimum number of regions required to be mapped. */
+  nReqRegion = ((iRegion+nShmPerMap) / nShmPerMap) * nShmPerMap;
+
+  if( pShmNode->nRegion<nReqRegion ){
+    char **apNew;                      /* New apRegion[] array */
+    int nByte = nReqRegion*szRegion;   /* Minimum required file size */
+    struct stat sStat;                 /* Used by fstat() */
+
+    pShmNode->szRegion = szRegion;
+
+    if( pShmNode->hShm>=0 ){
+      /* The requested region is not mapped into this processes address space.
+      ** Check to see if it has been allocated (i.e. if the wal-index file is
+      ** large enough to contain the requested region).
+      */
+      if( osFstat(pShmNode->hShm, &sStat) ){
+        rc = SQLITE_IOERR_SHMSIZE;
+        goto shmpage_out;
+      }
+
+      if( sStat.st_size<nByte ){
+        /* The requested memory region does not exist. If bExtend is set to
+        ** false, exit early. *pp will be set to NULL and SQLITE_OK returned.
+        */
+        if( !bExtend ){
+          goto shmpage_out;
+        }
+
+        /* Alternatively, if bExtend is true, extend the file. Do this by
+        ** writing a single byte to the end of each (OS) page being
+        ** allocated or extended. Technically, we need only write to the
+        ** last page in order to extend the file. But writing to all new
+        ** pages forces the OS to allocate them immediately, which reduces
+        ** the chances of SIGBUS while accessing the mapped region later on.
+        */
+        else{
+          static const int pgsz = 4096;
+          int iPg;
+
+          /* Write to the last byte of each newly allocated or extended page */
+          assert( (nByte % pgsz)==0 );
+          for(iPg=(sStat.st_size/pgsz); iPg<(nByte/pgsz); iPg++){
+            int x = 0;
+            if( seekAndWriteFd(pShmNode->hShm, iPg*pgsz + pgsz-1,"",1,&x)!=1 ){
+              const char *zFile = pShmNode->zFilename;
+              rc = uni
