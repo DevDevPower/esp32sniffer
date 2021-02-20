@@ -40282,4 +40282,213 @@ static int unixShmMap(
             int x = 0;
             if( seekAndWriteFd(pShmNode->hShm, iPg*pgsz + pgsz-1,"",1,&x)!=1 ){
               const char *zFile = pShmNode->zFilename;
-              rc = uni
+              rc = unixLogError(SQLITE_IOERR_SHMSIZE, "write", zFile);
+              goto shmpage_out;
+            }
+          }
+        }
+      }
+    }
+
+    /* Map the requested memory region into this processes address space. */
+    apNew = (char **)sqlite3_realloc(
+        pShmNode->apRegion, nReqRegion*sizeof(char *)
+    );
+    if( !apNew ){
+      rc = SQLITE_IOERR_NOMEM_BKPT;
+      goto shmpage_out;
+    }
+    pShmNode->apRegion = apNew;
+    while( pShmNode->nRegion<nReqRegion ){
+      int nMap = szRegion*nShmPerMap;
+      int i;
+      void *pMem;
+      if( pShmNode->hShm>=0 ){
+        pMem = osMmap(0, nMap,
+            pShmNode->isReadonly ? PROT_READ : PROT_READ|PROT_WRITE,
+            MAP_SHARED, pShmNode->hShm, szRegion*(i64)pShmNode->nRegion
+        );
+        if( pMem==MAP_FAILED ){
+          rc = unixLogError(SQLITE_IOERR_SHMMAP, "mmap", pShmNode->zFilename);
+          goto shmpage_out;
+        }
+      }else{
+        pMem = sqlite3_malloc64(nMap);
+        if( pMem==0 ){
+          rc = SQLITE_NOMEM_BKPT;
+          goto shmpage_out;
+        }
+        memset(pMem, 0, nMap);
+      }
+
+      for(i=0; i<nShmPerMap; i++){
+        pShmNode->apRegion[pShmNode->nRegion+i] = &((char*)pMem)[szRegion*i];
+      }
+      pShmNode->nRegion += nShmPerMap;
+    }
+  }
+
+shmpage_out:
+  if( pShmNode->nRegion>iRegion ){
+    *pp = pShmNode->apRegion[iRegion];
+  }else{
+    *pp = 0;
+  }
+  if( pShmNode->isReadonly && rc==SQLITE_OK ) rc = SQLITE_READONLY;
+  sqlite3_mutex_leave(pShmNode->pShmMutex);
+  return rc;
+}
+
+/*
+** Check that the pShmNode->aLock[] array comports with the locking bitmasks
+** held by each client. Return true if it does, or false otherwise. This
+** is to be used in an assert(). e.g.
+**
+**     assert( assertLockingArrayOk(pShmNode) );
+*/
+#ifdef SQLITE_DEBUG
+static int assertLockingArrayOk(unixShmNode *pShmNode){
+  unixShm *pX;
+  int aLock[SQLITE_SHM_NLOCK];
+  assert( sqlite3_mutex_held(pShmNode->pShmMutex) );
+
+  memset(aLock, 0, sizeof(aLock));
+  for(pX=pShmNode->pFirst; pX; pX=pX->pNext){
+    int i;
+    for(i=0; i<SQLITE_SHM_NLOCK; i++){
+      if( pX->exclMask & (1<<i) ){
+        assert( aLock[i]==0 );
+        aLock[i] = -1;
+      }else if( pX->sharedMask & (1<<i) ){
+        assert( aLock[i]>=0 );
+        aLock[i]++;
+      }
+    }
+  }
+
+  assert( 0==memcmp(pShmNode->aLock, aLock, sizeof(aLock)) );
+  return (memcmp(pShmNode->aLock, aLock, sizeof(aLock))==0);
+}
+#endif
+
+/*
+** Change the lock state for a shared-memory segment.
+**
+** Note that the relationship between SHAREd and EXCLUSIVE locks is a little
+** different here than in posix.  In xShmLock(), one can go from unlocked
+** to shared and back or from unlocked to exclusive and back.  But one may
+** not go from shared to exclusive or from exclusive to shared.
+*/
+static int unixShmLock(
+  sqlite3_file *fd,          /* Database file holding the shared memory */
+  int ofst,                  /* First lock to acquire or release */
+  int n,                     /* Number of locks to acquire or release */
+  int flags                  /* What to do with the lock */
+){
+  unixFile *pDbFd = (unixFile*)fd;      /* Connection holding shared memory */
+  unixShm *p;                           /* The shared memory being locked */
+  unixShmNode *pShmNode;                /* The underlying file iNode */
+  int rc = SQLITE_OK;                   /* Result code */
+  u16 mask;                             /* Mask of locks to take or release */
+  int *aLock;
+
+  p = pDbFd->pShm;
+  if( p==0 ) return SQLITE_IOERR_SHMLOCK;
+  pShmNode = p->pShmNode;
+  if( NEVER(pShmNode==0) ) return SQLITE_IOERR_SHMLOCK;
+  aLock = pShmNode->aLock;
+
+  assert( pShmNode==pDbFd->pInode->pShmNode );
+  assert( pShmNode->pInode==pDbFd->pInode );
+  assert( ofst>=0 && ofst+n<=SQLITE_SHM_NLOCK );
+  assert( n>=1 );
+  assert( flags==(SQLITE_SHM_LOCK | SQLITE_SHM_SHARED)
+       || flags==(SQLITE_SHM_LOCK | SQLITE_SHM_EXCLUSIVE)
+       || flags==(SQLITE_SHM_UNLOCK | SQLITE_SHM_SHARED)
+       || flags==(SQLITE_SHM_UNLOCK | SQLITE_SHM_EXCLUSIVE) );
+  assert( n==1 || (flags & SQLITE_SHM_EXCLUSIVE)!=0 );
+  assert( pShmNode->hShm>=0 || pDbFd->pInode->bProcessLock==1 );
+  assert( pShmNode->hShm<0 || pDbFd->pInode->bProcessLock==0 );
+
+  /* Check that, if this to be a blocking lock, no locks that occur later
+  ** in the following list than the lock being obtained are already held:
+  **
+  **   1. Checkpointer lock (ofst==1).
+  **   2. Write lock (ofst==0).
+  **   3. Read locks (ofst>=3 && ofst<SQLITE_SHM_NLOCK).
+  **
+  ** In other words, if this is a blocking lock, none of the locks that
+  ** occur later in the above list than the lock being obtained may be
+  ** held.
+  **
+  ** It is not permitted to block on the RECOVER lock.
+  */
+#ifdef SQLITE_ENABLE_SETLK_TIMEOUT
+  assert( (flags & SQLITE_SHM_UNLOCK) || pDbFd->iBusyTimeout==0 || (
+         (ofst!=2)                                   /* not RECOVER */
+      && (ofst!=1 || (p->exclMask|p->sharedMask)==0)
+      && (ofst!=0 || (p->exclMask|p->sharedMask)<3)
+      && (ofst<3  || (p->exclMask|p->sharedMask)<(1<<ofst))
+  ));
+#endif
+
+  mask = (1<<(ofst+n)) - (1<<ofst);
+  assert( n>1 || mask==(1<<ofst) );
+  sqlite3_mutex_enter(pShmNode->pShmMutex);
+  assert( assertLockingArrayOk(pShmNode) );
+  if( flags & SQLITE_SHM_UNLOCK ){
+    if( (p->exclMask|p->sharedMask) & mask ){
+      int ii;
+      int bUnlock = 1;
+
+      for(ii=ofst; ii<ofst+n; ii++){
+        if( aLock[ii]>((p->sharedMask & (1<<ii)) ? 1 : 0) ){
+          bUnlock = 0;
+        }
+      }
+
+      if( bUnlock ){
+        rc = unixShmSystemLock(pDbFd, F_UNLCK, ofst+UNIX_SHM_BASE, n);
+        if( rc==SQLITE_OK ){
+          memset(&aLock[ofst], 0, sizeof(int)*n);
+        }
+      }else if( ALWAYS(p->sharedMask & (1<<ofst)) ){
+        assert( n==1 && aLock[ofst]>1 );
+        aLock[ofst]--;
+      }
+
+      /* Undo the local locks */
+      if( rc==SQLITE_OK ){
+        p->exclMask &= ~mask;
+        p->sharedMask &= ~mask;
+      }
+    }
+  }else if( flags & SQLITE_SHM_SHARED ){
+    assert( n==1 );
+    assert( (p->exclMask & (1<<ofst))==0 );
+    if( (p->sharedMask & mask)==0 ){
+      if( aLock[ofst]<0 ){
+        rc = SQLITE_BUSY;
+      }else if( aLock[ofst]==0 ){
+        rc = unixShmSystemLock(pDbFd, F_RDLCK, ofst+UNIX_SHM_BASE, n);
+      }
+
+      /* Get the local shared locks */
+      if( rc==SQLITE_OK ){
+        p->sharedMask |= mask;
+        aLock[ofst]++;
+      }
+    }
+  }else{
+    /* Make sure no sibling connections hold locks that will block this
+    ** lock.  If any do, return SQLITE_BUSY right away.  */
+    int ii;
+    for(ii=ofst; ii<ofst+n; ii++){
+      assert( (p->sharedMask & mask)==0 );
+      if( ALWAYS((p->exclMask & (1<<ii))==0) && aLock[ii] ){
+        rc = SQLITE_BUSY;
+        break;
+      }
+    }
+
+    /* Get the exclusive locks at the system level. T
