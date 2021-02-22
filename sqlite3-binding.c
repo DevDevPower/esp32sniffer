@@ -40706,4 +40706,169 @@ static void unixRemapfile(
 ** created mapping is either the requested size or the value configured
 ** using SQLITE_FCNTL_MMAP_LIMIT, whichever is smaller.
 **
-** SQLITE_OK is returned if no error occurs (even if 
+** SQLITE_OK is returned if no error occurs (even if the mapping is not
+** recreated as a result of outstanding references) or an SQLite error
+** code otherwise.
+*/
+static int unixMapfile(unixFile *pFd, i64 nMap){
+  assert( nMap>=0 || pFd->nFetchOut==0 );
+  assert( nMap>0 || (pFd->mmapSize==0 && pFd->pMapRegion==0) );
+  if( pFd->nFetchOut>0 ) return SQLITE_OK;
+
+  if( nMap<0 ){
+    struct stat statbuf;          /* Low-level file information */
+    if( osFstat(pFd->h, &statbuf) ){
+      return SQLITE_IOERR_FSTAT;
+    }
+    nMap = statbuf.st_size;
+  }
+  if( nMap>pFd->mmapSizeMax ){
+    nMap = pFd->mmapSizeMax;
+  }
+
+  assert( nMap>0 || (pFd->mmapSize==0 && pFd->pMapRegion==0) );
+  if( nMap!=pFd->mmapSize ){
+    unixRemapfile(pFd, nMap);
+  }
+
+  return SQLITE_OK;
+}
+#endif /* SQLITE_MAX_MMAP_SIZE>0 */
+
+/*
+** If possible, return a pointer to a mapping of file fd starting at offset
+** iOff. The mapping must be valid for at least nAmt bytes.
+**
+** If such a pointer can be obtained, store it in *pp and return SQLITE_OK.
+** Or, if one cannot but no error occurs, set *pp to 0 and return SQLITE_OK.
+** Finally, if an error does occur, return an SQLite error code. The final
+** value of *pp is undefined in this case.
+**
+** If this function does return a pointer, the caller must eventually
+** release the reference by calling unixUnfetch().
+*/
+static int unixFetch(sqlite3_file *fd, i64 iOff, int nAmt, void **pp){
+#if SQLITE_MAX_MMAP_SIZE>0
+  unixFile *pFd = (unixFile *)fd;   /* The underlying database file */
+#endif
+  *pp = 0;
+
+#if SQLITE_MAX_MMAP_SIZE>0
+  if( pFd->mmapSizeMax>0 ){
+    if( pFd->pMapRegion==0 ){
+      int rc = unixMapfile(pFd, -1);
+      if( rc!=SQLITE_OK ) return rc;
+    }
+    if( pFd->mmapSize >= iOff+nAmt ){
+      *pp = &((u8 *)pFd->pMapRegion)[iOff];
+      pFd->nFetchOut++;
+    }
+  }
+#endif
+  return SQLITE_OK;
+}
+
+/*
+** If the third argument is non-NULL, then this function releases a
+** reference obtained by an earlier call to unixFetch(). The second
+** argument passed to this function must be the same as the corresponding
+** argument that was passed to the unixFetch() invocation.
+**
+** Or, if the third argument is NULL, then this function is being called
+** to inform the VFS layer that, according to POSIX, any existing mapping
+** may now be invalid and should be unmapped.
+*/
+static int unixUnfetch(sqlite3_file *fd, i64 iOff, void *p){
+#if SQLITE_MAX_MMAP_SIZE>0
+  unixFile *pFd = (unixFile *)fd;   /* The underlying database file */
+  UNUSED_PARAMETER(iOff);
+
+  /* If p==0 (unmap the entire file) then there must be no outstanding
+  ** xFetch references. Or, if p!=0 (meaning it is an xFetch reference),
+  ** then there must be at least one outstanding.  */
+  assert( (p==0)==(pFd->nFetchOut==0) );
+
+  /* If p!=0, it must match the iOff value. */
+  assert( p==0 || p==&((u8 *)pFd->pMapRegion)[iOff] );
+
+  if( p ){
+    pFd->nFetchOut--;
+  }else{
+    unixUnmapfile(pFd);
+  }
+
+  assert( pFd->nFetchOut>=0 );
+#else
+  UNUSED_PARAMETER(fd);
+  UNUSED_PARAMETER(p);
+  UNUSED_PARAMETER(iOff);
+#endif
+  return SQLITE_OK;
+}
+
+/*
+** Here ends the implementation of all sqlite3_file methods.
+**
+********************** End sqlite3_file Methods *******************************
+******************************************************************************/
+
+/*
+** This division contains definitions of sqlite3_io_methods objects that
+** implement various file locking strategies.  It also contains definitions
+** of "finder" functions.  A finder-function is used to locate the appropriate
+** sqlite3_io_methods object for a particular database file.  The pAppData
+** field of the sqlite3_vfs VFS objects are initialized to be pointers to
+** the correct finder-function for that VFS.
+**
+** Most finder functions return a pointer to a fixed sqlite3_io_methods
+** object.  The only interesting finder-function is autolockIoFinder, which
+** looks at the filesystem type and tries to guess the best locking
+** strategy from that.
+**
+** For finder-function F, two objects are created:
+**
+**    (1) The real finder-function named "FImpt()".
+**
+**    (2) A constant pointer to this function named just "F".
+**
+**
+** A pointer to the F pointer is used as the pAppData value for VFS
+** objects.  We have to do this instead of letting pAppData point
+** directly at the finder-function since C90 rules prevent a void*
+** from be cast into a function pointer.
+**
+**
+** Each instance of this macro generates two objects:
+**
+**   *  A constant sqlite3_io_methods object call METHOD that has locking
+**      methods CLOSE, LOCK, UNLOCK, CKRESLOCK.
+**
+**   *  An I/O method finder function called FINDER that returns a pointer
+**      to the METHOD object in the previous bullet.
+*/
+#define IOMETHODS(FINDER,METHOD,VERSION,CLOSE,LOCK,UNLOCK,CKLOCK,SHMMAP)     \
+static const sqlite3_io_methods METHOD = {                                   \
+   VERSION,                    /* iVersion */                                \
+   CLOSE,                      /* xClose */                                  \
+   unixRead,                   /* xRead */                                   \
+   unixWrite,                  /* xWrite */                                  \
+   unixTruncate,               /* xTruncate */                               \
+   unixSync,                   /* xSync */                                   \
+   unixFileSize,               /* xFileSize */                               \
+   LOCK,                       /* xLock */                                   \
+   UNLOCK,                     /* xUnlock */                                 \
+   CKLOCK,                     /* xCheckReservedLock */                      \
+   unixFileControl,            /* xFileControl */                            \
+   unixSectorSize,             /* xSectorSize */                             \
+   unixDeviceCharacteristics,  /* xDeviceCapabilities */                     \
+   SHMMAP,                     /* xShmMap */                                 \
+   unixShmLock,                /* xShmLock */                                \
+   unixShmBarrier,             /* xShmBarrier */                             \
+   unixShmUnmap,               /* xShmUnmap */                               \
+   unixFetch,                  /* xFetch */                                  \
+   unixUnfetch,                /* xUnfetch */                                \
+};                                                                           \
+static const sqlite3_io_methods *FINDER##Impl(const char *z, unixFile *p){   \
+  UNUSED_PARAMETER(z); UNUSED_PARAMETER(p);                                  \
+  return &METHOD;                                                            \
+}                                                                      
