@@ -40871,4 +40871,174 @@ static const sqlite3_io_methods METHOD = {                                   \
 static const sqlite3_io_methods *FINDER##Impl(const char *z, unixFile *p){   \
   UNUSED_PARAMETER(z); UNUSED_PARAMETER(p);                                  \
   return &METHOD;                                                            \
-}                                                                      
+}                                                                            \
+static const sqlite3_io_methods *(*const FINDER)(const char*,unixFile *p)    \
+    = FINDER##Impl;
+
+/*
+** Here are all of the sqlite3_io_methods objects for each of the
+** locking strategies.  Functions that return pointers to these methods
+** are also created.
+*/
+IOMETHODS(
+  posixIoFinder,            /* Finder function name */
+  posixIoMethods,           /* sqlite3_io_methods object name */
+  3,                        /* shared memory and mmap are enabled */
+  unixClose,                /* xClose method */
+  unixLock,                 /* xLock method */
+  unixUnlock,               /* xUnlock method */
+  unixCheckReservedLock,    /* xCheckReservedLock method */
+  unixShmMap                /* xShmMap method */
+)
+IOMETHODS(
+  nolockIoFinder,           /* Finder function name */
+  nolockIoMethods,          /* sqlite3_io_methods object name */
+  3,                        /* shared memory and mmap are enabled */
+  nolockClose,              /* xClose method */
+  nolockLock,               /* xLock method */
+  nolockUnlock,             /* xUnlock method */
+  nolockCheckReservedLock,  /* xCheckReservedLock method */
+  0                         /* xShmMap method */
+)
+IOMETHODS(
+  dotlockIoFinder,          /* Finder function name */
+  dotlockIoMethods,         /* sqlite3_io_methods object name */
+  1,                        /* shared memory is disabled */
+  dotlockClose,             /* xClose method */
+  dotlockLock,              /* xLock method */
+  dotlockUnlock,            /* xUnlock method */
+  dotlockCheckReservedLock, /* xCheckReservedLock method */
+  0                         /* xShmMap method */
+)
+
+#if SQLITE_ENABLE_LOCKING_STYLE
+IOMETHODS(
+  flockIoFinder,            /* Finder function name */
+  flockIoMethods,           /* sqlite3_io_methods object name */
+  1,                        /* shared memory is disabled */
+  flockClose,               /* xClose method */
+  flockLock,                /* xLock method */
+  flockUnlock,              /* xUnlock method */
+  flockCheckReservedLock,   /* xCheckReservedLock method */
+  0                         /* xShmMap method */
+)
+#endif
+
+#if OS_VXWORKS
+IOMETHODS(
+  semIoFinder,              /* Finder function name */
+  semIoMethods,             /* sqlite3_io_methods object name */
+  1,                        /* shared memory is disabled */
+  semXClose,                /* xClose method */
+  semXLock,                 /* xLock method */
+  semXUnlock,               /* xUnlock method */
+  semXCheckReservedLock,    /* xCheckReservedLock method */
+  0                         /* xShmMap method */
+)
+#endif
+
+#if defined(__APPLE__) && SQLITE_ENABLE_LOCKING_STYLE
+IOMETHODS(
+  afpIoFinder,              /* Finder function name */
+  afpIoMethods,             /* sqlite3_io_methods object name */
+  1,                        /* shared memory is disabled */
+  afpClose,                 /* xClose method */
+  afpLock,                  /* xLock method */
+  afpUnlock,                /* xUnlock method */
+  afpCheckReservedLock,     /* xCheckReservedLock method */
+  0                         /* xShmMap method */
+)
+#endif
+
+/*
+** The proxy locking method is a "super-method" in the sense that it
+** opens secondary file descriptors for the conch and lock files and
+** it uses proxy, dot-file, AFP, and flock() locking methods on those
+** secondary files.  For this reason, the division that implements
+** proxy locking is located much further down in the file.  But we need
+** to go ahead and define the sqlite3_io_methods and finder function
+** for proxy locking here.  So we forward declare the I/O methods.
+*/
+#if defined(__APPLE__) && SQLITE_ENABLE_LOCKING_STYLE
+static int proxyClose(sqlite3_file*);
+static int proxyLock(sqlite3_file*, int);
+static int proxyUnlock(sqlite3_file*, int);
+static int proxyCheckReservedLock(sqlite3_file*, int*);
+IOMETHODS(
+  proxyIoFinder,            /* Finder function name */
+  proxyIoMethods,           /* sqlite3_io_methods object name */
+  1,                        /* shared memory is disabled */
+  proxyClose,               /* xClose method */
+  proxyLock,                /* xLock method */
+  proxyUnlock,              /* xUnlock method */
+  proxyCheckReservedLock,   /* xCheckReservedLock method */
+  0                         /* xShmMap method */
+)
+#endif
+
+/* nfs lockd on OSX 10.3+ doesn't clear write locks when a read lock is set */
+#if defined(__APPLE__) && SQLITE_ENABLE_LOCKING_STYLE
+IOMETHODS(
+  nfsIoFinder,               /* Finder function name */
+  nfsIoMethods,              /* sqlite3_io_methods object name */
+  1,                         /* shared memory is disabled */
+  unixClose,                 /* xClose method */
+  unixLock,                  /* xLock method */
+  nfsUnlock,                 /* xUnlock method */
+  unixCheckReservedLock,     /* xCheckReservedLock method */
+  0                          /* xShmMap method */
+)
+#endif
+
+#if defined(__APPLE__) && SQLITE_ENABLE_LOCKING_STYLE
+/*
+** This "finder" function attempts to determine the best locking strategy
+** for the database file "filePath".  It then returns the sqlite3_io_methods
+** object that implements that strategy.
+**
+** This is for MacOSX only.
+*/
+static const sqlite3_io_methods *autolockIoFinderImpl(
+  const char *filePath,    /* name of the database file */
+  unixFile *pNew           /* open file object for the database file */
+){
+  static const struct Mapping {
+    const char *zFilesystem;              /* Filesystem type name */
+    const sqlite3_io_methods *pMethods;   /* Appropriate locking method */
+  } aMap[] = {
+    { "hfs",    &posixIoMethods },
+    { "ufs",    &posixIoMethods },
+    { "afpfs",  &afpIoMethods },
+    { "smbfs",  &afpIoMethods },
+    { "webdav", &nolockIoMethods },
+    { 0, 0 }
+  };
+  int i;
+  struct statfs fsInfo;
+  struct flock lockInfo;
+
+  if( !filePath ){
+    /* If filePath==NULL that means we are dealing with a transient file
+    ** that does not need to be locked. */
+    return &nolockIoMethods;
+  }
+  if( statfs(filePath, &fsInfo) != -1 ){
+    if( fsInfo.f_flags & MNT_RDONLY ){
+      return &nolockIoMethods;
+    }
+    for(i=0; aMap[i].zFilesystem; i++){
+      if( strcmp(fsInfo.f_fstypename, aMap[i].zFilesystem)==0 ){
+        return aMap[i].pMethods;
+      }
+    }
+  }
+
+  /* Default case. Handles, amongst others, "nfs".
+  ** Test byte-range lock using fcntl(). If the call succeeds,
+  ** assume that the file-system supports POSIX style locks.
+  */
+  lockInfo.l_len = 1;
+  lockInfo.l_start = 0;
+  lockInfo.l_whence = SEEK_SET;
+  lockInfo.l_type = F_RDLCK;
+  if( osFcntl(pNew->h, F_GETLK, &lockInfo)!=-1 ) {
