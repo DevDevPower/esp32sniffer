@@ -41042,3 +41042,212 @@ static const sqlite3_io_methods *autolockIoFinderImpl(
   lockInfo.l_whence = SEEK_SET;
   lockInfo.l_type = F_RDLCK;
   if( osFcntl(pNew->h, F_GETLK, &lockInfo)!=-1 ) {
+    if( strcmp(fsInfo.f_fstypename, "nfs")==0 ){
+      return &nfsIoMethods;
+    } else {
+      return &posixIoMethods;
+    }
+  }else{
+    return &dotlockIoMethods;
+  }
+}
+static const sqlite3_io_methods
+  *(*const autolockIoFinder)(const char*,unixFile*) = autolockIoFinderImpl;
+
+#endif /* defined(__APPLE__) && SQLITE_ENABLE_LOCKING_STYLE */
+
+#if OS_VXWORKS
+/*
+** This "finder" function for VxWorks checks to see if posix advisory
+** locking works.  If it does, then that is what is used.  If it does not
+** work, then fallback to named semaphore locking.
+*/
+static const sqlite3_io_methods *vxworksIoFinderImpl(
+  const char *filePath,    /* name of the database file */
+  unixFile *pNew           /* the open file object */
+){
+  struct flock lockInfo;
+
+  if( !filePath ){
+    /* If filePath==NULL that means we are dealing with a transient file
+    ** that does not need to be locked. */
+    return &nolockIoMethods;
+  }
+
+  /* Test if fcntl() is supported and use POSIX style locks.
+  ** Otherwise fall back to the named semaphore method.
+  */
+  lockInfo.l_len = 1;
+  lockInfo.l_start = 0;
+  lockInfo.l_whence = SEEK_SET;
+  lockInfo.l_type = F_RDLCK;
+  if( osFcntl(pNew->h, F_GETLK, &lockInfo)!=-1 ) {
+    return &posixIoMethods;
+  }else{
+    return &semIoMethods;
+  }
+}
+static const sqlite3_io_methods
+  *(*const vxworksIoFinder)(const char*,unixFile*) = vxworksIoFinderImpl;
+
+#endif /* OS_VXWORKS */
+
+/*
+** An abstract type for a pointer to an IO method finder function:
+*/
+typedef const sqlite3_io_methods *(*finder_type)(const char*,unixFile*);
+
+
+/****************************************************************************
+**************************** sqlite3_vfs methods ****************************
+**
+** This division contains the implementation of methods on the
+** sqlite3_vfs object.
+*/
+
+/*
+** Initialize the contents of the unixFile structure pointed to by pId.
+*/
+static int fillInUnixFile(
+  sqlite3_vfs *pVfs,      /* Pointer to vfs object */
+  int h,                  /* Open file descriptor of file being opened */
+  sqlite3_file *pId,      /* Write to the unixFile structure here */
+  const char *zFilename,  /* Name of the file being opened */
+  int ctrlFlags           /* Zero or more UNIXFILE_* values */
+){
+  const sqlite3_io_methods *pLockingStyle;
+  unixFile *pNew = (unixFile *)pId;
+  int rc = SQLITE_OK;
+
+  assert( pNew->pInode==NULL );
+
+  /* No locking occurs in temporary files */
+  assert( zFilename!=0 || (ctrlFlags & UNIXFILE_NOLOCK)!=0 );
+
+  OSTRACE(("OPEN    %-3d %s\n", h, zFilename));
+  pNew->h = h;
+  pNew->pVfs = pVfs;
+  pNew->zPath = zFilename;
+  pNew->ctrlFlags = (u8)ctrlFlags;
+#if SQLITE_MAX_MMAP_SIZE>0
+  pNew->mmapSizeMax = sqlite3GlobalConfig.szMmap;
+#endif
+  if( sqlite3_uri_boolean(((ctrlFlags & UNIXFILE_URI) ? zFilename : 0),
+                           "psow", SQLITE_POWERSAFE_OVERWRITE) ){
+    pNew->ctrlFlags |= UNIXFILE_PSOW;
+  }
+  if( strcmp(pVfs->zName,"unix-excl")==0 ){
+    pNew->ctrlFlags |= UNIXFILE_EXCL;
+  }
+
+#if OS_VXWORKS
+  pNew->pId = vxworksFindFileId(zFilename);
+  if( pNew->pId==0 ){
+    ctrlFlags |= UNIXFILE_NOLOCK;
+    rc = SQLITE_NOMEM_BKPT;
+  }
+#endif
+
+  if( ctrlFlags & UNIXFILE_NOLOCK ){
+    pLockingStyle = &nolockIoMethods;
+  }else{
+    pLockingStyle = (**(finder_type*)pVfs->pAppData)(zFilename, pNew);
+#if SQLITE_ENABLE_LOCKING_STYLE
+    /* Cache zFilename in the locking context (AFP and dotlock override) for
+    ** proxyLock activation is possible (remote proxy is based on db name)
+    ** zFilename remains valid until file is closed, to support */
+    pNew->lockingContext = (void*)zFilename;
+#endif
+  }
+
+  if( pLockingStyle == &posixIoMethods
+#if defined(__APPLE__) && SQLITE_ENABLE_LOCKING_STYLE
+    || pLockingStyle == &nfsIoMethods
+#endif
+  ){
+    unixEnterMutex();
+    rc = findInodeInfo(pNew, &pNew->pInode);
+    if( rc!=SQLITE_OK ){
+      /* If an error occurred in findInodeInfo(), close the file descriptor
+      ** immediately, before releasing the mutex. findInodeInfo() may fail
+      ** in two scenarios:
+      **
+      **   (a) A call to fstat() failed.
+      **   (b) A malloc failed.
+      **
+      ** Scenario (b) may only occur if the process is holding no other
+      ** file descriptors open on the same file. If there were other file
+      ** descriptors on this file, then no malloc would be required by
+      ** findInodeInfo(). If this is the case, it is quite safe to close
+      ** handle h - as it is guaranteed that no posix locks will be released
+      ** by doing so.
+      **
+      ** If scenario (a) caused the error then things are not so safe. The
+      ** implicit assumption here is that if fstat() fails, things are in
+      ** such bad shape that dropping a lock or two doesn't matter much.
+      */
+      robust_close(pNew, h, __LINE__);
+      h = -1;
+    }
+    unixLeaveMutex();
+  }
+
+#if SQLITE_ENABLE_LOCKING_STYLE && defined(__APPLE__)
+  else if( pLockingStyle == &afpIoMethods ){
+    /* AFP locking uses the file path so it needs to be included in
+    ** the afpLockingContext.
+    */
+    afpLockingContext *pCtx;
+    pNew->lockingContext = pCtx = sqlite3_malloc64( sizeof(*pCtx) );
+    if( pCtx==0 ){
+      rc = SQLITE_NOMEM_BKPT;
+    }else{
+      /* NB: zFilename exists and remains valid until the file is closed
+      ** according to requirement F11141.  So we do not need to make a
+      ** copy of the filename. */
+      pCtx->dbPath = zFilename;
+      pCtx->reserved = 0;
+      srandomdev();
+      unixEnterMutex();
+      rc = findInodeInfo(pNew, &pNew->pInode);
+      if( rc!=SQLITE_OK ){
+        sqlite3_free(pNew->lockingContext);
+        robust_close(pNew, h, __LINE__);
+        h = -1;
+      }
+      unixLeaveMutex();
+    }
+  }
+#endif
+
+  else if( pLockingStyle == &dotlockIoMethods ){
+    /* Dotfile locking uses the file path so it needs to be included in
+    ** the dotlockLockingContext
+    */
+    char *zLockFile;
+    int nFilename;
+    assert( zFilename!=0 );
+    nFilename = (int)strlen(zFilename) + 6;
+    zLockFile = (char *)sqlite3_malloc64(nFilename);
+    if( zLockFile==0 ){
+      rc = SQLITE_NOMEM_BKPT;
+    }else{
+      sqlite3_snprintf(nFilename, zLockFile, "%s" DOTLOCK_SUFFIX, zFilename);
+    }
+    pNew->lockingContext = zLockFile;
+  }
+
+#if OS_VXWORKS
+  else if( pLockingStyle == &semIoMethods ){
+    /* Named semaphore locking uses the file path so it needs to be
+    ** included in the semLockingContext
+    */
+    unixEnterMutex();
+    rc = findInodeInfo(pNew, &pNew->pInode);
+    if( (rc==SQLITE_OK) && (pNew->pInode->pSem==NULL) ){
+      char *zSemName = pNew->pInode->aSemName;
+      int n;
+      sqlite3_snprintf(MAX_PATHNAME, zSemName, "/%s.sem",
+                       pNew->pId->zCanonicalName);
+      for( n=1; zSemName[n]; n++ )
+        if( zSemName[n]=='/' ) zSemName[n] 
