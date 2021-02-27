@@ -42051,4 +42051,198 @@ static void *unixDlOpen(sqlite3_vfs *NotUsed, const char *zFilename){
 }
 
 /*
-** SQLite calls this function immediately after a call to unixDlSym() 
+** SQLite calls this function immediately after a call to unixDlSym() or
+** unixDlOpen() fails (returns a null pointer). If a more detailed error
+** message is available, it is written to zBufOut. If no error message
+** is available, zBufOut is left unmodified and SQLite uses a default
+** error message.
+*/
+static void unixDlError(sqlite3_vfs *NotUsed, int nBuf, char *zBufOut){
+  const char *zErr;
+  UNUSED_PARAMETER(NotUsed);
+  unixEnterMutex();
+  zErr = dlerror();
+  if( zErr ){
+    sqlite3_snprintf(nBuf, zBufOut, "%s", zErr);
+  }
+  unixLeaveMutex();
+}
+static void (*unixDlSym(sqlite3_vfs *NotUsed, void *p, const char*zSym))(void){
+  /*
+  ** GCC with -pedantic-errors says that C90 does not allow a void* to be
+  ** cast into a pointer to a function.  And yet the library dlsym() routine
+  ** returns a void* which is really a pointer to a function.  So how do we
+  ** use dlsym() with -pedantic-errors?
+  **
+  ** Variable x below is defined to be a pointer to a function taking
+  ** parameters void* and const char* and returning a pointer to a function.
+  ** We initialize x by assigning it a pointer to the dlsym() function.
+  ** (That assignment requires a cast.)  Then we call the function that
+  ** x points to.
+  **
+  ** This work-around is unlikely to work correctly on any system where
+  ** you really cannot cast a function pointer into void*.  But then, on the
+  ** other hand, dlsym() will not work on such a system either, so we have
+  ** not really lost anything.
+  */
+  void (*(*x)(void*,const char*))(void);
+  UNUSED_PARAMETER(NotUsed);
+  x = (void(*(*)(void*,const char*))(void))dlsym;
+  return (*x)(p, zSym);
+}
+static void unixDlClose(sqlite3_vfs *NotUsed, void *pHandle){
+  UNUSED_PARAMETER(NotUsed);
+  dlclose(pHandle);
+}
+#else /* if SQLITE_OMIT_LOAD_EXTENSION is defined: */
+  #define unixDlOpen  0
+  #define unixDlError 0
+  #define unixDlSym   0
+  #define unixDlClose 0
+#endif
+
+/*
+** Write nBuf bytes of random data to the supplied buffer zBuf.
+*/
+static int unixRandomness(sqlite3_vfs *NotUsed, int nBuf, char *zBuf){
+  UNUSED_PARAMETER(NotUsed);
+  assert((size_t)nBuf>=(sizeof(time_t)+sizeof(int)));
+
+  /* We have to initialize zBuf to prevent valgrind from reporting
+  ** errors.  The reports issued by valgrind are incorrect - we would
+  ** prefer that the randomness be increased by making use of the
+  ** uninitialized space in zBuf - but valgrind errors tend to worry
+  ** some users.  Rather than argue, it seems easier just to initialize
+  ** the whole array and silence valgrind, even if that means less randomness
+  ** in the random seed.
+  **
+  ** When testing, initializing zBuf[] to zero is all we do.  That means
+  ** that we always use the same random number sequence.  This makes the
+  ** tests repeatable.
+  */
+  memset(zBuf, 0, nBuf);
+  randomnessPid = osGetpid(0);
+#if !defined(SQLITE_TEST) && !defined(SQLITE_OMIT_RANDOMNESS)
+  {
+    int fd, got;
+    fd = robust_open("/dev/urandom", O_RDONLY, 0);
+    if( fd<0 ){
+      time_t t;
+      time(&t);
+      memcpy(zBuf, &t, sizeof(t));
+      memcpy(&zBuf[sizeof(t)], &randomnessPid, sizeof(randomnessPid));
+      assert( sizeof(t)+sizeof(randomnessPid)<=(size_t)nBuf );
+      nBuf = sizeof(t) + sizeof(randomnessPid);
+    }else{
+      do{ got = osRead(fd, zBuf, nBuf); }while( got<0 && errno==EINTR );
+      robust_close(0, fd, __LINE__);
+    }
+  }
+#endif
+  return nBuf;
+}
+
+
+/*
+** Sleep for a little while.  Return the amount of time slept.
+** The argument is the number of microseconds we want to sleep.
+** The return value is the number of microseconds of sleep actually
+** requested from the underlying operating system, a number which
+** might be greater than or equal to the argument, but not less
+** than the argument.
+*/
+static int unixSleep(sqlite3_vfs *NotUsed, int microseconds){
+#if OS_VXWORKS
+  struct timespec sp;
+
+  sp.tv_sec = microseconds / 1000000;
+  sp.tv_nsec = (microseconds % 1000000) * 1000;
+  nanosleep(&sp, NULL);
+  UNUSED_PARAMETER(NotUsed);
+  return microseconds;
+#elif defined(HAVE_USLEEP) && HAVE_USLEEP
+  if( microseconds>=1000000 ) sleep(microseconds/1000000);
+  if( microseconds%1000000 ) usleep(microseconds%1000000);
+  UNUSED_PARAMETER(NotUsed);
+  return microseconds;
+#else
+  int seconds = (microseconds+999999)/1000000;
+  sleep(seconds);
+  UNUSED_PARAMETER(NotUsed);
+  return seconds*1000000;
+#endif
+}
+
+/*
+** The following variable, if set to a non-zero value, is interpreted as
+** the number of seconds since 1970 and is used to set the result of
+** sqlite3OsCurrentTime() during testing.
+*/
+#ifdef SQLITE_TEST
+SQLITE_API int sqlite3_current_time = 0;  /* Fake system time in seconds since 1970. */
+#endif
+
+/*
+** Find the current time (in Universal Coordinated Time).  Write into *piNow
+** the current time and date as a Julian Day number times 86_400_000.  In
+** other words, write into *piNow the number of milliseconds since the Julian
+** epoch of noon in Greenwich on November 24, 4714 B.C according to the
+** proleptic Gregorian calendar.
+**
+** On success, return SQLITE_OK.  Return SQLITE_ERROR if the time and date
+** cannot be found.
+*/
+static int unixCurrentTimeInt64(sqlite3_vfs *NotUsed, sqlite3_int64 *piNow){
+  static const sqlite3_int64 unixEpoch = 24405875*(sqlite3_int64)8640000;
+  int rc = SQLITE_OK;
+#if defined(NO_GETTOD)
+  time_t t;
+  time(&t);
+  *piNow = ((sqlite3_int64)t)*1000 + unixEpoch;
+#elif OS_VXWORKS
+  struct timespec sNow;
+  clock_gettime(CLOCK_REALTIME, &sNow);
+  *piNow = unixEpoch + 1000*(sqlite3_int64)sNow.tv_sec + sNow.tv_nsec/1000000;
+#else
+  struct timeval sNow;
+  (void)gettimeofday(&sNow, 0);  /* Cannot fail given valid arguments */
+  *piNow = unixEpoch + 1000*(sqlite3_int64)sNow.tv_sec + sNow.tv_usec/1000;
+#endif
+
+#ifdef SQLITE_TEST
+  if( sqlite3_current_time ){
+    *piNow = 1000*(sqlite3_int64)sqlite3_current_time + unixEpoch;
+  }
+#endif
+  UNUSED_PARAMETER(NotUsed);
+  return rc;
+}
+
+#ifndef SQLITE_OMIT_DEPRECATED
+/*
+** Find the current time (in Universal Coordinated Time).  Write the
+** current time and date as a Julian Day number into *prNow and
+** return 0.  Return 1 if the time and date cannot be found.
+*/
+static int unixCurrentTime(sqlite3_vfs *NotUsed, double *prNow){
+  sqlite3_int64 i = 0;
+  int rc;
+  UNUSED_PARAMETER(NotUsed);
+  rc = unixCurrentTimeInt64(0, &i);
+  *prNow = i/86400000.0;
+  return rc;
+}
+#else
+# define unixCurrentTime 0
+#endif
+
+/*
+** The xGetLastError() method is designed to return a better
+** low-level error message when operating-system problems come up
+** during SQLite operation.  Only the integer return code is currently
+** used.
+*/
+static int unixGetLastError(sqlite3_vfs *NotUsed, int NotUsed2, char *NotUsed3){
+  UNUSED_PARAMETER(NotUsed);
+  UNUSED_PARAMETER(NotUsed2);
+  UNUSED_PARAM
