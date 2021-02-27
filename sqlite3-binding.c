@@ -42399,4 +42399,221 @@ static int unixGetLastError(sqlite3_vfs *NotUsed, int NotUsed2, char *NotUsed3){
 ** As mentioned above, when compiled with SQLITE_PREFER_PROXY_LOCKING,
 ** setting the environment variable SQLITE_FORCE_PROXY_LOCKING to 1 will
 ** force proxy locking to be used for every database file opened, and 0
-** will force automatic proxy l
+** will force automatic proxy locking to be disabled for all database
+** files (explicitly calling the SQLITE_FCNTL_SET_LOCKPROXYFILE pragma or
+** sqlite_file_control API is not affected by SQLITE_FORCE_PROXY_LOCKING).
+*/
+
+/*
+** Proxy locking is only available on MacOSX
+*/
+#if defined(__APPLE__) && SQLITE_ENABLE_LOCKING_STYLE
+
+/*
+** The proxyLockingContext has the path and file structures for the remote
+** and local proxy files in it
+*/
+typedef struct proxyLockingContext proxyLockingContext;
+struct proxyLockingContext {
+  unixFile *conchFile;         /* Open conch file */
+  char *conchFilePath;         /* Name of the conch file */
+  unixFile *lockProxy;         /* Open proxy lock file */
+  char *lockProxyPath;         /* Name of the proxy lock file */
+  char *dbPath;                /* Name of the open file */
+  int conchHeld;               /* 1 if the conch is held, -1 if lockless */
+  int nFails;                  /* Number of conch taking failures */
+  void *oldLockingContext;     /* Original lockingcontext to restore on close */
+  sqlite3_io_methods const *pOldMethod;     /* Original I/O methods for close */
+};
+
+/*
+** The proxy lock file path for the database at dbPath is written into lPath,
+** which must point to valid, writable memory large enough for a maxLen length
+** file path.
+*/
+static int proxyGetLockPath(const char *dbPath, char *lPath, size_t maxLen){
+  int len;
+  int dbLen;
+  int i;
+
+#ifdef LOCKPROXYDIR
+  len = strlcpy(lPath, LOCKPROXYDIR, maxLen);
+#else
+# ifdef _CS_DARWIN_USER_TEMP_DIR
+  {
+    if( !confstr(_CS_DARWIN_USER_TEMP_DIR, lPath, maxLen) ){
+      OSTRACE(("GETLOCKPATH  failed %s errno=%d pid=%d\n",
+               lPath, errno, osGetpid(0)));
+      return SQLITE_IOERR_LOCK;
+    }
+    len = strlcat(lPath, "sqliteplocks", maxLen);
+  }
+# else
+  len = strlcpy(lPath, "/tmp/", maxLen);
+# endif
+#endif
+
+  if( lPath[len-1]!='/' ){
+    len = strlcat(lPath, "/", maxLen);
+  }
+
+  /* transform the db path to a unique cache name */
+  dbLen = (int)strlen(dbPath);
+  for( i=0; i<dbLen && (i+len+7)<(int)maxLen; i++){
+    char c = dbPath[i];
+    lPath[i+len] = (c=='/')?'_':c;
+  }
+  lPath[i+len]='\0';
+  strlcat(lPath, ":auto:", maxLen);
+  OSTRACE(("GETLOCKPATH  proxy lock path=%s pid=%d\n", lPath, osGetpid(0)));
+  return SQLITE_OK;
+}
+
+/*
+ ** Creates the lock file and any missing directories in lockPath
+ */
+static int proxyCreateLockPath(const char *lockPath){
+  int i, len;
+  char buf[MAXPATHLEN];
+  int start = 0;
+
+  assert(lockPath!=NULL);
+  /* try to create all the intermediate directories */
+  len = (int)strlen(lockPath);
+  buf[0] = lockPath[0];
+  for( i=1; i<len; i++ ){
+    if( lockPath[i] == '/' && (i - start > 0) ){
+      /* only mkdir if leaf dir != "." or "/" or ".." */
+      if( i-start>2 || (i-start==1 && buf[start] != '.' && buf[start] != '/')
+         || (i-start==2 && buf[start] != '.' && buf[start+1] != '.') ){
+        buf[i]='\0';
+        if( osMkdir(buf, SQLITE_DEFAULT_PROXYDIR_PERMISSIONS) ){
+          int err=errno;
+          if( err!=EEXIST ) {
+            OSTRACE(("CREATELOCKPATH  FAILED creating %s, "
+                     "'%s' proxy lock path=%s pid=%d\n",
+                     buf, strerror(err), lockPath, osGetpid(0)));
+            return err;
+          }
+        }
+      }
+      start=i+1;
+    }
+    buf[i] = lockPath[i];
+  }
+  OSTRACE(("CREATELOCKPATH  proxy lock path=%s pid=%d\n",lockPath,osGetpid(0)));
+  return 0;
+}
+
+/*
+** Create a new VFS file descriptor (stored in memory obtained from
+** sqlite3_malloc) and open the file named "path" in the file descriptor.
+**
+** The caller is responsible not only for closing the file descriptor
+** but also for freeing the memory associated with the file descriptor.
+*/
+static int proxyCreateUnixFile(
+    const char *path,        /* path for the new unixFile */
+    unixFile **ppFile,       /* unixFile created and returned by ref */
+    int islockfile           /* if non zero missing dirs will be created */
+) {
+  int fd = -1;
+  unixFile *pNew;
+  int rc = SQLITE_OK;
+  int openFlags = O_RDWR | O_CREAT | O_NOFOLLOW;
+  sqlite3_vfs dummyVfs;
+  int terrno = 0;
+  UnixUnusedFd *pUnused = NULL;
+
+  /* 1. first try to open/create the file
+  ** 2. if that fails, and this is a lock file (not-conch), try creating
+  ** the parent directories and then try again.
+  ** 3. if that fails, try to open the file read-only
+  ** otherwise return BUSY (if lock file) or CANTOPEN for the conch file
+  */
+  pUnused = findReusableFd(path, openFlags);
+  if( pUnused ){
+    fd = pUnused->fd;
+  }else{
+    pUnused = sqlite3_malloc64(sizeof(*pUnused));
+    if( !pUnused ){
+      return SQLITE_NOMEM_BKPT;
+    }
+  }
+  if( fd<0 ){
+    fd = robust_open(path, openFlags, 0);
+    terrno = errno;
+    if( fd<0 && errno==ENOENT && islockfile ){
+      if( proxyCreateLockPath(path) == SQLITE_OK ){
+        fd = robust_open(path, openFlags, 0);
+      }
+    }
+  }
+  if( fd<0 ){
+    openFlags = O_RDONLY | O_NOFOLLOW;
+    fd = robust_open(path, openFlags, 0);
+    terrno = errno;
+  }
+  if( fd<0 ){
+    if( islockfile ){
+      return SQLITE_BUSY;
+    }
+    switch (terrno) {
+      case EACCES:
+        return SQLITE_PERM;
+      case EIO:
+        return SQLITE_IOERR_LOCK; /* even though it is the conch */
+      default:
+        return SQLITE_CANTOPEN_BKPT;
+    }
+  }
+
+  pNew = (unixFile *)sqlite3_malloc64(sizeof(*pNew));
+  if( pNew==NULL ){
+    rc = SQLITE_NOMEM_BKPT;
+    goto end_create_proxy;
+  }
+  memset(pNew, 0, sizeof(unixFile));
+  pNew->openFlags = openFlags;
+  memset(&dummyVfs, 0, sizeof(dummyVfs));
+  dummyVfs.pAppData = (void*)&autolockIoFinder;
+  dummyVfs.zName = "dummy";
+  pUnused->fd = fd;
+  pUnused->flags = openFlags;
+  pNew->pPreallocatedUnused = pUnused;
+
+  rc = fillInUnixFile(&dummyVfs, fd, (sqlite3_file*)pNew, path, 0);
+  if( rc==SQLITE_OK ){
+    *ppFile = pNew;
+    return SQLITE_OK;
+  }
+end_create_proxy:
+  robust_close(pNew, fd, __LINE__);
+  sqlite3_free(pNew);
+  sqlite3_free(pUnused);
+  return rc;
+}
+
+#ifdef SQLITE_TEST
+/* simulate multiple hosts by creating unique hostid file paths */
+SQLITE_API int sqlite3_hostid_num = 0;
+#endif
+
+#define PROXY_HOSTIDLEN    16  /* conch file host id length */
+
+#if HAVE_GETHOSTUUID
+/* Not always defined in the headers as it ought to be */
+extern int gethostuuid(uuid_t id, const struct timespec *wait);
+#endif
+
+/* get the host ID via gethostuuid(), pHostID must point to PROXY_HOSTIDLEN
+** bytes of writable memory.
+*/
+static int proxyGetHostID(unsigned char *pHostID, int *pError){
+  assert(PROXY_HOSTIDLEN == sizeof(uuid_t));
+  memset(pHostID, 0, PROXY_HOSTIDLEN);
+#if HAVE_GETHOSTUUID
+  {
+    struct timespec timeout = {1, 0}; /* 1 sec timeout */
+    if( gethostuuid(pHostID, &timeout) ){
+   
