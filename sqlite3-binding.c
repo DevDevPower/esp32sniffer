@@ -42822,4 +42822,172 @@ static int proxyTakeConch(unixFile *pFile){
     /* read the existing conch file */
     readLen = seekAndRead((unixFile*)conchFile, 0, readBuf, PROXY_MAXCONCHLEN);
     if( readLen<0 ){
-    
+      /* I/O error: lastErrno set by seekAndRead */
+      storeLastErrno(pFile, conchFile->lastErrno);
+      rc = SQLITE_IOERR_READ;
+      goto end_takeconch;
+    }else if( readLen<=(PROXY_HEADERLEN+PROXY_HOSTIDLEN) ||
+             readBuf[0]!=(char)PROXY_CONCHVERSION ){
+      /* a short read or version format mismatch means we need to create a new
+      ** conch file.
+      */
+      createConch = 1;
+    }
+    /* if the host id matches and the lock path already exists in the conch
+    ** we'll try to use the path there, if we can't open that path, we'll
+    ** retry with a new auto-generated path
+    */
+    do { /* in case we need to try again for an :auto: named lock file */
+
+      if( !createConch && !forceNewLockPath ){
+        hostIdMatch = !memcmp(&readBuf[PROXY_HEADERLEN], myHostID,
+                                  PROXY_HOSTIDLEN);
+        /* if the conch has data compare the contents */
+        if( !pCtx->lockProxyPath ){
+          /* for auto-named local lock file, just check the host ID and we'll
+           ** use the local lock file path that's already in there
+           */
+          if( hostIdMatch ){
+            size_t pathLen = (readLen - PROXY_PATHINDEX);
+
+            if( pathLen>=MAXPATHLEN ){
+              pathLen=MAXPATHLEN-1;
+            }
+            memcpy(lockPath, &readBuf[PROXY_PATHINDEX], pathLen);
+            lockPath[pathLen] = 0;
+            tempLockPath = lockPath;
+            tryOldLockPath = 1;
+            /* create a copy of the lock path if the conch is taken */
+            goto end_takeconch;
+          }
+        }else if( hostIdMatch
+               && !strncmp(pCtx->lockProxyPath, &readBuf[PROXY_PATHINDEX],
+                           readLen-PROXY_PATHINDEX)
+        ){
+          /* conch host and lock path match */
+          goto end_takeconch;
+        }
+      }
+
+      /* if the conch isn't writable and doesn't match, we can't take it */
+      if( (conchFile->openFlags&O_RDWR) == 0 ){
+        rc = SQLITE_BUSY;
+        goto end_takeconch;
+      }
+
+      /* either the conch didn't match or we need to create a new one */
+      if( !pCtx->lockProxyPath ){
+        proxyGetLockPath(pCtx->dbPath, lockPath, MAXPATHLEN);
+        tempLockPath = lockPath;
+        /* create a copy of the lock path _only_ if the conch is taken */
+      }
+
+      /* update conch with host and path (this will fail if other process
+      ** has a shared lock already), if the host id matches, use the big
+      ** stick.
+      */
+      futimes(conchFile->h, NULL);
+      if( hostIdMatch && !createConch ){
+        if( conchFile->pInode && conchFile->pInode->nShared>1 ){
+          /* We are trying for an exclusive lock but another thread in this
+           ** same process is still holding a shared lock. */
+          rc = SQLITE_BUSY;
+        } else {
+          rc = proxyConchLock(pFile, myHostID, EXCLUSIVE_LOCK);
+        }
+      }else{
+        rc = proxyConchLock(pFile, myHostID, EXCLUSIVE_LOCK);
+      }
+      if( rc==SQLITE_OK ){
+        char writeBuffer[PROXY_MAXCONCHLEN];
+        int writeSize = 0;
+
+        writeBuffer[0] = (char)PROXY_CONCHVERSION;
+        memcpy(&writeBuffer[PROXY_HEADERLEN], myHostID, PROXY_HOSTIDLEN);
+        if( pCtx->lockProxyPath!=NULL ){
+          strlcpy(&writeBuffer[PROXY_PATHINDEX], pCtx->lockProxyPath,
+                  MAXPATHLEN);
+        }else{
+          strlcpy(&writeBuffer[PROXY_PATHINDEX], tempLockPath, MAXPATHLEN);
+        }
+        writeSize = PROXY_PATHINDEX + strlen(&writeBuffer[PROXY_PATHINDEX]);
+        robust_ftruncate(conchFile->h, writeSize);
+        rc = unixWrite((sqlite3_file *)conchFile, writeBuffer, writeSize, 0);
+        full_fsync(conchFile->h,0,0);
+        /* If we created a new conch file (not just updated the contents of a
+         ** valid conch file), try to match the permissions of the database
+         */
+        if( rc==SQLITE_OK && createConch ){
+          struct stat buf;
+          int err = osFstat(pFile->h, &buf);
+          if( err==0 ){
+            mode_t cmode = buf.st_mode&(S_IRUSR|S_IWUSR | S_IRGRP|S_IWGRP |
+                                        S_IROTH|S_IWOTH);
+            /* try to match the database file R/W permissions, ignore failure */
+#ifndef SQLITE_PROXY_DEBUG
+            osFchmod(conchFile->h, cmode);
+#else
+            do{
+              rc = osFchmod(conchFile->h, cmode);
+            }while( rc==(-1) && errno==EINTR );
+            if( rc!=0 ){
+              int code = errno;
+              fprintf(stderr, "fchmod %o FAILED with %d %s\n",
+                      cmode, code, strerror(code));
+            } else {
+              fprintf(stderr, "fchmod %o SUCCEDED\n",cmode);
+            }
+          }else{
+            int code = errno;
+            fprintf(stderr, "STAT FAILED[%d] with %d %s\n",
+                    err, code, strerror(code));
+#endif
+          }
+        }
+      }
+      conchFile->pMethod->xUnlock((sqlite3_file*)conchFile, SHARED_LOCK);
+
+    end_takeconch:
+      OSTRACE(("TRANSPROXY: CLOSE  %d\n", pFile->h));
+      if( rc==SQLITE_OK && pFile->openFlags ){
+        int fd;
+        if( pFile->h>=0 ){
+          robust_close(pFile, pFile->h, __LINE__);
+        }
+        pFile->h = -1;
+        fd = robust_open(pCtx->dbPath, pFile->openFlags, 0);
+        OSTRACE(("TRANSPROXY: OPEN  %d\n", fd));
+        if( fd>=0 ){
+          pFile->h = fd;
+        }else{
+          rc=SQLITE_CANTOPEN_BKPT; /* SQLITE_BUSY? proxyTakeConch called
+           during locking */
+        }
+      }
+      if( rc==SQLITE_OK && !pCtx->lockProxy ){
+        char *path = tempLockPath ? tempLockPath : pCtx->lockProxyPath;
+        rc = proxyCreateUnixFile(path, &pCtx->lockProxy, 1);
+        if( rc!=SQLITE_OK && rc!=SQLITE_NOMEM && tryOldLockPath ){
+          /* we couldn't create the proxy lock file with the old lock file path
+           ** so try again via auto-naming
+           */
+          forceNewLockPath = 1;
+          tryOldLockPath = 0;
+          continue; /* go back to the do {} while start point, try again */
+        }
+      }
+      if( rc==SQLITE_OK ){
+        /* Need to make a copy of path if we extracted the value
+         ** from the conch file or the path was allocated on the stack
+         */
+        if( tempLockPath ){
+          pCtx->lockProxyPath = sqlite3DbStrDup(0, tempLockPath);
+          if( !pCtx->lockProxyPath ){
+            rc = SQLITE_NOMEM_BKPT;
+          }
+        }
+      }
+      if( rc==SQLITE_OK ){
+        pCtx->conchHeld = 1;
+
+        if( pCtx->lockProxy->pMethod ==
