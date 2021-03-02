@@ -43788,4 +43788,189 @@ WINBASEAPI HANDLE WINAPI CreateFileMappingA(HANDLE, LPSECURITY_ATTRIBUTES, \
 #if defined(SQLITE_WIN32_HAS_WIDE)
 WINBASEAPI HANDLE WINAPI CreateFileMappingW(HANDLE, LPSECURITY_ATTRIBUTES, \
         DWORD, DWORD, DWORD, LPCWSTR);
-#endif /* defined(SQLITE
+#endif /* defined(SQLITE_WIN32_HAS_WIDE) */
+
+WINBASEAPI LPVOID WINAPI MapViewOfFile(HANDLE, DWORD, DWORD, DWORD, SIZE_T);
+#endif /* SQLITE_OS_WINRT */
+
+/*
+** These file mapping APIs are common to both Win32 and WinRT.
+*/
+
+WINBASEAPI BOOL WINAPI FlushViewOfFile(LPCVOID, SIZE_T);
+WINBASEAPI BOOL WINAPI UnmapViewOfFile(LPCVOID);
+#endif /* SQLITE_WIN32_FILEMAPPING_API */
+
+/*
+** Some Microsoft compilers lack this definition.
+*/
+#ifndef INVALID_FILE_ATTRIBUTES
+# define INVALID_FILE_ATTRIBUTES ((DWORD)-1)
+#endif
+
+#ifndef FILE_FLAG_MASK
+# define FILE_FLAG_MASK          (0xFF3C0000)
+#endif
+
+#ifndef FILE_ATTRIBUTE_MASK
+# define FILE_ATTRIBUTE_MASK     (0x0003FFF7)
+#endif
+
+#ifndef SQLITE_OMIT_WAL
+/* Forward references to structures used for WAL */
+typedef struct winShm winShm;           /* A connection to shared-memory */
+typedef struct winShmNode winShmNode;   /* A region of shared-memory */
+#endif
+
+/*
+** WinCE lacks native support for file locking so we have to fake it
+** with some code of our own.
+*/
+#if SQLITE_OS_WINCE
+typedef struct winceLock {
+  int nReaders;       /* Number of reader locks obtained */
+  BOOL bPending;      /* Indicates a pending lock has been obtained */
+  BOOL bReserved;     /* Indicates a reserved lock has been obtained */
+  BOOL bExclusive;    /* Indicates an exclusive lock has been obtained */
+} winceLock;
+#endif
+
+/*
+** The winFile structure is a subclass of sqlite3_file* specific to the win32
+** portability layer.
+*/
+typedef struct winFile winFile;
+struct winFile {
+  const sqlite3_io_methods *pMethod; /*** Must be first ***/
+  sqlite3_vfs *pVfs;      /* The VFS used to open this file */
+  HANDLE h;               /* Handle for accessing the file */
+  u8 locktype;            /* Type of lock currently held on this file */
+  short sharedLockByte;   /* Randomly chosen byte used as a shared lock */
+  u8 ctrlFlags;           /* Flags.  See WINFILE_* below */
+  DWORD lastErrno;        /* The Windows errno from the last I/O error */
+#ifndef SQLITE_OMIT_WAL
+  winShm *pShm;           /* Instance of shared memory on this file */
+#endif
+  const char *zPath;      /* Full pathname of this file */
+  int szChunk;            /* Chunk size configured by FCNTL_CHUNK_SIZE */
+#if SQLITE_OS_WINCE
+  LPWSTR zDeleteOnClose;  /* Name of file to delete when closing */
+  HANDLE hMutex;          /* Mutex used to control access to shared lock */
+  HANDLE hShared;         /* Shared memory segment used for locking */
+  winceLock local;        /* Locks obtained by this instance of winFile */
+  winceLock *shared;      /* Global shared lock memory for the file  */
+#endif
+#if SQLITE_MAX_MMAP_SIZE>0
+  int nFetchOut;                /* Number of outstanding xFetch references */
+  HANDLE hMap;                  /* Handle for accessing memory mapping */
+  void *pMapRegion;             /* Area memory mapped */
+  sqlite3_int64 mmapSize;       /* Size of mapped region */
+  sqlite3_int64 mmapSizeMax;    /* Configured FCNTL_MMAP_SIZE value */
+#endif
+};
+
+/*
+** The winVfsAppData structure is used for the pAppData member for all of the
+** Win32 VFS variants.
+*/
+typedef struct winVfsAppData winVfsAppData;
+struct winVfsAppData {
+  const sqlite3_io_methods *pMethod; /* The file I/O methods to use. */
+  void *pAppData;                    /* The extra pAppData, if any. */
+  BOOL bNoLock;                      /* Non-zero if locking is disabled. */
+};
+
+/*
+** Allowed values for winFile.ctrlFlags
+*/
+#define WINFILE_RDONLY          0x02   /* Connection is read only */
+#define WINFILE_PERSIST_WAL     0x04   /* Persistent WAL mode */
+#define WINFILE_PSOW            0x10   /* SQLITE_IOCAP_POWERSAFE_OVERWRITE */
+
+/*
+ * The size of the buffer used by sqlite3_win32_write_debug().
+ */
+#ifndef SQLITE_WIN32_DBG_BUF_SIZE
+#  define SQLITE_WIN32_DBG_BUF_SIZE   ((int)(4096-sizeof(DWORD)))
+#endif
+
+/*
+ * If compiled with SQLITE_WIN32_MALLOC on Windows, we will use the
+ * various Win32 API heap functions instead of our own.
+ */
+#ifdef SQLITE_WIN32_MALLOC
+
+/*
+ * If this is non-zero, an isolated heap will be created by the native Win32
+ * allocator subsystem; otherwise, the default process heap will be used.  This
+ * setting has no effect when compiling for WinRT.  By default, this is enabled
+ * and an isolated heap will be created to store all allocated data.
+ *
+ ******************************************************************************
+ * WARNING: It is important to note that when this setting is non-zero and the
+ *          winMemShutdown function is called (e.g. by the sqlite3_shutdown
+ *          function), all data that was allocated using the isolated heap will
+ *          be freed immediately and any attempt to access any of that freed
+ *          data will almost certainly result in an immediate access violation.
+ ******************************************************************************
+ */
+#ifndef SQLITE_WIN32_HEAP_CREATE
+#  define SQLITE_WIN32_HEAP_CREATE        (TRUE)
+#endif
+
+/*
+ * This is the maximum possible initial size of the Win32-specific heap, in
+ * bytes.
+ */
+#ifndef SQLITE_WIN32_HEAP_MAX_INIT_SIZE
+#  define SQLITE_WIN32_HEAP_MAX_INIT_SIZE (4294967295U)
+#endif
+
+/*
+ * This is the extra space for the initial size of the Win32-specific heap,
+ * in bytes.  This value may be zero.
+ */
+#ifndef SQLITE_WIN32_HEAP_INIT_EXTRA
+#  define SQLITE_WIN32_HEAP_INIT_EXTRA  (4194304)
+#endif
+
+/*
+ * Calculate the maximum legal cache size, in pages, based on the maximum
+ * possible initial heap size and the default page size, setting aside the
+ * needed extra space.
+ */
+#ifndef SQLITE_WIN32_MAX_CACHE_SIZE
+#  define SQLITE_WIN32_MAX_CACHE_SIZE   (((SQLITE_WIN32_HEAP_MAX_INIT_SIZE) - \
+                                          (SQLITE_WIN32_HEAP_INIT_EXTRA)) / \
+                                         (SQLITE_DEFAULT_PAGE_SIZE))
+#endif
+
+/*
+ * This is cache size used in the calculation of the initial size of the
+ * Win32-specific heap.  It cannot be negative.
+ */
+#ifndef SQLITE_WIN32_CACHE_SIZE
+#  if SQLITE_DEFAULT_CACHE_SIZE>=0
+#    define SQLITE_WIN32_CACHE_SIZE     (SQLITE_DEFAULT_CACHE_SIZE)
+#  else
+#    define SQLITE_WIN32_CACHE_SIZE     (-(SQLITE_DEFAULT_CACHE_SIZE))
+#  endif
+#endif
+
+/*
+ * Make sure that the calculated cache size, in pages, cannot cause the
+ * initial size of the Win32-specific heap to exceed the maximum amount
+ * of memory that can be specified in the call to HeapCreate.
+ */
+#if SQLITE_WIN32_CACHE_SIZE>SQLITE_WIN32_MAX_CACHE_SIZE
+#  undef SQLITE_WIN32_CACHE_SIZE
+#  define SQLITE_WIN32_CACHE_SIZE       (2000)
+#endif
+
+/*
+ * The initial size of the Win32-specific heap.  This value may be zero.
+ */
+#ifndef SQLITE_WIN32_HEAP_INIT_SIZE
+#  define SQLITE_WIN32_HEAP_INIT_SIZE   ((SQLITE_WIN32_CACHE_SIZE) * \
+                                         (SQLITE_DEFAULT_PAGE_SIZE) + \
+                    
