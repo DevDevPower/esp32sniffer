@@ -43184,4 +43184,213 @@ static int proxyTransformUnixFile(unixFile *pFile, const char *path) {
       if( osStat(pCtx->conchFilePath, &conchInfo) == -1 ) {
         int err = errno;
         if( (err==ENOENT) && (statfs(dbPath, &fsInfo) != -1) ){
-          goLockless = (fsInfo.f_flags&MNT_RDO
+          goLockless = (fsInfo.f_flags&MNT_RDONLY) == MNT_RDONLY;
+        }
+      }
+      if( goLockless ){
+        pCtx->conchHeld = -1; /* read only FS/ lockless */
+        rc = SQLITE_OK;
+      }
+    }
+  }
+  if( rc==SQLITE_OK && lockPath ){
+    pCtx->lockProxyPath = sqlite3DbStrDup(0, lockPath);
+  }
+
+  if( rc==SQLITE_OK ){
+    pCtx->dbPath = sqlite3DbStrDup(0, dbPath);
+    if( pCtx->dbPath==NULL ){
+      rc = SQLITE_NOMEM_BKPT;
+    }
+  }
+  if( rc==SQLITE_OK ){
+    /* all memory is allocated, proxys are created and assigned,
+    ** switch the locking context and pMethod then return.
+    */
+    pCtx->oldLockingContext = pFile->lockingContext;
+    pFile->lockingContext = pCtx;
+    pCtx->pOldMethod = pFile->pMethod;
+    pFile->pMethod = &proxyIoMethods;
+  }else{
+    if( pCtx->conchFile ){
+      pCtx->conchFile->pMethod->xClose((sqlite3_file *)pCtx->conchFile);
+      sqlite3_free(pCtx->conchFile);
+    }
+    sqlite3DbFree(0, pCtx->lockProxyPath);
+    sqlite3_free(pCtx->conchFilePath);
+    sqlite3_free(pCtx);
+  }
+  OSTRACE(("TRANSPROXY  %d %s\n", pFile->h,
+           (rc==SQLITE_OK ? "ok" : "failed")));
+  return rc;
+}
+
+
+/*
+** This routine handles sqlite3_file_control() calls that are specific
+** to proxy locking.
+*/
+static int proxyFileControl(sqlite3_file *id, int op, void *pArg){
+  switch( op ){
+    case SQLITE_FCNTL_GET_LOCKPROXYFILE: {
+      unixFile *pFile = (unixFile*)id;
+      if( pFile->pMethod == &proxyIoMethods ){
+        proxyLockingContext *pCtx = (proxyLockingContext*)pFile->lockingContext;
+        proxyTakeConch(pFile);
+        if( pCtx->lockProxyPath ){
+          *(const char **)pArg = pCtx->lockProxyPath;
+        }else{
+          *(const char **)pArg = ":auto: (not held)";
+        }
+      } else {
+        *(const char **)pArg = NULL;
+      }
+      return SQLITE_OK;
+    }
+    case SQLITE_FCNTL_SET_LOCKPROXYFILE: {
+      unixFile *pFile = (unixFile*)id;
+      int rc = SQLITE_OK;
+      int isProxyStyle = (pFile->pMethod == &proxyIoMethods);
+      if( pArg==NULL || (const char *)pArg==0 ){
+        if( isProxyStyle ){
+          /* turn off proxy locking - not supported.  If support is added for
+          ** switching proxy locking mode off then it will need to fail if
+          ** the journal mode is WAL mode.
+          */
+          rc = SQLITE_ERROR /*SQLITE_PROTOCOL? SQLITE_MISUSE?*/;
+        }else{
+          /* turn off proxy locking - already off - NOOP */
+          rc = SQLITE_OK;
+        }
+      }else{
+        const char *proxyPath = (const char *)pArg;
+        if( isProxyStyle ){
+          proxyLockingContext *pCtx =
+            (proxyLockingContext*)pFile->lockingContext;
+          if( !strcmp(pArg, ":auto:")
+           || (pCtx->lockProxyPath &&
+               !strncmp(pCtx->lockProxyPath, proxyPath, MAXPATHLEN))
+          ){
+            rc = SQLITE_OK;
+          }else{
+            rc = switchLockProxyPath(pFile, proxyPath);
+          }
+        }else{
+          /* turn on proxy file locking */
+          rc = proxyTransformUnixFile(pFile, proxyPath);
+        }
+      }
+      return rc;
+    }
+    default: {
+      assert( 0 );  /* The call assures that only valid opcodes are sent */
+    }
+  }
+  /*NOTREACHED*/ assert(0);
+  return SQLITE_ERROR;
+}
+
+/*
+** Within this division (the proxying locking implementation) the procedures
+** above this point are all utilities.  The lock-related methods of the
+** proxy-locking sqlite3_io_method object follow.
+*/
+
+
+/*
+** This routine checks if there is a RESERVED lock held on the specified
+** file by this or any other process. If such a lock is held, set *pResOut
+** to a non-zero value otherwise *pResOut is set to zero.  The return value
+** is set to SQLITE_OK unless an I/O error occurs during lock checking.
+*/
+static int proxyCheckReservedLock(sqlite3_file *id, int *pResOut) {
+  unixFile *pFile = (unixFile*)id;
+  int rc = proxyTakeConch(pFile);
+  if( rc==SQLITE_OK ){
+    proxyLockingContext *pCtx = (proxyLockingContext *)pFile->lockingContext;
+    if( pCtx->conchHeld>0 ){
+      unixFile *proxy = pCtx->lockProxy;
+      return proxy->pMethod->xCheckReservedLock((sqlite3_file*)proxy, pResOut);
+    }else{ /* conchHeld < 0 is lockless */
+      pResOut=0;
+    }
+  }
+  return rc;
+}
+
+/*
+** Lock the file with the lock specified by parameter eFileLock - one
+** of the following:
+**
+**     (1) SHARED_LOCK
+**     (2) RESERVED_LOCK
+**     (3) PENDING_LOCK
+**     (4) EXCLUSIVE_LOCK
+**
+** Sometimes when requesting one lock state, additional lock states
+** are inserted in between.  The locking might fail on one of the later
+** transitions leaving the lock state different from what it started but
+** still short of its goal.  The following chart shows the allowed
+** transitions and the inserted intermediate states:
+**
+**    UNLOCKED -> SHARED
+**    SHARED -> RESERVED
+**    SHARED -> (PENDING) -> EXCLUSIVE
+**    RESERVED -> (PENDING) -> EXCLUSIVE
+**    PENDING -> EXCLUSIVE
+**
+** This routine will only increase a lock.  Use the sqlite3OsUnlock()
+** routine to lower a locking level.
+*/
+static int proxyLock(sqlite3_file *id, int eFileLock) {
+  unixFile *pFile = (unixFile*)id;
+  int rc = proxyTakeConch(pFile);
+  if( rc==SQLITE_OK ){
+    proxyLockingContext *pCtx = (proxyLockingContext *)pFile->lockingContext;
+    if( pCtx->conchHeld>0 ){
+      unixFile *proxy = pCtx->lockProxy;
+      rc = proxy->pMethod->xLock((sqlite3_file*)proxy, eFileLock);
+      pFile->eFileLock = proxy->eFileLock;
+    }else{
+      /* conchHeld < 0 is lockless */
+    }
+  }
+  return rc;
+}
+
+
+/*
+** Lower the locking level on file descriptor pFile to eFileLock.  eFileLock
+** must be either NO_LOCK or SHARED_LOCK.
+**
+** If the locking level of the file descriptor is already at or below
+** the requested locking level, this routine is a no-op.
+*/
+static int proxyUnlock(sqlite3_file *id, int eFileLock) {
+  unixFile *pFile = (unixFile*)id;
+  int rc = proxyTakeConch(pFile);
+  if( rc==SQLITE_OK ){
+    proxyLockingContext *pCtx = (proxyLockingContext *)pFile->lockingContext;
+    if( pCtx->conchHeld>0 ){
+      unixFile *proxy = pCtx->lockProxy;
+      rc = proxy->pMethod->xUnlock((sqlite3_file*)proxy, eFileLock);
+      pFile->eFileLock = proxy->eFileLock;
+    }else{
+      /* conchHeld < 0 is lockless */
+    }
+  }
+  return rc;
+}
+
+/*
+** Close a file that uses proxy locks.
+*/
+static int proxyClose(sqlite3_file *id) {
+  if( ALWAYS(id) ){
+    unixFile *pFile = (unixFile*)id;
+    proxyLockingContext *pCtx = (proxyLockingContext *)pFile->lockingContext;
+    unixFile *lockProxy = pCtx->lockProxy;
+    unixFile *conchFile = pCtx->conchFile;
+    int rc = SQLITE_OK;
+
+    if( lockProxy
