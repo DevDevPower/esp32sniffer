@@ -43973,4 +43973,211 @@ struct winVfsAppData {
 #ifndef SQLITE_WIN32_HEAP_INIT_SIZE
 #  define SQLITE_WIN32_HEAP_INIT_SIZE   ((SQLITE_WIN32_CACHE_SIZE) * \
                                          (SQLITE_DEFAULT_PAGE_SIZE) + \
-                    
+                                         (SQLITE_WIN32_HEAP_INIT_EXTRA))
+#endif
+
+/*
+ * The maximum size of the Win32-specific heap.  This value may be zero.
+ */
+#ifndef SQLITE_WIN32_HEAP_MAX_SIZE
+#  define SQLITE_WIN32_HEAP_MAX_SIZE    (0)
+#endif
+
+/*
+ * The extra flags to use in calls to the Win32 heap APIs.  This value may be
+ * zero for the default behavior.
+ */
+#ifndef SQLITE_WIN32_HEAP_FLAGS
+#  define SQLITE_WIN32_HEAP_FLAGS       (0)
+#endif
+
+
+/*
+** The winMemData structure stores information required by the Win32-specific
+** sqlite3_mem_methods implementation.
+*/
+typedef struct winMemData winMemData;
+struct winMemData {
+#ifndef NDEBUG
+  u32 magic1;   /* Magic number to detect structure corruption. */
+#endif
+  HANDLE hHeap; /* The handle to our heap. */
+  BOOL bOwned;  /* Do we own the heap (i.e. destroy it on shutdown)? */
+#ifndef NDEBUG
+  u32 magic2;   /* Magic number to detect structure corruption. */
+#endif
+};
+
+#ifndef NDEBUG
+#define WINMEM_MAGIC1     0x42b2830b
+#define WINMEM_MAGIC2     0xbd4d7cf4
+#endif
+
+static struct winMemData win_mem_data = {
+#ifndef NDEBUG
+  WINMEM_MAGIC1,
+#endif
+  NULL, FALSE
+#ifndef NDEBUG
+  ,WINMEM_MAGIC2
+#endif
+};
+
+#ifndef NDEBUG
+#define winMemAssertMagic1() assert( win_mem_data.magic1==WINMEM_MAGIC1 )
+#define winMemAssertMagic2() assert( win_mem_data.magic2==WINMEM_MAGIC2 )
+#define winMemAssertMagic()  winMemAssertMagic1(); winMemAssertMagic2();
+#else
+#define winMemAssertMagic()
+#endif
+
+#define winMemGetDataPtr()  &win_mem_data
+#define winMemGetHeap()     win_mem_data.hHeap
+#define winMemGetOwned()    win_mem_data.bOwned
+
+static void *winMemMalloc(int nBytes);
+static void winMemFree(void *pPrior);
+static void *winMemRealloc(void *pPrior, int nBytes);
+static int winMemSize(void *p);
+static int winMemRoundup(int n);
+static int winMemInit(void *pAppData);
+static void winMemShutdown(void *pAppData);
+
+SQLITE_PRIVATE const sqlite3_mem_methods *sqlite3MemGetWin32(void);
+#endif /* SQLITE_WIN32_MALLOC */
+
+/*
+** The following variable is (normally) set once and never changes
+** thereafter.  It records whether the operating system is Win9x
+** or WinNT.
+**
+** 0:   Operating system unknown.
+** 1:   Operating system is Win9x.
+** 2:   Operating system is WinNT.
+**
+** In order to facilitate testing on a WinNT system, the test fixture
+** can manually set this value to 1 to emulate Win98 behavior.
+*/
+#ifdef SQLITE_TEST
+SQLITE_API LONG SQLITE_WIN32_VOLATILE sqlite3_os_type = 0;
+#else
+static LONG SQLITE_WIN32_VOLATILE sqlite3_os_type = 0;
+#endif
+
+#ifndef SYSCALL
+#  define SYSCALL sqlite3_syscall_ptr
+#endif
+
+/*
+** This function is not available on Windows CE or WinRT.
+ */
+
+#if SQLITE_OS_WINCE || SQLITE_OS_WINRT
+#  define osAreFileApisANSI()       1
+#endif
+
+/*
+** Many system calls are accessed through pointer-to-functions so that
+** they may be overridden at runtime to facilitate fault injection during
+** testing and sandboxing.  The following array holds the names and pointers
+** to all overrideable system calls.
+*/
+static struct win_syscall {
+  const char *zName;            /* Name of the system call */
+  sqlite3_syscall_ptr pCurrent; /* Current value of the system call */
+  sqlite3_syscall_ptr pDefault; /* Default value */
+} aSyscall[] = {
+#if !SQLITE_OS_WINCE && !SQLITE_OS_WINRT
+  { "AreFileApisANSI",         (SYSCALL)AreFileApisANSI,         0 },
+#else
+  { "AreFileApisANSI",         (SYSCALL)0,                       0 },
+#endif
+
+#ifndef osAreFileApisANSI
+#define osAreFileApisANSI ((BOOL(WINAPI*)(VOID))aSyscall[0].pCurrent)
+#endif
+
+#if SQLITE_OS_WINCE && defined(SQLITE_WIN32_HAS_WIDE)
+  { "CharLowerW",              (SYSCALL)CharLowerW,              0 },
+#else
+  { "CharLowerW",              (SYSCALL)0,                       0 },
+#endif
+
+#define osCharLowerW ((LPWSTR(WINAPI*)(LPWSTR))aSyscall[1].pCurrent)
+
+#if SQLITE_OS_WINCE && defined(SQLITE_WIN32_HAS_WIDE)
+  { "CharUpperW",              (SYSCALL)CharUpperW,              0 },
+#else
+  { "CharUpperW",              (SYSCALL)0,                       0 },
+#endif
+
+#define osCharUpperW ((LPWSTR(WINAPI*)(LPWSTR))aSyscall[2].pCurrent)
+
+  { "CloseHandle",             (SYSCALL)CloseHandle,             0 },
+
+#define osCloseHandle ((BOOL(WINAPI*)(HANDLE))aSyscall[3].pCurrent)
+
+#if defined(SQLITE_WIN32_HAS_ANSI)
+  { "CreateFileA",             (SYSCALL)CreateFileA,             0 },
+#else
+  { "CreateFileA",             (SYSCALL)0,                       0 },
+#endif
+
+#define osCreateFileA ((HANDLE(WINAPI*)(LPCSTR,DWORD,DWORD, \
+        LPSECURITY_ATTRIBUTES,DWORD,DWORD,HANDLE))aSyscall[4].pCurrent)
+
+#if !SQLITE_OS_WINRT && defined(SQLITE_WIN32_HAS_WIDE)
+  { "CreateFileW",             (SYSCALL)CreateFileW,             0 },
+#else
+  { "CreateFileW",             (SYSCALL)0,                       0 },
+#endif
+
+#define osCreateFileW ((HANDLE(WINAPI*)(LPCWSTR,DWORD,DWORD, \
+        LPSECURITY_ATTRIBUTES,DWORD,DWORD,HANDLE))aSyscall[5].pCurrent)
+
+#if !SQLITE_OS_WINRT && defined(SQLITE_WIN32_HAS_ANSI) && \
+        (!defined(SQLITE_OMIT_WAL) || SQLITE_MAX_MMAP_SIZE>0) && \
+        SQLITE_WIN32_CREATEFILEMAPPINGA
+  { "CreateFileMappingA",      (SYSCALL)CreateFileMappingA,      0 },
+#else
+  { "CreateFileMappingA",      (SYSCALL)0,                       0 },
+#endif
+
+#define osCreateFileMappingA ((HANDLE(WINAPI*)(HANDLE,LPSECURITY_ATTRIBUTES, \
+        DWORD,DWORD,DWORD,LPCSTR))aSyscall[6].pCurrent)
+
+#if SQLITE_OS_WINCE || (!SQLITE_OS_WINRT && defined(SQLITE_WIN32_HAS_WIDE) && \
+        (!defined(SQLITE_OMIT_WAL) || SQLITE_MAX_MMAP_SIZE>0))
+  { "CreateFileMappingW",      (SYSCALL)CreateFileMappingW,      0 },
+#else
+  { "CreateFileMappingW",      (SYSCALL)0,                       0 },
+#endif
+
+#define osCreateFileMappingW ((HANDLE(WINAPI*)(HANDLE,LPSECURITY_ATTRIBUTES, \
+        DWORD,DWORD,DWORD,LPCWSTR))aSyscall[7].pCurrent)
+
+#if !SQLITE_OS_WINRT && defined(SQLITE_WIN32_HAS_WIDE)
+  { "CreateMutexW",            (SYSCALL)CreateMutexW,            0 },
+#else
+  { "CreateMutexW",            (SYSCALL)0,                       0 },
+#endif
+
+#define osCreateMutexW ((HANDLE(WINAPI*)(LPSECURITY_ATTRIBUTES,BOOL, \
+        LPCWSTR))aSyscall[8].pCurrent)
+
+#if defined(SQLITE_WIN32_HAS_ANSI)
+  { "DeleteFileA",             (SYSCALL)DeleteFileA,             0 },
+#else
+  { "DeleteFileA",             (SYSCALL)0,                       0 },
+#endif
+
+#define osDeleteFileA ((BOOL(WINAPI*)(LPCSTR))aSyscall[9].pCurrent)
+
+#if defined(SQLITE_WIN32_HAS_WIDE)
+  { "DeleteFileW",             (SYSCALL)DeleteFileW,             0 },
+#else
+  { "DeleteFileW",             (SYSCALL)0,                       0 },
+#endif
+
+#define osDeleteFileW ((BOOL(WINAPI*)(LPCWSTR))aSyscall[10].pCurrent)
+
