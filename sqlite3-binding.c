@@ -44570,4 +44570,201 @@ static struct win_syscall {
 #define osWideCharToMultiByte ((int(WINAPI*)(UINT,DWORD,LPCWSTR,int,LPSTR,int, \
         LPCSTR,LPBOOL))aSyscall[60].pCurrent)
 
-  { "WriteFile",  
+  { "WriteFile",               (SYSCALL)WriteFile,               0 },
+
+#define osWriteFile ((BOOL(WINAPI*)(HANDLE,LPCVOID,DWORD,LPDWORD, \
+        LPOVERLAPPED))aSyscall[61].pCurrent)
+
+#if SQLITE_OS_WINRT
+  { "CreateEventExW",          (SYSCALL)CreateEventExW,          0 },
+#else
+  { "CreateEventExW",          (SYSCALL)0,                       0 },
+#endif
+
+#define osCreateEventExW ((HANDLE(WINAPI*)(LPSECURITY_ATTRIBUTES,LPCWSTR, \
+        DWORD,DWORD))aSyscall[62].pCurrent)
+
+#if !SQLITE_OS_WINRT
+  { "WaitForSingleObject",     (SYSCALL)WaitForSingleObject,     0 },
+#else
+  { "WaitForSingleObject",     (SYSCALL)0,                       0 },
+#endif
+
+#define osWaitForSingleObject ((DWORD(WINAPI*)(HANDLE, \
+        DWORD))aSyscall[63].pCurrent)
+
+#if !SQLITE_OS_WINCE
+  { "WaitForSingleObjectEx",   (SYSCALL)WaitForSingleObjectEx,   0 },
+#else
+  { "WaitForSingleObjectEx",   (SYSCALL)0,                       0 },
+#endif
+
+#define osWaitForSingleObjectEx ((DWORD(WINAPI*)(HANDLE,DWORD, \
+        BOOL))aSyscall[64].pCurrent)
+
+#if SQLITE_OS_WINRT
+  { "SetFilePointerEx",        (SYSCALL)SetFilePointerEx,        0 },
+#else
+  { "SetFilePointerEx",        (SYSCALL)0,                       0 },
+#endif
+
+#define osSetFilePointerEx ((BOOL(WINAPI*)(HANDLE,LARGE_INTEGER, \
+        PLARGE_INTEGER,DWORD))aSyscall[65].pCurrent)
+
+#if SQLITE_OS_WINRT
+  { "GetFileInformationByHandleEx", (SYSCALL)GetFileInformationByHandleEx, 0 },
+#else
+  { "GetFileInformationByHandleEx", (SYSCALL)0,                  0 },
+#endif
+
+#define osGetFileInformationByHandleEx ((BOOL(WINAPI*)(HANDLE, \
+        FILE_INFO_BY_HANDLE_CLASS,LPVOID,DWORD))aSyscall[66].pCurrent)
+
+#if SQLITE_OS_WINRT && (!defined(SQLITE_OMIT_WAL) || SQLITE_MAX_MMAP_SIZE>0)
+  { "MapViewOfFileFromApp",    (SYSCALL)MapViewOfFileFromApp,    0 },
+#else
+  { "MapViewOfFileFromApp",    (SYSCALL)0,                       0 },
+#endif
+
+#define osMapViewOfFileFromApp ((LPVOID(WINAPI*)(HANDLE,ULONG,ULONG64, \
+        SIZE_T))aSyscall[67].pCurrent)
+
+#if SQLITE_OS_WINRT
+  { "CreateFile2",             (SYSCALL)CreateFile2,             0 },
+#else
+  { "CreateFile2",             (SYSCALL)0,                       0 },
+#endif
+
+#define osCreateFile2 ((HANDLE(WINAPI*)(LPCWSTR,DWORD,DWORD,DWORD, \
+        LPCREATEFILE2_EXTENDED_PARAMETERS))aSyscall[68].pCurrent)
+
+#if SQLITE_OS_WINRT && !defined(SQLITE_OMIT_LOAD_EXTENSION)
+  { "LoadPackagedLibrary",     (SYSCALL)LoadPackagedLibrary,     0 },
+#else
+  { "LoadPackagedLibrary",     (SYSCALL)0,                       0 },
+#endif
+
+#define osLoadPackagedLibrary ((HMODULE(WINAPI*)(LPCWSTR, \
+        DWORD))aSyscall[69].pCurrent)
+
+#if SQLITE_OS_WINRT
+  { "GetTickCount64",          (SYSCALL)GetTickCount64,          0 },
+#else
+  { "GetTickCount64",          (SYSCALL)0,                       0 },
+#endif
+
+#define osGetTickCount64 ((ULONGLONG(WINAPI*)(VOID))aSyscall[70].pCurrent)
+
+#if SQLITE_OS_WINRT
+  { "GetNativeSystemInfo",     (SYSCALL)GetNativeSystemInfo,     0 },
+#else
+  { "GetNativeSystemInfo",     (SYSCALL)0,                       0 },
+#endif
+
+#define osGetNativeSystemInfo ((VOID(WINAPI*)( \
+        LPSYSTEM_INFO))aSyscall[71].pCurrent)
+
+#if defined(SQLITE_WIN32_HAS_ANSI)
+  { "OutputDebugStringA",      (SYSCALL)OutputDebugStringA,      0 },
+#else
+  { "OutputDebugStringA",      (SYSCALL)0,                       0 },
+#endif
+
+#define osOutputDebugStringA ((VOID(WINAPI*)(LPCSTR))aSyscall[72].pCurrent)
+
+#if defined(SQLITE_WIN32_HAS_WIDE)
+  { "OutputDebugStringW",      (SYSCALL)OutputDebugStringW,      0 },
+#else
+  { "OutputDebugStringW",      (SYSCALL)0,                       0 },
+#endif
+
+#define osOutputDebugStringW ((VOID(WINAPI*)(LPCWSTR))aSyscall[73].pCurrent)
+
+  { "GetProcessHeap",          (SYSCALL)GetProcessHeap,          0 },
+
+#define osGetProcessHeap ((HANDLE(WINAPI*)(VOID))aSyscall[74].pCurrent)
+
+#if SQLITE_OS_WINRT && (!defined(SQLITE_OMIT_WAL) || SQLITE_MAX_MMAP_SIZE>0)
+  { "CreateFileMappingFromApp", (SYSCALL)CreateFileMappingFromApp, 0 },
+#else
+  { "CreateFileMappingFromApp", (SYSCALL)0,                      0 },
+#endif
+
+#define osCreateFileMappingFromApp ((HANDLE(WINAPI*)(HANDLE, \
+        LPSECURITY_ATTRIBUTES,ULONG,ULONG64,LPCWSTR))aSyscall[75].pCurrent)
+
+/*
+** NOTE: On some sub-platforms, the InterlockedCompareExchange "function"
+**       is really just a macro that uses a compiler intrinsic (e.g. x64).
+**       So do not try to make this is into a redefinable interface.
+*/
+#if defined(InterlockedCompareExchange)
+  { "InterlockedCompareExchange", (SYSCALL)0,                    0 },
+
+#define osInterlockedCompareExchange InterlockedCompareExchange
+#else
+  { "InterlockedCompareExchange", (SYSCALL)InterlockedCompareExchange, 0 },
+
+#define osInterlockedCompareExchange ((LONG(WINAPI*)(LONG \
+        SQLITE_WIN32_VOLATILE*, LONG,LONG))aSyscall[76].pCurrent)
+#endif /* defined(InterlockedCompareExchange) */
+
+#if !SQLITE_OS_WINCE && !SQLITE_OS_WINRT && SQLITE_WIN32_USE_UUID
+  { "UuidCreate",               (SYSCALL)UuidCreate,             0 },
+#else
+  { "UuidCreate",               (SYSCALL)0,                      0 },
+#endif
+
+#define osUuidCreate ((RPC_STATUS(RPC_ENTRY*)(UUID*))aSyscall[77].pCurrent)
+
+#if !SQLITE_OS_WINCE && !SQLITE_OS_WINRT && SQLITE_WIN32_USE_UUID
+  { "UuidCreateSequential",     (SYSCALL)UuidCreateSequential,   0 },
+#else
+  { "UuidCreateSequential",     (SYSCALL)0,                      0 },
+#endif
+
+#define osUuidCreateSequential \
+        ((RPC_STATUS(RPC_ENTRY*)(UUID*))aSyscall[78].pCurrent)
+
+#if !defined(SQLITE_NO_SYNC) && SQLITE_MAX_MMAP_SIZE>0
+  { "FlushViewOfFile",          (SYSCALL)FlushViewOfFile,        0 },
+#else
+  { "FlushViewOfFile",          (SYSCALL)0,                      0 },
+#endif
+
+#define osFlushViewOfFile \
+        ((BOOL(WINAPI*)(LPCVOID,SIZE_T))aSyscall[79].pCurrent)
+
+}; /* End of the overrideable system calls */
+
+/*
+** This is the xSetSystemCall() method of sqlite3_vfs for all of the
+** "win32" VFSes.  Return SQLITE_OK opon successfully updating the
+** system call pointer, or SQLITE_NOTFOUND if there is no configurable
+** system call named zName.
+*/
+static int winSetSystemCall(
+  sqlite3_vfs *pNotUsed,        /* The VFS pointer.  Not used */
+  const char *zName,            /* Name of system call to override */
+  sqlite3_syscall_ptr pNewFunc  /* Pointer to new system call value */
+){
+  unsigned int i;
+  int rc = SQLITE_NOTFOUND;
+
+  UNUSED_PARAMETER(pNotUsed);
+  if( zName==0 ){
+    /* If no zName is given, restore all system calls to their default
+    ** settings and return NULL
+    */
+    rc = SQLITE_OK;
+    for(i=0; i<sizeof(aSyscall)/sizeof(aSyscall[0]); i++){
+      if( aSyscall[i].pDefault ){
+        aSyscall[i].pCurrent = aSyscall[i].pDefault;
+      }
+    }
+  }else{
+    /* If zName is specified, operate on only the one system call
+    ** specified.
+    */
+    for(i=0; i<sizeof(aSyscall)/sizeof(aSyscall[0]); i++){
+      if( strcmp(zNa
