@@ -44767,4 +44767,213 @@ static int winSetSystemCall(
     ** specified.
     */
     for(i=0; i<sizeof(aSyscall)/sizeof(aSyscall[0]); i++){
-      if( strcmp(zNa
+      if( strcmp(zName, aSyscall[i].zName)==0 ){
+        if( aSyscall[i].pDefault==0 ){
+          aSyscall[i].pDefault = aSyscall[i].pCurrent;
+        }
+        rc = SQLITE_OK;
+        if( pNewFunc==0 ) pNewFunc = aSyscall[i].pDefault;
+        aSyscall[i].pCurrent = pNewFunc;
+        break;
+      }
+    }
+  }
+  return rc;
+}
+
+/*
+** Return the value of a system call.  Return NULL if zName is not a
+** recognized system call name.  NULL is also returned if the system call
+** is currently undefined.
+*/
+static sqlite3_syscall_ptr winGetSystemCall(
+  sqlite3_vfs *pNotUsed,
+  const char *zName
+){
+  unsigned int i;
+
+  UNUSED_PARAMETER(pNotUsed);
+  for(i=0; i<sizeof(aSyscall)/sizeof(aSyscall[0]); i++){
+    if( strcmp(zName, aSyscall[i].zName)==0 ) return aSyscall[i].pCurrent;
+  }
+  return 0;
+}
+
+/*
+** Return the name of the first system call after zName.  If zName==NULL
+** then return the name of the first system call.  Return NULL if zName
+** is the last system call or if zName is not the name of a valid
+** system call.
+*/
+static const char *winNextSystemCall(sqlite3_vfs *p, const char *zName){
+  int i = -1;
+
+  UNUSED_PARAMETER(p);
+  if( zName ){
+    for(i=0; i<ArraySize(aSyscall)-1; i++){
+      if( strcmp(zName, aSyscall[i].zName)==0 ) break;
+    }
+  }
+  for(i++; i<ArraySize(aSyscall); i++){
+    if( aSyscall[i].pCurrent!=0 ) return aSyscall[i].zName;
+  }
+  return 0;
+}
+
+#ifdef SQLITE_WIN32_MALLOC
+/*
+** If a Win32 native heap has been configured, this function will attempt to
+** compact it.  Upon success, SQLITE_OK will be returned.  Upon failure, one
+** of SQLITE_NOMEM, SQLITE_ERROR, or SQLITE_NOTFOUND will be returned.  The
+** "pnLargest" argument, if non-zero, will be used to return the size of the
+** largest committed free block in the heap, in bytes.
+*/
+SQLITE_API int sqlite3_win32_compact_heap(LPUINT pnLargest){
+  int rc = SQLITE_OK;
+  UINT nLargest = 0;
+  HANDLE hHeap;
+
+  winMemAssertMagic();
+  hHeap = winMemGetHeap();
+  assert( hHeap!=0 );
+  assert( hHeap!=INVALID_HANDLE_VALUE );
+#if !SQLITE_OS_WINRT && defined(SQLITE_WIN32_MALLOC_VALIDATE)
+  assert( osHeapValidate(hHeap, SQLITE_WIN32_HEAP_FLAGS, NULL) );
+#endif
+#if !SQLITE_OS_WINCE && !SQLITE_OS_WINRT
+  if( (nLargest=osHeapCompact(hHeap, SQLITE_WIN32_HEAP_FLAGS))==0 ){
+    DWORD lastErrno = osGetLastError();
+    if( lastErrno==NO_ERROR ){
+      sqlite3_log(SQLITE_NOMEM, "failed to HeapCompact (no space), heap=%p",
+                  (void*)hHeap);
+      rc = SQLITE_NOMEM_BKPT;
+    }else{
+      sqlite3_log(SQLITE_ERROR, "failed to HeapCompact (%lu), heap=%p",
+                  osGetLastError(), (void*)hHeap);
+      rc = SQLITE_ERROR;
+    }
+  }
+#else
+  sqlite3_log(SQLITE_NOTFOUND, "failed to HeapCompact, heap=%p",
+              (void*)hHeap);
+  rc = SQLITE_NOTFOUND;
+#endif
+  if( pnLargest ) *pnLargest = nLargest;
+  return rc;
+}
+
+/*
+** If a Win32 native heap has been configured, this function will attempt to
+** destroy and recreate it.  If the Win32 native heap is not isolated and/or
+** the sqlite3_memory_used() function does not return zero, SQLITE_BUSY will
+** be returned and no changes will be made to the Win32 native heap.
+*/
+SQLITE_API int sqlite3_win32_reset_heap(){
+  int rc;
+  MUTEX_LOGIC( sqlite3_mutex *pMainMtx; ) /* The main static mutex */
+  MUTEX_LOGIC( sqlite3_mutex *pMem; )    /* The memsys static mutex */
+  MUTEX_LOGIC( pMainMtx = sqlite3MutexAlloc(SQLITE_MUTEX_STATIC_MAIN); )
+  MUTEX_LOGIC( pMem = sqlite3MutexAlloc(SQLITE_MUTEX_STATIC_MEM); )
+  sqlite3_mutex_enter(pMainMtx);
+  sqlite3_mutex_enter(pMem);
+  winMemAssertMagic();
+  if( winMemGetHeap()!=NULL && winMemGetOwned() && sqlite3_memory_used()==0 ){
+    /*
+    ** At this point, there should be no outstanding memory allocations on
+    ** the heap.  Also, since both the main and memsys locks are currently
+    ** being held by us, no other function (i.e. from another thread) should
+    ** be able to even access the heap.  Attempt to destroy and recreate our
+    ** isolated Win32 native heap now.
+    */
+    assert( winMemGetHeap()!=NULL );
+    assert( winMemGetOwned() );
+    assert( sqlite3_memory_used()==0 );
+    winMemShutdown(winMemGetDataPtr());
+    assert( winMemGetHeap()==NULL );
+    assert( !winMemGetOwned() );
+    assert( sqlite3_memory_used()==0 );
+    rc = winMemInit(winMemGetDataPtr());
+    assert( rc!=SQLITE_OK || winMemGetHeap()!=NULL );
+    assert( rc!=SQLITE_OK || winMemGetOwned() );
+    assert( rc!=SQLITE_OK || sqlite3_memory_used()==0 );
+  }else{
+    /*
+    ** The Win32 native heap cannot be modified because it may be in use.
+    */
+    rc = SQLITE_BUSY;
+  }
+  sqlite3_mutex_leave(pMem);
+  sqlite3_mutex_leave(pMainMtx);
+  return rc;
+}
+#endif /* SQLITE_WIN32_MALLOC */
+
+/*
+** This function outputs the specified (ANSI) string to the Win32 debugger
+** (if available).
+*/
+
+SQLITE_API void sqlite3_win32_write_debug(const char *zBuf, int nBuf){
+  char zDbgBuf[SQLITE_WIN32_DBG_BUF_SIZE];
+  int nMin = MIN(nBuf, (SQLITE_WIN32_DBG_BUF_SIZE - 1)); /* may be negative. */
+  if( nMin<-1 ) nMin = -1; /* all negative values become -1. */
+  assert( nMin==-1 || nMin==0 || nMin<SQLITE_WIN32_DBG_BUF_SIZE );
+#ifdef SQLITE_ENABLE_API_ARMOR
+  if( !zBuf ){
+    (void)SQLITE_MISUSE_BKPT;
+    return;
+  }
+#endif
+#if defined(SQLITE_WIN32_HAS_ANSI)
+  if( nMin>0 ){
+    memset(zDbgBuf, 0, SQLITE_WIN32_DBG_BUF_SIZE);
+    memcpy(zDbgBuf, zBuf, nMin);
+    osOutputDebugStringA(zDbgBuf);
+  }else{
+    osOutputDebugStringA(zBuf);
+  }
+#elif defined(SQLITE_WIN32_HAS_WIDE)
+  memset(zDbgBuf, 0, SQLITE_WIN32_DBG_BUF_SIZE);
+  if ( osMultiByteToWideChar(
+          osAreFileApisANSI() ? CP_ACP : CP_OEMCP, 0, zBuf,
+          nMin, (LPWSTR)zDbgBuf, SQLITE_WIN32_DBG_BUF_SIZE/sizeof(WCHAR))<=0 ){
+    return;
+  }
+  osOutputDebugStringW((LPCWSTR)zDbgBuf);
+#else
+  if( nMin>0 ){
+    memset(zDbgBuf, 0, SQLITE_WIN32_DBG_BUF_SIZE);
+    memcpy(zDbgBuf, zBuf, nMin);
+    fprintf(stderr, "%s", zDbgBuf);
+  }else{
+    fprintf(stderr, "%s", zBuf);
+  }
+#endif
+}
+
+/*
+** The following routine suspends the current thread for at least ms
+** milliseconds.  This is equivalent to the Win32 Sleep() interface.
+*/
+#if SQLITE_OS_WINRT
+static HANDLE sleepObj = NULL;
+#endif
+
+SQLITE_API void sqlite3_win32_sleep(DWORD milliseconds){
+#if SQLITE_OS_WINRT
+  if ( sleepObj==NULL ){
+    sleepObj = osCreateEventExW(NULL, NULL, CREATE_EVENT_MANUAL_RESET,
+                                SYNCHRONIZE);
+  }
+  assert( sleepObj!=NULL );
+  osWaitForSingleObjectEx(sleepObj, milliseconds, FALSE);
+#else
+  osSleep(milliseconds);
+#endif
+}
+
+#if SQLITE_MAX_WORKER_THREADS>0 && !SQLITE_OS_WINCE && !SQLITE_OS_WINRT && \
+        SQLITE_THREADSAFE>0
+SQLITE_PRIVATE DWORD sqlite3Win32Wait(HANDLE hObject){
+  DWORD rc;
+  while( (rc = osWaitForSingleO
