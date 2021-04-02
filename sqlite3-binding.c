@@ -44976,4 +44976,226 @@ SQLITE_API void sqlite3_win32_sleep(DWORD milliseconds){
         SQLITE_THREADSAFE>0
 SQLITE_PRIVATE DWORD sqlite3Win32Wait(HANDLE hObject){
   DWORD rc;
-  while( (rc = osWaitForSingleO
+  while( (rc = osWaitForSingleObjectEx(hObject, INFINITE,
+                                       TRUE))==WAIT_IO_COMPLETION ){}
+  return rc;
+}
+#endif
+
+/*
+** Return true (non-zero) if we are running under WinNT, Win2K, WinXP,
+** or WinCE.  Return false (zero) for Win95, Win98, or WinME.
+**
+** Here is an interesting observation:  Win95, Win98, and WinME lack
+** the LockFileEx() API.  But we can still statically link against that
+** API as long as we don't call it when running Win95/98/ME.  A call to
+** this routine is used to determine if the host is Win95/98/ME or
+** WinNT/2K/XP so that we will know whether or not we can safely call
+** the LockFileEx() API.
+*/
+
+#if !SQLITE_WIN32_GETVERSIONEX
+# define osIsNT()  (1)
+#elif SQLITE_OS_WINCE || SQLITE_OS_WINRT || !defined(SQLITE_WIN32_HAS_ANSI)
+# define osIsNT()  (1)
+#elif !defined(SQLITE_WIN32_HAS_WIDE)
+# define osIsNT()  (0)
+#else
+# define osIsNT()  ((sqlite3_os_type==2) || sqlite3_win32_is_nt())
+#endif
+
+/*
+** This function determines if the machine is running a version of Windows
+** based on the NT kernel.
+*/
+SQLITE_API int sqlite3_win32_is_nt(void){
+#if SQLITE_OS_WINRT
+  /*
+  ** NOTE: The WinRT sub-platform is always assumed to be based on the NT
+  **       kernel.
+  */
+  return 1;
+#elif SQLITE_WIN32_GETVERSIONEX
+  if( osInterlockedCompareExchange(&sqlite3_os_type, 0, 0)==0 ){
+#if defined(SQLITE_WIN32_HAS_ANSI)
+    OSVERSIONINFOA sInfo;
+    sInfo.dwOSVersionInfoSize = sizeof(sInfo);
+    osGetVersionExA(&sInfo);
+    osInterlockedCompareExchange(&sqlite3_os_type,
+        (sInfo.dwPlatformId == VER_PLATFORM_WIN32_NT) ? 2 : 1, 0);
+#elif defined(SQLITE_WIN32_HAS_WIDE)
+    OSVERSIONINFOW sInfo;
+    sInfo.dwOSVersionInfoSize = sizeof(sInfo);
+    osGetVersionExW(&sInfo);
+    osInterlockedCompareExchange(&sqlite3_os_type,
+        (sInfo.dwPlatformId == VER_PLATFORM_WIN32_NT) ? 2 : 1, 0);
+#endif
+  }
+  return osInterlockedCompareExchange(&sqlite3_os_type, 2, 2)==2;
+#elif SQLITE_TEST
+  return osInterlockedCompareExchange(&sqlite3_os_type, 2, 2)==2;
+#else
+  /*
+  ** NOTE: All sub-platforms where the GetVersionEx[AW] functions are
+  **       deprecated are always assumed to be based on the NT kernel.
+  */
+  return 1;
+#endif
+}
+
+#ifdef SQLITE_WIN32_MALLOC
+/*
+** Allocate nBytes of memory.
+*/
+static void *winMemMalloc(int nBytes){
+  HANDLE hHeap;
+  void *p;
+
+  winMemAssertMagic();
+  hHeap = winMemGetHeap();
+  assert( hHeap!=0 );
+  assert( hHeap!=INVALID_HANDLE_VALUE );
+#if !SQLITE_OS_WINRT && defined(SQLITE_WIN32_MALLOC_VALIDATE)
+  assert( osHeapValidate(hHeap, SQLITE_WIN32_HEAP_FLAGS, NULL) );
+#endif
+  assert( nBytes>=0 );
+  p = osHeapAlloc(hHeap, SQLITE_WIN32_HEAP_FLAGS, (SIZE_T)nBytes);
+  if( !p ){
+    sqlite3_log(SQLITE_NOMEM, "failed to HeapAlloc %u bytes (%lu), heap=%p",
+                nBytes, osGetLastError(), (void*)hHeap);
+  }
+  return p;
+}
+
+/*
+** Free memory.
+*/
+static void winMemFree(void *pPrior){
+  HANDLE hHeap;
+
+  winMemAssertMagic();
+  hHeap = winMemGetHeap();
+  assert( hHeap!=0 );
+  assert( hHeap!=INVALID_HANDLE_VALUE );
+#if !SQLITE_OS_WINRT && defined(SQLITE_WIN32_MALLOC_VALIDATE)
+  assert( osHeapValidate(hHeap, SQLITE_WIN32_HEAP_FLAGS, pPrior) );
+#endif
+  if( !pPrior ) return; /* Passing NULL to HeapFree is undefined. */
+  if( !osHeapFree(hHeap, SQLITE_WIN32_HEAP_FLAGS, pPrior) ){
+    sqlite3_log(SQLITE_NOMEM, "failed to HeapFree block %p (%lu), heap=%p",
+                pPrior, osGetLastError(), (void*)hHeap);
+  }
+}
+
+/*
+** Change the size of an existing memory allocation
+*/
+static void *winMemRealloc(void *pPrior, int nBytes){
+  HANDLE hHeap;
+  void *p;
+
+  winMemAssertMagic();
+  hHeap = winMemGetHeap();
+  assert( hHeap!=0 );
+  assert( hHeap!=INVALID_HANDLE_VALUE );
+#if !SQLITE_OS_WINRT && defined(SQLITE_WIN32_MALLOC_VALIDATE)
+  assert( osHeapValidate(hHeap, SQLITE_WIN32_HEAP_FLAGS, pPrior) );
+#endif
+  assert( nBytes>=0 );
+  if( !pPrior ){
+    p = osHeapAlloc(hHeap, SQLITE_WIN32_HEAP_FLAGS, (SIZE_T)nBytes);
+  }else{
+    p = osHeapReAlloc(hHeap, SQLITE_WIN32_HEAP_FLAGS, pPrior, (SIZE_T)nBytes);
+  }
+  if( !p ){
+    sqlite3_log(SQLITE_NOMEM, "failed to %s %u bytes (%lu), heap=%p",
+                pPrior ? "HeapReAlloc" : "HeapAlloc", nBytes, osGetLastError(),
+                (void*)hHeap);
+  }
+  return p;
+}
+
+/*
+** Return the size of an outstanding allocation, in bytes.
+*/
+static int winMemSize(void *p){
+  HANDLE hHeap;
+  SIZE_T n;
+
+  winMemAssertMagic();
+  hHeap = winMemGetHeap();
+  assert( hHeap!=0 );
+  assert( hHeap!=INVALID_HANDLE_VALUE );
+#if !SQLITE_OS_WINRT && defined(SQLITE_WIN32_MALLOC_VALIDATE)
+  assert( osHeapValidate(hHeap, SQLITE_WIN32_HEAP_FLAGS, p) );
+#endif
+  if( !p ) return 0;
+  n = osHeapSize(hHeap, SQLITE_WIN32_HEAP_FLAGS, p);
+  if( n==(SIZE_T)-1 ){
+    sqlite3_log(SQLITE_NOMEM, "failed to HeapSize block %p (%lu), heap=%p",
+                p, osGetLastError(), (void*)hHeap);
+    return 0;
+  }
+  return (int)n;
+}
+
+/*
+** Round up a request size to the next valid allocation size.
+*/
+static int winMemRoundup(int n){
+  return n;
+}
+
+/*
+** Initialize this module.
+*/
+static int winMemInit(void *pAppData){
+  winMemData *pWinMemData = (winMemData *)pAppData;
+
+  if( !pWinMemData ) return SQLITE_ERROR;
+  assert( pWinMemData->magic1==WINMEM_MAGIC1 );
+  assert( pWinMemData->magic2==WINMEM_MAGIC2 );
+
+#if !SQLITE_OS_WINRT && SQLITE_WIN32_HEAP_CREATE
+  if( !pWinMemData->hHeap ){
+    DWORD dwInitialSize = SQLITE_WIN32_HEAP_INIT_SIZE;
+    DWORD dwMaximumSize = (DWORD)sqlite3GlobalConfig.nHeap;
+    if( dwMaximumSize==0 ){
+      dwMaximumSize = SQLITE_WIN32_HEAP_MAX_SIZE;
+    }else if( dwInitialSize>dwMaximumSize ){
+      dwInitialSize = dwMaximumSize;
+    }
+    pWinMemData->hHeap = osHeapCreate(SQLITE_WIN32_HEAP_FLAGS,
+                                      dwInitialSize, dwMaximumSize);
+    if( !pWinMemData->hHeap ){
+      sqlite3_log(SQLITE_NOMEM,
+          "failed to HeapCreate (%lu), flags=%u, initSize=%lu, maxSize=%lu",
+          osGetLastError(), SQLITE_WIN32_HEAP_FLAGS, dwInitialSize,
+          dwMaximumSize);
+      return SQLITE_NOMEM_BKPT;
+    }
+    pWinMemData->bOwned = TRUE;
+    assert( pWinMemData->bOwned );
+  }
+#else
+  pWinMemData->hHeap = osGetProcessHeap();
+  if( !pWinMemData->hHeap ){
+    sqlite3_log(SQLITE_NOMEM,
+        "failed to GetProcessHeap (%lu)", osGetLastError());
+    return SQLITE_NOMEM_BKPT;
+  }
+  pWinMemData->bOwned = FALSE;
+  assert( !pWinMemData->bOwned );
+#endif
+  assert( pWinMemData->hHeap!=0 );
+  assert( pWinMemData->hHeap!=INVALID_HANDLE_VALUE );
+#if !SQLITE_OS_WINRT && defined(SQLITE_WIN32_MALLOC_VALIDATE)
+  assert( osHeapValidate(pWinMemData->hHeap, SQLITE_WIN32_HEAP_FLAGS, NULL) );
+#endif
+  return SQLITE_OK;
+}
+
+/*
+** Deinitialize this module.
+*/
+static void winMemShutdown(vo
