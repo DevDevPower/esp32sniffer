@@ -45667,4 +45667,218 @@ static int winLogErrorAtLine(
   DWORD lastErrno,                /* Win32 last error */
   const char *zFunc,              /* Name of OS function that failed */
   const char *zPath,              /* File path associated with error */
-  int iLine 
+  int iLine                       /* Source line number where error occurred */
+){
+  char zMsg[500];                 /* Human readable error text */
+  int i;                          /* Loop counter */
+
+  zMsg[0] = 0;
+  winGetLastErrorMsg(lastErrno, sizeof(zMsg), zMsg);
+  assert( errcode!=SQLITE_OK );
+  if( zPath==0 ) zPath = "";
+  for(i=0; zMsg[i] && zMsg[i]!='\r' && zMsg[i]!='\n'; i++){}
+  zMsg[i] = 0;
+  sqlite3_log(errcode,
+      "os_win.c:%d: (%lu) %s(%s) - %s",
+      iLine, lastErrno, zFunc, zPath, zMsg
+  );
+
+  return errcode;
+}
+
+/*
+** The number of times that a ReadFile(), WriteFile(), and DeleteFile()
+** will be retried following a locking error - probably caused by
+** antivirus software.  Also the initial delay before the first retry.
+** The delay increases linearly with each retry.
+*/
+#ifndef SQLITE_WIN32_IOERR_RETRY
+# define SQLITE_WIN32_IOERR_RETRY 10
+#endif
+#ifndef SQLITE_WIN32_IOERR_RETRY_DELAY
+# define SQLITE_WIN32_IOERR_RETRY_DELAY 25
+#endif
+static int winIoerrRetry = SQLITE_WIN32_IOERR_RETRY;
+static int winIoerrRetryDelay = SQLITE_WIN32_IOERR_RETRY_DELAY;
+
+/*
+** The "winIoerrCanRetry1" macro is used to determine if a particular I/O
+** error code obtained via GetLastError() is eligible to be retried.  It
+** must accept the error code DWORD as its only argument and should return
+** non-zero if the error code is transient in nature and the operation
+** responsible for generating the original error might succeed upon being
+** retried.  The argument to this macro should be a variable.
+**
+** Additionally, a macro named "winIoerrCanRetry2" may be defined.  If it
+** is defined, it will be consulted only when the macro "winIoerrCanRetry1"
+** returns zero.  The "winIoerrCanRetry2" macro is completely optional and
+** may be used to include additional error codes in the set that should
+** result in the failing I/O operation being retried by the caller.  If
+** defined, the "winIoerrCanRetry2" macro must exhibit external semantics
+** identical to those of the "winIoerrCanRetry1" macro.
+*/
+#if !defined(winIoerrCanRetry1)
+#define winIoerrCanRetry1(a) (((a)==ERROR_ACCESS_DENIED)        || \
+                              ((a)==ERROR_SHARING_VIOLATION)    || \
+                              ((a)==ERROR_LOCK_VIOLATION)       || \
+                              ((a)==ERROR_DEV_NOT_EXIST)        || \
+                              ((a)==ERROR_NETNAME_DELETED)      || \
+                              ((a)==ERROR_SEM_TIMEOUT)          || \
+                              ((a)==ERROR_NETWORK_UNREACHABLE))
+#endif
+
+/*
+** If a ReadFile() or WriteFile() error occurs, invoke this routine
+** to see if it should be retried.  Return TRUE to retry.  Return FALSE
+** to give up with an error.
+*/
+static int winRetryIoerr(int *pnRetry, DWORD *pError){
+  DWORD e = osGetLastError();
+  if( *pnRetry>=winIoerrRetry ){
+    if( pError ){
+      *pError = e;
+    }
+    return 0;
+  }
+  if( winIoerrCanRetry1(e) ){
+    sqlite3_win32_sleep(winIoerrRetryDelay*(1+*pnRetry));
+    ++*pnRetry;
+    return 1;
+  }
+#if defined(winIoerrCanRetry2)
+  else if( winIoerrCanRetry2(e) ){
+    sqlite3_win32_sleep(winIoerrRetryDelay*(1+*pnRetry));
+    ++*pnRetry;
+    return 1;
+  }
+#endif
+  if( pError ){
+    *pError = e;
+  }
+  return 0;
+}
+
+/*
+** Log a I/O error retry episode.
+*/
+static void winLogIoerr(int nRetry, int lineno){
+  if( nRetry ){
+    sqlite3_log(SQLITE_NOTICE,
+      "delayed %dms for lock/sharing conflict at line %d",
+      winIoerrRetryDelay*nRetry*(nRetry+1)/2, lineno
+    );
+  }
+}
+
+/*
+** This #if does not rely on the SQLITE_OS_WINCE define because the
+** corresponding section in "date.c" cannot use it.
+*/
+#if !defined(SQLITE_OMIT_LOCALTIME) && defined(_WIN32_WCE) && \
+    (!defined(SQLITE_MSVC_LOCALTIME_API) || !SQLITE_MSVC_LOCALTIME_API)
+/*
+** The MSVC CRT on Windows CE may not have a localtime() function.
+** So define a substitute.
+*/
+/* #  include <time.h> */
+struct tm *__cdecl localtime(const time_t *t)
+{
+  static struct tm y;
+  FILETIME uTm, lTm;
+  SYSTEMTIME pTm;
+  sqlite3_int64 t64;
+  t64 = *t;
+  t64 = (t64 + 11644473600)*10000000;
+  uTm.dwLowDateTime = (DWORD)(t64 & 0xFFFFFFFF);
+  uTm.dwHighDateTime= (DWORD)(t64 >> 32);
+  osFileTimeToLocalFileTime(&uTm,&lTm);
+  osFileTimeToSystemTime(&lTm,&pTm);
+  y.tm_year = pTm.wYear - 1900;
+  y.tm_mon = pTm.wMonth - 1;
+  y.tm_wday = pTm.wDayOfWeek;
+  y.tm_mday = pTm.wDay;
+  y.tm_hour = pTm.wHour;
+  y.tm_min = pTm.wMinute;
+  y.tm_sec = pTm.wSecond;
+  return &y;
+}
+#endif
+
+#if SQLITE_OS_WINCE
+/*************************************************************************
+** This section contains code for WinCE only.
+*/
+#define HANDLE_TO_WINFILE(a) (winFile*)&((char*)a)[-(int)offsetof(winFile,h)]
+
+/*
+** Acquire a lock on the handle h
+*/
+static void winceMutexAcquire(HANDLE h){
+   DWORD dwErr;
+   do {
+     dwErr = osWaitForSingleObject(h, INFINITE);
+   } while (dwErr != WAIT_OBJECT_0 && dwErr != WAIT_ABANDONED);
+}
+/*
+** Release a lock acquired by winceMutexAcquire()
+*/
+#define winceMutexRelease(h) ReleaseMutex(h)
+
+/*
+** Create the mutex and shared memory used for locking in the file
+** descriptor pFile
+*/
+static int winceCreateLock(const char *zFilename, winFile *pFile){
+  LPWSTR zTok;
+  LPWSTR zName;
+  DWORD lastErrno;
+  BOOL bLogged = FALSE;
+  BOOL bInit = TRUE;
+
+  zName = winUtf8ToUnicode(zFilename);
+  if( zName==0 ){
+    /* out of memory */
+    return SQLITE_IOERR_NOMEM_BKPT;
+  }
+
+  /* Initialize the local lockdata */
+  memset(&pFile->local, 0, sizeof(pFile->local));
+
+  /* Replace the backslashes from the filename and lowercase it
+  ** to derive a mutex name. */
+  zTok = osCharLowerW(zName);
+  for (;*zTok;zTok++){
+    if (*zTok == '\\') *zTok = '_';
+  }
+
+  /* Create/open the named mutex */
+  pFile->hMutex = osCreateMutexW(NULL, FALSE, zName);
+  if (!pFile->hMutex){
+    pFile->lastErrno = osGetLastError();
+    sqlite3_free(zName);
+    return winLogError(SQLITE_IOERR, pFile->lastErrno,
+                       "winceCreateLock1", zFilename);
+  }
+
+  /* Acquire the mutex before continuing */
+  winceMutexAcquire(pFile->hMutex);
+
+  /* Since the names of named mutexes, semaphores, file mappings etc are
+  ** case-sensitive, take advantage of that by uppercasing the mutex name
+  ** and using that as the shared filemapping name.
+  */
+  osCharUpperW(zName);
+  pFile->hShared = osCreateFileMappingW(INVALID_HANDLE_VALUE, NULL,
+                                        PAGE_READWRITE, 0, sizeof(winceLock),
+                                        zName);
+
+  /* Set a flag that indicates we're the first to create the memory so it
+  ** must be zero-initialized */
+  lastErrno = osGetLastError();
+  if (lastErrno == ERROR_ALREADY_EXISTS){
+    bInit = FALSE;
+  }
+
+  sqlite3_free(zName);
+
+  /* If we succeeded 
