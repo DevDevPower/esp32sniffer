@@ -46328,4 +46328,181 @@ static int winRead(
                osGetCurrentProcessId(), pFile, pFile->h));
       return SQLITE_OK;
     }else{
-  
+      int nCopy = (int)(pFile->mmapSize - offset);
+      memcpy(pBuf, &((u8 *)(pFile->pMapRegion))[offset], nCopy);
+      pBuf = &((u8 *)pBuf)[nCopy];
+      amt -= nCopy;
+      offset += nCopy;
+    }
+  }
+#endif
+
+#if SQLITE_OS_WINCE || defined(SQLITE_WIN32_NO_OVERLAPPED)
+  if( winSeekFile(pFile, offset) ){
+    OSTRACE(("READ pid=%lu, pFile=%p, file=%p, rc=SQLITE_FULL\n",
+             osGetCurrentProcessId(), pFile, pFile->h));
+    return SQLITE_FULL;
+  }
+  while( !osReadFile(pFile->h, pBuf, amt, &nRead, 0) ){
+#else
+  memset(&overlapped, 0, sizeof(OVERLAPPED));
+  overlapped.Offset = (LONG)(offset & 0xffffffff);
+  overlapped.OffsetHigh = (LONG)((offset>>32) & 0x7fffffff);
+  while( !osReadFile(pFile->h, pBuf, amt, &nRead, &overlapped) &&
+         osGetLastError()!=ERROR_HANDLE_EOF ){
+#endif
+    DWORD lastErrno;
+    if( winRetryIoerr(&nRetry, &lastErrno) ) continue;
+    pFile->lastErrno = lastErrno;
+    OSTRACE(("READ pid=%lu, pFile=%p, file=%p, rc=SQLITE_IOERR_READ\n",
+             osGetCurrentProcessId(), pFile, pFile->h));
+    return winLogError(SQLITE_IOERR_READ, pFile->lastErrno,
+                       "winRead", pFile->zPath);
+  }
+  winLogIoerr(nRetry, __LINE__);
+  if( nRead<(DWORD)amt ){
+    /* Unread parts of the buffer must be zero-filled */
+    memset(&((char*)pBuf)[nRead], 0, amt-nRead);
+    OSTRACE(("READ pid=%lu, pFile=%p, file=%p, rc=SQLITE_IOERR_SHORT_READ\n",
+             osGetCurrentProcessId(), pFile, pFile->h));
+    return SQLITE_IOERR_SHORT_READ;
+  }
+
+  OSTRACE(("READ pid=%lu, pFile=%p, file=%p, rc=SQLITE_OK\n",
+           osGetCurrentProcessId(), pFile, pFile->h));
+  return SQLITE_OK;
+}
+
+/*
+** Write data from a buffer into a file.  Return SQLITE_OK on success
+** or some other error code on failure.
+*/
+static int winWrite(
+  sqlite3_file *id,               /* File to write into */
+  const void *pBuf,               /* The bytes to be written */
+  int amt,                        /* Number of bytes to write */
+  sqlite3_int64 offset            /* Offset into the file to begin writing at */
+){
+  int rc = 0;                     /* True if error has occurred, else false */
+  winFile *pFile = (winFile*)id;  /* File handle */
+  int nRetry = 0;                 /* Number of retries */
+
+  assert( amt>0 );
+  assert( pFile );
+  SimulateIOError(return SQLITE_IOERR_WRITE);
+  SimulateDiskfullError(return SQLITE_FULL);
+
+  OSTRACE(("WRITE pid=%lu, pFile=%p, file=%p, buffer=%p, amount=%d, "
+           "offset=%lld, lock=%d\n", osGetCurrentProcessId(), pFile,
+           pFile->h, pBuf, amt, offset, pFile->locktype));
+
+#if defined(SQLITE_MMAP_READWRITE) && SQLITE_MAX_MMAP_SIZE>0
+  /* Deal with as much of this write request as possible by transfering
+  ** data from the memory mapping using memcpy().  */
+  if( offset<pFile->mmapSize ){
+    if( offset+amt <= pFile->mmapSize ){
+      memcpy(&((u8 *)(pFile->pMapRegion))[offset], pBuf, amt);
+      OSTRACE(("WRITE-MMAP pid=%lu, pFile=%p, file=%p, rc=SQLITE_OK\n",
+               osGetCurrentProcessId(), pFile, pFile->h));
+      return SQLITE_OK;
+    }else{
+      int nCopy = (int)(pFile->mmapSize - offset);
+      memcpy(&((u8 *)(pFile->pMapRegion))[offset], pBuf, nCopy);
+      pBuf = &((u8 *)pBuf)[nCopy];
+      amt -= nCopy;
+      offset += nCopy;
+    }
+  }
+#endif
+
+#if SQLITE_OS_WINCE || defined(SQLITE_WIN32_NO_OVERLAPPED)
+  rc = winSeekFile(pFile, offset);
+  if( rc==0 ){
+#else
+  {
+#endif
+#if !SQLITE_OS_WINCE && !defined(SQLITE_WIN32_NO_OVERLAPPED)
+    OVERLAPPED overlapped;        /* The offset for WriteFile. */
+#endif
+    u8 *aRem = (u8 *)pBuf;        /* Data yet to be written */
+    int nRem = amt;               /* Number of bytes yet to be written */
+    DWORD nWrite;                 /* Bytes written by each WriteFile() call */
+    DWORD lastErrno = NO_ERROR;   /* Value returned by GetLastError() */
+
+#if !SQLITE_OS_WINCE && !defined(SQLITE_WIN32_NO_OVERLAPPED)
+    memset(&overlapped, 0, sizeof(OVERLAPPED));
+    overlapped.Offset = (LONG)(offset & 0xffffffff);
+    overlapped.OffsetHigh = (LONG)((offset>>32) & 0x7fffffff);
+#endif
+
+    while( nRem>0 ){
+#if SQLITE_OS_WINCE || defined(SQLITE_WIN32_NO_OVERLAPPED)
+      if( !osWriteFile(pFile->h, aRem, nRem, &nWrite, 0) ){
+#else
+      if( !osWriteFile(pFile->h, aRem, nRem, &nWrite, &overlapped) ){
+#endif
+        if( winRetryIoerr(&nRetry, &lastErrno) ) continue;
+        break;
+      }
+      assert( nWrite==0 || nWrite<=(DWORD)nRem );
+      if( nWrite==0 || nWrite>(DWORD)nRem ){
+        lastErrno = osGetLastError();
+        break;
+      }
+#if !SQLITE_OS_WINCE && !defined(SQLITE_WIN32_NO_OVERLAPPED)
+      offset += nWrite;
+      overlapped.Offset = (LONG)(offset & 0xffffffff);
+      overlapped.OffsetHigh = (LONG)((offset>>32) & 0x7fffffff);
+#endif
+      aRem += nWrite;
+      nRem -= nWrite;
+    }
+    if( nRem>0 ){
+      pFile->lastErrno = lastErrno;
+      rc = 1;
+    }
+  }
+
+  if( rc ){
+    if(   ( pFile->lastErrno==ERROR_HANDLE_DISK_FULL )
+       || ( pFile->lastErrno==ERROR_DISK_FULL )){
+      OSTRACE(("WRITE pid=%lu, pFile=%p, file=%p, rc=SQLITE_FULL\n",
+               osGetCurrentProcessId(), pFile, pFile->h));
+      return winLogError(SQLITE_FULL, pFile->lastErrno,
+                         "winWrite1", pFile->zPath);
+    }
+    OSTRACE(("WRITE pid=%lu, pFile=%p, file=%p, rc=SQLITE_IOERR_WRITE\n",
+             osGetCurrentProcessId(), pFile, pFile->h));
+    return winLogError(SQLITE_IOERR_WRITE, pFile->lastErrno,
+                       "winWrite2", pFile->zPath);
+  }else{
+    winLogIoerr(nRetry, __LINE__);
+  }
+  OSTRACE(("WRITE pid=%lu, pFile=%p, file=%p, rc=SQLITE_OK\n",
+           osGetCurrentProcessId(), pFile, pFile->h));
+  return SQLITE_OK;
+}
+
+/*
+** Truncate an open file to a specified size
+*/
+static int winTruncate(sqlite3_file *id, sqlite3_int64 nByte){
+  winFile *pFile = (winFile*)id;  /* File handle object */
+  int rc = SQLITE_OK;             /* Return code for this function */
+  DWORD lastErrno;
+#if SQLITE_MAX_MMAP_SIZE>0
+  sqlite3_int64 oldMmapSize;
+  if( pFile->nFetchOut>0 ){
+    /* File truncation is a no-op if there are outstanding memory mapped
+    ** pages.  This is because truncating the file means temporarily unmapping
+    ** the file, and that might delete memory out from under existing cursors.
+    **
+    ** This can result in incremental vacuum not truncating the file,
+    ** if there is an active read cursor when the incremental vacuum occurs.
+    ** No real harm comes of this - the database file is not corrupted,
+    ** though some folks might complain that the file is bigger than it
+    ** needs to be.
+    **
+    ** The only feasible work-around is to defer the truncation until after
+    ** all references to memory-mapped content are closed.  That is doable,
+    ** but involves adding a few branches in the common write code path whic
