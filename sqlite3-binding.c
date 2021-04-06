@@ -46505,4 +46505,225 @@ static int winTruncate(sqlite3_file *id, sqlite3_int64 nByte){
     **
     ** The only feasible work-around is to defer the truncation until after
     ** all references to memory-mapped content are closed.  That is doable,
-    ** but involves adding a few branches in the common write code path whic
+    ** but involves adding a few branches in the common write code path which
+    ** could slow down normal operations slightly.  Hence, we have decided for
+    ** now to simply make trancations a no-op if there are pending reads.  We
+    ** can maybe revisit this decision in the future.
+    */
+    return SQLITE_OK;
+  }
+#endif
+
+  assert( pFile );
+  SimulateIOError(return SQLITE_IOERR_TRUNCATE);
+  OSTRACE(("TRUNCATE pid=%lu, pFile=%p, file=%p, size=%lld, lock=%d\n",
+           osGetCurrentProcessId(), pFile, pFile->h, nByte, pFile->locktype));
+
+  /* If the user has configured a chunk-size for this file, truncate the
+  ** file so that it consists of an integer number of chunks (i.e. the
+  ** actual file size after the operation may be larger than the requested
+  ** size).
+  */
+  if( pFile->szChunk>0 ){
+    nByte = ((nByte + pFile->szChunk - 1)/pFile->szChunk) * pFile->szChunk;
+  }
+
+#if SQLITE_MAX_MMAP_SIZE>0
+  if( pFile->pMapRegion ){
+    oldMmapSize = pFile->mmapSize;
+  }else{
+    oldMmapSize = 0;
+  }
+  winUnmapfile(pFile);
+#endif
+
+  /* SetEndOfFile() returns non-zero when successful, or zero when it fails. */
+  if( winSeekFile(pFile, nByte) ){
+    rc = winLogError(SQLITE_IOERR_TRUNCATE, pFile->lastErrno,
+                     "winTruncate1", pFile->zPath);
+  }else if( 0==osSetEndOfFile(pFile->h) &&
+            ((lastErrno = osGetLastError())!=ERROR_USER_MAPPED_FILE) ){
+    pFile->lastErrno = lastErrno;
+    rc = winLogError(SQLITE_IOERR_TRUNCATE, pFile->lastErrno,
+                     "winTruncate2", pFile->zPath);
+  }
+
+#if SQLITE_MAX_MMAP_SIZE>0
+  if( rc==SQLITE_OK && oldMmapSize>0 ){
+    if( oldMmapSize>nByte ){
+      winMapfile(pFile, -1);
+    }else{
+      winMapfile(pFile, oldMmapSize);
+    }
+  }
+#endif
+
+  OSTRACE(("TRUNCATE pid=%lu, pFile=%p, file=%p, rc=%s\n",
+           osGetCurrentProcessId(), pFile, pFile->h, sqlite3ErrName(rc)));
+  return rc;
+}
+
+#ifdef SQLITE_TEST
+/*
+** Count the number of fullsyncs and normal syncs.  This is used to test
+** that syncs and fullsyncs are occuring at the right times.
+*/
+SQLITE_API int sqlite3_sync_count = 0;
+SQLITE_API int sqlite3_fullsync_count = 0;
+#endif
+
+/*
+** Make sure all writes to a particular file are committed to disk.
+*/
+static int winSync(sqlite3_file *id, int flags){
+#ifndef SQLITE_NO_SYNC
+  /*
+  ** Used only when SQLITE_NO_SYNC is not defined.
+   */
+  BOOL rc;
+#endif
+#if !defined(NDEBUG) || !defined(SQLITE_NO_SYNC) || \
+    defined(SQLITE_HAVE_OS_TRACE)
+  /*
+  ** Used when SQLITE_NO_SYNC is not defined and by the assert() and/or
+  ** OSTRACE() macros.
+   */
+  winFile *pFile = (winFile*)id;
+#else
+  UNUSED_PARAMETER(id);
+#endif
+
+  assert( pFile );
+  /* Check that one of SQLITE_SYNC_NORMAL or FULL was passed */
+  assert((flags&0x0F)==SQLITE_SYNC_NORMAL
+      || (flags&0x0F)==SQLITE_SYNC_FULL
+  );
+
+  /* Unix cannot, but some systems may return SQLITE_FULL from here. This
+  ** line is to test that doing so does not cause any problems.
+  */
+  SimulateDiskfullError( return SQLITE_FULL );
+
+  OSTRACE(("SYNC pid=%lu, pFile=%p, file=%p, flags=%x, lock=%d\n",
+           osGetCurrentProcessId(), pFile, pFile->h, flags,
+           pFile->locktype));
+
+#ifndef SQLITE_TEST
+  UNUSED_PARAMETER(flags);
+#else
+  if( (flags&0x0F)==SQLITE_SYNC_FULL ){
+    sqlite3_fullsync_count++;
+  }
+  sqlite3_sync_count++;
+#endif
+
+  /* If we compiled with the SQLITE_NO_SYNC flag, then syncing is a
+  ** no-op
+  */
+#ifdef SQLITE_NO_SYNC
+  OSTRACE(("SYNC-NOP pid=%lu, pFile=%p, file=%p, rc=SQLITE_OK\n",
+           osGetCurrentProcessId(), pFile, pFile->h));
+  return SQLITE_OK;
+#else
+#if SQLITE_MAX_MMAP_SIZE>0
+  if( pFile->pMapRegion ){
+    if( osFlushViewOfFile(pFile->pMapRegion, 0) ){
+      OSTRACE(("SYNC-MMAP pid=%lu, pFile=%p, pMapRegion=%p, "
+               "rc=SQLITE_OK\n", osGetCurrentProcessId(),
+               pFile, pFile->pMapRegion));
+    }else{
+      pFile->lastErrno = osGetLastError();
+      OSTRACE(("SYNC-MMAP pid=%lu, pFile=%p, pMapRegion=%p, "
+               "rc=SQLITE_IOERR_MMAP\n", osGetCurrentProcessId(),
+               pFile, pFile->pMapRegion));
+      return winLogError(SQLITE_IOERR_MMAP, pFile->lastErrno,
+                         "winSync1", pFile->zPath);
+    }
+  }
+#endif
+  rc = osFlushFileBuffers(pFile->h);
+  SimulateIOError( rc=FALSE );
+  if( rc ){
+    OSTRACE(("SYNC pid=%lu, pFile=%p, file=%p, rc=SQLITE_OK\n",
+             osGetCurrentProcessId(), pFile, pFile->h));
+    return SQLITE_OK;
+  }else{
+    pFile->lastErrno = osGetLastError();
+    OSTRACE(("SYNC pid=%lu, pFile=%p, file=%p, rc=SQLITE_IOERR_FSYNC\n",
+             osGetCurrentProcessId(), pFile, pFile->h));
+    return winLogError(SQLITE_IOERR_FSYNC, pFile->lastErrno,
+                       "winSync2", pFile->zPath);
+  }
+#endif
+}
+
+/*
+** Determine the current size of a file in bytes
+*/
+static int winFileSize(sqlite3_file *id, sqlite3_int64 *pSize){
+  winFile *pFile = (winFile*)id;
+  int rc = SQLITE_OK;
+
+  assert( id!=0 );
+  assert( pSize!=0 );
+  SimulateIOError(return SQLITE_IOERR_FSTAT);
+  OSTRACE(("SIZE file=%p, pSize=%p\n", pFile->h, pSize));
+
+#if SQLITE_OS_WINRT
+  {
+    FILE_STANDARD_INFO info;
+    if( osGetFileInformationByHandleEx(pFile->h, FileStandardInfo,
+                                     &info, sizeof(info)) ){
+      *pSize = info.EndOfFile.QuadPart;
+    }else{
+      pFile->lastErrno = osGetLastError();
+      rc = winLogError(SQLITE_IOERR_FSTAT, pFile->lastErrno,
+                       "winFileSize", pFile->zPath);
+    }
+  }
+#else
+  {
+    DWORD upperBits;
+    DWORD lowerBits;
+    DWORD lastErrno;
+
+    lowerBits = osGetFileSize(pFile->h, &upperBits);
+    *pSize = (((sqlite3_int64)upperBits)<<32) + lowerBits;
+    if(   (lowerBits == INVALID_FILE_SIZE)
+       && ((lastErrno = osGetLastError())!=NO_ERROR) ){
+      pFile->lastErrno = lastErrno;
+      rc = winLogError(SQLITE_IOERR_FSTAT, pFile->lastErrno,
+                       "winFileSize", pFile->zPath);
+    }
+  }
+#endif
+  OSTRACE(("SIZE file=%p, pSize=%p, *pSize=%lld, rc=%s\n",
+           pFile->h, pSize, *pSize, sqlite3ErrName(rc)));
+  return rc;
+}
+
+/*
+** LOCKFILE_FAIL_IMMEDIATELY is undefined on some Windows systems.
+*/
+#ifndef LOCKFILE_FAIL_IMMEDIATELY
+# define LOCKFILE_FAIL_IMMEDIATELY 1
+#endif
+
+#ifndef LOCKFILE_EXCLUSIVE_LOCK
+# define LOCKFILE_EXCLUSIVE_LOCK 2
+#endif
+
+/*
+** Historically, SQLite has used both the LockFile and LockFileEx functions.
+** When the LockFile function was used, it was always expected to fail
+** immediately if the lock could not be obtained.  Also, it always expected to
+** obtain an exclusive lock.  These flags are used with the LockFileEx function
+** and reflect those expectations; therefore, they should not be changed.
+*/
+#ifndef SQLITE_LOCKFILE_FLAGS
+# define SQLITE_LOCKFILE_FLAGS   (LOCKFILE_FAIL_IMMEDIATELY | \
+                                  LOCKFILE_EXCLUSIVE_LOCK)
+#endif
+
+/*
+** Currently, SQLite ne
