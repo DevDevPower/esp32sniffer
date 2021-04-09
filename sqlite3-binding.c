@@ -47344,4 +47344,191 @@ static winShmNode *winShmNodeList = 0;
 **    winShm.pShmNode
 **    winShm.id
 **
-** All other fields are read/write.  The winShm.pShmNode->mutex must b
+** All other fields are read/write.  The winShm.pShmNode->mutex must be held
+** while accessing any read/write fields.
+*/
+struct winShm {
+  winShmNode *pShmNode;      /* The underlying winShmNode object */
+  winShm *pNext;             /* Next winShm with the same winShmNode */
+  u8 hasMutex;               /* True if holding the winShmNode mutex */
+  u16 sharedMask;            /* Mask of shared locks held */
+  u16 exclMask;              /* Mask of exclusive locks held */
+#if defined(SQLITE_DEBUG) || defined(SQLITE_HAVE_OS_TRACE)
+  u8 id;                     /* Id of this connection with its winShmNode */
+#endif
+};
+
+/*
+** Constants used for locking
+*/
+#define WIN_SHM_BASE   ((22+SQLITE_SHM_NLOCK)*4)        /* first lock byte */
+#define WIN_SHM_DMS    (WIN_SHM_BASE+SQLITE_SHM_NLOCK)  /* deadman switch */
+
+/*
+** Apply advisory locks for all n bytes beginning at ofst.
+*/
+#define WINSHM_UNLCK  1
+#define WINSHM_RDLCK  2
+#define WINSHM_WRLCK  3
+static int winShmSystemLock(
+  winShmNode *pFile,    /* Apply locks to this open shared-memory segment */
+  int lockType,         /* WINSHM_UNLCK, WINSHM_RDLCK, or WINSHM_WRLCK */
+  int ofst,             /* Offset to first byte to be locked/unlocked */
+  int nByte             /* Number of bytes to lock or unlock */
+){
+  int rc = 0;           /* Result code form Lock/UnlockFileEx() */
+
+  /* Access to the winShmNode object is serialized by the caller */
+  assert( pFile->nRef==0 || sqlite3_mutex_held(pFile->mutex) );
+
+  OSTRACE(("SHM-LOCK file=%p, lock=%d, offset=%d, size=%d\n",
+           pFile->hFile.h, lockType, ofst, nByte));
+
+  /* Release/Acquire the system-level lock */
+  if( lockType==WINSHM_UNLCK ){
+    rc = winUnlockFile(&pFile->hFile.h, ofst, 0, nByte, 0);
+  }else{
+    /* Initialize the locking parameters */
+    DWORD dwFlags = LOCKFILE_FAIL_IMMEDIATELY;
+    if( lockType == WINSHM_WRLCK ) dwFlags |= LOCKFILE_EXCLUSIVE_LOCK;
+    rc = winLockFile(&pFile->hFile.h, dwFlags, ofst, 0, nByte, 0);
+  }
+
+  if( rc!= 0 ){
+    rc = SQLITE_OK;
+  }else{
+    pFile->lastErrno =  osGetLastError();
+    rc = SQLITE_BUSY;
+  }
+
+  OSTRACE(("SHM-LOCK file=%p, func=%s, errno=%lu, rc=%s\n",
+           pFile->hFile.h, (lockType == WINSHM_UNLCK) ? "winUnlockFile" :
+           "winLockFile", pFile->lastErrno, sqlite3ErrName(rc)));
+
+  return rc;
+}
+
+/* Forward references to VFS methods */
+static int winOpen(sqlite3_vfs*,const char*,sqlite3_file*,int,int*);
+static int winDelete(sqlite3_vfs *,const char*,int);
+
+/*
+** Purge the winShmNodeList list of all entries with winShmNode.nRef==0.
+**
+** This is not a VFS shared-memory method; it is a utility function called
+** by VFS shared-memory methods.
+*/
+static void winShmPurge(sqlite3_vfs *pVfs, int deleteFlag){
+  winShmNode **pp;
+  winShmNode *p;
+  assert( winShmMutexHeld() );
+  OSTRACE(("SHM-PURGE pid=%lu, deleteFlag=%d\n",
+           osGetCurrentProcessId(), deleteFlag));
+  pp = &winShmNodeList;
+  while( (p = *pp)!=0 ){
+    if( p->nRef==0 ){
+      int i;
+      if( p->mutex ){ sqlite3_mutex_free(p->mutex); }
+      for(i=0; i<p->nRegion; i++){
+        BOOL bRc = osUnmapViewOfFile(p->aRegion[i].pMap);
+        OSTRACE(("SHM-PURGE-UNMAP pid=%lu, region=%d, rc=%s\n",
+                 osGetCurrentProcessId(), i, bRc ? "ok" : "failed"));
+        UNUSED_VARIABLE_VALUE(bRc);
+        bRc = osCloseHandle(p->aRegion[i].hMap);
+        OSTRACE(("SHM-PURGE-CLOSE pid=%lu, region=%d, rc=%s\n",
+                 osGetCurrentProcessId(), i, bRc ? "ok" : "failed"));
+        UNUSED_VARIABLE_VALUE(bRc);
+      }
+      if( p->hFile.h!=NULL && p->hFile.h!=INVALID_HANDLE_VALUE ){
+        SimulateIOErrorBenign(1);
+        winClose((sqlite3_file *)&p->hFile);
+        SimulateIOErrorBenign(0);
+      }
+      if( deleteFlag ){
+        SimulateIOErrorBenign(1);
+        sqlite3BeginBenignMalloc();
+        winDelete(pVfs, p->zFilename, 0);
+        sqlite3EndBenignMalloc();
+        SimulateIOErrorBenign(0);
+      }
+      *pp = p->pNext;
+      sqlite3_free(p->aRegion);
+      sqlite3_free(p);
+    }else{
+      pp = &p->pNext;
+    }
+  }
+}
+
+/*
+** The DMS lock has not yet been taken on shm file pShmNode. Attempt to
+** take it now. Return SQLITE_OK if successful, or an SQLite error
+** code otherwise.
+**
+** If the DMS cannot be locked because this is a readonly_shm=1
+** connection and no other process already holds a lock, return
+** SQLITE_READONLY_CANTINIT and set pShmNode->isUnlocked=1.
+*/
+static int winLockSharedMemory(winShmNode *pShmNode){
+  int rc = winShmSystemLock(pShmNode, WINSHM_WRLCK, WIN_SHM_DMS, 1);
+
+  if( rc==SQLITE_OK ){
+    if( pShmNode->isReadonly ){
+      pShmNode->isUnlocked = 1;
+      winShmSystemLock(pShmNode, WINSHM_UNLCK, WIN_SHM_DMS, 1);
+      return SQLITE_READONLY_CANTINIT;
+    }else if( winTruncate((sqlite3_file*)&pShmNode->hFile, 0) ){
+      winShmSystemLock(pShmNode, WINSHM_UNLCK, WIN_SHM_DMS, 1);
+      return winLogError(SQLITE_IOERR_SHMOPEN, osGetLastError(),
+                         "winLockSharedMemory", pShmNode->zFilename);
+    }
+  }
+
+  if( rc==SQLITE_OK ){
+    winShmSystemLock(pShmNode, WINSHM_UNLCK, WIN_SHM_DMS, 1);
+  }
+
+  return winShmSystemLock(pShmNode, WINSHM_RDLCK, WIN_SHM_DMS, 1);
+}
+
+/*
+** Open the shared-memory area associated with database file pDbFd.
+**
+** When opening a new shared-memory file, if no other instances of that
+** file are currently open, in this process or in other processes, then
+** the file must be truncated to zero length or have its header cleared.
+*/
+static int winOpenSharedMemory(winFile *pDbFd){
+  struct winShm *p;                  /* The connection to be opened */
+  winShmNode *pShmNode = 0;          /* The underlying mmapped file */
+  int rc = SQLITE_OK;                /* Result code */
+  winShmNode *pNew;                  /* Newly allocated winShmNode */
+  int nName;                         /* Size of zName in bytes */
+
+  assert( pDbFd->pShm==0 );    /* Not previously opened */
+
+  /* Allocate space for the new sqlite3_shm object.  Also speculatively
+  ** allocate space for a new winShmNode and filename.
+  */
+  p = sqlite3MallocZero( sizeof(*p) );
+  if( p==0 ) return SQLITE_IOERR_NOMEM_BKPT;
+  nName = sqlite3Strlen30(pDbFd->zPath);
+  pNew = sqlite3MallocZero( sizeof(*pShmNode) + nName + 17 );
+  if( pNew==0 ){
+    sqlite3_free(p);
+    return SQLITE_IOERR_NOMEM_BKPT;
+  }
+  pNew->zFilename = (char*)&pNew[1];
+  sqlite3_snprintf(nName+15, pNew->zFilename, "%s-shm", pDbFd->zPath);
+  sqlite3FileSuffix3(pDbFd->zPath, pNew->zFilename);
+
+  /* Look to see if there is an existing winShmNode that can be used.
+  ** If no matching winShmNode currently exists, create a new one.
+  */
+  winShmEnterMutex();
+  for(pShmNode = winShmNodeList; pShmNode; pShmNode=pShmNode->pNext){
+    /* TBD need to come up with better match here.  Perhaps
+    ** use FILE_ID_BOTH_DIR_INFO Structure.
+    */
+    if( sqlite3StrICmp(pShmNode->zFilename, pNew->zFilename)==0 ) break;
+  }
