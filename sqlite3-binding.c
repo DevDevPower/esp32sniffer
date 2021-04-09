@@ -46936,3 +46936,198 @@ static int winLock(sqlite3_file *id, int locktype){
 
   /* If we are holding a PENDING lock that ought to be released, then
   ** release it now.
+  */
+  if( gotPendingLock && locktype==SHARED_LOCK ){
+    winUnlockFile(&pFile->h, PENDING_BYTE, 0, 1, 0);
+  }
+
+  /* Update the state of the lock has held in the file descriptor then
+  ** return the appropriate result code.
+  */
+  if( res ){
+    rc = SQLITE_OK;
+  }else{
+    pFile->lastErrno = lastErrno;
+    rc = SQLITE_BUSY;
+    OSTRACE(("LOCK-FAIL file=%p, wanted=%d, got=%d\n",
+             pFile->h, locktype, newLocktype));
+  }
+  pFile->locktype = (u8)newLocktype;
+  OSTRACE(("LOCK file=%p, lock=%d, rc=%s\n",
+           pFile->h, pFile->locktype, sqlite3ErrName(rc)));
+  return rc;
+}
+
+/*
+** This routine checks if there is a RESERVED lock held on the specified
+** file by this or any other process. If such a lock is held, return
+** non-zero, otherwise zero.
+*/
+static int winCheckReservedLock(sqlite3_file *id, int *pResOut){
+  int res;
+  winFile *pFile = (winFile*)id;
+
+  SimulateIOError( return SQLITE_IOERR_CHECKRESERVEDLOCK; );
+  OSTRACE(("TEST-WR-LOCK file=%p, pResOut=%p\n", pFile->h, pResOut));
+
+  assert( id!=0 );
+  if( pFile->locktype>=RESERVED_LOCK ){
+    res = 1;
+    OSTRACE(("TEST-WR-LOCK file=%p, result=%d (local)\n", pFile->h, res));
+  }else{
+    res = winLockFile(&pFile->h, SQLITE_LOCKFILEEX_FLAGS,RESERVED_BYTE,0,1,0);
+    if( res ){
+      winUnlockFile(&pFile->h, RESERVED_BYTE, 0, 1, 0);
+    }
+    res = !res;
+    OSTRACE(("TEST-WR-LOCK file=%p, result=%d (remote)\n", pFile->h, res));
+  }
+  *pResOut = res;
+  OSTRACE(("TEST-WR-LOCK file=%p, pResOut=%p, *pResOut=%d, rc=SQLITE_OK\n",
+           pFile->h, pResOut, *pResOut));
+  return SQLITE_OK;
+}
+
+/*
+** Lower the locking level on file descriptor id to locktype.  locktype
+** must be either NO_LOCK or SHARED_LOCK.
+**
+** If the locking level of the file descriptor is already at or below
+** the requested locking level, this routine is a no-op.
+**
+** It is not possible for this routine to fail if the second argument
+** is NO_LOCK.  If the second argument is SHARED_LOCK then this routine
+** might return SQLITE_IOERR;
+*/
+static int winUnlock(sqlite3_file *id, int locktype){
+  int type;
+  winFile *pFile = (winFile*)id;
+  int rc = SQLITE_OK;
+  assert( pFile!=0 );
+  assert( locktype<=SHARED_LOCK );
+  OSTRACE(("UNLOCK file=%p, oldLock=%d(%d), newLock=%d\n",
+           pFile->h, pFile->locktype, pFile->sharedLockByte, locktype));
+  type = pFile->locktype;
+  if( type>=EXCLUSIVE_LOCK ){
+    winUnlockFile(&pFile->h, SHARED_FIRST, 0, SHARED_SIZE, 0);
+    if( locktype==SHARED_LOCK && !winGetReadLock(pFile) ){
+      /* This should never happen.  We should always be able to
+      ** reacquire the read lock */
+      rc = winLogError(SQLITE_IOERR_UNLOCK, osGetLastError(),
+                       "winUnlock", pFile->zPath);
+    }
+  }
+  if( type>=RESERVED_LOCK ){
+    winUnlockFile(&pFile->h, RESERVED_BYTE, 0, 1, 0);
+  }
+  if( locktype==NO_LOCK && type>=SHARED_LOCK ){
+    winUnlockReadLock(pFile);
+  }
+  if( type>=PENDING_LOCK ){
+    winUnlockFile(&pFile->h, PENDING_BYTE, 0, 1, 0);
+  }
+  pFile->locktype = (u8)locktype;
+  OSTRACE(("UNLOCK file=%p, lock=%d, rc=%s\n",
+           pFile->h, pFile->locktype, sqlite3ErrName(rc)));
+  return rc;
+}
+
+/******************************************************************************
+****************************** No-op Locking **********************************
+**
+** Of the various locking implementations available, this is by far the
+** simplest:  locking is ignored.  No attempt is made to lock the database
+** file for reading or writing.
+**
+** This locking mode is appropriate for use on read-only databases
+** (ex: databases that are burned into CD-ROM, for example.)  It can
+** also be used if the application employs some external mechanism to
+** prevent simultaneous access of the same database by two or more
+** database connections.  But there is a serious risk of database
+** corruption if this locking mode is used in situations where multiple
+** database connections are accessing the same database file at the same
+** time and one or more of those connections are writing.
+*/
+
+static int winNolockLock(sqlite3_file *id, int locktype){
+  UNUSED_PARAMETER(id);
+  UNUSED_PARAMETER(locktype);
+  return SQLITE_OK;
+}
+
+static int winNolockCheckReservedLock(sqlite3_file *id, int *pResOut){
+  UNUSED_PARAMETER(id);
+  UNUSED_PARAMETER(pResOut);
+  return SQLITE_OK;
+}
+
+static int winNolockUnlock(sqlite3_file *id, int locktype){
+  UNUSED_PARAMETER(id);
+  UNUSED_PARAMETER(locktype);
+  return SQLITE_OK;
+}
+
+/******************* End of the no-op lock implementation *********************
+******************************************************************************/
+
+/*
+** If *pArg is initially negative then this is a query.  Set *pArg to
+** 1 or 0 depending on whether or not bit mask of pFile->ctrlFlags is set.
+**
+** If *pArg is 0 or 1, then clear or set the mask bit of pFile->ctrlFlags.
+*/
+static void winModeBit(winFile *pFile, unsigned char mask, int *pArg){
+  if( *pArg<0 ){
+    *pArg = (pFile->ctrlFlags & mask)!=0;
+  }else if( (*pArg)==0 ){
+    pFile->ctrlFlags &= ~mask;
+  }else{
+    pFile->ctrlFlags |= mask;
+  }
+}
+
+/* Forward references to VFS helper methods used for temporary files */
+static int winGetTempname(sqlite3_vfs *, char **);
+static int winIsDir(const void *);
+static BOOL winIsLongPathPrefix(const char *);
+static BOOL winIsDriveLetterAndColon(const char *);
+
+/*
+** Control and query of the open file handle.
+*/
+static int winFileControl(sqlite3_file *id, int op, void *pArg){
+  winFile *pFile = (winFile*)id;
+  OSTRACE(("FCNTL file=%p, op=%d, pArg=%p\n", pFile->h, op, pArg));
+  switch( op ){
+    case SQLITE_FCNTL_LOCKSTATE: {
+      *(int*)pArg = pFile->locktype;
+      OSTRACE(("FCNTL file=%p, rc=SQLITE_OK\n", pFile->h));
+      return SQLITE_OK;
+    }
+    case SQLITE_FCNTL_LAST_ERRNO: {
+      *(int*)pArg = (int)pFile->lastErrno;
+      OSTRACE(("FCNTL file=%p, rc=SQLITE_OK\n", pFile->h));
+      return SQLITE_OK;
+    }
+    case SQLITE_FCNTL_CHUNK_SIZE: {
+      pFile->szChunk = *(int *)pArg;
+      OSTRACE(("FCNTL file=%p, rc=SQLITE_OK\n", pFile->h));
+      return SQLITE_OK;
+    }
+    case SQLITE_FCNTL_SIZE_HINT: {
+      if( pFile->szChunk>0 ){
+        sqlite3_int64 oldSz;
+        int rc = winFileSize(id, &oldSz);
+        if( rc==SQLITE_OK ){
+          sqlite3_int64 newSz = *(sqlite3_int64*)pArg;
+          if( newSz>oldSz ){
+            SimulateIOErrorBenign(1);
+            rc = winTruncate(id, newSz);
+            SimulateIOErrorBenign(0);
+          }
+        }
+        OSTRACE(("FCNTL file=%p, rc=%s\n", pFile->h, sqlite3ErrName(rc)));
+        return rc;
+      }
+      OSTRACE(("FCNTL file=%p, rc=SQLITE_OK\n", pFile->h));
+ 
