@@ -48711,4 +48711,212 @@ static int winOpen(
   }
 
   if( isReadWrite ){
-    dwDesiredAccess = GENERIC_R
+    dwDesiredAccess = GENERIC_READ | GENERIC_WRITE;
+  }else{
+    dwDesiredAccess = GENERIC_READ;
+  }
+
+  /* SQLITE_OPEN_EXCLUSIVE is used to make sure that a new file is
+  ** created. SQLite doesn't use it to indicate "exclusive access"
+  ** as it is usually understood.
+  */
+  if( isExclusive ){
+    /* Creates a new file, only if it does not already exist. */
+    /* If the file exists, it fails. */
+    dwCreationDisposition = CREATE_NEW;
+  }else if( isCreate ){
+    /* Open existing file, or create if it doesn't exist */
+    dwCreationDisposition = OPEN_ALWAYS;
+  }else{
+    /* Opens a file, only if it exists. */
+    dwCreationDisposition = OPEN_EXISTING;
+  }
+
+  if( 0==sqlite3_uri_boolean(zName, "exclusive", 0) ){
+    dwShareMode = FILE_SHARE_READ | FILE_SHARE_WRITE;
+  }else{
+    dwShareMode = 0;
+  }
+
+  if( isDelete ){
+#if SQLITE_OS_WINCE
+    dwFlagsAndAttributes = FILE_ATTRIBUTE_HIDDEN;
+    isTemp = 1;
+#else
+    dwFlagsAndAttributes = FILE_ATTRIBUTE_TEMPORARY
+                               | FILE_ATTRIBUTE_HIDDEN
+                               | FILE_FLAG_DELETE_ON_CLOSE;
+#endif
+  }else{
+    dwFlagsAndAttributes = FILE_ATTRIBUTE_NORMAL;
+  }
+  /* Reports from the internet are that performance is always
+  ** better if FILE_FLAG_RANDOM_ACCESS is used.  Ticket #2699. */
+#if SQLITE_OS_WINCE
+  dwFlagsAndAttributes |= FILE_FLAG_RANDOM_ACCESS;
+#endif
+
+  if( osIsNT() ){
+#if SQLITE_OS_WINRT
+    CREATEFILE2_EXTENDED_PARAMETERS extendedParameters;
+    extendedParameters.dwSize = sizeof(CREATEFILE2_EXTENDED_PARAMETERS);
+    extendedParameters.dwFileAttributes =
+            dwFlagsAndAttributes & FILE_ATTRIBUTE_MASK;
+    extendedParameters.dwFileFlags = dwFlagsAndAttributes & FILE_FLAG_MASK;
+    extendedParameters.dwSecurityQosFlags = SECURITY_ANONYMOUS;
+    extendedParameters.lpSecurityAttributes = NULL;
+    extendedParameters.hTemplateFile = NULL;
+    do{
+      h = osCreateFile2((LPCWSTR)zConverted,
+                        dwDesiredAccess,
+                        dwShareMode,
+                        dwCreationDisposition,
+                        &extendedParameters);
+      if( h!=INVALID_HANDLE_VALUE ) break;
+      if( isReadWrite ){
+        int rc2, isRO = 0;
+        sqlite3BeginBenignMalloc();
+        rc2 = winAccess(pVfs, zName, SQLITE_ACCESS_READ, &isRO);
+        sqlite3EndBenignMalloc();
+        if( rc2==SQLITE_OK && isRO ) break;
+      }
+    }while( winRetryIoerr(&cnt, &lastErrno) );
+#else
+    do{
+      h = osCreateFileW((LPCWSTR)zConverted,
+                        dwDesiredAccess,
+                        dwShareMode, NULL,
+                        dwCreationDisposition,
+                        dwFlagsAndAttributes,
+                        NULL);
+      if( h!=INVALID_HANDLE_VALUE ) break;
+      if( isReadWrite ){
+        int rc2, isRO = 0;
+        sqlite3BeginBenignMalloc();
+        rc2 = winAccess(pVfs, zName, SQLITE_ACCESS_READ, &isRO);
+        sqlite3EndBenignMalloc();
+        if( rc2==SQLITE_OK && isRO ) break;
+      }
+    }while( winRetryIoerr(&cnt, &lastErrno) );
+#endif
+  }
+#ifdef SQLITE_WIN32_HAS_ANSI
+  else{
+    do{
+      h = osCreateFileA((LPCSTR)zConverted,
+                        dwDesiredAccess,
+                        dwShareMode, NULL,
+                        dwCreationDisposition,
+                        dwFlagsAndAttributes,
+                        NULL);
+      if( h!=INVALID_HANDLE_VALUE ) break;
+      if( isReadWrite ){
+        int rc2, isRO = 0;
+        sqlite3BeginBenignMalloc();
+        rc2 = winAccess(pVfs, zName, SQLITE_ACCESS_READ, &isRO);
+        sqlite3EndBenignMalloc();
+        if( rc2==SQLITE_OK && isRO ) break;
+      }
+    }while( winRetryIoerr(&cnt, &lastErrno) );
+  }
+#endif
+  winLogIoerr(cnt, __LINE__);
+
+  OSTRACE(("OPEN file=%p, name=%s, access=%lx, rc=%s\n", h, zUtf8Name,
+           dwDesiredAccess, (h==INVALID_HANDLE_VALUE) ? "failed" : "ok"));
+
+  if( h==INVALID_HANDLE_VALUE ){
+    sqlite3_free(zConverted);
+    sqlite3_free(zTmpname);
+    if( isReadWrite && !isExclusive ){
+      return winOpen(pVfs, zName, id,
+         ((flags|SQLITE_OPEN_READONLY) &
+                     ~(SQLITE_OPEN_CREATE|SQLITE_OPEN_READWRITE)),
+         pOutFlags);
+    }else{
+      pFile->lastErrno = lastErrno;
+      winLogError(SQLITE_CANTOPEN, pFile->lastErrno, "winOpen", zUtf8Name);
+      return SQLITE_CANTOPEN_BKPT;
+    }
+  }
+
+  if( pOutFlags ){
+    if( isReadWrite ){
+      *pOutFlags = SQLITE_OPEN_READWRITE;
+    }else{
+      *pOutFlags = SQLITE_OPEN_READONLY;
+    }
+  }
+
+  OSTRACE(("OPEN file=%p, name=%s, access=%lx, pOutFlags=%p, *pOutFlags=%d, "
+           "rc=%s\n", h, zUtf8Name, dwDesiredAccess, pOutFlags, pOutFlags ?
+           *pOutFlags : 0, (h==INVALID_HANDLE_VALUE) ? "failed" : "ok"));
+
+  pAppData = (winVfsAppData*)pVfs->pAppData;
+
+#if SQLITE_OS_WINCE
+  {
+    if( isReadWrite && eType==SQLITE_OPEN_MAIN_DB
+         && ((pAppData==NULL) || !pAppData->bNoLock)
+         && (rc = winceCreateLock(zName, pFile))!=SQLITE_OK
+    ){
+      osCloseHandle(h);
+      sqlite3_free(zConverted);
+      sqlite3_free(zTmpname);
+      OSTRACE(("OPEN-CE-LOCK name=%s, rc=%s\n", zName, sqlite3ErrName(rc)));
+      return rc;
+    }
+  }
+  if( isTemp ){
+    pFile->zDeleteOnClose = zConverted;
+  }else
+#endif
+  {
+    sqlite3_free(zConverted);
+  }
+
+  sqlite3_free(zTmpname);
+  id->pMethods = pAppData ? pAppData->pMethod : &winIoMethod;
+  pFile->pVfs = pVfs;
+  pFile->h = h;
+  if( isReadonly ){
+    pFile->ctrlFlags |= WINFILE_RDONLY;
+  }
+  if( (flags & SQLITE_OPEN_MAIN_DB)
+   && sqlite3_uri_boolean(zName, "psow", SQLITE_POWERSAFE_OVERWRITE)
+  ){
+    pFile->ctrlFlags |= WINFILE_PSOW;
+  }
+  pFile->lastErrno = NO_ERROR;
+  pFile->zPath = zName;
+#if SQLITE_MAX_MMAP_SIZE>0
+  pFile->hMap = NULL;
+  pFile->pMapRegion = 0;
+  pFile->mmapSize = 0;
+  pFile->mmapSizeMax = sqlite3GlobalConfig.szMmap;
+#endif
+
+  OpenCounter(+1);
+  return rc;
+}
+
+/*
+** Delete the named file.
+**
+** Note that Windows does not allow a file to be deleted if some other
+** process has it open.  Sometimes a virus scanner or indexing program
+** will open a journal file shortly after it is created in order to do
+** whatever it does.  While this other process is holding the
+** file open, we will be unable to delete it.  To work around this
+** problem, we delay 100 milliseconds and try to delete again.  Up
+** to MX_DELETION_ATTEMPTs deletion attempts are run before giving
+** up and returning an error.
+*/
+static int winDelete(
+  sqlite3_vfs *pVfs,          /* Not used on win32 */
+  const char *zFilename,      /* Name of file to delete */
+  int syncDir                 /* Not used on win32 */
+){
+  int cnt = 0;
+  int rc;
+  D
