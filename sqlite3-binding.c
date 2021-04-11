@@ -47742,4 +47742,189 @@ static int winShmLock(
     */
     if( rc==SQLITE_OK ){
       rc = winShmSystemLock(pShmNode, WINSHM_WRLCK, ofst+WIN_SHM_BASE, n);
- 
+      if( rc==SQLITE_OK ){
+        assert( (p->sharedMask & mask)==0 );
+        p->exclMask |= mask;
+      }
+    }
+  }
+  sqlite3_mutex_leave(pShmNode->mutex);
+  OSTRACE(("SHM-LOCK pid=%lu, id=%d, sharedMask=%03x, exclMask=%03x, rc=%s\n",
+           osGetCurrentProcessId(), p->id, p->sharedMask, p->exclMask,
+           sqlite3ErrName(rc)));
+  return rc;
+}
+
+/*
+** Implement a memory barrier or memory fence on shared memory.
+**
+** All loads and stores begun before the barrier must complete before
+** any load or store begun after the barrier.
+*/
+static void winShmBarrier(
+  sqlite3_file *fd          /* Database holding the shared memory */
+){
+  UNUSED_PARAMETER(fd);
+  sqlite3MemoryBarrier();   /* compiler-defined memory barrier */
+  winShmEnterMutex();       /* Also mutex, for redundancy */
+  winShmLeaveMutex();
+}
+
+/*
+** This function is called to obtain a pointer to region iRegion of the
+** shared-memory associated with the database file fd. Shared-memory regions
+** are numbered starting from zero. Each shared-memory region is szRegion
+** bytes in size.
+**
+** If an error occurs, an error code is returned and *pp is set to NULL.
+**
+** Otherwise, if the isWrite parameter is 0 and the requested shared-memory
+** region has not been allocated (by any client, including one running in a
+** separate process), then *pp is set to NULL and SQLITE_OK returned. If
+** isWrite is non-zero and the requested shared-memory region has not yet
+** been allocated, it is allocated by this function.
+**
+** If the shared-memory region has already been allocated or is allocated by
+** this call as described above, then it is mapped into this processes
+** address space (if it is not already), *pp is set to point to the mapped
+** memory and SQLITE_OK returned.
+*/
+static int winShmMap(
+  sqlite3_file *fd,               /* Handle open on database file */
+  int iRegion,                    /* Region to retrieve */
+  int szRegion,                   /* Size of regions */
+  int isWrite,                    /* True to extend file if necessary */
+  void volatile **pp              /* OUT: Mapped memory */
+){
+  winFile *pDbFd = (winFile*)fd;
+  winShm *pShm = pDbFd->pShm;
+  winShmNode *pShmNode;
+  DWORD protect = PAGE_READWRITE;
+  DWORD flags = FILE_MAP_WRITE | FILE_MAP_READ;
+  int rc = SQLITE_OK;
+
+  if( !pShm ){
+    rc = winOpenSharedMemory(pDbFd);
+    if( rc!=SQLITE_OK ) return rc;
+    pShm = pDbFd->pShm;
+    assert( pShm!=0 );
+  }
+  pShmNode = pShm->pShmNode;
+
+  sqlite3_mutex_enter(pShmNode->mutex);
+  if( pShmNode->isUnlocked ){
+    rc = winLockSharedMemory(pShmNode);
+    if( rc!=SQLITE_OK ) goto shmpage_out;
+    pShmNode->isUnlocked = 0;
+  }
+  assert( szRegion==pShmNode->szRegion || pShmNode->nRegion==0 );
+
+  if( pShmNode->nRegion<=iRegion ){
+    struct ShmRegion *apNew;           /* New aRegion[] array */
+    int nByte = (iRegion+1)*szRegion;  /* Minimum required file size */
+    sqlite3_int64 sz;                  /* Current size of wal-index file */
+
+    pShmNode->szRegion = szRegion;
+
+    /* The requested region is not mapped into this processes address space.
+    ** Check to see if it has been allocated (i.e. if the wal-index file is
+    ** large enough to contain the requested region).
+    */
+    rc = winFileSize((sqlite3_file *)&pShmNode->hFile, &sz);
+    if( rc!=SQLITE_OK ){
+      rc = winLogError(SQLITE_IOERR_SHMSIZE, osGetLastError(),
+                       "winShmMap1", pDbFd->zPath);
+      goto shmpage_out;
+    }
+
+    if( sz<nByte ){
+      /* The requested memory region does not exist. If isWrite is set to
+      ** zero, exit early. *pp will be set to NULL and SQLITE_OK returned.
+      **
+      ** Alternatively, if isWrite is non-zero, use ftruncate() to allocate
+      ** the requested memory region.
+      */
+      if( !isWrite ) goto shmpage_out;
+      rc = winTruncate((sqlite3_file *)&pShmNode->hFile, nByte);
+      if( rc!=SQLITE_OK ){
+        rc = winLogError(SQLITE_IOERR_SHMSIZE, osGetLastError(),
+                         "winShmMap2", pDbFd->zPath);
+        goto shmpage_out;
+      }
+    }
+
+    /* Map the requested memory region into this processes address space. */
+    apNew = (struct ShmRegion *)sqlite3_realloc64(
+        pShmNode->aRegion, (iRegion+1)*sizeof(apNew[0])
+    );
+    if( !apNew ){
+      rc = SQLITE_IOERR_NOMEM_BKPT;
+      goto shmpage_out;
+    }
+    pShmNode->aRegion = apNew;
+
+    if( pShmNode->isReadonly ){
+      protect = PAGE_READONLY;
+      flags = FILE_MAP_READ;
+    }
+
+    while( pShmNode->nRegion<=iRegion ){
+      HANDLE hMap = NULL;         /* file-mapping handle */
+      void *pMap = 0;             /* Mapped memory region */
+
+#if SQLITE_OS_WINRT
+      hMap = osCreateFileMappingFromApp(pShmNode->hFile.h,
+          NULL, protect, nByte, NULL
+      );
+#elif defined(SQLITE_WIN32_HAS_WIDE)
+      hMap = osCreateFileMappingW(pShmNode->hFile.h,
+          NULL, protect, 0, nByte, NULL
+      );
+#elif defined(SQLITE_WIN32_HAS_ANSI) && SQLITE_WIN32_CREATEFILEMAPPINGA
+      hMap = osCreateFileMappingA(pShmNode->hFile.h,
+          NULL, protect, 0, nByte, NULL
+      );
+#endif
+      OSTRACE(("SHM-MAP-CREATE pid=%lu, region=%d, size=%d, rc=%s\n",
+               osGetCurrentProcessId(), pShmNode->nRegion, nByte,
+               hMap ? "ok" : "failed"));
+      if( hMap ){
+        int iOffset = pShmNode->nRegion*szRegion;
+        int iOffsetShift = iOffset % winSysInfo.dwAllocationGranularity;
+#if SQLITE_OS_WINRT
+        pMap = osMapViewOfFileFromApp(hMap, flags,
+            iOffset - iOffsetShift, szRegion + iOffsetShift
+        );
+#else
+        pMap = osMapViewOfFile(hMap, flags,
+            0, iOffset - iOffsetShift, szRegion + iOffsetShift
+        );
+#endif
+        OSTRACE(("SHM-MAP-MAP pid=%lu, region=%d, offset=%d, size=%d, rc=%s\n",
+                 osGetCurrentProcessId(), pShmNode->nRegion, iOffset,
+                 szRegion, pMap ? "ok" : "failed"));
+      }
+      if( !pMap ){
+        pShmNode->lastErrno = osGetLastError();
+        rc = winLogError(SQLITE_IOERR_SHMMAP, pShmNode->lastErrno,
+                         "winShmMap3", pDbFd->zPath);
+        if( hMap ) osCloseHandle(hMap);
+        goto shmpage_out;
+      }
+
+      pShmNode->aRegion[pShmNode->nRegion].pMap = pMap;
+      pShmNode->aRegion[pShmNode->nRegion].hMap = hMap;
+      pShmNode->nRegion++;
+    }
+  }
+
+shmpage_out:
+  if( pShmNode->nRegion>iRegion ){
+    int iOffset = iRegion*szRegion;
+    int iOffsetShift = iOffset % winSysInfo.dwAllocationGranularity;
+    char *p = (char *)pShmNode->aRegion[iRegion].pMap;
+    *pp = (void *)&p[iOffsetShift];
+  }else{
+    *pp = 0;
+  }
+  if( pShmNode->isRead
