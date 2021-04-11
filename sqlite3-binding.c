@@ -48512,4 +48512,203 @@ static int winGetTempname(sqlite3_vfs *pVfs, char **pzBuf){
   */
   if( !winMakeEndInDirSep(nDir+1, zBuf) ){
     sqlite3_free(zBuf);
-    OSTRACE(("TEMP-FILENAME rc=
+    OSTRACE(("TEMP-FILENAME rc=SQLITE_ERROR\n"));
+    return winLogError(SQLITE_ERROR, 0, "winGetTempname4", 0);
+  }
+
+  /*
+  ** Check that the output buffer is large enough for the temporary file
+  ** name in the following format:
+  **
+  **   "<temporary_directory>/etilqs_XXXXXXXXXXXXXXX\0\0"
+  **
+  ** If not, return SQLITE_ERROR.  The number 17 is used here in order to
+  ** account for the space used by the 15 character random suffix and the
+  ** two trailing NUL characters.  The final directory separator character
+  ** has already added if it was not already present.
+  */
+  nLen = sqlite3Strlen30(zBuf);
+  if( (nLen + nPre + 17) > nBuf ){
+    sqlite3_free(zBuf);
+    OSTRACE(("TEMP-FILENAME rc=SQLITE_ERROR\n"));
+    return winLogError(SQLITE_ERROR, 0, "winGetTempname5", 0);
+  }
+
+  sqlite3_snprintf(nBuf-16-nLen, zBuf+nLen, SQLITE_TEMP_FILE_PREFIX);
+
+  j = sqlite3Strlen30(zBuf);
+  sqlite3_randomness(15, &zBuf[j]);
+  for(i=0; i<15; i++, j++){
+    zBuf[j] = (char)zChars[ ((unsigned char)zBuf[j])%(sizeof(zChars)-1) ];
+  }
+  zBuf[j] = 0;
+  zBuf[j+1] = 0;
+  *pzBuf = zBuf;
+
+  OSTRACE(("TEMP-FILENAME name=%s, rc=SQLITE_OK\n", zBuf));
+  return SQLITE_OK;
+}
+
+/*
+** Return TRUE if the named file is really a directory.  Return false if
+** it is something other than a directory, or if there is any kind of memory
+** allocation failure.
+*/
+static int winIsDir(const void *zConverted){
+  DWORD attr;
+  int rc = 0;
+  DWORD lastErrno;
+
+  if( osIsNT() ){
+    int cnt = 0;
+    WIN32_FILE_ATTRIBUTE_DATA sAttrData;
+    memset(&sAttrData, 0, sizeof(sAttrData));
+    while( !(rc = osGetFileAttributesExW((LPCWSTR)zConverted,
+                             GetFileExInfoStandard,
+                             &sAttrData)) && winRetryIoerr(&cnt, &lastErrno) ){}
+    if( !rc ){
+      return 0; /* Invalid name? */
+    }
+    attr = sAttrData.dwFileAttributes;
+#if SQLITE_OS_WINCE==0
+  }else{
+    attr = osGetFileAttributesA((char*)zConverted);
+#endif
+  }
+  return (attr!=INVALID_FILE_ATTRIBUTES) && (attr&FILE_ATTRIBUTE_DIRECTORY);
+}
+
+/* forward reference */
+static int winAccess(
+  sqlite3_vfs *pVfs,         /* Not used on win32 */
+  const char *zFilename,     /* Name of file to check */
+  int flags,                 /* Type of test to make on this file */
+  int *pResOut               /* OUT: Result */
+);
+
+/*
+** Open a file.
+*/
+static int winOpen(
+  sqlite3_vfs *pVfs,        /* Used to get maximum path length and AppData */
+  const char *zName,        /* Name of the file (UTF-8) */
+  sqlite3_file *id,         /* Write the SQLite file handle here */
+  int flags,                /* Open mode flags */
+  int *pOutFlags            /* Status return flags */
+){
+  HANDLE h;
+  DWORD lastErrno = 0;
+  DWORD dwDesiredAccess;
+  DWORD dwShareMode;
+  DWORD dwCreationDisposition;
+  DWORD dwFlagsAndAttributes = 0;
+#if SQLITE_OS_WINCE
+  int isTemp = 0;
+#endif
+  winVfsAppData *pAppData;
+  winFile *pFile = (winFile*)id;
+  void *zConverted;              /* Filename in OS encoding */
+  const char *zUtf8Name = zName; /* Filename in UTF-8 encoding */
+  int cnt = 0;
+
+  /* If argument zPath is a NULL pointer, this function is required to open
+  ** a temporary file. Use this buffer to store the file name in.
+  */
+  char *zTmpname = 0; /* For temporary filename, if necessary. */
+
+  int rc = SQLITE_OK;            /* Function Return Code */
+#if !defined(NDEBUG) || SQLITE_OS_WINCE
+  int eType = flags&0xFFFFFF00;  /* Type of file to open */
+#endif
+
+  int isExclusive  = (flags & SQLITE_OPEN_EXCLUSIVE);
+  int isDelete     = (flags & SQLITE_OPEN_DELETEONCLOSE);
+  int isCreate     = (flags & SQLITE_OPEN_CREATE);
+  int isReadonly   = (flags & SQLITE_OPEN_READONLY);
+  int isReadWrite  = (flags & SQLITE_OPEN_READWRITE);
+
+#ifndef NDEBUG
+  int isOpenJournal = (isCreate && (
+        eType==SQLITE_OPEN_SUPER_JOURNAL
+     || eType==SQLITE_OPEN_MAIN_JOURNAL
+     || eType==SQLITE_OPEN_WAL
+  ));
+#endif
+
+  OSTRACE(("OPEN name=%s, pFile=%p, flags=%x, pOutFlags=%p\n",
+           zUtf8Name, id, flags, pOutFlags));
+
+  /* Check the following statements are true:
+  **
+  **   (a) Exactly one of the READWRITE and READONLY flags must be set, and
+  **   (b) if CREATE is set, then READWRITE must also be set, and
+  **   (c) if EXCLUSIVE is set, then CREATE must also be set.
+  **   (d) if DELETEONCLOSE is set, then CREATE must also be set.
+  */
+  assert((isReadonly==0 || isReadWrite==0) && (isReadWrite || isReadonly));
+  assert(isCreate==0 || isReadWrite);
+  assert(isExclusive==0 || isCreate);
+  assert(isDelete==0 || isCreate);
+
+  /* The main DB, main journal, WAL file and super-journal are never
+  ** automatically deleted. Nor are they ever temporary files.  */
+  assert( (!isDelete && zName) || eType!=SQLITE_OPEN_MAIN_DB );
+  assert( (!isDelete && zName) || eType!=SQLITE_OPEN_MAIN_JOURNAL );
+  assert( (!isDelete && zName) || eType!=SQLITE_OPEN_SUPER_JOURNAL );
+  assert( (!isDelete && zName) || eType!=SQLITE_OPEN_WAL );
+
+  /* Assert that the upper layer has set one of the "file-type" flags. */
+  assert( eType==SQLITE_OPEN_MAIN_DB      || eType==SQLITE_OPEN_TEMP_DB
+       || eType==SQLITE_OPEN_MAIN_JOURNAL || eType==SQLITE_OPEN_TEMP_JOURNAL
+       || eType==SQLITE_OPEN_SUBJOURNAL   || eType==SQLITE_OPEN_SUPER_JOURNAL
+       || eType==SQLITE_OPEN_TRANSIENT_DB || eType==SQLITE_OPEN_WAL
+  );
+
+  assert( pFile!=0 );
+  memset(pFile, 0, sizeof(winFile));
+  pFile->h = INVALID_HANDLE_VALUE;
+
+#if SQLITE_OS_WINRT
+  if( !zUtf8Name && !sqlite3_temp_directory ){
+    sqlite3_log(SQLITE_ERROR,
+        "sqlite3_temp_directory variable should be set for WinRT");
+  }
+#endif
+
+  /* If the second argument to this function is NULL, generate a
+  ** temporary file name to use
+  */
+  if( !zUtf8Name ){
+    assert( isDelete && !isOpenJournal );
+    rc = winGetTempname(pVfs, &zTmpname);
+    if( rc!=SQLITE_OK ){
+      OSTRACE(("OPEN name=%s, rc=%s", zUtf8Name, sqlite3ErrName(rc)));
+      return rc;
+    }
+    zUtf8Name = zTmpname;
+  }
+
+  /* Database filenames are double-zero terminated if they are not
+  ** URIs with parameters.  Hence, they can always be passed into
+  ** sqlite3_uri_parameter().
+  */
+  assert( (eType!=SQLITE_OPEN_MAIN_DB) || (flags & SQLITE_OPEN_URI) ||
+       zUtf8Name[sqlite3Strlen30(zUtf8Name)+1]==0 );
+
+  /* Convert the filename to the system encoding. */
+  zConverted = winConvertFromUtf8Filename(zUtf8Name);
+  if( zConverted==0 ){
+    sqlite3_free(zTmpname);
+    OSTRACE(("OPEN name=%s, rc=SQLITE_IOERR_NOMEM", zUtf8Name));
+    return SQLITE_IOERR_NOMEM_BKPT;
+  }
+
+  if( winIsDir(zConverted) ){
+    sqlite3_free(zConverted);
+    sqlite3_free(zTmpname);
+    OSTRACE(("OPEN name=%s, rc=SQLITE_CANTOPEN_ISDIR", zUtf8Name));
+    return SQLITE_CANTOPEN_ISDIR;
+  }
+
+  if( isReadWrite ){
+    dwDesiredAccess = GENERIC_R
