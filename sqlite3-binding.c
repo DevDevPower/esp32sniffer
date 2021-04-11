@@ -49324,4 +49324,224 @@ static int winFullPathnameNoMutex(
     }
     sqlite3_free(zConverted);
     zOut = winMbcsToUtf8(zTemp, osAreFileApisANSI());
-    sqlite3
+    sqlite3_free(zTemp);
+  }
+#endif
+  if( zOut ){
+    sqlite3_snprintf(MIN(nFull, pVfs->mxPathname), zFull, "%s", zOut);
+    sqlite3_free(zOut);
+    return SQLITE_OK;
+  }else{
+    return SQLITE_IOERR_NOMEM_BKPT;
+  }
+#endif
+}
+static int winFullPathname(
+  sqlite3_vfs *pVfs,            /* Pointer to vfs object */
+  const char *zRelative,        /* Possibly relative input path */
+  int nFull,                    /* Size of output buffer in bytes */
+  char *zFull                   /* Output buffer */
+){
+  int rc;
+  sqlite3_mutex *pMutex = sqlite3MutexAlloc(SQLITE_MUTEX_STATIC_TEMPDIR);
+  sqlite3_mutex_enter(pMutex);
+  rc = winFullPathnameNoMutex(pVfs, zRelative, nFull, zFull);
+  sqlite3_mutex_leave(pMutex);
+  return rc;
+}
+
+#ifndef SQLITE_OMIT_LOAD_EXTENSION
+/*
+** Interfaces for opening a shared library, finding entry points
+** within the shared library, and closing the shared library.
+*/
+static void *winDlOpen(sqlite3_vfs *pVfs, const char *zFilename){
+  HANDLE h;
+#if defined(__CYGWIN__)
+  int nFull = pVfs->mxPathname+1;
+  char *zFull = sqlite3MallocZero( nFull );
+  void *zConverted = 0;
+  if( zFull==0 ){
+    OSTRACE(("DLOPEN name=%s, handle=%p\n", zFilename, (void*)0));
+    return 0;
+  }
+  if( winFullPathname(pVfs, zFilename, nFull, zFull)!=SQLITE_OK ){
+    sqlite3_free(zFull);
+    OSTRACE(("DLOPEN name=%s, handle=%p\n", zFilename, (void*)0));
+    return 0;
+  }
+  zConverted = winConvertFromUtf8Filename(zFull);
+  sqlite3_free(zFull);
+#else
+  void *zConverted = winConvertFromUtf8Filename(zFilename);
+  UNUSED_PARAMETER(pVfs);
+#endif
+  if( zConverted==0 ){
+    OSTRACE(("DLOPEN name=%s, handle=%p\n", zFilename, (void*)0));
+    return 0;
+  }
+  if( osIsNT() ){
+#if SQLITE_OS_WINRT
+    h = osLoadPackagedLibrary((LPCWSTR)zConverted, 0);
+#else
+    h = osLoadLibraryW((LPCWSTR)zConverted);
+#endif
+  }
+#ifdef SQLITE_WIN32_HAS_ANSI
+  else{
+    h = osLoadLibraryA((char*)zConverted);
+  }
+#endif
+  OSTRACE(("DLOPEN name=%s, handle=%p\n", zFilename, (void*)h));
+  sqlite3_free(zConverted);
+  return (void*)h;
+}
+static void winDlError(sqlite3_vfs *pVfs, int nBuf, char *zBufOut){
+  UNUSED_PARAMETER(pVfs);
+  winGetLastErrorMsg(osGetLastError(), nBuf, zBufOut);
+}
+static void (*winDlSym(sqlite3_vfs *pVfs,void *pH,const char *zSym))(void){
+  FARPROC proc;
+  UNUSED_PARAMETER(pVfs);
+  proc = osGetProcAddressA((HANDLE)pH, zSym);
+  OSTRACE(("DLSYM handle=%p, symbol=%s, address=%p\n",
+           (void*)pH, zSym, (void*)proc));
+  return (void(*)(void))proc;
+}
+static void winDlClose(sqlite3_vfs *pVfs, void *pHandle){
+  UNUSED_PARAMETER(pVfs);
+  osFreeLibrary((HANDLE)pHandle);
+  OSTRACE(("DLCLOSE handle=%p\n", (void*)pHandle));
+}
+#else /* if SQLITE_OMIT_LOAD_EXTENSION is defined: */
+  #define winDlOpen  0
+  #define winDlError 0
+  #define winDlSym   0
+  #define winDlClose 0
+#endif
+
+/* State information for the randomness gatherer. */
+typedef struct EntropyGatherer EntropyGatherer;
+struct EntropyGatherer {
+  unsigned char *a;   /* Gather entropy into this buffer */
+  int na;             /* Size of a[] in bytes */
+  int i;              /* XOR next input into a[i] */
+  int nXor;           /* Number of XOR operations done */
+};
+
+#if !defined(SQLITE_TEST) && !defined(SQLITE_OMIT_RANDOMNESS)
+/* Mix sz bytes of entropy into p. */
+static void xorMemory(EntropyGatherer *p, unsigned char *x, int sz){
+  int j, k;
+  for(j=0, k=p->i; j<sz; j++){
+    p->a[k++] ^= x[j];
+    if( k>=p->na ) k = 0;
+  }
+  p->i = k;
+  p->nXor += sz;
+}
+#endif /* !defined(SQLITE_TEST) && !defined(SQLITE_OMIT_RANDOMNESS) */
+
+/*
+** Write up to nBuf bytes of randomness into zBuf.
+*/
+static int winRandomness(sqlite3_vfs *pVfs, int nBuf, char *zBuf){
+#if defined(SQLITE_TEST) || defined(SQLITE_OMIT_RANDOMNESS)
+  UNUSED_PARAMETER(pVfs);
+  memset(zBuf, 0, nBuf);
+  return nBuf;
+#else
+  EntropyGatherer e;
+  UNUSED_PARAMETER(pVfs);
+  memset(zBuf, 0, nBuf);
+  e.a = (unsigned char*)zBuf;
+  e.na = nBuf;
+  e.nXor = 0;
+  e.i = 0;
+  {
+    SYSTEMTIME x;
+    osGetSystemTime(&x);
+    xorMemory(&e, (unsigned char*)&x, sizeof(SYSTEMTIME));
+  }
+  {
+    DWORD pid = osGetCurrentProcessId();
+    xorMemory(&e, (unsigned char*)&pid, sizeof(DWORD));
+  }
+#if SQLITE_OS_WINRT
+  {
+    ULONGLONG cnt = osGetTickCount64();
+    xorMemory(&e, (unsigned char*)&cnt, sizeof(ULONGLONG));
+  }
+#else
+  {
+    DWORD cnt = osGetTickCount();
+    xorMemory(&e, (unsigned char*)&cnt, sizeof(DWORD));
+  }
+#endif /* SQLITE_OS_WINRT */
+  {
+    LARGE_INTEGER i;
+    osQueryPerformanceCounter(&i);
+    xorMemory(&e, (unsigned char*)&i, sizeof(LARGE_INTEGER));
+  }
+#if !SQLITE_OS_WINCE && !SQLITE_OS_WINRT && SQLITE_WIN32_USE_UUID
+  {
+    UUID id;
+    memset(&id, 0, sizeof(UUID));
+    osUuidCreate(&id);
+    xorMemory(&e, (unsigned char*)&id, sizeof(UUID));
+    memset(&id, 0, sizeof(UUID));
+    osUuidCreateSequential(&id);
+    xorMemory(&e, (unsigned char*)&id, sizeof(UUID));
+  }
+#endif /* !SQLITE_OS_WINCE && !SQLITE_OS_WINRT && SQLITE_WIN32_USE_UUID */
+  return e.nXor>nBuf ? nBuf : e.nXor;
+#endif /* defined(SQLITE_TEST) || defined(SQLITE_OMIT_RANDOMNESS) */
+}
+
+
+/*
+** Sleep for a little while.  Return the amount of time slept.
+*/
+static int winSleep(sqlite3_vfs *pVfs, int microsec){
+  sqlite3_win32_sleep((microsec+999)/1000);
+  UNUSED_PARAMETER(pVfs);
+  return ((microsec+999)/1000)*1000;
+}
+
+/*
+** The following variable, if set to a non-zero value, is interpreted as
+** the number of seconds since 1970 and is used to set the result of
+** sqlite3OsCurrentTime() during testing.
+*/
+#ifdef SQLITE_TEST
+SQLITE_API int sqlite3_current_time = 0;  /* Fake system time in seconds since 1970. */
+#endif
+
+/*
+** Find the current time (in Universal Coordinated Time).  Write into *piNow
+** the current time and date as a Julian Day number times 86_400_000.  In
+** other words, write into *piNow the number of milliseconds since the Julian
+** epoch of noon in Greenwich on November 24, 4714 B.C according to the
+** proleptic Gregorian calendar.
+**
+** On success, return SQLITE_OK.  Return SQLITE_ERROR if the time and date
+** cannot be found.
+*/
+static int winCurrentTimeInt64(sqlite3_vfs *pVfs, sqlite3_int64 *piNow){
+  /* FILETIME structure is a 64-bit value representing the number of
+     100-nanosecond intervals since January 1, 1601 (= JD 2305813.5).
+  */
+  FILETIME ft;
+  static const sqlite3_int64 winFiletimeEpoch = 23058135*(sqlite3_int64)8640000;
+#ifdef SQLITE_TEST
+  static const sqlite3_int64 unixEpoch = 24405875*(sqlite3_int64)8640000;
+#endif
+  /* 2^32 - to avoid use of LL and warnings in gcc */
+  static const sqlite3_int64 max32BitValue =
+      (sqlite3_int64)2000000000 + (sqlite3_int64)2000000000 +
+      (sqlite3_int64)294967296;
+
+#if SQLITE_OS_WINCE
+  SYSTEMTIME time;
+  osGetSystemTime(&time);
+  /
