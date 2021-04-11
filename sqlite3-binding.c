@@ -49724,4 +49724,183 @@ SQLITE_API int sqlite3_os_init(void){
 
   /* Double-check that the aSyscall[] array has been constructed
   ** correctly.  See ticket [bb3a86e890c8e96ab] */
-  assert( ArraySize(aSyscall)==8
+  assert( ArraySize(aSyscall)==80 );
+
+  /* get memory map allocation granularity */
+  memset(&winSysInfo, 0, sizeof(SYSTEM_INFO));
+#if SQLITE_OS_WINRT
+  osGetNativeSystemInfo(&winSysInfo);
+#else
+  osGetSystemInfo(&winSysInfo);
+#endif
+  assert( winSysInfo.dwAllocationGranularity>0 );
+  assert( winSysInfo.dwPageSize>0 );
+
+  sqlite3_vfs_register(&winVfs, 1);
+
+#if defined(SQLITE_WIN32_HAS_WIDE)
+  sqlite3_vfs_register(&winLongPathVfs, 0);
+#endif
+
+  sqlite3_vfs_register(&winNolockVfs, 0);
+
+#if defined(SQLITE_WIN32_HAS_WIDE)
+  sqlite3_vfs_register(&winLongPathNolockVfs, 0);
+#endif
+
+#ifndef SQLITE_OMIT_WAL
+  winBigLock = sqlite3MutexAlloc(SQLITE_MUTEX_STATIC_VFS1);
+#endif
+
+  return SQLITE_OK;
+}
+
+SQLITE_API int sqlite3_os_end(void){
+#if SQLITE_OS_WINRT
+  if( sleepObj!=NULL ){
+    osCloseHandle(sleepObj);
+    sleepObj = NULL;
+  }
+#endif
+
+#ifndef SQLITE_OMIT_WAL
+  winBigLock = 0;
+#endif
+
+  return SQLITE_OK;
+}
+
+#endif /* SQLITE_OS_WIN */
+
+/************** End of os_win.c **********************************************/
+/************** Begin file memdb.c *******************************************/
+/*
+** 2016-09-07
+**
+** The author disclaims copyright to this source code.  In place of
+** a legal notice, here is a blessing:
+**
+**    May you do good and not evil.
+**    May you find forgiveness for yourself and forgive others.
+**    May you share freely, never taking more than you give.
+**
+******************************************************************************
+**
+** This file implements an in-memory VFS. A database is held as a contiguous
+** block of memory.
+**
+** This file also implements interface sqlite3_serialize() and
+** sqlite3_deserialize().
+*/
+/* #include "sqliteInt.h" */
+#ifndef SQLITE_OMIT_DESERIALIZE
+
+/*
+** Forward declaration of objects used by this utility
+*/
+typedef struct sqlite3_vfs MemVfs;
+typedef struct MemFile MemFile;
+typedef struct MemStore MemStore;
+
+/* Access to a lower-level VFS that (might) implement dynamic loading,
+** access to randomness, etc.
+*/
+#define ORIGVFS(p) ((sqlite3_vfs*)((p)->pAppData))
+
+/* Storage for a memdb file.
+**
+** An memdb object can be shared or separate.  Shared memdb objects can be
+** used by more than one database connection.  Mutexes are used by shared
+** memdb objects to coordinate access.  Separate memdb objects are only
+** connected to a single database connection and do not require additional
+** mutexes.
+**
+** Shared memdb objects have .zFName!=0 and .pMutex!=0.  They are created
+** using "file:/name?vfs=memdb".  The first character of the name must be
+** "/" or else the object will be a separate memdb object.  All shared
+** memdb objects are stored in memdb_g.apMemStore[] in an arbitrary order.
+**
+** Separate memdb objects are created using a name that does not begin
+** with "/" or using sqlite3_deserialize().
+**
+** Access rules for shared MemStore objects:
+**
+**   *  .zFName is initialized when the object is created and afterwards
+**      is unchanged until the object is destroyed.  So it can be accessed
+**      at any time as long as we know the object is not being destroyed,
+**      which means while either the SQLITE_MUTEX_STATIC_VFS1 or
+**      .pMutex is held or the object is not part of memdb_g.apMemStore[].
+**
+**   *  Can .pMutex can only be changed while holding the
+**      SQLITE_MUTEX_STATIC_VFS1 mutex or while the object is not part
+**      of memdb_g.apMemStore[].
+**
+**   *  Other fields can only be changed while holding the .pMutex mutex
+**      or when the .nRef is less than zero and the object is not part of
+**      memdb_g.apMemStore[].
+**
+**   *  The .aData pointer has the added requirement that it can can only
+**      be changed (for resizing) when nMmap is zero.
+**
+*/
+struct MemStore {
+  sqlite3_int64 sz;               /* Size of the file */
+  sqlite3_int64 szAlloc;          /* Space allocated to aData */
+  sqlite3_int64 szMax;            /* Maximum allowed size of the file */
+  unsigned char *aData;           /* content of the file */
+  sqlite3_mutex *pMutex;          /* Used by shared stores only */
+  int nMmap;                      /* Number of memory mapped pages */
+  unsigned mFlags;                /* Flags */
+  int nRdLock;                    /* Number of readers */
+  int nWrLock;                    /* Number of writers.  (Always 0 or 1) */
+  int nRef;                       /* Number of users of this MemStore */
+  char *zFName;                   /* The filename for shared stores */
+};
+
+/* An open file */
+struct MemFile {
+  sqlite3_file base;              /* IO methods */
+  MemStore *pStore;               /* The storage */
+  int eLock;                      /* Most recent lock against this file */
+};
+
+/*
+** File-scope variables for holding the memdb files that are accessible
+** to multiple database connections in separate threads.
+**
+** Must hold SQLITE_MUTEX_STATIC_VFS1 to access any part of this object.
+*/
+static struct MemFS {
+  int nMemStore;                  /* Number of shared MemStore objects */
+  MemStore **apMemStore;          /* Array of all shared MemStore objects */
+} memdb_g;
+
+/*
+** Methods for MemFile
+*/
+static int memdbClose(sqlite3_file*);
+static int memdbRead(sqlite3_file*, void*, int iAmt, sqlite3_int64 iOfst);
+static int memdbWrite(sqlite3_file*,const void*,int iAmt, sqlite3_int64 iOfst);
+static int memdbTruncate(sqlite3_file*, sqlite3_int64 size);
+static int memdbSync(sqlite3_file*, int flags);
+static int memdbFileSize(sqlite3_file*, sqlite3_int64 *pSize);
+static int memdbLock(sqlite3_file*, int);
+/* static int memdbCheckReservedLock(sqlite3_file*, int *pResOut);// not used */
+static int memdbFileControl(sqlite3_file*, int op, void *pArg);
+/* static int memdbSectorSize(sqlite3_file*); // not used */
+static int memdbDeviceCharacteristics(sqlite3_file*);
+static int memdbFetch(sqlite3_file*, sqlite3_int64 iOfst, int iAmt, void **pp);
+static int memdbUnfetch(sqlite3_file*, sqlite3_int64 iOfst, void *p);
+
+/*
+** Methods for MemVfs
+*/
+static int memdbOpen(sqlite3_vfs*, const char *, sqlite3_file*, int , int *);
+/* static int memdbDelete(sqlite3_vfs*, const char *zName, int syncDir); */
+static int memdbAccess(sqlite3_vfs*, const char *zName, int flags, int *);
+static int memdbFullPathname(sqlite3_vfs*, const char *zName, int, char *zOut);
+static void *memdbDlOpen(sqlite3_vfs*, const char *zFilename);
+static void memdbDlError(sqlite3_vfs*, int nByte, char *zErrMsg);
+static void (*memdbDlSym(sqlite3_vfs *pVfs, void *p, const char*zSym))(void);
+static void memdbDlClose(sqlite3_vfs*, void*);
+static int memdbRandomness(sqlite3_vfs*, int nByte, cha
