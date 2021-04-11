@@ -49544,4 +49544,184 @@ static int winCurrentTimeInt64(sqlite3_vfs *pVfs, sqlite3_int64 *piNow){
 #if SQLITE_OS_WINCE
   SYSTEMTIME time;
   osGetSystemTime(&time);
-  /
+  /* if SystemTimeToFileTime() fails, it returns zero. */
+  if (!osSystemTimeToFileTime(&time,&ft)){
+    return SQLITE_ERROR;
+  }
+#else
+  osGetSystemTimeAsFileTime( &ft );
+#endif
+
+  *piNow = winFiletimeEpoch +
+            ((((sqlite3_int64)ft.dwHighDateTime)*max32BitValue) +
+               (sqlite3_int64)ft.dwLowDateTime)/(sqlite3_int64)10000;
+
+#ifdef SQLITE_TEST
+  if( sqlite3_current_time ){
+    *piNow = 1000*(sqlite3_int64)sqlite3_current_time + unixEpoch;
+  }
+#endif
+  UNUSED_PARAMETER(pVfs);
+  return SQLITE_OK;
+}
+
+/*
+** Find the current time (in Universal Coordinated Time).  Write the
+** current time and date as a Julian Day number into *prNow and
+** return 0.  Return 1 if the time and date cannot be found.
+*/
+static int winCurrentTime(sqlite3_vfs *pVfs, double *prNow){
+  int rc;
+  sqlite3_int64 i;
+  rc = winCurrentTimeInt64(pVfs, &i);
+  if( !rc ){
+    *prNow = i/86400000.0;
+  }
+  return rc;
+}
+
+/*
+** The idea is that this function works like a combination of
+** GetLastError() and FormatMessage() on Windows (or errno and
+** strerror_r() on Unix). After an error is returned by an OS
+** function, SQLite calls this function with zBuf pointing to
+** a buffer of nBuf bytes. The OS layer should populate the
+** buffer with a nul-terminated UTF-8 encoded error message
+** describing the last IO error to have occurred within the calling
+** thread.
+**
+** If the error message is too large for the supplied buffer,
+** it should be truncated. The return value of xGetLastError
+** is zero if the error message fits in the buffer, or non-zero
+** otherwise (if the message was truncated). If non-zero is returned,
+** then it is not necessary to include the nul-terminator character
+** in the output buffer.
+**
+** Not supplying an error message will have no adverse effect
+** on SQLite. It is fine to have an implementation that never
+** returns an error message:
+**
+**   int xGetLastError(sqlite3_vfs *pVfs, int nBuf, char *zBuf){
+**     assert(zBuf[0]=='\0');
+**     return 0;
+**   }
+**
+** However if an error message is supplied, it will be incorporated
+** by sqlite into the error message available to the user using
+** sqlite3_errmsg(), possibly making IO errors easier to debug.
+*/
+static int winGetLastError(sqlite3_vfs *pVfs, int nBuf, char *zBuf){
+  DWORD e = osGetLastError();
+  UNUSED_PARAMETER(pVfs);
+  if( nBuf>0 ) winGetLastErrorMsg(e, nBuf, zBuf);
+  return e;
+}
+
+/*
+** Initialize and deinitialize the operating system interface.
+*/
+SQLITE_API int sqlite3_os_init(void){
+  static sqlite3_vfs winVfs = {
+    3,                     /* iVersion */
+    sizeof(winFile),       /* szOsFile */
+    SQLITE_WIN32_MAX_PATH_BYTES, /* mxPathname */
+    0,                     /* pNext */
+    "win32",               /* zName */
+    &winAppData,           /* pAppData */
+    winOpen,               /* xOpen */
+    winDelete,             /* xDelete */
+    winAccess,             /* xAccess */
+    winFullPathname,       /* xFullPathname */
+    winDlOpen,             /* xDlOpen */
+    winDlError,            /* xDlError */
+    winDlSym,              /* xDlSym */
+    winDlClose,            /* xDlClose */
+    winRandomness,         /* xRandomness */
+    winSleep,              /* xSleep */
+    winCurrentTime,        /* xCurrentTime */
+    winGetLastError,       /* xGetLastError */
+    winCurrentTimeInt64,   /* xCurrentTimeInt64 */
+    winSetSystemCall,      /* xSetSystemCall */
+    winGetSystemCall,      /* xGetSystemCall */
+    winNextSystemCall,     /* xNextSystemCall */
+  };
+#if defined(SQLITE_WIN32_HAS_WIDE)
+  static sqlite3_vfs winLongPathVfs = {
+    3,                     /* iVersion */
+    sizeof(winFile),       /* szOsFile */
+    SQLITE_WINNT_MAX_PATH_BYTES, /* mxPathname */
+    0,                     /* pNext */
+    "win32-longpath",      /* zName */
+    &winAppData,           /* pAppData */
+    winOpen,               /* xOpen */
+    winDelete,             /* xDelete */
+    winAccess,             /* xAccess */
+    winFullPathname,       /* xFullPathname */
+    winDlOpen,             /* xDlOpen */
+    winDlError,            /* xDlError */
+    winDlSym,              /* xDlSym */
+    winDlClose,            /* xDlClose */
+    winRandomness,         /* xRandomness */
+    winSleep,              /* xSleep */
+    winCurrentTime,        /* xCurrentTime */
+    winGetLastError,       /* xGetLastError */
+    winCurrentTimeInt64,   /* xCurrentTimeInt64 */
+    winSetSystemCall,      /* xSetSystemCall */
+    winGetSystemCall,      /* xGetSystemCall */
+    winNextSystemCall,     /* xNextSystemCall */
+  };
+#endif
+  static sqlite3_vfs winNolockVfs = {
+    3,                     /* iVersion */
+    sizeof(winFile),       /* szOsFile */
+    SQLITE_WIN32_MAX_PATH_BYTES, /* mxPathname */
+    0,                     /* pNext */
+    "win32-none",          /* zName */
+    &winNolockAppData,     /* pAppData */
+    winOpen,               /* xOpen */
+    winDelete,             /* xDelete */
+    winAccess,             /* xAccess */
+    winFullPathname,       /* xFullPathname */
+    winDlOpen,             /* xDlOpen */
+    winDlError,            /* xDlError */
+    winDlSym,              /* xDlSym */
+    winDlClose,            /* xDlClose */
+    winRandomness,         /* xRandomness */
+    winSleep,              /* xSleep */
+    winCurrentTime,        /* xCurrentTime */
+    winGetLastError,       /* xGetLastError */
+    winCurrentTimeInt64,   /* xCurrentTimeInt64 */
+    winSetSystemCall,      /* xSetSystemCall */
+    winGetSystemCall,      /* xGetSystemCall */
+    winNextSystemCall,     /* xNextSystemCall */
+  };
+#if defined(SQLITE_WIN32_HAS_WIDE)
+  static sqlite3_vfs winLongPathNolockVfs = {
+    3,                     /* iVersion */
+    sizeof(winFile),       /* szOsFile */
+    SQLITE_WINNT_MAX_PATH_BYTES, /* mxPathname */
+    0,                     /* pNext */
+    "win32-longpath-none", /* zName */
+    &winNolockAppData,     /* pAppData */
+    winOpen,               /* xOpen */
+    winDelete,             /* xDelete */
+    winAccess,             /* xAccess */
+    winFullPathname,       /* xFullPathname */
+    winDlOpen,             /* xDlOpen */
+    winDlError,            /* xDlError */
+    winDlSym,              /* xDlSym */
+    winDlClose,            /* xDlClose */
+    winRandomness,         /* xRandomness */
+    winSleep,              /* xSleep */
+    winCurrentTime,        /* xCurrentTime */
+    winGetLastError,       /* xGetLastError */
+    winCurrentTimeInt64,   /* xCurrentTimeInt64 */
+    winSetSystemCall,      /* xSetSystemCall */
+    winGetSystemCall,      /* xGetSystemCall */
+    winNextSystemCall,     /* xNextSystemCall */
+  };
+#endif
+
+  /* Double-check that the aSyscall[] array has been constructed
+  ** correctly.  See ticket [bb3a86e890c8e96ab] */
+  assert( ArraySize(aSyscall)==8
