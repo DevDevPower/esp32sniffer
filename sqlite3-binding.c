@@ -52149,4 +52149,181 @@ struct PCache1 {
   unsigned int iMaxKey;               /* Largest key seen since xTruncate() */
   unsigned int nPurgeableDummy;       /* pnPurgeable points here when not used*/
 
-  /* Has
+  /* Hash table of all pages. The following variables may only be accessed
+  ** when the accessor is holding the PGroup mutex.
+  */
+  unsigned int nRecyclable;           /* Number of pages in the LRU list */
+  unsigned int nPage;                 /* Total number of pages in apHash */
+  unsigned int nHash;                 /* Number of slots in apHash[] */
+  PgHdr1 **apHash;                    /* Hash table for fast lookup by key */
+  PgHdr1 *pFree;                      /* List of unused pcache-local pages */
+  void *pBulk;                        /* Bulk memory used by pcache-local */
+};
+
+/*
+** Free slots in the allocator used to divide up the global page cache
+** buffer provided using the SQLITE_CONFIG_PAGECACHE mechanism.
+*/
+struct PgFreeslot {
+  PgFreeslot *pNext;  /* Next free slot */
+};
+
+/*
+** Global data used by this cache.
+*/
+static SQLITE_WSD struct PCacheGlobal {
+  PGroup grp;                    /* The global PGroup for mode (2) */
+
+  /* Variables related to SQLITE_CONFIG_PAGECACHE settings.  The
+  ** szSlot, nSlot, pStart, pEnd, nReserve, and isInit values are all
+  ** fixed at sqlite3_initialize() time and do not require mutex protection.
+  ** The nFreeSlot and pFree values do require mutex protection.
+  */
+  int isInit;                    /* True if initialized */
+  int separateCache;             /* Use a new PGroup for each PCache */
+  int nInitPage;                 /* Initial bulk allocation size */
+  int szSlot;                    /* Size of each free slot */
+  int nSlot;                     /* The number of pcache slots */
+  int nReserve;                  /* Try to keep nFreeSlot above this */
+  void *pStart, *pEnd;           /* Bounds of global page cache memory */
+  /* Above requires no mutex.  Use mutex below for variable that follow. */
+  sqlite3_mutex *mutex;          /* Mutex for accessing the following: */
+  PgFreeslot *pFree;             /* Free page blocks */
+  int nFreeSlot;                 /* Number of unused pcache slots */
+  /* The following value requires a mutex to change.  We skip the mutex on
+  ** reading because (1) most platforms read a 32-bit integer atomically and
+  ** (2) even if an incorrect value is read, no great harm is done since this
+  ** is really just an optimization. */
+  int bUnderPressure;            /* True if low on PAGECACHE memory */
+} pcache1_g;
+
+/*
+** All code in this file should access the global structure above via the
+** alias "pcache1". This ensures that the WSD emulation is used when
+** compiling for systems that do not support real WSD.
+*/
+#define pcache1 (GLOBAL(struct PCacheGlobal, pcache1_g))
+
+/*
+** Macros to enter and leave the PCache LRU mutex.
+*/
+#if !defined(SQLITE_ENABLE_MEMORY_MANAGEMENT) || SQLITE_THREADSAFE==0
+# define pcache1EnterMutex(X)  assert((X)->mutex==0)
+# define pcache1LeaveMutex(X)  assert((X)->mutex==0)
+# define PCACHE1_MIGHT_USE_GROUP_MUTEX 0
+#else
+# define pcache1EnterMutex(X) sqlite3_mutex_enter((X)->mutex)
+# define pcache1LeaveMutex(X) sqlite3_mutex_leave((X)->mutex)
+# define PCACHE1_MIGHT_USE_GROUP_MUTEX 1
+#endif
+
+/******************************************************************************/
+/******** Page Allocation/SQLITE_CONFIG_PCACHE Related Functions **************/
+
+
+/*
+** This function is called during initialization if a static buffer is
+** supplied to use for the page-cache by passing the SQLITE_CONFIG_PAGECACHE
+** verb to sqlite3_config(). Parameter pBuf points to an allocation large
+** enough to contain 'n' buffers of 'sz' bytes each.
+**
+** This routine is called from sqlite3_initialize() and so it is guaranteed
+** to be serialized already.  There is no need for further mutexing.
+*/
+SQLITE_PRIVATE void sqlite3PCacheBufferSetup(void *pBuf, int sz, int n){
+  if( pcache1.isInit ){
+    PgFreeslot *p;
+    if( pBuf==0 ) sz = n = 0;
+    if( n==0 ) sz = 0;
+    sz = ROUNDDOWN8(sz);
+    pcache1.szSlot = sz;
+    pcache1.nSlot = pcache1.nFreeSlot = n;
+    pcache1.nReserve = n>90 ? 10 : (n/10 + 1);
+    pcache1.pStart = pBuf;
+    pcache1.pFree = 0;
+    pcache1.bUnderPressure = 0;
+    while( n-- ){
+      p = (PgFreeslot*)pBuf;
+      p->pNext = pcache1.pFree;
+      pcache1.pFree = p;
+      pBuf = (void*)&((char*)pBuf)[sz];
+    }
+    pcache1.pEnd = pBuf;
+  }
+}
+
+/*
+** Try to initialize the pCache->pFree and pCache->pBulk fields.  Return
+** true if pCache->pFree ends up containing one or more free pages.
+*/
+static int pcache1InitBulk(PCache1 *pCache){
+  i64 szBulk;
+  char *zBulk;
+  if( pcache1.nInitPage==0 ) return 0;
+  /* Do not bother with a bulk allocation if the cache size very small */
+  if( pCache->nMax<3 ) return 0;
+  sqlite3BeginBenignMalloc();
+  if( pcache1.nInitPage>0 ){
+    szBulk = pCache->szAlloc * (i64)pcache1.nInitPage;
+  }else{
+    szBulk = -1024 * (i64)pcache1.nInitPage;
+  }
+  if( szBulk > pCache->szAlloc*(i64)pCache->nMax ){
+    szBulk = pCache->szAlloc*(i64)pCache->nMax;
+  }
+  zBulk = pCache->pBulk = sqlite3Malloc( szBulk );
+  sqlite3EndBenignMalloc();
+  if( zBulk ){
+    int nBulk = sqlite3MallocSize(zBulk)/pCache->szAlloc;
+    do{
+      PgHdr1 *pX = (PgHdr1*)&zBulk[pCache->szPage];
+      pX->page.pBuf = zBulk;
+      pX->page.pExtra = &pX[1];
+      pX->isBulkLocal = 1;
+      pX->isAnchor = 0;
+      pX->pNext = pCache->pFree;
+      pX->pLruPrev = 0;           /* Initializing this saves a valgrind error */
+      pCache->pFree = pX;
+      zBulk += pCache->szAlloc;
+    }while( --nBulk );
+  }
+  return pCache->pFree!=0;
+}
+
+/*
+** Malloc function used within this file to allocate space from the buffer
+** configured using sqlite3_config(SQLITE_CONFIG_PAGECACHE) option. If no
+** such buffer exists or there is no space left in it, this function falls
+** back to sqlite3Malloc().
+**
+** Multiple threads can run this routine at the same time.  Global variables
+** in pcache1 need to be protected via mutex.
+*/
+static void *pcache1Alloc(int nByte){
+  void *p = 0;
+  assert( sqlite3_mutex_notheld(pcache1.grp.mutex) );
+  if( nByte<=pcache1.szSlot ){
+    sqlite3_mutex_enter(pcache1.mutex);
+    p = (PgHdr1 *)pcache1.pFree;
+    if( p ){
+      pcache1.pFree = pcache1.pFree->pNext;
+      pcache1.nFreeSlot--;
+      pcache1.bUnderPressure = pcache1.nFreeSlot<pcache1.nReserve;
+      assert( pcache1.nFreeSlot>=0 );
+      sqlite3StatusHighwater(SQLITE_STATUS_PAGECACHE_SIZE, nByte);
+      sqlite3StatusUp(SQLITE_STATUS_PAGECACHE_USED, 1);
+    }
+    sqlite3_mutex_leave(pcache1.mutex);
+  }
+  if( p==0 ){
+    /* Memory is not available in the SQLITE_CONFIG_PAGECACHE pool.  Get
+    ** it from sqlite3Malloc instead.
+    */
+    p = sqlite3Malloc(nByte);
+#ifndef SQLITE_DISABLE_PAGECACHE_OVERFLOW_STATS
+    if( p ){
+      int sz = sqlite3MallocSize(p);
+      sqlite3_mutex_enter(pcache1.mutex);
+      sqlite3StatusHighwater(SQLITE_STATUS_PAGECACHE_SIZE, nByte);
+      sqlite3StatusUp(SQLITE_STATUS_PAGECACHE_OVERFLOW, sz);
+  
