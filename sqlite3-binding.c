@@ -51560,4 +51560,235 @@ static SQLITE_NOINLINE PgHdr *pcacheFetchFinishWithInit(
 SQLITE_PRIVATE PgHdr *sqlite3PcacheFetchFinish(
   PCache *pCache,             /* Obtain the page from this cache */
   Pgno pgno,                  /* Page number obtained */
-  sqlite3_pcache_page *pPage  /* Page obtaine
+  sqlite3_pcache_page *pPage  /* Page obtained by prior PcacheFetch() call */
+){
+  PgHdr *pPgHdr;
+
+  assert( pPage!=0 );
+  pPgHdr = (PgHdr *)pPage->pExtra;
+
+  if( !pPgHdr->pPage ){
+    return pcacheFetchFinishWithInit(pCache, pgno, pPage);
+  }
+  pCache->nRefSum++;
+  pPgHdr->nRef++;
+  assert( sqlite3PcachePageSanity(pPgHdr) );
+  return pPgHdr;
+}
+
+/*
+** Decrement the reference count on a page. If the page is clean and the
+** reference count drops to 0, then it is made eligible for recycling.
+*/
+SQLITE_PRIVATE void SQLITE_NOINLINE sqlite3PcacheRelease(PgHdr *p){
+  assert( p->nRef>0 );
+  p->pCache->nRefSum--;
+  if( (--p->nRef)==0 ){
+    if( p->flags&PGHDR_CLEAN ){
+      pcacheUnpin(p);
+    }else{
+      pcacheManageDirtyList(p, PCACHE_DIRTYLIST_FRONT);
+    }
+  }
+}
+
+/*
+** Increase the reference count of a supplied page by 1.
+*/
+SQLITE_PRIVATE void sqlite3PcacheRef(PgHdr *p){
+  assert(p->nRef>0);
+  assert( sqlite3PcachePageSanity(p) );
+  p->nRef++;
+  p->pCache->nRefSum++;
+}
+
+/*
+** Drop a page from the cache. There must be exactly one reference to the
+** page. This function deletes that reference, so after it returns the
+** page pointed to by p is invalid.
+*/
+SQLITE_PRIVATE void sqlite3PcacheDrop(PgHdr *p){
+  assert( p->nRef==1 );
+  assert( sqlite3PcachePageSanity(p) );
+  if( p->flags&PGHDR_DIRTY ){
+    pcacheManageDirtyList(p, PCACHE_DIRTYLIST_REMOVE);
+  }
+  p->pCache->nRefSum--;
+  sqlite3GlobalConfig.pcache2.xUnpin(p->pCache->pCache, p->pPage, 1);
+}
+
+/*
+** Make sure the page is marked as dirty. If it isn't dirty already,
+** make it so.
+*/
+SQLITE_PRIVATE void sqlite3PcacheMakeDirty(PgHdr *p){
+  assert( p->nRef>0 );
+  assert( sqlite3PcachePageSanity(p) );
+  if( p->flags & (PGHDR_CLEAN|PGHDR_DONT_WRITE) ){    /*OPTIMIZATION-IF-FALSE*/
+    p->flags &= ~PGHDR_DONT_WRITE;
+    if( p->flags & PGHDR_CLEAN ){
+      p->flags ^= (PGHDR_DIRTY|PGHDR_CLEAN);
+      pcacheTrace(("%p.DIRTY %d\n",p->pCache,p->pgno));
+      assert( (p->flags & (PGHDR_DIRTY|PGHDR_CLEAN))==PGHDR_DIRTY );
+      pcacheManageDirtyList(p, PCACHE_DIRTYLIST_ADD);
+    }
+    assert( sqlite3PcachePageSanity(p) );
+  }
+}
+
+/*
+** Make sure the page is marked as clean. If it isn't clean already,
+** make it so.
+*/
+SQLITE_PRIVATE void sqlite3PcacheMakeClean(PgHdr *p){
+  assert( sqlite3PcachePageSanity(p) );
+  assert( (p->flags & PGHDR_DIRTY)!=0 );
+  assert( (p->flags & PGHDR_CLEAN)==0 );
+  pcacheManageDirtyList(p, PCACHE_DIRTYLIST_REMOVE);
+  p->flags &= ~(PGHDR_DIRTY|PGHDR_NEED_SYNC|PGHDR_WRITEABLE);
+  p->flags |= PGHDR_CLEAN;
+  pcacheTrace(("%p.CLEAN %d\n",p->pCache,p->pgno));
+  assert( sqlite3PcachePageSanity(p) );
+  if( p->nRef==0 ){
+    pcacheUnpin(p);
+  }
+}
+
+/*
+** Make every page in the cache clean.
+*/
+SQLITE_PRIVATE void sqlite3PcacheCleanAll(PCache *pCache){
+  PgHdr *p;
+  pcacheTrace(("%p.CLEAN-ALL\n",pCache));
+  while( (p = pCache->pDirty)!=0 ){
+    sqlite3PcacheMakeClean(p);
+  }
+}
+
+/*
+** Clear the PGHDR_NEED_SYNC and PGHDR_WRITEABLE flag from all dirty pages.
+*/
+SQLITE_PRIVATE void sqlite3PcacheClearWritable(PCache *pCache){
+  PgHdr *p;
+  pcacheTrace(("%p.CLEAR-WRITEABLE\n",pCache));
+  for(p=pCache->pDirty; p; p=p->pDirtyNext){
+    p->flags &= ~(PGHDR_NEED_SYNC|PGHDR_WRITEABLE);
+  }
+  pCache->pSynced = pCache->pDirtyTail;
+}
+
+/*
+** Clear the PGHDR_NEED_SYNC flag from all dirty pages.
+*/
+SQLITE_PRIVATE void sqlite3PcacheClearSyncFlags(PCache *pCache){
+  PgHdr *p;
+  for(p=pCache->pDirty; p; p=p->pDirtyNext){
+    p->flags &= ~PGHDR_NEED_SYNC;
+  }
+  pCache->pSynced = pCache->pDirtyTail;
+}
+
+/*
+** Change the page number of page p to newPgno.
+*/
+SQLITE_PRIVATE void sqlite3PcacheMove(PgHdr *p, Pgno newPgno){
+  PCache *pCache = p->pCache;
+  sqlite3_pcache_page *pOther;
+  assert( p->nRef>0 );
+  assert( newPgno>0 );
+  assert( sqlite3PcachePageSanity(p) );
+  pcacheTrace(("%p.MOVE %d -> %d\n",pCache,p->pgno,newPgno));
+  pOther = sqlite3GlobalConfig.pcache2.xFetch(pCache->pCache, newPgno, 0);
+  if( pOther ){
+    PgHdr *pXPage = (PgHdr*)pOther->pExtra;
+    assert( pXPage->nRef==0 );
+    pXPage->nRef++;
+    pCache->nRefSum++;
+    sqlite3PcacheDrop(pXPage);
+  }
+  sqlite3GlobalConfig.pcache2.xRekey(pCache->pCache, p->pPage, p->pgno,newPgno);
+  p->pgno = newPgno;
+  if( (p->flags&PGHDR_DIRTY) && (p->flags&PGHDR_NEED_SYNC) ){
+    pcacheManageDirtyList(p, PCACHE_DIRTYLIST_FRONT);
+    assert( sqlite3PcachePageSanity(p) );
+  }
+}
+
+/*
+** Drop every cache entry whose page number is greater than "pgno". The
+** caller must ensure that there are no outstanding references to any pages
+** other than page 1 with a page number greater than pgno.
+**
+** If there is a reference to page 1 and the pgno parameter passed to this
+** function is 0, then the data area associated with page 1 is zeroed, but
+** the page object is not dropped.
+*/
+SQLITE_PRIVATE void sqlite3PcacheTruncate(PCache *pCache, Pgno pgno){
+  if( pCache->pCache ){
+    PgHdr *p;
+    PgHdr *pNext;
+    pcacheTrace(("%p.TRUNCATE %d\n",pCache,pgno));
+    for(p=pCache->pDirty; p; p=pNext){
+      pNext = p->pDirtyNext;
+      /* This routine never gets call with a positive pgno except right
+      ** after sqlite3PcacheCleanAll().  So if there are dirty pages,
+      ** it must be that pgno==0.
+      */
+      assert( p->pgno>0 );
+      if( p->pgno>pgno ){
+        assert( p->flags&PGHDR_DIRTY );
+        sqlite3PcacheMakeClean(p);
+      }
+    }
+    if( pgno==0 && pCache->nRefSum ){
+      sqlite3_pcache_page *pPage1;
+      pPage1 = sqlite3GlobalConfig.pcache2.xFetch(pCache->pCache,1,0);
+      if( ALWAYS(pPage1) ){  /* Page 1 is always available in cache, because
+                             ** pCache->nRefSum>0 */
+        memset(pPage1->pBuf, 0, pCache->szPage);
+        pgno = 1;
+      }
+    }
+    sqlite3GlobalConfig.pcache2.xTruncate(pCache->pCache, pgno+1);
+  }
+}
+
+/*
+** Close a cache.
+*/
+SQLITE_PRIVATE void sqlite3PcacheClose(PCache *pCache){
+  assert( pCache->pCache!=0 );
+  pcacheTrace(("%p.CLOSE\n",pCache));
+  sqlite3GlobalConfig.pcache2.xDestroy(pCache->pCache);
+}
+
+/*
+** Discard the contents of the cache.
+*/
+SQLITE_PRIVATE void sqlite3PcacheClear(PCache *pCache){
+  sqlite3PcacheTruncate(pCache, 0);
+}
+
+/*
+** Merge two lists of pages connected by pDirty and in pgno order.
+** Do not bother fixing the pDirtyPrev pointers.
+*/
+static PgHdr *pcacheMergeDirtyList(PgHdr *pA, PgHdr *pB){
+  PgHdr result, *pTail;
+  pTail = &result;
+  assert( pA!=0 && pB!=0 );
+  for(;;){
+    if( pA->pgno<pB->pgno ){
+      pTail->pDirty = pA;
+      pTail = pA;
+      pA = pA->pDirty;
+      if( pA==0 ){
+        pTail->pDirty = pB;
+        break;
+      }
+    }else{
+      pTail->pDirty = pB;
+      pTail = pB;
+      pB = pB->pDirty;
+      if( pB==0 ){
+        pTail->pDirty = 
