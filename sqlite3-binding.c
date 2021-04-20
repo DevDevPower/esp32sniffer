@@ -51391,4 +51391,173 @@ SQLITE_PRIVATE int sqlite3PcacheOpen(
 ** are no outstanding page references when this function is called.
 */
 SQLITE_PRIVATE int sqlite3PcacheSetPageSize(PCache *pCache, int szPage){
-  assert( pCache->nRefSum==
+  assert( pCache->nRefSum==0 && pCache->pDirty==0 );
+  if( pCache->szPage ){
+    sqlite3_pcache *pNew;
+    pNew = sqlite3GlobalConfig.pcache2.xCreate(
+                szPage, pCache->szExtra + ROUND8(sizeof(PgHdr)),
+                pCache->bPurgeable
+    );
+    if( pNew==0 ) return SQLITE_NOMEM_BKPT;
+    sqlite3GlobalConfig.pcache2.xCachesize(pNew, numberOfCachePages(pCache));
+    if( pCache->pCache ){
+      sqlite3GlobalConfig.pcache2.xDestroy(pCache->pCache);
+    }
+    pCache->pCache = pNew;
+    pCache->szPage = szPage;
+    pcacheTrace(("%p.PAGESIZE %d\n",pCache,szPage));
+  }
+  return SQLITE_OK;
+}
+
+/*
+** Try to obtain a page from the cache.
+**
+** This routine returns a pointer to an sqlite3_pcache_page object if
+** such an object is already in cache, or if a new one is created.
+** This routine returns a NULL pointer if the object was not in cache
+** and could not be created.
+**
+** The createFlags should be 0 to check for existing pages and should
+** be 3 (not 1, but 3) to try to create a new page.
+**
+** If the createFlag is 0, then NULL is always returned if the page
+** is not already in the cache.  If createFlag is 1, then a new page
+** is created only if that can be done without spilling dirty pages
+** and without exceeding the cache size limit.
+**
+** The caller needs to invoke sqlite3PcacheFetchFinish() to properly
+** initialize the sqlite3_pcache_page object and convert it into a
+** PgHdr object.  The sqlite3PcacheFetch() and sqlite3PcacheFetchFinish()
+** routines are split this way for performance reasons. When separated
+** they can both (usually) operate without having to push values to
+** the stack on entry and pop them back off on exit, which saves a
+** lot of pushing and popping.
+*/
+SQLITE_PRIVATE sqlite3_pcache_page *sqlite3PcacheFetch(
+  PCache *pCache,       /* Obtain the page from this cache */
+  Pgno pgno,            /* Page number to obtain */
+  int createFlag        /* If true, create page if it does not exist already */
+){
+  int eCreate;
+  sqlite3_pcache_page *pRes;
+
+  assert( pCache!=0 );
+  assert( pCache->pCache!=0 );
+  assert( createFlag==3 || createFlag==0 );
+  assert( pCache->eCreate==((pCache->bPurgeable && pCache->pDirty) ? 1 : 2) );
+
+  /* eCreate defines what to do if the page does not exist.
+  **    0     Do not allocate a new page.  (createFlag==0)
+  **    1     Allocate a new page if doing so is inexpensive.
+  **          (createFlag==1 AND bPurgeable AND pDirty)
+  **    2     Allocate a new page even it doing so is difficult.
+  **          (createFlag==1 AND !(bPurgeable AND pDirty)
+  */
+  eCreate = createFlag & pCache->eCreate;
+  assert( eCreate==0 || eCreate==1 || eCreate==2 );
+  assert( createFlag==0 || pCache->eCreate==eCreate );
+  assert( createFlag==0 || eCreate==1+(!pCache->bPurgeable||!pCache->pDirty) );
+  pRes = sqlite3GlobalConfig.pcache2.xFetch(pCache->pCache, pgno, eCreate);
+  pcacheTrace(("%p.FETCH %d%s (result: %p)\n",pCache,pgno,
+               createFlag?" create":"",pRes));
+  return pRes;
+}
+
+/*
+** If the sqlite3PcacheFetch() routine is unable to allocate a new
+** page because no clean pages are available for reuse and the cache
+** size limit has been reached, then this routine can be invoked to
+** try harder to allocate a page.  This routine might invoke the stress
+** callback to spill dirty pages to the journal.  It will then try to
+** allocate the new page and will only fail to allocate a new page on
+** an OOM error.
+**
+** This routine should be invoked only after sqlite3PcacheFetch() fails.
+*/
+SQLITE_PRIVATE int sqlite3PcacheFetchStress(
+  PCache *pCache,                 /* Obtain the page from this cache */
+  Pgno pgno,                      /* Page number to obtain */
+  sqlite3_pcache_page **ppPage    /* Write result here */
+){
+  PgHdr *pPg;
+  if( pCache->eCreate==2 ) return 0;
+
+  if( sqlite3PcachePagecount(pCache)>pCache->szSpill ){
+    /* Find a dirty page to write-out and recycle. First try to find a
+    ** page that does not require a journal-sync (one with PGHDR_NEED_SYNC
+    ** cleared), but if that is not possible settle for any other
+    ** unreferenced dirty page.
+    **
+    ** If the LRU page in the dirty list that has a clear PGHDR_NEED_SYNC
+    ** flag is currently referenced, then the following may leave pSynced
+    ** set incorrectly (pointing to other than the LRU page with NEED_SYNC
+    ** cleared). This is Ok, as pSynced is just an optimization.  */
+    for(pPg=pCache->pSynced;
+        pPg && (pPg->nRef || (pPg->flags&PGHDR_NEED_SYNC));
+        pPg=pPg->pDirtyPrev
+    );
+    pCache->pSynced = pPg;
+    if( !pPg ){
+      for(pPg=pCache->pDirtyTail; pPg && pPg->nRef; pPg=pPg->pDirtyPrev);
+    }
+    if( pPg ){
+      int rc;
+#ifdef SQLITE_LOG_CACHE_SPILL
+      sqlite3_log(SQLITE_FULL,
+                  "spill page %d making room for %d - cache used: %d/%d",
+                  pPg->pgno, pgno,
+                  sqlite3GlobalConfig.pcache2.xPagecount(pCache->pCache),
+                numberOfCachePages(pCache));
+#endif
+      pcacheTrace(("%p.SPILL %d\n",pCache,pPg->pgno));
+      rc = pCache->xStress(pCache->pStress, pPg);
+      pcacheDump(pCache);
+      if( rc!=SQLITE_OK && rc!=SQLITE_BUSY ){
+        return rc;
+      }
+    }
+  }
+  *ppPage = sqlite3GlobalConfig.pcache2.xFetch(pCache->pCache, pgno, 2);
+  return *ppPage==0 ? SQLITE_NOMEM_BKPT : SQLITE_OK;
+}
+
+/*
+** This is a helper routine for sqlite3PcacheFetchFinish()
+**
+** In the uncommon case where the page being fetched has not been
+** initialized, this routine is invoked to do the initialization.
+** This routine is broken out into a separate function since it
+** requires extra stack manipulation that can be avoided in the common
+** case.
+*/
+static SQLITE_NOINLINE PgHdr *pcacheFetchFinishWithInit(
+  PCache *pCache,             /* Obtain the page from this cache */
+  Pgno pgno,                  /* Page number obtained */
+  sqlite3_pcache_page *pPage  /* Page obtained by prior PcacheFetch() call */
+){
+  PgHdr *pPgHdr;
+  assert( pPage!=0 );
+  pPgHdr = (PgHdr*)pPage->pExtra;
+  assert( pPgHdr->pPage==0 );
+  memset(&pPgHdr->pDirty, 0, sizeof(PgHdr) - offsetof(PgHdr,pDirty));
+  pPgHdr->pPage = pPage;
+  pPgHdr->pData = pPage->pBuf;
+  pPgHdr->pExtra = (void *)&pPgHdr[1];
+  memset(pPgHdr->pExtra, 0, 8);
+  pPgHdr->pCache = pCache;
+  pPgHdr->pgno = pgno;
+  pPgHdr->flags = PGHDR_CLEAN;
+  return sqlite3PcacheFetchFinish(pCache,pgno,pPage);
+}
+
+/*
+** This routine converts the sqlite3_pcache_page object returned by
+** sqlite3PcacheFetch() into an initialized PgHdr object.  This routine
+** must be called after sqlite3PcacheFetch() in order to get a usable
+** result.
+*/
+SQLITE_PRIVATE PgHdr *sqlite3PcacheFetchFinish(
+  PCache *pCache,             /* Obtain the page from this cache */
+  Pgno pgno,                  /* Page number obtained */
+  sqlite3_pcache_page *pPage  /* Page obtaine
