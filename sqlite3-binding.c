@@ -51050,4 +51050,167 @@ SQLITE_PRIVATE int sqlite3BitvecBuiltinTest(int sz, int *aOp){
   */
   rc = sqlite3BitvecTest(0,0) + sqlite3BitvecTest(pBitvec, sz+1)
           + sqlite3BitvecTest(pBitvec, 0)
-          + 
+          + (sqlite3BitvecSize(pBitvec) - sz);
+  for(i=1; i<=sz; i++){
+    if(  (TESTBIT(pV,i))!=sqlite3BitvecTest(pBitvec,i) ){
+      rc = i;
+      break;
+    }
+  }
+
+  /* Free allocated structure */
+bitvec_end:
+  sqlite3_free(pTmpSpace);
+  sqlite3_free(pV);
+  sqlite3BitvecDestroy(pBitvec);
+  return rc;
+}
+#endif /* SQLITE_UNTESTABLE */
+
+/************** End of bitvec.c **********************************************/
+/************** Begin file pcache.c ******************************************/
+/*
+** 2008 August 05
+**
+** The author disclaims copyright to this source code.  In place of
+** a legal notice, here is a blessing:
+**
+**    May you do good and not evil.
+**    May you find forgiveness for yourself and forgive others.
+**    May you share freely, never taking more than you give.
+**
+*************************************************************************
+** This file implements that page cache.
+*/
+/* #include "sqliteInt.h" */
+
+/*
+** A complete page cache is an instance of this structure.  Every
+** entry in the cache holds a single page of the database file.  The
+** btree layer only operates on the cached copy of the database pages.
+**
+** A page cache entry is "clean" if it exactly matches what is currently
+** on disk.  A page is "dirty" if it has been modified and needs to be
+** persisted to disk.
+**
+** pDirty, pDirtyTail, pSynced:
+**   All dirty pages are linked into the doubly linked list using
+**   PgHdr.pDirtyNext and pDirtyPrev. The list is maintained in LRU order
+**   such that p was added to the list more recently than p->pDirtyNext.
+**   PCache.pDirty points to the first (newest) element in the list and
+**   pDirtyTail to the last (oldest).
+**
+**   The PCache.pSynced variable is used to optimize searching for a dirty
+**   page to eject from the cache mid-transaction. It is better to eject
+**   a page that does not require a journal sync than one that does.
+**   Therefore, pSynced is maintained so that it *almost* always points
+**   to either the oldest page in the pDirty/pDirtyTail list that has a
+**   clear PGHDR_NEED_SYNC flag or to a page that is older than this one
+**   (so that the right page to eject can be found by following pDirtyPrev
+**   pointers).
+*/
+struct PCache {
+  PgHdr *pDirty, *pDirtyTail;         /* List of dirty pages in LRU order */
+  PgHdr *pSynced;                     /* Last synced page in dirty page list */
+  int nRefSum;                        /* Sum of ref counts over all pages */
+  int szCache;                        /* Configured cache size */
+  int szSpill;                        /* Size before spilling occurs */
+  int szPage;                         /* Size of every page in this cache */
+  int szExtra;                        /* Size of extra space for each page */
+  u8 bPurgeable;                      /* True if pages are on backing store */
+  u8 eCreate;                         /* eCreate value for for xFetch() */
+  int (*xStress)(void*,PgHdr*);       /* Call to try make a page clean */
+  void *pStress;                      /* Argument to xStress */
+  sqlite3_pcache *pCache;             /* Pluggable cache module */
+};
+
+/********************************** Test and Debug Logic **********************/
+/*
+** Debug tracing macros.  Enable by by changing the "0" to "1" and
+** recompiling.
+**
+** When sqlite3PcacheTrace is 1, single line trace messages are issued.
+** When sqlite3PcacheTrace is 2, a dump of the pcache showing all cache entries
+** is displayed for many operations, resulting in a lot of output.
+*/
+#if defined(SQLITE_DEBUG) && 0
+  int sqlite3PcacheTrace = 2;       /* 0: off  1: simple  2: cache dumps */
+  int sqlite3PcacheMxDump = 9999;   /* Max cache entries for pcacheDump() */
+# define pcacheTrace(X) if(sqlite3PcacheTrace){sqlite3DebugPrintf X;}
+  void pcacheDump(PCache *pCache){
+    int N;
+    int i, j;
+    sqlite3_pcache_page *pLower;
+    PgHdr *pPg;
+    unsigned char *a;
+
+    if( sqlite3PcacheTrace<2 ) return;
+    if( pCache->pCache==0 ) return;
+    N = sqlite3PcachePagecount(pCache);
+    if( N>sqlite3PcacheMxDump ) N = sqlite3PcacheMxDump;
+    for(i=1; i<=N; i++){
+       pLower = sqlite3GlobalConfig.pcache2.xFetch(pCache->pCache, i, 0);
+       if( pLower==0 ) continue;
+       pPg = (PgHdr*)pLower->pExtra;
+       printf("%3d: nRef %2d flgs %02x data ", i, pPg->nRef, pPg->flags);
+       a = (unsigned char *)pLower->pBuf;
+       for(j=0; j<12; j++) printf("%02x", a[j]);
+       printf("\n");
+       if( pPg->pPage==0 ){
+         sqlite3GlobalConfig.pcache2.xUnpin(pCache->pCache, pLower, 0);
+       }
+    }
+  }
+  #else
+# define pcacheTrace(X)
+# define pcacheDump(X)
+#endif
+
+/*
+** Check invariants on a PgHdr entry.  Return true if everything is OK.
+** Return false if any invariant is violated.
+**
+** This routine is for use inside of assert() statements only.  For
+** example:
+**
+**          assert( sqlite3PcachePageSanity(pPg) );
+*/
+#ifdef SQLITE_DEBUG
+SQLITE_PRIVATE int sqlite3PcachePageSanity(PgHdr *pPg){
+  PCache *pCache;
+  assert( pPg!=0 );
+  assert( pPg->pgno>0 || pPg->pPager==0 );    /* Page number is 1 or more */
+  pCache = pPg->pCache;
+  assert( pCache!=0 );      /* Every page has an associated PCache */
+  if( pPg->flags & PGHDR_CLEAN ){
+    assert( (pPg->flags & PGHDR_DIRTY)==0 );/* Cannot be both CLEAN and DIRTY */
+    assert( pCache->pDirty!=pPg );          /* CLEAN pages not on dirty list */
+    assert( pCache->pDirtyTail!=pPg );
+  }
+  /* WRITEABLE pages must also be DIRTY */
+  if( pPg->flags & PGHDR_WRITEABLE ){
+    assert( pPg->flags & PGHDR_DIRTY );     /* WRITEABLE implies DIRTY */
+  }
+  /* NEED_SYNC can be set independently of WRITEABLE.  This can happen,
+  ** for example, when using the sqlite3PagerDontWrite() optimization:
+  **    (1)  Page X is journalled, and gets WRITEABLE and NEED_SEEK.
+  **    (2)  Page X moved to freelist, WRITEABLE is cleared
+  **    (3)  Page X reused, WRITEABLE is set again
+  ** If NEED_SYNC had been cleared in step 2, then it would not be reset
+  ** in step 3, and page might be written into the database without first
+  ** syncing the rollback journal, which might cause corruption on a power
+  ** loss.
+  **
+  ** Another example is when the database page size is smaller than the
+  ** disk sector size.  When any page of a sector is journalled, all pages
+  ** in that sector are marked NEED_SYNC even if they are still CLEAN, just
+  ** in case they are later modified, since all pages in the same sector
+  ** must be journalled and synced before any of those pages can be safely
+  ** written.
+  */
+  return 1;
+}
+#endif /* SQLITE_DEBUG */
+
+
+/
