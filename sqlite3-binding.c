@@ -52557,4 +52557,212 @@ static PgHdr1 *pcache1PinPage(PgHdr1 *pPage){
   pPage->pLruPrev->pLruNext = pPage->pLruNext;
   pPage->pLruNext->pLruPrev = pPage->pLruPrev;
   pPage->pLruNext = 0;
-  /* pPage->pLruPrev
+  /* pPage->pLruPrev = 0;
+  ** No need to clear pLruPrev as it is never accessed if pLruNext is 0 */
+  assert( pPage->isAnchor==0 );
+  assert( pPage->pCache->pGroup->lru.isAnchor==1 );
+  pPage->pCache->nRecyclable--;
+  return pPage;
+}
+
+
+/*
+** Remove the page supplied as an argument from the hash table
+** (PCache1.apHash structure) that it is currently stored in.
+** Also free the page if freePage is true.
+**
+** The PGroup mutex must be held when this function is called.
+*/
+static void pcache1RemoveFromHash(PgHdr1 *pPage, int freeFlag){
+  unsigned int h;
+  PCache1 *pCache = pPage->pCache;
+  PgHdr1 **pp;
+
+  assert( sqlite3_mutex_held(pCache->pGroup->mutex) );
+  h = pPage->iKey % pCache->nHash;
+  for(pp=&pCache->apHash[h]; (*pp)!=pPage; pp=&(*pp)->pNext);
+  *pp = (*pp)->pNext;
+
+  pCache->nPage--;
+  if( freeFlag ) pcache1FreePage(pPage);
+}
+
+/*
+** If there are currently more than nMaxPage pages allocated, try
+** to recycle pages to reduce the number allocated to nMaxPage.
+*/
+static void pcache1EnforceMaxPage(PCache1 *pCache){
+  PGroup *pGroup = pCache->pGroup;
+  PgHdr1 *p;
+  assert( sqlite3_mutex_held(pGroup->mutex) );
+  while( pGroup->nPurgeable>pGroup->nMaxPage
+      && (p=pGroup->lru.pLruPrev)->isAnchor==0
+  ){
+    assert( p->pCache->pGroup==pGroup );
+    assert( PAGE_IS_UNPINNED(p) );
+    pcache1PinPage(p);
+    pcache1RemoveFromHash(p, 1);
+  }
+  if( pCache->nPage==0 && pCache->pBulk ){
+    sqlite3_free(pCache->pBulk);
+    pCache->pBulk = pCache->pFree = 0;
+  }
+}
+
+/*
+** Discard all pages from cache pCache with a page number (key value)
+** greater than or equal to iLimit. Any pinned pages that meet this
+** criteria are unpinned before they are discarded.
+**
+** The PCache mutex must be held when this function is called.
+*/
+static void pcache1TruncateUnsafe(
+  PCache1 *pCache,             /* The cache to truncate */
+  unsigned int iLimit          /* Drop pages with this pgno or larger */
+){
+  TESTONLY( int nPage = 0; )  /* To assert pCache->nPage is correct */
+  unsigned int h, iStop;
+  assert( sqlite3_mutex_held(pCache->pGroup->mutex) );
+  assert( pCache->iMaxKey >= iLimit );
+  assert( pCache->nHash > 0 );
+  if( pCache->iMaxKey - iLimit < pCache->nHash ){
+    /* If we are just shaving the last few pages off the end of the
+    ** cache, then there is no point in scanning the entire hash table.
+    ** Only scan those hash slots that might contain pages that need to
+    ** be removed. */
+    h = iLimit % pCache->nHash;
+    iStop = pCache->iMaxKey % pCache->nHash;
+    TESTONLY( nPage = -10; )  /* Disable the pCache->nPage validity check */
+  }else{
+    /* This is the general case where many pages are being removed.
+    ** It is necessary to scan the entire hash table */
+    h = pCache->nHash/2;
+    iStop = h - 1;
+  }
+  for(;;){
+    PgHdr1 **pp;
+    PgHdr1 *pPage;
+    assert( h<pCache->nHash );
+    pp = &pCache->apHash[h];
+    while( (pPage = *pp)!=0 ){
+      if( pPage->iKey>=iLimit ){
+        pCache->nPage--;
+        *pp = pPage->pNext;
+        if( PAGE_IS_UNPINNED(pPage) ) pcache1PinPage(pPage);
+        pcache1FreePage(pPage);
+      }else{
+        pp = &pPage->pNext;
+        TESTONLY( if( nPage>=0 ) nPage++; )
+      }
+    }
+    if( h==iStop ) break;
+    h = (h+1) % pCache->nHash;
+  }
+  assert( nPage<0 || pCache->nPage==(unsigned)nPage );
+}
+
+/******************************************************************************/
+/******** sqlite3_pcache Methods **********************************************/
+
+/*
+** Implementation of the sqlite3_pcache.xInit method.
+*/
+static int pcache1Init(void *NotUsed){
+  UNUSED_PARAMETER(NotUsed);
+  assert( pcache1.isInit==0 );
+  memset(&pcache1, 0, sizeof(pcache1));
+
+
+  /*
+  ** The pcache1.separateCache variable is true if each PCache has its own
+  ** private PGroup (mode-1).  pcache1.separateCache is false if the single
+  ** PGroup in pcache1.grp is used for all page caches (mode-2).
+  **
+  **   *  Always use a unified cache (mode-2) if ENABLE_MEMORY_MANAGEMENT
+  **
+  **   *  Use a unified cache in single-threaded applications that have
+  **      configured a start-time buffer for use as page-cache memory using
+  **      sqlite3_config(SQLITE_CONFIG_PAGECACHE, pBuf, sz, N) with non-NULL
+  **      pBuf argument.
+  **
+  **   *  Otherwise use separate caches (mode-1)
+  */
+#if defined(SQLITE_ENABLE_MEMORY_MANAGEMENT)
+  pcache1.separateCache = 0;
+#elif SQLITE_THREADSAFE
+  pcache1.separateCache = sqlite3GlobalConfig.pPage==0
+                          || sqlite3GlobalConfig.bCoreMutex>0;
+#else
+  pcache1.separateCache = sqlite3GlobalConfig.pPage==0;
+#endif
+
+#if SQLITE_THREADSAFE
+  if( sqlite3GlobalConfig.bCoreMutex ){
+    pcache1.grp.mutex = sqlite3MutexAlloc(SQLITE_MUTEX_STATIC_LRU);
+    pcache1.mutex = sqlite3MutexAlloc(SQLITE_MUTEX_STATIC_PMEM);
+  }
+#endif
+  if( pcache1.separateCache
+   && sqlite3GlobalConfig.nPage!=0
+   && sqlite3GlobalConfig.pPage==0
+  ){
+    pcache1.nInitPage = sqlite3GlobalConfig.nPage;
+  }else{
+    pcache1.nInitPage = 0;
+  }
+  pcache1.grp.mxPinned = 10;
+  pcache1.isInit = 1;
+  return SQLITE_OK;
+}
+
+/*
+** Implementation of the sqlite3_pcache.xShutdown method.
+** Note that the static mutex allocated in xInit does
+** not need to be freed.
+*/
+static void pcache1Shutdown(void *NotUsed){
+  UNUSED_PARAMETER(NotUsed);
+  assert( pcache1.isInit!=0 );
+  memset(&pcache1, 0, sizeof(pcache1));
+}
+
+/* forward declaration */
+static void pcache1Destroy(sqlite3_pcache *p);
+
+/*
+** Implementation of the sqlite3_pcache.xCreate method.
+**
+** Allocate a new cache.
+*/
+static sqlite3_pcache *pcache1Create(int szPage, int szExtra, int bPurgeable){
+  PCache1 *pCache;      /* The newly created page cache */
+  PGroup *pGroup;       /* The group the new page cache will belong to */
+  int sz;               /* Bytes of memory required to allocate the new cache */
+
+  assert( (szPage & (szPage-1))==0 && szPage>=512 && szPage<=65536 );
+  assert( szExtra < 300 );
+
+  sz = sizeof(PCache1) + sizeof(PGroup)*pcache1.separateCache;
+  pCache = (PCache1 *)sqlite3MallocZero(sz);
+  if( pCache ){
+    if( pcache1.separateCache ){
+      pGroup = (PGroup*)&pCache[1];
+      pGroup->mxPinned = 10;
+    }else{
+      pGroup = &pcache1.grp;
+    }
+    pcache1EnterMutex(pGroup);
+    if( pGroup->lru.isAnchor==0 ){
+      pGroup->lru.isAnchor = 1;
+      pGroup->lru.pLruPrev = pGroup->lru.pLruNext = &pGroup->lru;
+    }
+    pCache->pGroup = pGroup;
+    pCache->szPage = szPage;
+    pCache->szExtra = szExtra;
+    pCache->szAlloc = szPage + szExtra + ROUND8(sizeof(PgHdr1));
+    pCache->bPurgeable = (bPurgeable ? 1 : 0);
+    pcache1ResizeHash(pCache);
+    if( bPurgeable ){
+      pCache->nMin = 10;
+      pGroup->nMinPage += pCache->nMin;
+      pGroup->mxPinned = pGroup->nMaxPage + 10 - pGroup->nMinPage
