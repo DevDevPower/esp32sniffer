@@ -53199,4 +53199,179 @@ SQLITE_PRIVATE sqlite3_mutex *sqlite3Pcache1Mutex(void){
 #ifdef SQLITE_ENABLE_MEMORY_MANAGEMENT
 /*
 ** This function is called to free superfluous dynamically allocated memory
-** held by the pager system. Memory in use by any SQLite p
+** held by the pager system. Memory in use by any SQLite pager allocated
+** by the current thread may be sqlite3_free()ed.
+**
+** nReq is the number of bytes of memory required. Once this much has
+** been released, the function returns. The return value is the total number
+** of bytes of memory released.
+*/
+SQLITE_PRIVATE int sqlite3PcacheReleaseMemory(int nReq){
+  int nFree = 0;
+  assert( sqlite3_mutex_notheld(pcache1.grp.mutex) );
+  assert( sqlite3_mutex_notheld(pcache1.mutex) );
+  if( sqlite3GlobalConfig.pPage==0 ){
+    PgHdr1 *p;
+    pcache1EnterMutex(&pcache1.grp);
+    while( (nReq<0 || nFree<nReq)
+       &&  (p=pcache1.grp.lru.pLruPrev)!=0
+       &&  p->isAnchor==0
+    ){
+      nFree += pcache1MemSize(p->page.pBuf);
+#ifdef SQLITE_PCACHE_SEPARATE_HEADER
+      nFree += sqlite3MemSize(p);
+#endif
+      assert( PAGE_IS_UNPINNED(p) );
+      pcache1PinPage(p);
+      pcache1RemoveFromHash(p, 1);
+    }
+    pcache1LeaveMutex(&pcache1.grp);
+  }
+  return nFree;
+}
+#endif /* SQLITE_ENABLE_MEMORY_MANAGEMENT */
+
+#ifdef SQLITE_TEST
+/*
+** This function is used by test procedures to inspect the internal state
+** of the global cache.
+*/
+SQLITE_PRIVATE void sqlite3PcacheStats(
+  int *pnCurrent,      /* OUT: Total number of pages cached */
+  int *pnMax,          /* OUT: Global maximum cache size */
+  int *pnMin,          /* OUT: Sum of PCache1.nMin for purgeable caches */
+  int *pnRecyclable    /* OUT: Total number of pages available for recycling */
+){
+  PgHdr1 *p;
+  int nRecyclable = 0;
+  for(p=pcache1.grp.lru.pLruNext; p && !p->isAnchor; p=p->pLruNext){
+    assert( PAGE_IS_UNPINNED(p) );
+    nRecyclable++;
+  }
+  *pnCurrent = pcache1.grp.nPurgeable;
+  *pnMax = (int)pcache1.grp.nMaxPage;
+  *pnMin = (int)pcache1.grp.nMinPage;
+  *pnRecyclable = nRecyclable;
+}
+#endif
+
+/************** End of pcache1.c *********************************************/
+/************** Begin file rowset.c ******************************************/
+/*
+** 2008 December 3
+**
+** The author disclaims copyright to this source code.  In place of
+** a legal notice, here is a blessing:
+**
+**    May you do good and not evil.
+**    May you find forgiveness for yourself and forgive others.
+**    May you share freely, never taking more than you give.
+**
+*************************************************************************
+**
+** This module implements an object we call a "RowSet".
+**
+** The RowSet object is a collection of rowids.  Rowids
+** are inserted into the RowSet in an arbitrary order.  Inserts
+** can be intermixed with tests to see if a given rowid has been
+** previously inserted into the RowSet.
+**
+** After all inserts are finished, it is possible to extract the
+** elements of the RowSet in sorted order.  Once this extraction
+** process has started, no new elements may be inserted.
+**
+** Hence, the primitive operations for a RowSet are:
+**
+**    CREATE
+**    INSERT
+**    TEST
+**    SMALLEST
+**    DESTROY
+**
+** The CREATE and DESTROY primitives are the constructor and destructor,
+** obviously.  The INSERT primitive adds a new element to the RowSet.
+** TEST checks to see if an element is already in the RowSet.  SMALLEST
+** extracts the least value from the RowSet.
+**
+** The INSERT primitive might allocate additional memory.  Memory is
+** allocated in chunks so most INSERTs do no allocation.  There is an
+** upper bound on the size of allocated memory.  No memory is freed
+** until DESTROY.
+**
+** The TEST primitive includes a "batch" number.  The TEST primitive
+** will only see elements that were inserted before the last change
+** in the batch number.  In other words, if an INSERT occurs between
+** two TESTs where the TESTs have the same batch nubmer, then the
+** value added by the INSERT will not be visible to the second TEST.
+** The initial batch number is zero, so if the very first TEST contains
+** a non-zero batch number, it will see all prior INSERTs.
+**
+** No INSERTs may occurs after a SMALLEST.  An assertion will fail if
+** that is attempted.
+**
+** The cost of an INSERT is roughly constant.  (Sometimes new memory
+** has to be allocated on an INSERT.)  The cost of a TEST with a new
+** batch number is O(NlogN) where N is the number of elements in the RowSet.
+** The cost of a TEST using the same batch number is O(logN).  The cost
+** of the first SMALLEST is O(NlogN).  Second and subsequent SMALLEST
+** primitives are constant time.  The cost of DESTROY is O(N).
+**
+** TEST and SMALLEST may not be used by the same RowSet.  This used to
+** be possible, but the feature was not used, so it was removed in order
+** to simplify the code.
+*/
+/* #include "sqliteInt.h" */
+
+
+/*
+** Target size for allocation chunks.
+*/
+#define ROWSET_ALLOCATION_SIZE 1024
+
+/*
+** The number of rowset entries per allocation chunk.
+*/
+#define ROWSET_ENTRY_PER_CHUNK  \
+                       ((ROWSET_ALLOCATION_SIZE-8)/sizeof(struct RowSetEntry))
+
+/*
+** Each entry in a RowSet is an instance of the following object.
+**
+** This same object is reused to store a linked list of trees of RowSetEntry
+** objects.  In that alternative use, pRight points to the next entry
+** in the list, pLeft points to the tree, and v is unused.  The
+** RowSet.pForest value points to the head of this forest list.
+*/
+struct RowSetEntry {
+  i64 v;                        /* ROWID value for this entry */
+  struct RowSetEntry *pRight;   /* Right subtree (larger entries) or list */
+  struct RowSetEntry *pLeft;    /* Left subtree (smaller entries) */
+};
+
+/*
+** RowSetEntry objects are allocated in large chunks (instances of the
+** following structure) to reduce memory allocation overhead.  The
+** chunks are kept on a linked list so that they can be deallocated
+** when the RowSet is destroyed.
+*/
+struct RowSetChunk {
+  struct RowSetChunk *pNextChunk;        /* Next chunk on list of them all */
+  struct RowSetEntry aEntry[ROWSET_ENTRY_PER_CHUNK]; /* Allocated entries */
+};
+
+/*
+** A RowSet in an instance of the following structure.
+**
+** A typedef of this structure if found in sqliteInt.h.
+*/
+struct RowSet {
+  struct RowSetChunk *pChunk;    /* List of all chunk allocations */
+  sqlite3 *db;                   /* The database connection */
+  struct RowSetEntry *pEntry;    /* List of entries using pRight */
+  struct RowSetEntry *pLast;     /* Last entry on the pEntry list */
+  struct RowSetEntry *pFresh;    /* Source of new entry objects */
+  struct RowSetEntry *pForest;   /* List of binary trees of entries */
+  u16 nFresh;                    /* Number of objects on pFresh */
+  u16 rsFlags;                   /* Various flags */
+  int iBatch;                    /* Current insert batch */
+};
