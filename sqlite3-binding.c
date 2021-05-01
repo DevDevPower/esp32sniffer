@@ -53967,3 +53967,155 @@ SQLITE_PRIVATE void sqlite3WalDb(Wal *pWal, sqlite3 *db);
 **     (b)  The page was a freelist leaf page at the start of the transaction.
 **
 **     (c)  The page number is greater than the largest page that existed in
+**          the database file at the start of the transaction.
+**
+** (1) A page of the database file is never overwritten unless one of the
+**     following are true:
+**
+**     (a) The page and all other pages on the same sector are overwriteable.
+**
+**     (b) The atomic page write optimization is enabled, and the entire
+**         transaction other than the update of the transaction sequence
+**         number consists of a single page change.
+**
+** (2) The content of a page written into the rollback journal exactly matches
+**     both the content in the database when the rollback journal was written
+**     and the content in the database at the beginning of the current
+**     transaction.
+**
+** (3) Writes to the database file are an integer multiple of the page size
+**     in length and are aligned on a page boundary.
+**
+** (4) Reads from the database file are either aligned on a page boundary and
+**     an integer multiple of the page size in length or are taken from the
+**     first 100 bytes of the database file.
+**
+** (5) All writes to the database file are synced prior to the rollback journal
+**     being deleted, truncated, or zeroed.
+**
+** (6) If a super-journal file is used, then all writes to the database file
+**     are synced prior to the super-journal being deleted.
+**
+** Definition: Two databases (or the same database at two points it time)
+** are said to be "logically equivalent" if they give the same answer to
+** all queries.  Note in particular the content of freelist leaf
+** pages can be changed arbitrarily without affecting the logical equivalence
+** of the database.
+**
+** (7) At any time, if any subset, including the empty set and the total set,
+**     of the unsynced changes to a rollback journal are removed and the
+**     journal is rolled back, the resulting database file will be logically
+**     equivalent to the database file at the beginning of the transaction.
+**
+** (8) When a transaction is rolled back, the xTruncate method of the VFS
+**     is called to restore the database file to the same size it was at
+**     the beginning of the transaction.  (In some VFSes, the xTruncate
+**     method is a no-op, but that does not change the fact the SQLite will
+**     invoke it.)
+**
+** (9) Whenever the database file is modified, at least one bit in the range
+**     of bytes from 24 through 39 inclusive will be changed prior to releasing
+**     the EXCLUSIVE lock, thus signaling other connections on the same
+**     database to flush their caches.
+**
+** (10) The pattern of bits in bytes 24 through 39 shall not repeat in less
+**      than one billion transactions.
+**
+** (11) A database file is well-formed at the beginning and at the conclusion
+**      of every transaction.
+**
+** (12) An EXCLUSIVE lock is held on the database file when writing to
+**      the database file.
+**
+** (13) A SHARED lock is held on the database file while reading any
+**      content out of the database file.
+**
+******************************************************************************/
+
+/*
+** Macros for troubleshooting.  Normally turned off
+*/
+#if 0
+int sqlite3PagerTrace=1;  /* True to enable tracing */
+#define sqlite3DebugPrintf printf
+#define PAGERTRACE(X)     if( sqlite3PagerTrace ){ sqlite3DebugPrintf X; }
+#else
+#define PAGERTRACE(X)
+#endif
+
+/*
+** The following two macros are used within the PAGERTRACE() macros above
+** to print out file-descriptors.
+**
+** PAGERID() takes a pointer to a Pager struct as its argument. The
+** associated file-descriptor is returned. FILEHANDLEID() takes an sqlite3_file
+** struct as its argument.
+*/
+#define PAGERID(p) (SQLITE_PTR_TO_INT(p->fd))
+#define FILEHANDLEID(fd) (SQLITE_PTR_TO_INT(fd))
+
+/*
+** The Pager.eState variable stores the current 'state' of a pager. A
+** pager may be in any one of the seven states shown in the following
+** state diagram.
+**
+**                            OPEN <------+------+
+**                              |         |      |
+**                              V         |      |
+**               +---------> READER-------+      |
+**               |              |                |
+**               |              V                |
+**               |<-------WRITER_LOCKED------> ERROR
+**               |              |                ^
+**               |              V                |
+**               |<------WRITER_CACHEMOD-------->|
+**               |              |                |
+**               |              V                |
+**               |<-------WRITER_DBMOD---------->|
+**               |              |                |
+**               |              V                |
+**               +<------WRITER_FINISHED-------->+
+**
+**
+** List of state transitions and the C [function] that performs each:
+**
+**   OPEN              -> READER              [sqlite3PagerSharedLock]
+**   READER            -> OPEN                [pager_unlock]
+**
+**   READER            -> WRITER_LOCKED       [sqlite3PagerBegin]
+**   WRITER_LOCKED     -> WRITER_CACHEMOD     [pager_open_journal]
+**   WRITER_CACHEMOD   -> WRITER_DBMOD        [syncJournal]
+**   WRITER_DBMOD      -> WRITER_FINISHED     [sqlite3PagerCommitPhaseOne]
+**   WRITER_***        -> READER              [pager_end_transaction]
+**
+**   WRITER_***        -> ERROR               [pager_error]
+**   ERROR             -> OPEN                [pager_unlock]
+**
+**
+**  OPEN:
+**
+**    The pager starts up in this state. Nothing is guaranteed in this
+**    state - the file may or may not be locked and the database size is
+**    unknown. The database may not be read or written.
+**
+**    * No read or write transaction is active.
+**    * Any lock, or no lock at all, may be held on the database file.
+**    * The dbSize, dbOrigSize and dbFileSize variables may not be trusted.
+**
+**  READER:
+**
+**    In this state all the requirements for reading the database in
+**    rollback (non-WAL) mode are met. Unless the pager is (or recently
+**    was) in exclusive-locking mode, a user-level read transaction is
+**    open. The database size is known in this state.
+**
+**    A connection running with locking_mode=normal enters this state when
+**    it opens a read-transaction on the database and returns to state
+**    OPEN after the read-transaction is completed. However a connection
+**    running in locking_mode=exclusive (including temp databases) remains in
+**    this state even after the read-transaction is closed. The only way
+**    a locking_mode=exclusive connection can transition from READER to OPEN
+**    is via the ERROR state (see below).
+**
+**    * A read transaction may be active (but a write-transaction cannot).
+**    * A SHARED o
