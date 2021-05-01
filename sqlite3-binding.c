@@ -54252,4 +54252,144 @@ int sqlite3PagerTrace=1;  /* True to enable tracing */
 **    read-only statement cannot leave the pager in an internally inconsistent
 **    state.
 **
-**    * The Pager.errCode variable is set to some
+**    * The Pager.errCode variable is set to something other than SQLITE_OK.
+**    * There are one or more outstanding references to pages (after the
+**      last reference is dropped the pager should move back to OPEN state).
+**    * The pager is not an in-memory pager.
+**
+**
+** Notes:
+**
+**   * A pager is never in WRITER_DBMOD or WRITER_FINISHED state if the
+**     connection is open in WAL mode. A WAL connection is always in one
+**     of the first four states.
+**
+**   * Normally, a connection open in exclusive mode is never in PAGER_OPEN
+**     state. There are two exceptions: immediately after exclusive-mode has
+**     been turned on (and before any read or write transactions are
+**     executed), and when the pager is leaving the "error state".
+**
+**   * See also: assert_pager_state().
+*/
+#define PAGER_OPEN                  0
+#define PAGER_READER                1
+#define PAGER_WRITER_LOCKED         2
+#define PAGER_WRITER_CACHEMOD       3
+#define PAGER_WRITER_DBMOD          4
+#define PAGER_WRITER_FINISHED       5
+#define PAGER_ERROR                 6
+
+/*
+** The Pager.eLock variable is almost always set to one of the
+** following locking-states, according to the lock currently held on
+** the database file: NO_LOCK, SHARED_LOCK, RESERVED_LOCK or EXCLUSIVE_LOCK.
+** This variable is kept up to date as locks are taken and released by
+** the pagerLockDb() and pagerUnlockDb() wrappers.
+**
+** If the VFS xLock() or xUnlock() returns an error other than SQLITE_BUSY
+** (i.e. one of the SQLITE_IOERR subtypes), it is not clear whether or not
+** the operation was successful. In these circumstances pagerLockDb() and
+** pagerUnlockDb() take a conservative approach - eLock is always updated
+** when unlocking the file, and only updated when locking the file if the
+** VFS call is successful. This way, the Pager.eLock variable may be set
+** to a less exclusive (lower) value than the lock that is actually held
+** at the system level, but it is never set to a more exclusive value.
+**
+** This is usually safe. If an xUnlock fails or appears to fail, there may
+** be a few redundant xLock() calls or a lock may be held for longer than
+** required, but nothing really goes wrong.
+**
+** The exception is when the database file is unlocked as the pager moves
+** from ERROR to OPEN state. At this point there may be a hot-journal file
+** in the file-system that needs to be rolled back (as part of an OPEN->SHARED
+** transition, by the same pager or any other). If the call to xUnlock()
+** fails at this point and the pager is left holding an EXCLUSIVE lock, this
+** can confuse the call to xCheckReservedLock() call made later as part
+** of hot-journal detection.
+**
+** xCheckReservedLock() is defined as returning true "if there is a RESERVED
+** lock held by this process or any others". So xCheckReservedLock may
+** return true because the caller itself is holding an EXCLUSIVE lock (but
+** doesn't know it because of a previous error in xUnlock). If this happens
+** a hot-journal may be mistaken for a journal being created by an active
+** transaction in another process, causing SQLite to read from the database
+** without rolling it back.
+**
+** To work around this, if a call to xUnlock() fails when unlocking the
+** database in the ERROR state, Pager.eLock is set to UNKNOWN_LOCK. It
+** is only changed back to a real locking state after a successful call
+** to xLock(EXCLUSIVE). Also, the code to do the OPEN->SHARED state transition
+** omits the check for a hot-journal if Pager.eLock is set to UNKNOWN_LOCK
+** lock. Instead, it assumes a hot-journal exists and obtains an EXCLUSIVE
+** lock on the database file before attempting to roll it back. See function
+** PagerSharedLock() for more detail.
+**
+** Pager.eLock may only be set to UNKNOWN_LOCK when the pager is in
+** PAGER_OPEN state.
+*/
+#define UNKNOWN_LOCK                (EXCLUSIVE_LOCK+1)
+
+/*
+** The maximum allowed sector size. 64KiB. If the xSectorsize() method
+** returns a value larger than this, then MAX_SECTOR_SIZE is used instead.
+** This could conceivably cause corruption following a power failure on
+** such a system. This is currently an undocumented limit.
+*/
+#define MAX_SECTOR_SIZE 0x10000
+
+
+/*
+** An instance of the following structure is allocated for each active
+** savepoint and statement transaction in the system. All such structures
+** are stored in the Pager.aSavepoint[] array, which is allocated and
+** resized using sqlite3Realloc().
+**
+** When a savepoint is created, the PagerSavepoint.iHdrOffset field is
+** set to 0. If a journal-header is written into the main journal while
+** the savepoint is active, then iHdrOffset is set to the byte offset
+** immediately following the last journal record written into the main
+** journal before the journal-header. This is required during savepoint
+** rollback (see pagerPlaybackSavepoint()).
+*/
+typedef struct PagerSavepoint PagerSavepoint;
+struct PagerSavepoint {
+  i64 iOffset;                 /* Starting offset in main journal */
+  i64 iHdrOffset;              /* See above */
+  Bitvec *pInSavepoint;        /* Set of pages in this savepoint */
+  Pgno nOrig;                  /* Original number of pages in file */
+  Pgno iSubRec;                /* Index of first record in sub-journal */
+  int bTruncateOnRelease;      /* If stmt journal may be truncated on RELEASE */
+#ifndef SQLITE_OMIT_WAL
+  u32 aWalData[WAL_SAVEPOINT_NDATA];        /* WAL savepoint context */
+#endif
+};
+
+/*
+** Bits of the Pager.doNotSpill flag.  See further description below.
+*/
+#define SPILLFLAG_OFF         0x01 /* Never spill cache.  Set via pragma */
+#define SPILLFLAG_ROLLBACK    0x02 /* Current rolling back, so do not spill */
+#define SPILLFLAG_NOSYNC      0x04 /* Spill is ok, but do not sync */
+
+/*
+** An open page cache is an instance of struct Pager. A description of
+** some of the more important member variables follows:
+**
+** eState
+**
+**   The current 'state' of the pager object. See the comment and state
+**   diagram above for a description of the pager state.
+**
+** eLock
+**
+**   For a real on-disk database, the current lock held on the database file -
+**   NO_LOCK, SHARED_LOCK, RESERVED_LOCK or EXCLUSIVE_LOCK.
+**
+**   For a temporary or in-memory database (neither of which require any
+**   locks), this variable is always set to EXCLUSIVE_LOCK. Since such
+**   databases always have Pager.exclusiveMode==1, this tricks the pager
+**   logic into thinking that it already has all the locks it will ever
+**   need (and no reason to release them).
+**
+**   In some (obscure) circumstances, this variable may also be set to
+**   UNKNOWN_LOCK. See the comment above the 
