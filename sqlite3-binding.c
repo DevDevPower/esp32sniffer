@@ -54638,4 +54638,200 @@ struct Pager {
 /*
 ** The following global variables hold counters used for
 ** testing purposes only.  These variables do not exist in
-** a non-testing build. 
+** a non-testing build.  These variables are not thread-safe.
+*/
+#ifdef SQLITE_TEST
+SQLITE_API int sqlite3_pager_readdb_count = 0;    /* Number of full pages read from DB */
+SQLITE_API int sqlite3_pager_writedb_count = 0;   /* Number of full pages written to DB */
+SQLITE_API int sqlite3_pager_writej_count = 0;    /* Number of pages written to journal */
+# define PAGER_INCR(v)  v++
+#else
+# define PAGER_INCR(v)
+#endif
+
+
+
+/*
+** Journal files begin with the following magic string.  The data
+** was obtained from /dev/random.  It is used only as a sanity check.
+**
+** Since version 2.8.0, the journal format contains additional sanity
+** checking information.  If the power fails while the journal is being
+** written, semi-random garbage data might appear in the journal
+** file after power is restored.  If an attempt is then made
+** to roll the journal back, the database could be corrupted.  The additional
+** sanity checking data is an attempt to discover the garbage in the
+** journal and ignore it.
+**
+** The sanity checking information for the new journal format consists
+** of a 32-bit checksum on each page of data.  The checksum covers both
+** the page number and the pPager->pageSize bytes of data for the page.
+** This cksum is initialized to a 32-bit random value that appears in the
+** journal file right after the header.  The random initializer is important,
+** because garbage data that appears at the end of a journal is likely
+** data that was once in other files that have now been deleted.  If the
+** garbage data came from an obsolete journal file, the checksums might
+** be correct.  But by initializing the checksum to random value which
+** is different for every journal, we minimize that risk.
+*/
+static const unsigned char aJournalMagic[] = {
+  0xd9, 0xd5, 0x05, 0xf9, 0x20, 0xa1, 0x63, 0xd7,
+};
+
+/*
+** The size of the of each page record in the journal is given by
+** the following macro.
+*/
+#define JOURNAL_PG_SZ(pPager)  ((pPager->pageSize) + 8)
+
+/*
+** The journal header size for this pager. This is usually the same
+** size as a single disk sector. See also setSectorSize().
+*/
+#define JOURNAL_HDR_SZ(pPager) (pPager->sectorSize)
+
+/*
+** The macro MEMDB is true if we are dealing with an in-memory database.
+** We do this as a macro so that if the SQLITE_OMIT_MEMORYDB macro is set,
+** the value of MEMDB will be a constant and the compiler will optimize
+** out code that would never execute.
+*/
+#ifdef SQLITE_OMIT_MEMORYDB
+# define MEMDB 0
+#else
+# define MEMDB pPager->memDb
+#endif
+
+/*
+** The macro USEFETCH is true if we are allowed to use the xFetch and xUnfetch
+** interfaces to access the database using memory-mapped I/O.
+*/
+#if SQLITE_MAX_MMAP_SIZE>0
+# define USEFETCH(x) ((x)->bUseFetch)
+#else
+# define USEFETCH(x) 0
+#endif
+
+/*
+** The argument to this macro is a file descriptor (type sqlite3_file*).
+** Return 0 if it is not open, or non-zero (but not 1) if it is.
+**
+** This is so that expressions can be written as:
+**
+**   if( isOpen(pPager->jfd) ){ ...
+**
+** instead of
+**
+**   if( pPager->jfd->pMethods ){ ...
+*/
+#define isOpen(pFd) ((pFd)->pMethods!=0)
+
+#ifdef SQLITE_DIRECT_OVERFLOW_READ
+/*
+** Return true if page pgno can be read directly from the database file
+** by the b-tree layer. This is the case if:
+**
+**   * the database file is open,
+**   * there are no dirty pages in the cache, and
+**   * the desired page is not currently in the wal file.
+*/
+SQLITE_PRIVATE int sqlite3PagerDirectReadOk(Pager *pPager, Pgno pgno){
+  if( pPager->fd->pMethods==0 ) return 0;
+  if( sqlite3PCacheIsDirty(pPager->pPCache) ) return 0;
+#ifndef SQLITE_OMIT_WAL
+  if( pPager->pWal ){
+    u32 iRead = 0;
+    int rc;
+    rc = sqlite3WalFindFrame(pPager->pWal, pgno, &iRead);
+    return (rc==SQLITE_OK && iRead==0);
+  }
+#endif
+  return 1;
+}
+#endif
+
+#ifndef SQLITE_OMIT_WAL
+# define pagerUseWal(x) ((x)->pWal!=0)
+#else
+# define pagerUseWal(x) 0
+# define pagerRollbackWal(x) 0
+# define pagerWalFrames(v,w,x,y) 0
+# define pagerOpenWalIfPresent(z) SQLITE_OK
+# define pagerBeginReadTransaction(z) SQLITE_OK
+#endif
+
+#ifndef NDEBUG
+/*
+** Usage:
+**
+**   assert( assert_pager_state(pPager) );
+**
+** This function runs many asserts to try to find inconsistencies in
+** the internal state of the Pager object.
+*/
+static int assert_pager_state(Pager *p){
+  Pager *pPager = p;
+
+  /* State must be valid. */
+  assert( p->eState==PAGER_OPEN
+       || p->eState==PAGER_READER
+       || p->eState==PAGER_WRITER_LOCKED
+       || p->eState==PAGER_WRITER_CACHEMOD
+       || p->eState==PAGER_WRITER_DBMOD
+       || p->eState==PAGER_WRITER_FINISHED
+       || p->eState==PAGER_ERROR
+  );
+
+  /* Regardless of the current state, a temp-file connection always behaves
+  ** as if it has an exclusive lock on the database file. It never updates
+  ** the change-counter field, so the changeCountDone flag is always set.
+  */
+  assert( p->tempFile==0 || p->eLock==EXCLUSIVE_LOCK );
+  assert( p->tempFile==0 || pPager->changeCountDone );
+
+  /* If the useJournal flag is clear, the journal-mode must be "OFF".
+  ** And if the journal-mode is "OFF", the journal file must not be open.
+  */
+  assert( p->journalMode==PAGER_JOURNALMODE_OFF || p->useJournal );
+  assert( p->journalMode!=PAGER_JOURNALMODE_OFF || !isOpen(p->jfd) );
+
+  /* Check that MEMDB implies noSync. And an in-memory journal. Since
+  ** this means an in-memory pager performs no IO at all, it cannot encounter
+  ** either SQLITE_IOERR or SQLITE_FULL during rollback or while finalizing
+  ** a journal file. (although the in-memory journal implementation may
+  ** return SQLITE_IOERR_NOMEM while the journal file is being written). It
+  ** is therefore not possible for an in-memory pager to enter the ERROR
+  ** state.
+  */
+  if( MEMDB ){
+    assert( !isOpen(p->fd) );
+    assert( p->noSync );
+    assert( p->journalMode==PAGER_JOURNALMODE_OFF
+         || p->journalMode==PAGER_JOURNALMODE_MEMORY
+    );
+    assert( p->eState!=PAGER_ERROR && p->eState!=PAGER_OPEN );
+    assert( pagerUseWal(p)==0 );
+  }
+
+  /* If changeCountDone is set, a RESERVED lock or greater must be held
+  ** on the file.
+  */
+  assert( pPager->changeCountDone==0 || pPager->eLock>=RESERVED_LOCK );
+  assert( p->eLock!=PENDING_LOCK );
+
+  switch( p->eState ){
+    case PAGER_OPEN:
+      assert( !MEMDB );
+      assert( pPager->errCode==SQLITE_OK );
+      assert( sqlite3PcacheRefCount(pPager->pPCache)==0 || pPager->tempFile );
+      break;
+
+    case PAGER_READER:
+      assert( pPager->errCode==SQLITE_OK );
+      assert( p->eLock!=UNKNOWN_LOCK );
+      assert( p->eLock>=SHARED_LOCK );
+      break;
+
+    case PAGER_WRITER_LOCKED:
+      assert( p->eLock!=UNKNOWN_LOCK );
+      assert
