@@ -54834,4 +54834,193 @@ static int assert_pager_state(Pager *p){
 
     case PAGER_WRITER_LOCKED:
       assert( p->eLock!=UNKNOWN_LOCK );
-      assert
+      assert( pPager->errCode==SQLITE_OK );
+      if( !pagerUseWal(pPager) ){
+        assert( p->eLock>=RESERVED_LOCK );
+      }
+      assert( pPager->dbSize==pPager->dbOrigSize );
+      assert( pPager->dbOrigSize==pPager->dbFileSize );
+      assert( pPager->dbOrigSize==pPager->dbHintSize );
+      assert( pPager->setSuper==0 );
+      break;
+
+    case PAGER_WRITER_CACHEMOD:
+      assert( p->eLock!=UNKNOWN_LOCK );
+      assert( pPager->errCode==SQLITE_OK );
+      if( !pagerUseWal(pPager) ){
+        /* It is possible that if journal_mode=wal here that neither the
+        ** journal file nor the WAL file are open. This happens during
+        ** a rollback transaction that switches from journal_mode=off
+        ** to journal_mode=wal.
+        */
+        assert( p->eLock>=RESERVED_LOCK );
+        assert( isOpen(p->jfd)
+             || p->journalMode==PAGER_JOURNALMODE_OFF
+             || p->journalMode==PAGER_JOURNALMODE_WAL
+        );
+      }
+      assert( pPager->dbOrigSize==pPager->dbFileSize );
+      assert( pPager->dbOrigSize==pPager->dbHintSize );
+      break;
+
+    case PAGER_WRITER_DBMOD:
+      assert( p->eLock==EXCLUSIVE_LOCK );
+      assert( pPager->errCode==SQLITE_OK );
+      assert( !pagerUseWal(pPager) );
+      assert( p->eLock>=EXCLUSIVE_LOCK );
+      assert( isOpen(p->jfd)
+           || p->journalMode==PAGER_JOURNALMODE_OFF
+           || p->journalMode==PAGER_JOURNALMODE_WAL
+           || (sqlite3OsDeviceCharacteristics(p->fd)&SQLITE_IOCAP_BATCH_ATOMIC)
+      );
+      assert( pPager->dbOrigSize<=pPager->dbHintSize );
+      break;
+
+    case PAGER_WRITER_FINISHED:
+      assert( p->eLock==EXCLUSIVE_LOCK );
+      assert( pPager->errCode==SQLITE_OK );
+      assert( !pagerUseWal(pPager) );
+      assert( isOpen(p->jfd)
+           || p->journalMode==PAGER_JOURNALMODE_OFF
+           || p->journalMode==PAGER_JOURNALMODE_WAL
+           || (sqlite3OsDeviceCharacteristics(p->fd)&SQLITE_IOCAP_BATCH_ATOMIC)
+      );
+      break;
+
+    case PAGER_ERROR:
+      /* There must be at least one outstanding reference to the pager if
+      ** in ERROR state. Otherwise the pager should have already dropped
+      ** back to OPEN state.
+      */
+      assert( pPager->errCode!=SQLITE_OK );
+      assert( sqlite3PcacheRefCount(pPager->pPCache)>0 || pPager->tempFile );
+      break;
+  }
+
+  return 1;
+}
+#endif /* ifndef NDEBUG */
+
+#ifdef SQLITE_DEBUG
+/*
+** Return a pointer to a human readable string in a static buffer
+** containing the state of the Pager object passed as an argument. This
+** is intended to be used within debuggers. For example, as an alternative
+** to "print *pPager" in gdb:
+**
+** (gdb) printf "%s", print_pager_state(pPager)
+**
+** This routine has external linkage in order to suppress compiler warnings
+** about an unused function.  It is enclosed within SQLITE_DEBUG and so does
+** not appear in normal builds.
+*/
+char *print_pager_state(Pager *p){
+  static char zRet[1024];
+
+  sqlite3_snprintf(1024, zRet,
+      "Filename:      %s\n"
+      "State:         %s errCode=%d\n"
+      "Lock:          %s\n"
+      "Locking mode:  locking_mode=%s\n"
+      "Journal mode:  journal_mode=%s\n"
+      "Backing store: tempFile=%d memDb=%d useJournal=%d\n"
+      "Journal:       journalOff=%lld journalHdr=%lld\n"
+      "Size:          dbsize=%d dbOrigSize=%d dbFileSize=%d\n"
+      , p->zFilename
+      , p->eState==PAGER_OPEN            ? "OPEN" :
+        p->eState==PAGER_READER          ? "READER" :
+        p->eState==PAGER_WRITER_LOCKED   ? "WRITER_LOCKED" :
+        p->eState==PAGER_WRITER_CACHEMOD ? "WRITER_CACHEMOD" :
+        p->eState==PAGER_WRITER_DBMOD    ? "WRITER_DBMOD" :
+        p->eState==PAGER_WRITER_FINISHED ? "WRITER_FINISHED" :
+        p->eState==PAGER_ERROR           ? "ERROR" : "?error?"
+      , (int)p->errCode
+      , p->eLock==NO_LOCK         ? "NO_LOCK" :
+        p->eLock==RESERVED_LOCK   ? "RESERVED" :
+        p->eLock==EXCLUSIVE_LOCK  ? "EXCLUSIVE" :
+        p->eLock==SHARED_LOCK     ? "SHARED" :
+        p->eLock==UNKNOWN_LOCK    ? "UNKNOWN" : "?error?"
+      , p->exclusiveMode ? "exclusive" : "normal"
+      , p->journalMode==PAGER_JOURNALMODE_MEMORY   ? "memory" :
+        p->journalMode==PAGER_JOURNALMODE_OFF      ? "off" :
+        p->journalMode==PAGER_JOURNALMODE_DELETE   ? "delete" :
+        p->journalMode==PAGER_JOURNALMODE_PERSIST  ? "persist" :
+        p->journalMode==PAGER_JOURNALMODE_TRUNCATE ? "truncate" :
+        p->journalMode==PAGER_JOURNALMODE_WAL      ? "wal" : "?error?"
+      , (int)p->tempFile, (int)p->memDb, (int)p->useJournal
+      , p->journalOff, p->journalHdr
+      , (int)p->dbSize, (int)p->dbOrigSize, (int)p->dbFileSize
+  );
+
+  return zRet;
+}
+#endif
+
+/* Forward references to the various page getters */
+static int getPageNormal(Pager*,Pgno,DbPage**,int);
+static int getPageError(Pager*,Pgno,DbPage**,int);
+#if SQLITE_MAX_MMAP_SIZE>0
+static int getPageMMap(Pager*,Pgno,DbPage**,int);
+#endif
+
+/*
+** Set the Pager.xGet method for the appropriate routine used to fetch
+** content from the pager.
+*/
+static void setGetterMethod(Pager *pPager){
+  if( pPager->errCode ){
+    pPager->xGet = getPageError;
+#if SQLITE_MAX_MMAP_SIZE>0
+  }else if( USEFETCH(pPager) ){
+    pPager->xGet = getPageMMap;
+#endif /* SQLITE_MAX_MMAP_SIZE>0 */
+  }else{
+    pPager->xGet = getPageNormal;
+  }
+}
+
+/*
+** Return true if it is necessary to write page *pPg into the sub-journal.
+** A page needs to be written into the sub-journal if there exists one
+** or more open savepoints for which:
+**
+**   * The page-number is less than or equal to PagerSavepoint.nOrig, and
+**   * The bit corresponding to the page-number is not set in
+**     PagerSavepoint.pInSavepoint.
+*/
+static int subjRequiresPage(PgHdr *pPg){
+  Pager *pPager = pPg->pPager;
+  PagerSavepoint *p;
+  Pgno pgno = pPg->pgno;
+  int i;
+  for(i=0; i<pPager->nSavepoint; i++){
+    p = &pPager->aSavepoint[i];
+    if( p->nOrig>=pgno && 0==sqlite3BitvecTestNotNull(p->pInSavepoint, pgno) ){
+      for(i=i+1; i<pPager->nSavepoint; i++){
+        pPager->aSavepoint[i].bTruncateOnRelease = 0;
+      }
+      return 1;
+    }
+  }
+  return 0;
+}
+
+#ifdef SQLITE_DEBUG
+/*
+** Return true if the page is already in the journal file.
+*/
+static int pageInJournal(Pager *pPager, PgHdr *pPg){
+  return sqlite3BitvecTest(pPager->pInJournal, pPg->pgno);
+}
+#endif
+
+/*
+** Read a 32-bit integer from the given file descriptor.  Store the integer
+** that is read in *pRes.  Return SQLITE_OK if everything worked, or an
+** error code is something goes wrong.
+**
+** All values are stored on disk as big-endian.
+*/
+static int read32bits(sqlite3_file *fd, i64 offset, u32 *pRes){
+  unsigned char ac[4];
+  int rc = sqlite3OsRead(fd, ac, sizeof(ac),
