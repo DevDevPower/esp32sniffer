@@ -55023,4 +55023,203 @@ static int pageInJournal(Pager *pPager, PgHdr *pPg){
 */
 static int read32bits(sqlite3_file *fd, i64 offset, u32 *pRes){
   unsigned char ac[4];
-  int rc = sqlite3OsRead(fd, ac, sizeof(ac),
+  int rc = sqlite3OsRead(fd, ac, sizeof(ac), offset);
+  if( rc==SQLITE_OK ){
+    *pRes = sqlite3Get4byte(ac);
+  }
+  return rc;
+}
+
+/*
+** Write a 32-bit integer into a string buffer in big-endian byte order.
+*/
+#define put32bits(A,B)  sqlite3Put4byte((u8*)A,B)
+
+
+/*
+** Write a 32-bit integer into the given file descriptor.  Return SQLITE_OK
+** on success or an error code is something goes wrong.
+*/
+static int write32bits(sqlite3_file *fd, i64 offset, u32 val){
+  char ac[4];
+  put32bits(ac, val);
+  return sqlite3OsWrite(fd, ac, 4, offset);
+}
+
+/*
+** Unlock the database file to level eLock, which must be either NO_LOCK
+** or SHARED_LOCK. Regardless of whether or not the call to xUnlock()
+** succeeds, set the Pager.eLock variable to match the (attempted) new lock.
+**
+** Except, if Pager.eLock is set to UNKNOWN_LOCK when this function is
+** called, do not modify it. See the comment above the #define of
+** UNKNOWN_LOCK for an explanation of this.
+*/
+static int pagerUnlockDb(Pager *pPager, int eLock){
+  int rc = SQLITE_OK;
+
+  assert( !pPager->exclusiveMode || pPager->eLock==eLock );
+  assert( eLock==NO_LOCK || eLock==SHARED_LOCK );
+  assert( eLock!=NO_LOCK || pagerUseWal(pPager)==0 );
+  if( isOpen(pPager->fd) ){
+    assert( pPager->eLock>=eLock );
+    rc = pPager->noLock ? SQLITE_OK : sqlite3OsUnlock(pPager->fd, eLock);
+    if( pPager->eLock!=UNKNOWN_LOCK ){
+      pPager->eLock = (u8)eLock;
+    }
+    IOTRACE(("UNLOCK %p %d\n", pPager, eLock))
+  }
+  pPager->changeCountDone = pPager->tempFile; /* ticket fb3b3024ea238d5c */
+  return rc;
+}
+
+/*
+** Lock the database file to level eLock, which must be either SHARED_LOCK,
+** RESERVED_LOCK or EXCLUSIVE_LOCK. If the caller is successful, set the
+** Pager.eLock variable to the new locking state.
+**
+** Except, if Pager.eLock is set to UNKNOWN_LOCK when this function is
+** called, do not modify it unless the new locking state is EXCLUSIVE_LOCK.
+** See the comment above the #define of UNKNOWN_LOCK for an explanation
+** of this.
+*/
+static int pagerLockDb(Pager *pPager, int eLock){
+  int rc = SQLITE_OK;
+
+  assert( eLock==SHARED_LOCK || eLock==RESERVED_LOCK || eLock==EXCLUSIVE_LOCK );
+  if( pPager->eLock<eLock || pPager->eLock==UNKNOWN_LOCK ){
+    rc = pPager->noLock ? SQLITE_OK : sqlite3OsLock(pPager->fd, eLock);
+    if( rc==SQLITE_OK && (pPager->eLock!=UNKNOWN_LOCK||eLock==EXCLUSIVE_LOCK) ){
+      pPager->eLock = (u8)eLock;
+      IOTRACE(("LOCK %p %d\n", pPager, eLock))
+    }
+  }
+  return rc;
+}
+
+/*
+** This function determines whether or not the atomic-write or
+** atomic-batch-write optimizations can be used with this pager. The
+** atomic-write optimization can be used if:
+**
+**  (a) the value returned by OsDeviceCharacteristics() indicates that
+**      a database page may be written atomically, and
+**  (b) the value returned by OsSectorSize() is less than or equal
+**      to the page size.
+**
+** If it can be used, then the value returned is the size of the journal
+** file when it contains rollback data for exactly one page.
+**
+** The atomic-batch-write optimization can be used if OsDeviceCharacteristics()
+** returns a value with the SQLITE_IOCAP_BATCH_ATOMIC bit set. -1 is
+** returned in this case.
+**
+** If neither optimization can be used, 0 is returned.
+*/
+static int jrnlBufferSize(Pager *pPager){
+  assert( !MEMDB );
+
+#if defined(SQLITE_ENABLE_ATOMIC_WRITE) \
+ || defined(SQLITE_ENABLE_BATCH_ATOMIC_WRITE)
+  int dc;                           /* Device characteristics */
+
+  assert( isOpen(pPager->fd) );
+  dc = sqlite3OsDeviceCharacteristics(pPager->fd);
+#else
+  UNUSED_PARAMETER(pPager);
+#endif
+
+#ifdef SQLITE_ENABLE_BATCH_ATOMIC_WRITE
+  if( pPager->dbSize>0 && (dc&SQLITE_IOCAP_BATCH_ATOMIC) ){
+    return -1;
+  }
+#endif
+
+#ifdef SQLITE_ENABLE_ATOMIC_WRITE
+  {
+    int nSector = pPager->sectorSize;
+    int szPage = pPager->pageSize;
+
+    assert(SQLITE_IOCAP_ATOMIC512==(512>>8));
+    assert(SQLITE_IOCAP_ATOMIC64K==(65536>>8));
+    if( 0==(dc&(SQLITE_IOCAP_ATOMIC|(szPage>>8)) || nSector>szPage) ){
+      return 0;
+    }
+  }
+
+  return JOURNAL_HDR_SZ(pPager) + JOURNAL_PG_SZ(pPager);
+#endif
+
+  return 0;
+}
+
+/*
+** If SQLITE_CHECK_PAGES is defined then we do some sanity checking
+** on the cache using a hash function.  This is used for testing
+** and debugging only.
+*/
+#ifdef SQLITE_CHECK_PAGES
+/*
+** Return a 32-bit hash of the page data for pPage.
+*/
+static u32 pager_datahash(int nByte, unsigned char *pData){
+  u32 hash = 0;
+  int i;
+  for(i=0; i<nByte; i++){
+    hash = (hash*1039) + pData[i];
+  }
+  return hash;
+}
+static u32 pager_pagehash(PgHdr *pPage){
+  return pager_datahash(pPage->pPager->pageSize, (unsigned char *)pPage->pData);
+}
+static void pager_set_pagehash(PgHdr *pPage){
+  pPage->pageHash = pager_pagehash(pPage);
+}
+
+/*
+** The CHECK_PAGE macro takes a PgHdr* as an argument. If SQLITE_CHECK_PAGES
+** is defined, and NDEBUG is not defined, an assert() statement checks
+** that the page is either dirty or still matches the calculated page-hash.
+*/
+#define CHECK_PAGE(x) checkPage(x)
+static void checkPage(PgHdr *pPg){
+  Pager *pPager = pPg->pPager;
+  assert( pPager->eState!=PAGER_ERROR );
+  assert( (pPg->flags&PGHDR_DIRTY) || pPg->pageHash==pager_pagehash(pPg) );
+}
+
+#else
+#define pager_datahash(X,Y)  0
+#define pager_pagehash(X)  0
+#define pager_set_pagehash(X)
+#define CHECK_PAGE(x)
+#endif  /* SQLITE_CHECK_PAGES */
+
+/*
+** When this is called the journal file for pager pPager must be open.
+** This function attempts to read a super-journal file name from the
+** end of the file and, if successful, copies it into memory supplied
+** by the caller. See comments above writeSuperJournal() for the format
+** used to store a super-journal file name at the end of a journal file.
+**
+** zSuper must point to a buffer of at least nSuper bytes allocated by
+** the caller. This should be sqlite3_vfs.mxPathname+1 (to ensure there is
+** enough space to write the super-journal name). If the super-journal
+** name in the journal is longer than nSuper bytes (including a
+** nul-terminator), then this is handled as if no super-journal name
+** were present in the journal.
+**
+** If a super-journal file name is present at the end of the journal
+** file, then it is copied into the buffer pointed to by zSuper. A
+** nul-terminator byte is appended to the buffer following the
+** super-journal file name.
+**
+** If it is determined that no super-journal file name is present
+** zSuper[0] is set to 0 and SQLITE_OK returned.
+**
+** If an error occurs while reading from the journal file, an SQLite
+** error code is returned.
+*/
+static int readSuperJournal(sqlite3_file *pJrnl, char *zSuper, u32 nSuper){
+  int rc;                   
