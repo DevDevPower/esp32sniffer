@@ -55916,4 +55916,168 @@ static int pagerFlushOnCommit(Pager *pPager, int bCommit){
 **     If the pager is running in exclusive mode, this method of finalizing
 **     the journal file is never used. Instead, if the journalMode is
 **     DELETE and the pager is in exclusive mode, the method described under
-**     journalMode==PERSIST 
+**     journalMode==PERSIST is used instead.
+**
+** After the journal is finalized, the pager moves to PAGER_READER state.
+** If running in non-exclusive rollback mode, the lock on the file is
+** downgraded to a SHARED_LOCK.
+**
+** SQLITE_OK is returned if no error occurs. If an error occurs during
+** any of the IO operations to finalize the journal file or unlock the
+** database then the IO error code is returned to the user. If the
+** operation to finalize the journal file fails, then the code still
+** tries to unlock the database file if not in exclusive mode. If the
+** unlock operation fails as well, then the first error code related
+** to the first error encountered (the journal finalization one) is
+** returned.
+*/
+static int pager_end_transaction(Pager *pPager, int hasSuper, int bCommit){
+  int rc = SQLITE_OK;      /* Error code from journal finalization operation */
+  int rc2 = SQLITE_OK;     /* Error code from db file unlock operation */
+
+  /* Do nothing if the pager does not have an open write transaction
+  ** or at least a RESERVED lock. This function may be called when there
+  ** is no write-transaction active but a RESERVED or greater lock is
+  ** held under two circumstances:
+  **
+  **   1. After a successful hot-journal rollback, it is called with
+  **      eState==PAGER_NONE and eLock==EXCLUSIVE_LOCK.
+  **
+  **   2. If a connection with locking_mode=exclusive holding an EXCLUSIVE
+  **      lock switches back to locking_mode=normal and then executes a
+  **      read-transaction, this function is called with eState==PAGER_READER
+  **      and eLock==EXCLUSIVE_LOCK when the read-transaction is closed.
+  */
+  assert( assert_pager_state(pPager) );
+  assert( pPager->eState!=PAGER_ERROR );
+  if( pPager->eState<PAGER_WRITER_LOCKED && pPager->eLock<RESERVED_LOCK ){
+    return SQLITE_OK;
+  }
+
+  releaseAllSavepoints(pPager);
+  assert( isOpen(pPager->jfd) || pPager->pInJournal==0
+      || (sqlite3OsDeviceCharacteristics(pPager->fd)&SQLITE_IOCAP_BATCH_ATOMIC)
+  );
+  if( isOpen(pPager->jfd) ){
+    assert( !pagerUseWal(pPager) );
+
+    /* Finalize the journal file. */
+    if( sqlite3JournalIsInMemory(pPager->jfd) ){
+      /* assert( pPager->journalMode==PAGER_JOURNALMODE_MEMORY ); */
+      sqlite3OsClose(pPager->jfd);
+    }else if( pPager->journalMode==PAGER_JOURNALMODE_TRUNCATE ){
+      if( pPager->journalOff==0 ){
+        rc = SQLITE_OK;
+      }else{
+        rc = sqlite3OsTruncate(pPager->jfd, 0);
+        if( rc==SQLITE_OK && pPager->fullSync ){
+          /* Make sure the new file size is written into the inode right away.
+          ** Otherwise the journal might resurrect following a power loss and
+          ** cause the last transaction to roll back.  See
+          ** https://bugzilla.mozilla.org/show_bug.cgi?id=1072773
+          */
+          rc = sqlite3OsSync(pPager->jfd, pPager->syncFlags);
+        }
+      }
+      pPager->journalOff = 0;
+    }else if( pPager->journalMode==PAGER_JOURNALMODE_PERSIST
+      || (pPager->exclusiveMode && pPager->journalMode!=PAGER_JOURNALMODE_WAL)
+    ){
+      rc = zeroJournalHdr(pPager, hasSuper||pPager->tempFile);
+      pPager->journalOff = 0;
+    }else{
+      /* This branch may be executed with Pager.journalMode==MEMORY if
+      ** a hot-journal was just rolled back. In this case the journal
+      ** file should be closed and deleted. If this connection writes to
+      ** the database file, it will do so using an in-memory journal.
+      */
+      int bDelete = !pPager->tempFile;
+      assert( sqlite3JournalIsInMemory(pPager->jfd)==0 );
+      assert( pPager->journalMode==PAGER_JOURNALMODE_DELETE
+           || pPager->journalMode==PAGER_JOURNALMODE_MEMORY
+           || pPager->journalMode==PAGER_JOURNALMODE_WAL
+      );
+      sqlite3OsClose(pPager->jfd);
+      if( bDelete ){
+        rc = sqlite3OsDelete(pPager->pVfs, pPager->zJournal, pPager->extraSync);
+      }
+    }
+  }
+
+#ifdef SQLITE_CHECK_PAGES
+  sqlite3PcacheIterateDirty(pPager->pPCache, pager_set_pagehash);
+  if( pPager->dbSize==0 && sqlite3PcacheRefCount(pPager->pPCache)>0 ){
+    PgHdr *p = sqlite3PagerLookup(pPager, 1);
+    if( p ){
+      p->pageHash = 0;
+      sqlite3PagerUnrefNotNull(p);
+    }
+  }
+#endif
+
+  sqlite3BitvecDestroy(pPager->pInJournal);
+  pPager->pInJournal = 0;
+  pPager->nRec = 0;
+  if( rc==SQLITE_OK ){
+    if( MEMDB || pagerFlushOnCommit(pPager, bCommit) ){
+      sqlite3PcacheCleanAll(pPager->pPCache);
+    }else{
+      sqlite3PcacheClearWritable(pPager->pPCache);
+    }
+    sqlite3PcacheTruncate(pPager->pPCache, pPager->dbSize);
+  }
+
+  if( pagerUseWal(pPager) ){
+    /* Drop the WAL write-lock, if any. Also, if the connection was in
+    ** locking_mode=exclusive mode but is no longer, drop the EXCLUSIVE
+    ** lock held on the database file.
+    */
+    rc2 = sqlite3WalEndWriteTransaction(pPager->pWal);
+    assert( rc2==SQLITE_OK );
+  }else if( rc==SQLITE_OK && bCommit && pPager->dbFileSize>pPager->dbSize ){
+    /* This branch is taken when committing a transaction in rollback-journal
+    ** mode if the database file on disk is larger than the database image.
+    ** At this point the journal has been finalized and the transaction
+    ** successfully committed, but the EXCLUSIVE lock is still held on the
+    ** file. So it is safe to truncate the database file to its minimum
+    ** required size.  */
+    assert( pPager->eLock==EXCLUSIVE_LOCK );
+    rc = pager_truncate(pPager, pPager->dbSize);
+  }
+
+  if( rc==SQLITE_OK && bCommit ){
+    rc = sqlite3OsFileControl(pPager->fd, SQLITE_FCNTL_COMMIT_PHASETWO, 0);
+    if( rc==SQLITE_NOTFOUND ) rc = SQLITE_OK;
+  }
+
+  if( !pPager->exclusiveMode
+   && (!pagerUseWal(pPager) || sqlite3WalExclusiveMode(pPager->pWal, 0))
+  ){
+    rc2 = pagerUnlockDb(pPager, SHARED_LOCK);
+  }
+  pPager->eState = PAGER_READER;
+  pPager->setSuper = 0;
+
+  return (rc==SQLITE_OK?rc2:rc);
+}
+
+/*
+** Execute a rollback if a transaction is active and unlock the
+** database file.
+**
+** If the pager has already entered the ERROR state, do not attempt
+** the rollback at this time. Instead, pager_unlock() is called. The
+** call to pager_unlock() will discard all in-memory pages, unlock
+** the database file and move the pager back to OPEN state. If this
+** means that there is a hot-journal left in the file-system, the next
+** connection to obtain a shared lock on the pager (which may be this one)
+** will roll it back.
+**
+** If the pager has not already entered the ERROR state, but an IO or
+** malloc error occurs during a rollback, then this will itself cause
+** the pager to enter the ERROR state. Which will be cleared by the
+** call to pager_unlock(), as described above.
+*/
+static void pagerUnlockAndRollback(Pager *pPager){
+  if( pPager->eState!=PAGER_ERROR && pPager->eState!=PAGER_OPEN ){
+    assert( assert_pager_state(pPag
