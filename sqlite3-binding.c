@@ -56380,4 +56380,170 @@ static int pager_playback_one_page(
 **
 **   "/home/bill/a.db-journal\x00/home/bill/b.db-journal\x00"
 **
-** A super-journal fi
+** A super-journal file may only be deleted once all of its child
+** journals have been rolled back.
+**
+** This function reads the contents of the super-journal file into
+** memory and loops through each of the child journal names. For
+** each child journal, it checks if:
+**
+**   * if the child journal exists, and if so
+**   * if the child journal contains a reference to super-journal
+**     file zSuper
+**
+** If a child journal can be found that matches both of the criteria
+** above, this function returns without doing anything. Otherwise, if
+** no such child journal can be found, file zSuper is deleted from
+** the file-system using sqlite3OsDelete().
+**
+** If an IO error within this function, an error code is returned. This
+** function allocates memory by calling sqlite3Malloc(). If an allocation
+** fails, SQLITE_NOMEM is returned. Otherwise, if no IO or malloc errors
+** occur, SQLITE_OK is returned.
+**
+** TODO: This function allocates a single block of memory to load
+** the entire contents of the super-journal file. This could be
+** a couple of kilobytes or so - potentially larger than the page
+** size.
+*/
+static int pager_delsuper(Pager *pPager, const char *zSuper){
+  sqlite3_vfs *pVfs = pPager->pVfs;
+  int rc;                   /* Return code */
+  sqlite3_file *pSuper;     /* Malloc'd super-journal file descriptor */
+  sqlite3_file *pJournal;   /* Malloc'd child-journal file descriptor */
+  char *zSuperJournal = 0;  /* Contents of super-journal file */
+  i64 nSuperJournal;        /* Size of super-journal file */
+  char *zJournal;           /* Pointer to one journal within MJ file */
+  char *zSuperPtr;          /* Space to hold super-journal filename */
+  char *zFree = 0;          /* Free this buffer */
+  int nSuperPtr;            /* Amount of space allocated to zSuperPtr[] */
+
+  /* Allocate space for both the pJournal and pSuper file descriptors.
+  ** If successful, open the super-journal file for reading.
+  */
+  pSuper = (sqlite3_file *)sqlite3MallocZero(pVfs->szOsFile * 2);
+  if( !pSuper ){
+    rc = SQLITE_NOMEM_BKPT;
+    pJournal = 0;
+  }else{
+    const int flags = (SQLITE_OPEN_READONLY|SQLITE_OPEN_SUPER_JOURNAL);
+    rc = sqlite3OsOpen(pVfs, zSuper, pSuper, flags, 0);
+    pJournal = (sqlite3_file *)(((u8 *)pSuper) + pVfs->szOsFile);
+  }
+  if( rc!=SQLITE_OK ) goto delsuper_out;
+
+  /* Load the entire super-journal file into space obtained from
+  ** sqlite3_malloc() and pointed to by zSuperJournal.   Also obtain
+  ** sufficient space (in zSuperPtr) to hold the names of super-journal
+  ** files extracted from regular rollback-journals.
+  */
+  rc = sqlite3OsFileSize(pSuper, &nSuperJournal);
+  if( rc!=SQLITE_OK ) goto delsuper_out;
+  nSuperPtr = pVfs->mxPathname+1;
+  zFree = sqlite3Malloc(4 + nSuperJournal + nSuperPtr + 2);
+  if( !zFree ){
+    rc = SQLITE_NOMEM_BKPT;
+    goto delsuper_out;
+  }
+  zFree[0] = zFree[1] = zFree[2] = zFree[3] = 0;
+  zSuperJournal = &zFree[4];
+  zSuperPtr = &zSuperJournal[nSuperJournal+2];
+  rc = sqlite3OsRead(pSuper, zSuperJournal, (int)nSuperJournal, 0);
+  if( rc!=SQLITE_OK ) goto delsuper_out;
+  zSuperJournal[nSuperJournal] = 0;
+  zSuperJournal[nSuperJournal+1] = 0;
+
+  zJournal = zSuperJournal;
+  while( (zJournal-zSuperJournal)<nSuperJournal ){
+    int exists;
+    rc = sqlite3OsAccess(pVfs, zJournal, SQLITE_ACCESS_EXISTS, &exists);
+    if( rc!=SQLITE_OK ){
+      goto delsuper_out;
+    }
+    if( exists ){
+      /* One of the journals pointed to by the super-journal exists.
+      ** Open it and check if it points at the super-journal. If
+      ** so, return without deleting the super-journal file.
+      ** NB:  zJournal is really a MAIN_JOURNAL.  But call it a
+      ** SUPER_JOURNAL here so that the VFS will not send the zJournal
+      ** name into sqlite3_database_file_object().
+      */
+      int c;
+      int flags = (SQLITE_OPEN_READONLY|SQLITE_OPEN_SUPER_JOURNAL);
+      rc = sqlite3OsOpen(pVfs, zJournal, pJournal, flags, 0);
+      if( rc!=SQLITE_OK ){
+        goto delsuper_out;
+      }
+
+      rc = readSuperJournal(pJournal, zSuperPtr, nSuperPtr);
+      sqlite3OsClose(pJournal);
+      if( rc!=SQLITE_OK ){
+        goto delsuper_out;
+      }
+
+      c = zSuperPtr[0]!=0 && strcmp(zSuperPtr, zSuper)==0;
+      if( c ){
+        /* We have a match. Do not delete the super-journal file. */
+        goto delsuper_out;
+      }
+    }
+    zJournal += (sqlite3Strlen30(zJournal)+1);
+  }
+
+  sqlite3OsClose(pSuper);
+  rc = sqlite3OsDelete(pVfs, zSuper, 0);
+
+delsuper_out:
+  sqlite3_free(zFree);
+  if( pSuper ){
+    sqlite3OsClose(pSuper);
+    assert( !isOpen(pJournal) );
+    sqlite3_free(pSuper);
+  }
+  return rc;
+}
+
+
+/*
+** This function is used to change the actual size of the database
+** file in the file-system. This only happens when committing a transaction,
+** or rolling back a transaction (including rolling back a hot-journal).
+**
+** If the main database file is not open, or the pager is not in either
+** DBMOD or OPEN state, this function is a no-op. Otherwise, the size
+** of the file is changed to nPage pages (nPage*pPager->pageSize bytes).
+** If the file on disk is currently larger than nPage pages, then use the VFS
+** xTruncate() method to truncate it.
+**
+** Or, it might be the case that the file on disk is smaller than
+** nPage pages. Some operating system implementations can get confused if
+** you try to truncate a file to some size that is larger than it
+** currently is, so detect this case and write a single zero byte to
+** the end of the new file instead.
+**
+** If successful, return SQLITE_OK. If an IO error occurs while modifying
+** the database file, return the error code to the caller.
+*/
+static int pager_truncate(Pager *pPager, Pgno nPage){
+  int rc = SQLITE_OK;
+  assert( pPager->eState!=PAGER_ERROR );
+  assert( pPager->eState!=PAGER_READER );
+
+  if( isOpen(pPager->fd)
+   && (pPager->eState>=PAGER_WRITER_DBMOD || pPager->eState==PAGER_OPEN)
+  ){
+    i64 currentSize, newSize;
+    int szPage = pPager->pageSize;
+    assert( pPager->eLock==EXCLUSIVE_LOCK );
+    /* TODO: Is it safe to use Pager.dbFileSize here? */
+    rc = sqlite3OsFileSize(pPager->fd, &currentSize);
+    newSize = szPage*(i64)nPage;
+    if( rc==SQLITE_OK && currentSize!=newSize ){
+      if( currentSize>newSize ){
+        rc = sqlite3OsTruncate(pPager->fd, newSize);
+      }else if( (currentSize+szPage)<=newSize ){
+        char *pTmp = pPager->pTmpSpace;
+        memset(pTmp, 0, szPage);
+        testcase( (newSize-szPage) == currentSize );
+        testcase( (newSize-szPage) >  currentSize );
+        sqlite3OsFileControlHint(pPager->fd, SQLITE_FCNTL
