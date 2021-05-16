@@ -55556,4 +55556,190 @@ static int readJournalHdr(
      || ((iPageSize-1)&iPageSize)!=0   || ((iSectorSize-1)&iSectorSize)!=0
     ){
       /* If the either the page-size or sector-size in the journal-header is
-      
+      ** invalid, then the process that wrote the journal-header must have
+      ** crashed before the header was synced. In this case stop reading
+      ** the journal file here.
+      */
+      return SQLITE_DONE;
+    }
+
+    /* Update the page-size to match the value read from the journal.
+    ** Use a testcase() macro to make sure that malloc failure within
+    ** PagerSetPagesize() is tested.
+    */
+    rc = sqlite3PagerSetPagesize(pPager, &iPageSize, -1);
+    testcase( rc!=SQLITE_OK );
+
+    /* Update the assumed sector-size to match the value used by
+    ** the process that created this journal. If this journal was
+    ** created by a process other than this one, then this routine
+    ** is being called from within pager_playback(). The local value
+    ** of Pager.sectorSize is restored at the end of that routine.
+    */
+    pPager->sectorSize = iSectorSize;
+  }
+
+  pPager->journalOff += JOURNAL_HDR_SZ(pPager);
+  return rc;
+}
+
+
+/*
+** Write the supplied super-journal name into the journal file for pager
+** pPager at the current location. The super-journal name must be the last
+** thing written to a journal file. If the pager is in full-sync mode, the
+** journal file descriptor is advanced to the next sector boundary before
+** anything is written. The format is:
+**
+**   + 4 bytes: PAGER_SJ_PGNO.
+**   + N bytes: super-journal filename in utf-8.
+**   + 4 bytes: N (length of super-journal name in bytes, no nul-terminator).
+**   + 4 bytes: super-journal name checksum.
+**   + 8 bytes: aJournalMagic[].
+**
+** The super-journal page checksum is the sum of the bytes in thesuper-journal
+** name, where each byte is interpreted as a signed 8-bit integer.
+**
+** If zSuper is a NULL pointer (occurs for a single database transaction),
+** this call is a no-op.
+*/
+static int writeSuperJournal(Pager *pPager, const char *zSuper){
+  int rc;                          /* Return code */
+  int nSuper;                      /* Length of string zSuper */
+  i64 iHdrOff;                     /* Offset of header in journal file */
+  i64 jrnlSize;                    /* Size of journal file on disk */
+  u32 cksum = 0;                   /* Checksum of string zSuper */
+
+  assert( pPager->setSuper==0 );
+  assert( !pagerUseWal(pPager) );
+
+  if( !zSuper
+   || pPager->journalMode==PAGER_JOURNALMODE_MEMORY
+   || !isOpen(pPager->jfd)
+  ){
+    return SQLITE_OK;
+  }
+  pPager->setSuper = 1;
+  assert( pPager->journalHdr <= pPager->journalOff );
+
+  /* Calculate the length in bytes and the checksum of zSuper */
+  for(nSuper=0; zSuper[nSuper]; nSuper++){
+    cksum += zSuper[nSuper];
+  }
+
+  /* If in full-sync mode, advance to the next disk sector before writing
+  ** the super-journal name. This is in case the previous page written to
+  ** the journal has already been synced.
+  */
+  if( pPager->fullSync ){
+    pPager->journalOff = journalHdrOffset(pPager);
+  }
+  iHdrOff = pPager->journalOff;
+
+  /* Write the super-journal data to the end of the journal file. If
+  ** an error occurs, return the error code to the caller.
+  */
+  if( (0 != (rc = write32bits(pPager->jfd, iHdrOff, PAGER_SJ_PGNO(pPager))))
+   || (0 != (rc = sqlite3OsWrite(pPager->jfd, zSuper, nSuper, iHdrOff+4)))
+   || (0 != (rc = write32bits(pPager->jfd, iHdrOff+4+nSuper, nSuper)))
+   || (0 != (rc = write32bits(pPager->jfd, iHdrOff+4+nSuper+4, cksum)))
+   || (0 != (rc = sqlite3OsWrite(pPager->jfd, aJournalMagic, 8,
+                                 iHdrOff+4+nSuper+8)))
+  ){
+    return rc;
+  }
+  pPager->journalOff += (nSuper+20);
+
+  /* If the pager is in peristent-journal mode, then the physical
+  ** journal-file may extend past the end of the super-journal name
+  ** and 8 bytes of magic data just written to the file. This is
+  ** dangerous because the code to rollback a hot-journal file
+  ** will not be able to find the super-journal name to determine
+  ** whether or not the journal is hot.
+  **
+  ** Easiest thing to do in this scenario is to truncate the journal
+  ** file to the required size.
+  */
+  if( SQLITE_OK==(rc = sqlite3OsFileSize(pPager->jfd, &jrnlSize))
+   && jrnlSize>pPager->journalOff
+  ){
+    rc = sqlite3OsTruncate(pPager->jfd, pPager->journalOff);
+  }
+  return rc;
+}
+
+/*
+** Discard the entire contents of the in-memory page-cache.
+*/
+static void pager_reset(Pager *pPager){
+  pPager->iDataVersion++;
+  sqlite3BackupRestart(pPager->pBackup);
+  sqlite3PcacheClear(pPager->pPCache);
+}
+
+/*
+** Return the pPager->iDataVersion value
+*/
+SQLITE_PRIVATE u32 sqlite3PagerDataVersion(Pager *pPager){
+  return pPager->iDataVersion;
+}
+
+/*
+** Free all structures in the Pager.aSavepoint[] array and set both
+** Pager.aSavepoint and Pager.nSavepoint to zero. Close the sub-journal
+** if it is open and the pager is not in exclusive mode.
+*/
+static void releaseAllSavepoints(Pager *pPager){
+  int ii;               /* Iterator for looping through Pager.aSavepoint */
+  for(ii=0; ii<pPager->nSavepoint; ii++){
+    sqlite3BitvecDestroy(pPager->aSavepoint[ii].pInSavepoint);
+  }
+  if( !pPager->exclusiveMode || sqlite3JournalIsInMemory(pPager->sjfd) ){
+    sqlite3OsClose(pPager->sjfd);
+  }
+  sqlite3_free(pPager->aSavepoint);
+  pPager->aSavepoint = 0;
+  pPager->nSavepoint = 0;
+  pPager->nSubRec = 0;
+}
+
+/*
+** Set the bit number pgno in the PagerSavepoint.pInSavepoint
+** bitvecs of all open savepoints. Return SQLITE_OK if successful
+** or SQLITE_NOMEM if a malloc failure occurs.
+*/
+static int addToSavepointBitvecs(Pager *pPager, Pgno pgno){
+  int ii;                   /* Loop counter */
+  int rc = SQLITE_OK;       /* Result code */
+
+  for(ii=0; ii<pPager->nSavepoint; ii++){
+    PagerSavepoint *p = &pPager->aSavepoint[ii];
+    if( pgno<=p->nOrig ){
+      rc |= sqlite3BitvecSet(p->pInSavepoint, pgno);
+      testcase( rc==SQLITE_NOMEM );
+      assert( rc==SQLITE_OK || rc==SQLITE_NOMEM );
+    }
+  }
+  return rc;
+}
+
+/*
+** This function is a no-op if the pager is in exclusive mode and not
+** in the ERROR state. Otherwise, it switches the pager to PAGER_OPEN
+** state.
+**
+** If the pager is not in exclusive-access mode, the database file is
+** completely unlocked. If the file is unlocked and the file-system does
+** not exhibit the UNDELETABLE_WHEN_OPEN property, the journal file is
+** closed (if it is open).
+**
+** If the pager is in ERROR state when this function is called, the
+** contents of the pager cache are discarded before switching back to
+** the OPEN state. Regardless of whether the pager is in exclusive-mode
+** or not, any journal file left in the file-system will be treated
+** as a hot-journal and rolled back the next time a read-transaction
+** is opened (by this or by any other connection).
+*/
+static void pager_unlock(Pager *pPager){
+
+  assert( pPager->eStat
