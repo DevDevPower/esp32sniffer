@@ -56080,4 +56080,156 @@ static int pager_end_transaction(Pager *pPager, int hasSuper, int bCommit){
 */
 static void pagerUnlockAndRollback(Pager *pPager){
   if( pPager->eState!=PAGER_ERROR && pPager->eState!=PAGER_OPEN ){
-    assert( assert_pager_state(pPag
+    assert( assert_pager_state(pPager) );
+    if( pPager->eState>=PAGER_WRITER_LOCKED ){
+      sqlite3BeginBenignMalloc();
+      sqlite3PagerRollback(pPager);
+      sqlite3EndBenignMalloc();
+    }else if( !pPager->exclusiveMode ){
+      assert( pPager->eState==PAGER_READER );
+      pager_end_transaction(pPager, 0, 0);
+    }
+  }
+  pager_unlock(pPager);
+}
+
+/*
+** Parameter aData must point to a buffer of pPager->pageSize bytes
+** of data. Compute and return a checksum based ont the contents of the
+** page of data and the current value of pPager->cksumInit.
+**
+** This is not a real checksum. It is really just the sum of the
+** random initial value (pPager->cksumInit) and every 200th byte
+** of the page data, starting with byte offset (pPager->pageSize%200).
+** Each byte is interpreted as an 8-bit unsigned integer.
+**
+** Changing the formula used to compute this checksum results in an
+** incompatible journal file format.
+**
+** If journal corruption occurs due to a power failure, the most likely
+** scenario is that one end or the other of the record will be changed.
+** It is much less likely that the two ends of the journal record will be
+** correct and the middle be corrupt.  Thus, this "checksum" scheme,
+** though fast and simple, catches the mostly likely kind of corruption.
+*/
+static u32 pager_cksum(Pager *pPager, const u8 *aData){
+  u32 cksum = pPager->cksumInit;         /* Checksum value to return */
+  int i = pPager->pageSize-200;          /* Loop counter */
+  while( i>0 ){
+    cksum += aData[i];
+    i -= 200;
+  }
+  return cksum;
+}
+
+/*
+** Read a single page from either the journal file (if isMainJrnl==1) or
+** from the sub-journal (if isMainJrnl==0) and playback that page.
+** The page begins at offset *pOffset into the file. The *pOffset
+** value is increased to the start of the next page in the journal.
+**
+** The main rollback journal uses checksums - the statement journal does
+** not.
+**
+** If the page number of the page record read from the (sub-)journal file
+** is greater than the current value of Pager.dbSize, then playback is
+** skipped and SQLITE_OK is returned.
+**
+** If pDone is not NULL, then it is a record of pages that have already
+** been played back.  If the page at *pOffset has already been played back
+** (if the corresponding pDone bit is set) then skip the playback.
+** Make sure the pDone bit corresponding to the *pOffset page is set
+** prior to returning.
+**
+** If the page record is successfully read from the (sub-)journal file
+** and played back, then SQLITE_OK is returned. If an IO error occurs
+** while reading the record from the (sub-)journal file or while writing
+** to the database file, then the IO error code is returned. If data
+** is successfully read from the (sub-)journal file but appears to be
+** corrupted, SQLITE_DONE is returned. Data is considered corrupted in
+** two circumstances:
+**
+**   * If the record page-number is illegal (0 or PAGER_SJ_PGNO), or
+**   * If the record is being rolled back from the main journal file
+**     and the checksum field does not match the record content.
+**
+** Neither of these two scenarios are possible during a savepoint rollback.
+**
+** If this is a savepoint rollback, then memory may have to be dynamically
+** allocated by this function. If this is the case and an allocation fails,
+** SQLITE_NOMEM is returned.
+*/
+static int pager_playback_one_page(
+  Pager *pPager,                /* The pager being played back */
+  i64 *pOffset,                 /* Offset of record to playback */
+  Bitvec *pDone,                /* Bitvec of pages already played back */
+  int isMainJrnl,               /* 1 -> main journal. 0 -> sub-journal. */
+  int isSavepnt                 /* True for a savepoint rollback */
+){
+  int rc;
+  PgHdr *pPg;                   /* An existing page in the cache */
+  Pgno pgno;                    /* The page number of a page in journal */
+  u32 cksum;                    /* Checksum used for sanity checking */
+  char *aData;                  /* Temporary storage for the page */
+  sqlite3_file *jfd;            /* The file descriptor for the journal file */
+  int isSynced;                 /* True if journal page is synced */
+
+  assert( (isMainJrnl&~1)==0 );      /* isMainJrnl is 0 or 1 */
+  assert( (isSavepnt&~1)==0 );       /* isSavepnt is 0 or 1 */
+  assert( isMainJrnl || pDone );     /* pDone always used on sub-journals */
+  assert( isSavepnt || pDone==0 );   /* pDone never used on non-savepoint */
+
+  aData = pPager->pTmpSpace;
+  assert( aData );         /* Temp storage must have already been allocated */
+  assert( pagerUseWal(pPager)==0 || (!isMainJrnl && isSavepnt) );
+
+  /* Either the state is greater than PAGER_WRITER_CACHEMOD (a transaction
+  ** or savepoint rollback done at the request of the caller) or this is
+  ** a hot-journal rollback. If it is a hot-journal rollback, the pager
+  ** is in state OPEN and holds an EXCLUSIVE lock. Hot-journal rollback
+  ** only reads from the main journal, not the sub-journal.
+  */
+  assert( pPager->eState>=PAGER_WRITER_CACHEMOD
+       || (pPager->eState==PAGER_OPEN && pPager->eLock==EXCLUSIVE_LOCK)
+  );
+  assert( pPager->eState>=PAGER_WRITER_CACHEMOD || isMainJrnl );
+
+  /* Read the page number and page data from the journal or sub-journal
+  ** file. Return an error code to the caller if an IO error occurs.
+  */
+  jfd = isMainJrnl ? pPager->jfd : pPager->sjfd;
+  rc = read32bits(jfd, *pOffset, &pgno);
+  if( rc!=SQLITE_OK ) return rc;
+  rc = sqlite3OsRead(jfd, (u8*)aData, pPager->pageSize, (*pOffset)+4);
+  if( rc!=SQLITE_OK ) return rc;
+  *pOffset += pPager->pageSize + 4 + isMainJrnl*4;
+
+  /* Sanity checking on the page.  This is more important that I originally
+  ** thought.  If a power failure occurs while the journal is being written,
+  ** it could cause invalid data to be written into the journal.  We need to
+  ** detect this invalid data (with high probability) and ignore it.
+  */
+  if( pgno==0 || pgno==PAGER_SJ_PGNO(pPager) ){
+    assert( !isSavepnt );
+    return SQLITE_DONE;
+  }
+  if( pgno>(Pgno)pPager->dbSize || sqlite3BitvecTest(pDone, pgno) ){
+    return SQLITE_OK;
+  }
+  if( isMainJrnl ){
+    rc = read32bits(jfd, (*pOffset)-4, &cksum);
+    if( rc ) return rc;
+    if( !isSavepnt && pager_cksum(pPager, (u8*)aData)!=cksum ){
+      return SQLITE_DONE;
+    }
+  }
+
+  /* If this page has already been played back before during the current
+  ** rollback, then don't bother to play it back again.
+  */
+  if( pDone && (rc = sqlite3BitvecSet(pDone, pgno))!=SQLITE_OK ){
+    return rc;
+  }
+
+  /* When playing back page 1, restore the nReserve setting
+  */
