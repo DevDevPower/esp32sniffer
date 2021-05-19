@@ -57432,4 +57432,171 @@ SQLITE_PRIVATE void sqlite3PagerShrink(Pager *pPager){
 ** Adjust settings of the pager to those specified in the pgFlags parameter.
 **
 ** The "level" in pgFlags & PAGER_SYNCHRONOUS_MASK sets the robustness
-** of the database t
+** of the database to damage due to OS crashes or power failures by
+** changing the number of syncs()s when writing the journals.
+** There are four levels:
+**
+**    OFF       sqlite3OsSync() is never called.  This is the default
+**              for temporary and transient files.
+**
+**    NORMAL    The journal is synced once before writes begin on the
+**              database.  This is normally adequate protection, but
+**              it is theoretically possible, though very unlikely,
+**              that an inopertune power failure could leave the journal
+**              in a state which would cause damage to the database
+**              when it is rolled back.
+**
+**    FULL      The journal is synced twice before writes begin on the
+**              database (with some additional information - the nRec field
+**              of the journal header - being written in between the two
+**              syncs).  If we assume that writing a
+**              single disk sector is atomic, then this mode provides
+**              assurance that the journal will not be corrupted to the
+**              point of causing damage to the database during rollback.
+**
+**    EXTRA     This is like FULL except that is also syncs the directory
+**              that contains the rollback journal after the rollback
+**              journal is unlinked.
+**
+** The above is for a rollback-journal mode.  For WAL mode, OFF continues
+** to mean that no syncs ever occur.  NORMAL means that the WAL is synced
+** prior to the start of checkpoint and that the database file is synced
+** at the conclusion of the checkpoint if the entire content of the WAL
+** was written back into the database.  But no sync operations occur for
+** an ordinary commit in NORMAL mode with WAL.  FULL means that the WAL
+** file is synced following each commit operation, in addition to the
+** syncs associated with NORMAL.  There is no difference between FULL
+** and EXTRA for WAL mode.
+**
+** Do not confuse synchronous=FULL with SQLITE_SYNC_FULL.  The
+** SQLITE_SYNC_FULL macro means to use the MacOSX-style full-fsync
+** using fcntl(F_FULLFSYNC).  SQLITE_SYNC_NORMAL means to do an
+** ordinary fsync() call.  There is no difference between SQLITE_SYNC_FULL
+** and SQLITE_SYNC_NORMAL on platforms other than MacOSX.  But the
+** synchronous=FULL versus synchronous=NORMAL setting determines when
+** the xSync primitive is called and is relevant to all platforms.
+**
+** Numeric values associated with these states are OFF==1, NORMAL=2,
+** and FULL=3.
+*/
+#ifndef SQLITE_OMIT_PAGER_PRAGMAS
+SQLITE_PRIVATE void sqlite3PagerSetFlags(
+  Pager *pPager,        /* The pager to set safety level for */
+  unsigned pgFlags      /* Various flags */
+){
+  unsigned level = pgFlags & PAGER_SYNCHRONOUS_MASK;
+  if( pPager->tempFile ){
+    pPager->noSync = 1;
+    pPager->fullSync = 0;
+    pPager->extraSync = 0;
+  }else{
+    pPager->noSync =  level==PAGER_SYNCHRONOUS_OFF ?1:0;
+    pPager->fullSync = level>=PAGER_SYNCHRONOUS_FULL ?1:0;
+    pPager->extraSync = level==PAGER_SYNCHRONOUS_EXTRA ?1:0;
+  }
+  if( pPager->noSync ){
+    pPager->syncFlags = 0;
+  }else if( pgFlags & PAGER_FULLFSYNC ){
+    pPager->syncFlags = SQLITE_SYNC_FULL;
+  }else{
+    pPager->syncFlags = SQLITE_SYNC_NORMAL;
+  }
+  pPager->walSyncFlags = (pPager->syncFlags<<2);
+  if( pPager->fullSync ){
+    pPager->walSyncFlags |= pPager->syncFlags;
+  }
+  if( (pgFlags & PAGER_CKPT_FULLFSYNC) && !pPager->noSync ){
+    pPager->walSyncFlags |= (SQLITE_SYNC_FULL<<2);
+  }
+  if( pgFlags & PAGER_CACHESPILL ){
+    pPager->doNotSpill &= ~SPILLFLAG_OFF;
+  }else{
+    pPager->doNotSpill |= SPILLFLAG_OFF;
+  }
+}
+#endif
+
+/*
+** The following global variable is incremented whenever the library
+** attempts to open a temporary file.  This information is used for
+** testing and analysis only.
+*/
+#ifdef SQLITE_TEST
+SQLITE_API int sqlite3_opentemp_count = 0;
+#endif
+
+/*
+** Open a temporary file.
+**
+** Write the file descriptor into *pFile. Return SQLITE_OK on success
+** or some other error code if we fail. The OS will automatically
+** delete the temporary file when it is closed.
+**
+** The flags passed to the VFS layer xOpen() call are those specified
+** by parameter vfsFlags ORed with the following:
+**
+**     SQLITE_OPEN_READWRITE
+**     SQLITE_OPEN_CREATE
+**     SQLITE_OPEN_EXCLUSIVE
+**     SQLITE_OPEN_DELETEONCLOSE
+*/
+static int pagerOpentemp(
+  Pager *pPager,        /* The pager object */
+  sqlite3_file *pFile,  /* Write the file descriptor here */
+  int vfsFlags          /* Flags passed through to the VFS */
+){
+  int rc;               /* Return code */
+
+#ifdef SQLITE_TEST
+  sqlite3_opentemp_count++;  /* Used for testing and analysis only */
+#endif
+
+  vfsFlags |=  SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE |
+            SQLITE_OPEN_EXCLUSIVE | SQLITE_OPEN_DELETEONCLOSE;
+  rc = sqlite3OsOpen(pPager->pVfs, 0, pFile, vfsFlags, 0);
+  assert( rc!=SQLITE_OK || isOpen(pFile) );
+  return rc;
+}
+
+/*
+** Set the busy handler function.
+**
+** The pager invokes the busy-handler if sqlite3OsLock() returns
+** SQLITE_BUSY when trying to upgrade from no-lock to a SHARED lock,
+** or when trying to upgrade from a RESERVED lock to an EXCLUSIVE
+** lock. It does *not* invoke the busy handler when upgrading from
+** SHARED to RESERVED, or when upgrading from SHARED to EXCLUSIVE
+** (which occurs during hot-journal rollback). Summary:
+**
+**   Transition                        | Invokes xBusyHandler
+**   --------------------------------------------------------
+**   NO_LOCK       -> SHARED_LOCK      | Yes
+**   SHARED_LOCK   -> RESERVED_LOCK    | No
+**   SHARED_LOCK   -> EXCLUSIVE_LOCK   | No
+**   RESERVED_LOCK -> EXCLUSIVE_LOCK   | Yes
+**
+** If the busy-handler callback returns non-zero, the lock is
+** retried. If it returns zero, then the SQLITE_BUSY error is
+** returned to the caller of the pager API function.
+*/
+SQLITE_PRIVATE void sqlite3PagerSetBusyHandler(
+  Pager *pPager,                       /* Pager object */
+  int (*xBusyHandler)(void *),         /* Pointer to busy-handler function */
+  void *pBusyHandlerArg                /* Argument to pass to xBusyHandler */
+){
+  void **ap;
+  pPager->xBusyHandler = xBusyHandler;
+  pPager->pBusyHandlerArg = pBusyHandlerArg;
+  ap = (void **)&pPager->xBusyHandler;
+  assert( ((int(*)(void *))(ap[0]))==xBusyHandler );
+  assert( ap[1]==pBusyHandlerArg );
+  sqlite3OsFileControlHint(pPager->fd, SQLITE_FCNTL_BUSYHANDLER, (void *)ap);
+}
+
+/*
+** Change the page size used by the Pager object. The new page size
+** is passed in *pPageSize.
+**
+** If the pager is in the error state when this function is called, it
+** is a no-op. The value returned is the error state error code (i.e.
+** one of SQLITE_IOERR, an SQLITE_IOERR_xxx sub-code or SQLITE_
