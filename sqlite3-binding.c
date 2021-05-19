@@ -57052,4 +57052,201 @@ static int pagerWalFrames(
   Pgno nTruncate,                 /* Database size after this commit */
   int isCommit                    /* True if this is a commit */
 ){
-  int rc;                     
+  int rc;                         /* Return code */
+  int nList;                      /* Number of pages in pList */
+  PgHdr *p;                       /* For looping over pages */
+
+  assert( pPager->pWal );
+  assert( pList );
+#ifdef SQLITE_DEBUG
+  /* Verify that the page list is in accending order */
+  for(p=pList; p && p->pDirty; p=p->pDirty){
+    assert( p->pgno < p->pDirty->pgno );
+  }
+#endif
+
+  assert( pList->pDirty==0 || isCommit );
+  if( isCommit ){
+    /* If a WAL transaction is being committed, there is no point in writing
+    ** any pages with page numbers greater than nTruncate into the WAL file.
+    ** They will never be read by any client. So remove them from the pDirty
+    ** list here. */
+    PgHdr **ppNext = &pList;
+    nList = 0;
+    for(p=pList; (*ppNext = p)!=0; p=p->pDirty){
+      if( p->pgno<=nTruncate ){
+        ppNext = &p->pDirty;
+        nList++;
+      }
+    }
+    assert( pList );
+  }else{
+    nList = 1;
+  }
+  pPager->aStat[PAGER_STAT_WRITE] += nList;
+
+  if( pList->pgno==1 ) pager_write_changecounter(pList);
+  rc = sqlite3WalFrames(pPager->pWal,
+      pPager->pageSize, pList, nTruncate, isCommit, pPager->walSyncFlags
+  );
+  if( rc==SQLITE_OK && pPager->pBackup ){
+    for(p=pList; p; p=p->pDirty){
+      sqlite3BackupUpdate(pPager->pBackup, p->pgno, (u8 *)p->pData);
+    }
+  }
+
+#ifdef SQLITE_CHECK_PAGES
+  pList = sqlite3PcacheDirtyList(pPager->pPCache);
+  for(p=pList; p; p=p->pDirty){
+    pager_set_pagehash(p);
+  }
+#endif
+
+  return rc;
+}
+
+/*
+** Begin a read transaction on the WAL.
+**
+** This routine used to be called "pagerOpenSnapshot()" because it essentially
+** makes a snapshot of the database at the current point in time and preserves
+** that snapshot for use by the reader in spite of concurrently changes by
+** other writers or checkpointers.
+*/
+static int pagerBeginReadTransaction(Pager *pPager){
+  int rc;                         /* Return code */
+  int changed = 0;                /* True if cache must be reset */
+
+  assert( pagerUseWal(pPager) );
+  assert( pPager->eState==PAGER_OPEN || pPager->eState==PAGER_READER );
+
+  /* sqlite3WalEndReadTransaction() was not called for the previous
+  ** transaction in locking_mode=EXCLUSIVE.  So call it now.  If we
+  ** are in locking_mode=NORMAL and EndRead() was previously called,
+  ** the duplicate call is harmless.
+  */
+  sqlite3WalEndReadTransaction(pPager->pWal);
+
+  rc = sqlite3WalBeginReadTransaction(pPager->pWal, &changed);
+  if( rc!=SQLITE_OK || changed ){
+    pager_reset(pPager);
+    if( USEFETCH(pPager) ) sqlite3OsUnfetch(pPager->fd, 0, 0);
+  }
+
+  return rc;
+}
+#endif
+
+/*
+** This function is called as part of the transition from PAGER_OPEN
+** to PAGER_READER state to determine the size of the database file
+** in pages (assuming the page size currently stored in Pager.pageSize).
+**
+** If no error occurs, SQLITE_OK is returned and the size of the database
+** in pages is stored in *pnPage. Otherwise, an error code (perhaps
+** SQLITE_IOERR_FSTAT) is returned and *pnPage is left unmodified.
+*/
+static int pagerPagecount(Pager *pPager, Pgno *pnPage){
+  Pgno nPage;                     /* Value to return via *pnPage */
+
+  /* Query the WAL sub-system for the database size. The WalDbsize()
+  ** function returns zero if the WAL is not open (i.e. Pager.pWal==0), or
+  ** if the database size is not available. The database size is not
+  ** available from the WAL sub-system if the log file is empty or
+  ** contains no valid committed transactions.
+  */
+  assert( pPager->eState==PAGER_OPEN );
+  assert( pPager->eLock>=SHARED_LOCK );
+  assert( isOpen(pPager->fd) );
+  assert( pPager->tempFile==0 );
+  nPage = sqlite3WalDbsize(pPager->pWal);
+
+  /* If the number of pages in the database is not available from the
+  ** WAL sub-system, determine the page count based on the size of
+  ** the database file.  If the size of the database file is not an
+  ** integer multiple of the page-size, round up the result.
+  */
+  if( nPage==0 && ALWAYS(isOpen(pPager->fd)) ){
+    i64 n = 0;                    /* Size of db file in bytes */
+    int rc = sqlite3OsFileSize(pPager->fd, &n);
+    if( rc!=SQLITE_OK ){
+      return rc;
+    }
+    nPage = (Pgno)((n+pPager->pageSize-1) / pPager->pageSize);
+  }
+
+  /* If the current number of pages in the file is greater than the
+  ** configured maximum pager number, increase the allowed limit so
+  ** that the file can be read.
+  */
+  if( nPage>pPager->mxPgno ){
+    pPager->mxPgno = (Pgno)nPage;
+  }
+
+  *pnPage = nPage;
+  return SQLITE_OK;
+}
+
+#ifndef SQLITE_OMIT_WAL
+/*
+** Check if the *-wal file that corresponds to the database opened by pPager
+** exists if the database is not empy, or verify that the *-wal file does
+** not exist (by deleting it) if the database file is empty.
+**
+** If the database is not empty and the *-wal file exists, open the pager
+** in WAL mode.  If the database is empty or if no *-wal file exists and
+** if no error occurs, make sure Pager.journalMode is not set to
+** PAGER_JOURNALMODE_WAL.
+**
+** Return SQLITE_OK or an error code.
+**
+** The caller must hold a SHARED lock on the database file to call this
+** function. Because an EXCLUSIVE lock on the db file is required to delete
+** a WAL on a none-empty database, this ensures there is no race condition
+** between the xAccess() below and an xDelete() being executed by some
+** other connection.
+*/
+static int pagerOpenWalIfPresent(Pager *pPager){
+  int rc = SQLITE_OK;
+  assert( pPager->eState==PAGER_OPEN );
+  assert( pPager->eLock>=SHARED_LOCK );
+
+  if( !pPager->tempFile ){
+    int isWal;                    /* True if WAL file exists */
+    rc = sqlite3OsAccess(
+        pPager->pVfs, pPager->zWal, SQLITE_ACCESS_EXISTS, &isWal
+    );
+    if( rc==SQLITE_OK ){
+      if( isWal ){
+        Pgno nPage;                   /* Size of the database file */
+
+        rc = pagerPagecount(pPager, &nPage);
+        if( rc ) return rc;
+        if( nPage==0 ){
+          rc = sqlite3OsDelete(pPager->pVfs, pPager->zWal, 0);
+        }else{
+          testcase( sqlite3PcachePagecount(pPager->pPCache)==0 );
+          rc = sqlite3PagerOpenWal(pPager, 0);
+        }
+      }else if( pPager->journalMode==PAGER_JOURNALMODE_WAL ){
+        pPager->journalMode = PAGER_JOURNALMODE_DELETE;
+      }
+    }
+  }
+  return rc;
+}
+#endif
+
+/*
+** Playback savepoint pSavepoint. Or, if pSavepoint==NULL, then playback
+** the entire super-journal file. The case pSavepoint==NULL occurs when
+** a ROLLBACK TO command is invoked on a SAVEPOINT that is a transaction
+** savepoint.
+**
+** When pSavepoint is not NULL (meaning a non-transaction savepoint is
+** being rolled back), then the rollback consists of up to three stages,
+** performed in the order specified:
+**
+**   * Pages are played back from the main journal starting at byte
+**     offset PagerSavepoint.iOffset and continuing to
+**     PagerSavepoint.iHdrOffset, or to the end of the main journal
