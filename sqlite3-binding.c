@@ -57599,4 +57599,194 @@ SQLITE_PRIVATE void sqlite3PagerSetBusyHandler(
 **
 ** If the pager is in the error state when this function is called, it
 ** is a no-op. The value returned is the error state error code (i.e.
-** one of SQLITE_IOERR, an SQLITE_IOERR_xxx sub-code or SQLITE_
+** one of SQLITE_IOERR, an SQLITE_IOERR_xxx sub-code or SQLITE_FULL).
+**
+** Otherwise, if all of the following are true:
+**
+**   * the new page size (value of *pPageSize) is valid (a power
+**     of two between 512 and SQLITE_MAX_PAGE_SIZE, inclusive), and
+**
+**   * there are no outstanding page references, and
+**
+**   * the database is either not an in-memory database or it is
+**     an in-memory database that currently consists of zero pages.
+**
+** then the pager object page size is set to *pPageSize.
+**
+** If the page size is changed, then this function uses sqlite3PagerMalloc()
+** to obtain a new Pager.pTmpSpace buffer. If this allocation attempt
+** fails, SQLITE_NOMEM is returned and the page size remains unchanged.
+** In all other cases, SQLITE_OK is returned.
+**
+** If the page size is not changed, either because one of the enumerated
+** conditions above is not true, the pager was in error state when this
+** function was called, or because the memory allocation attempt failed,
+** then *pPageSize is set to the old, retained page size before returning.
+*/
+SQLITE_PRIVATE int sqlite3PagerSetPagesize(Pager *pPager, u32 *pPageSize, int nReserve){
+  int rc = SQLITE_OK;
+
+  /* It is not possible to do a full assert_pager_state() here, as this
+  ** function may be called from within PagerOpen(), before the state
+  ** of the Pager object is internally consistent.
+  **
+  ** At one point this function returned an error if the pager was in
+  ** PAGER_ERROR state. But since PAGER_ERROR state guarantees that
+  ** there is at least one outstanding page reference, this function
+  ** is a no-op for that case anyhow.
+  */
+
+  u32 pageSize = *pPageSize;
+  assert( pageSize==0 || (pageSize>=512 && pageSize<=SQLITE_MAX_PAGE_SIZE) );
+  if( (pPager->memDb==0 || pPager->dbSize==0)
+   && sqlite3PcacheRefCount(pPager->pPCache)==0
+   && pageSize && pageSize!=(u32)pPager->pageSize
+  ){
+    char *pNew = NULL;             /* New temp space */
+    i64 nByte = 0;
+
+    if( pPager->eState>PAGER_OPEN && isOpen(pPager->fd) ){
+      rc = sqlite3OsFileSize(pPager->fd, &nByte);
+    }
+    if( rc==SQLITE_OK ){
+      /* 8 bytes of zeroed overrun space is sufficient so that the b-tree
+      * cell header parser will never run off the end of the allocation */
+      pNew = (char *)sqlite3PageMalloc(pageSize+8);
+      if( !pNew ){
+        rc = SQLITE_NOMEM_BKPT;
+      }else{
+        memset(pNew+pageSize, 0, 8);
+      }
+    }
+
+    if( rc==SQLITE_OK ){
+      pager_reset(pPager);
+      rc = sqlite3PcacheSetPageSize(pPager->pPCache, pageSize);
+    }
+    if( rc==SQLITE_OK ){
+      sqlite3PageFree(pPager->pTmpSpace);
+      pPager->pTmpSpace = pNew;
+      pPager->dbSize = (Pgno)((nByte+pageSize-1)/pageSize);
+      pPager->pageSize = pageSize;
+      pPager->lckPgno = (Pgno)(PENDING_BYTE/pageSize) + 1;
+    }else{
+      sqlite3PageFree(pNew);
+    }
+  }
+
+  *pPageSize = pPager->pageSize;
+  if( rc==SQLITE_OK ){
+    if( nReserve<0 ) nReserve = pPager->nReserve;
+    assert( nReserve>=0 && nReserve<1000 );
+    pPager->nReserve = (i16)nReserve;
+    pagerFixMaplimit(pPager);
+  }
+  return rc;
+}
+
+/*
+** Return a pointer to the "temporary page" buffer held internally
+** by the pager.  This is a buffer that is big enough to hold the
+** entire content of a database page.  This buffer is used internally
+** during rollback and will be overwritten whenever a rollback
+** occurs.  But other modules are free to use it too, as long as
+** no rollbacks are happening.
+*/
+SQLITE_PRIVATE void *sqlite3PagerTempSpace(Pager *pPager){
+  return pPager->pTmpSpace;
+}
+
+/*
+** Attempt to set the maximum database page count if mxPage is positive.
+** Make no changes if mxPage is zero or negative.  And never reduce the
+** maximum page count below the current size of the database.
+**
+** Regardless of mxPage, return the current maximum page count.
+*/
+SQLITE_PRIVATE Pgno sqlite3PagerMaxPageCount(Pager *pPager, Pgno mxPage){
+  if( mxPage>0 ){
+    pPager->mxPgno = mxPage;
+  }
+  assert( pPager->eState!=PAGER_OPEN );      /* Called only by OP_MaxPgcnt */
+  /* assert( pPager->mxPgno>=pPager->dbSize ); */
+  /* OP_MaxPgcnt ensures that the parameter passed to this function is not
+  ** less than the total number of valid pages in the database. But this
+  ** may be less than Pager.dbSize, and so the assert() above is not valid */
+  return pPager->mxPgno;
+}
+
+/*
+** The following set of routines are used to disable the simulated
+** I/O error mechanism.  These routines are used to avoid simulated
+** errors in places where we do not care about errors.
+**
+** Unless -DSQLITE_TEST=1 is used, these routines are all no-ops
+** and generate no code.
+*/
+#ifdef SQLITE_TEST
+SQLITE_API extern int sqlite3_io_error_pending;
+SQLITE_API extern int sqlite3_io_error_hit;
+static int saved_cnt;
+void disable_simulated_io_errors(void){
+  saved_cnt = sqlite3_io_error_pending;
+  sqlite3_io_error_pending = -1;
+}
+void enable_simulated_io_errors(void){
+  sqlite3_io_error_pending = saved_cnt;
+}
+#else
+# define disable_simulated_io_errors()
+# define enable_simulated_io_errors()
+#endif
+
+/*
+** Read the first N bytes from the beginning of the file into memory
+** that pDest points to.
+**
+** If the pager was opened on a transient file (zFilename==""), or
+** opened on a file less than N bytes in size, the output buffer is
+** zeroed and SQLITE_OK returned. The rationale for this is that this
+** function is used to read database headers, and a new transient or
+** zero sized database has a header than consists entirely of zeroes.
+**
+** If any IO error apart from SQLITE_IOERR_SHORT_READ is encountered,
+** the error code is returned to the caller and the contents of the
+** output buffer undefined.
+*/
+SQLITE_PRIVATE int sqlite3PagerReadFileheader(Pager *pPager, int N, unsigned char *pDest){
+  int rc = SQLITE_OK;
+  memset(pDest, 0, N);
+  assert( isOpen(pPager->fd) || pPager->tempFile );
+
+  /* This routine is only called by btree immediately after creating
+  ** the Pager object.  There has not been an opportunity to transition
+  ** to WAL mode yet.
+  */
+  assert( !pagerUseWal(pPager) );
+
+  if( isOpen(pPager->fd) ){
+    IOTRACE(("DBHDR %p 0 %d\n", pPager, N))
+    rc = sqlite3OsRead(pPager->fd, pDest, N, 0);
+    if( rc==SQLITE_IOERR_SHORT_READ ){
+      rc = SQLITE_OK;
+    }
+  }
+  return rc;
+}
+
+/*
+** This function may only be called when a read-transaction is open on
+** the pager. It returns the total number of pages in the database.
+**
+** However, if the file is between 1 and <page-size> bytes in size, then
+** this is considered a 1 page file.
+*/
+SQLITE_PRIVATE void sqlite3PagerPagecount(Pager *pPager, int *pnPage){
+  assert( pPager->eState>=PAGER_READER );
+  assert( pPager->eState!=PAGER_WRITER_FINISHED );
+  *pnPage = (int)pPager->dbSize;
+}
+
+
+/*
+** Try to obtain
