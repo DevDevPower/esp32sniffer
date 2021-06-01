@@ -58839,4 +58839,188 @@ SQLITE_PRIVATE int sqlite3PagerOpen(
           assert(SQLITE_IOCAP_ATOMIC64K==(65536>>8));
           assert(SQLITE_MAX_DEFAULT_PAGE_SIZE<=65536);
           for(ii=szPageDflt; ii<=SQLITE_MAX_DEFAULT_PAGE_SIZE; ii=ii*2){
-            if( iDc&(SQLITE_
+            if( iDc&(SQLITE_IOCAP_ATOMIC|(ii>>8)) ){
+              szPageDflt = ii;
+            }
+          }
+        }
+#endif
+      }
+      pPager->noLock = sqlite3_uri_boolean(pPager->zFilename, "nolock", 0);
+      if( (iDc & SQLITE_IOCAP_IMMUTABLE)!=0
+       || sqlite3_uri_boolean(pPager->zFilename, "immutable", 0) ){
+          vfsFlags |= SQLITE_OPEN_READONLY;
+          goto act_like_temp_file;
+      }
+    }
+  }else{
+    /* If a temporary file is requested, it is not opened immediately.
+    ** In this case we accept the default page size and delay actually
+    ** opening the file until the first call to OsWrite().
+    **
+    ** This branch is also run for an in-memory database. An in-memory
+    ** database is the same as a temp-file that is never written out to
+    ** disk and uses an in-memory rollback journal.
+    **
+    ** This branch also runs for files marked as immutable.
+    */
+act_like_temp_file:
+    tempFile = 1;
+    pPager->eState = PAGER_READER;     /* Pretend we already have a lock */
+    pPager->eLock = EXCLUSIVE_LOCK;    /* Pretend we are in EXCLUSIVE mode */
+    pPager->noLock = 1;                /* Do no locking */
+    readOnly = (vfsFlags&SQLITE_OPEN_READONLY);
+  }
+
+  /* The following call to PagerSetPagesize() serves to set the value of
+  ** Pager.pageSize and to allocate the Pager.pTmpSpace buffer.
+  */
+  if( rc==SQLITE_OK ){
+    assert( pPager->memDb==0 );
+    rc = sqlite3PagerSetPagesize(pPager, &szPageDflt, -1);
+    testcase( rc!=SQLITE_OK );
+  }
+
+  /* Initialize the PCache object. */
+  if( rc==SQLITE_OK ){
+    nExtra = ROUND8(nExtra);
+    assert( nExtra>=8 && nExtra<1000 );
+    rc = sqlite3PcacheOpen(szPageDflt, nExtra, !memDb,
+                       !memDb?pagerStress:0, (void *)pPager, pPager->pPCache);
+  }
+
+  /* If an error occurred above, free the  Pager structure and close the file.
+  */
+  if( rc!=SQLITE_OK ){
+    sqlite3OsClose(pPager->fd);
+    sqlite3PageFree(pPager->pTmpSpace);
+    sqlite3_free(pPager);
+    return rc;
+  }
+
+  PAGERTRACE(("OPEN %d %s\n", FILEHANDLEID(pPager->fd), pPager->zFilename));
+  IOTRACE(("OPEN %p %s\n", pPager, pPager->zFilename))
+
+  pPager->useJournal = (u8)useJournal;
+  /* pPager->stmtOpen = 0; */
+  /* pPager->stmtInUse = 0; */
+  /* pPager->nRef = 0; */
+  /* pPager->stmtSize = 0; */
+  /* pPager->stmtJSize = 0; */
+  /* pPager->nPage = 0; */
+  pPager->mxPgno = SQLITE_MAX_PAGE_COUNT;
+  /* pPager->state = PAGER_UNLOCK; */
+  /* pPager->errMask = 0; */
+  pPager->tempFile = (u8)tempFile;
+  assert( tempFile==PAGER_LOCKINGMODE_NORMAL
+          || tempFile==PAGER_LOCKINGMODE_EXCLUSIVE );
+  assert( PAGER_LOCKINGMODE_EXCLUSIVE==1 );
+  pPager->exclusiveMode = (u8)tempFile;
+  pPager->changeCountDone = pPager->tempFile;
+  pPager->memDb = (u8)memDb;
+  pPager->readOnly = (u8)readOnly;
+  assert( useJournal || pPager->tempFile );
+  pPager->noSync = pPager->tempFile;
+  if( pPager->noSync ){
+    assert( pPager->fullSync==0 );
+    assert( pPager->extraSync==0 );
+    assert( pPager->syncFlags==0 );
+    assert( pPager->walSyncFlags==0 );
+  }else{
+    pPager->fullSync = 1;
+    pPager->extraSync = 0;
+    pPager->syncFlags = SQLITE_SYNC_NORMAL;
+    pPager->walSyncFlags = SQLITE_SYNC_NORMAL | (SQLITE_SYNC_NORMAL<<2);
+  }
+  /* pPager->pFirst = 0; */
+  /* pPager->pFirstSynced = 0; */
+  /* pPager->pLast = 0; */
+  pPager->nExtra = (u16)nExtra;
+  pPager->journalSizeLimit = SQLITE_DEFAULT_JOURNAL_SIZE_LIMIT;
+  assert( isOpen(pPager->fd) || tempFile );
+  setSectorSize(pPager);
+  if( !useJournal ){
+    pPager->journalMode = PAGER_JOURNALMODE_OFF;
+  }else if( memDb || memJM ){
+    pPager->journalMode = PAGER_JOURNALMODE_MEMORY;
+  }
+  /* pPager->xBusyHandler = 0; */
+  /* pPager->pBusyHandlerArg = 0; */
+  pPager->xReiniter = xReinit;
+  setGetterMethod(pPager);
+  /* memset(pPager->aHash, 0, sizeof(pPager->aHash)); */
+  /* pPager->szMmap = SQLITE_DEFAULT_MMAP_SIZE // will be set by btree.c */
+
+  *ppPager = pPager;
+  return SQLITE_OK;
+}
+
+/*
+** Return the sqlite3_file for the main database given the name
+** of the corresonding WAL or Journal name as passed into
+** xOpen.
+*/
+SQLITE_API sqlite3_file *sqlite3_database_file_object(const char *zName){
+  Pager *pPager;
+  while( zName[-1]!=0 || zName[-2]!=0 || zName[-3]!=0 || zName[-4]!=0 ){
+    zName--;
+  }
+  pPager = *(Pager**)(zName - 4 - sizeof(Pager*));
+  return pPager->fd;
+}
+
+
+/*
+** This function is called after transitioning from PAGER_UNLOCK to
+** PAGER_SHARED state. It tests if there is a hot journal present in
+** the file-system for the given pager. A hot journal is one that
+** needs to be played back. According to this function, a hot-journal
+** file exists if the following criteria are met:
+**
+**   * The journal file exists in the file system, and
+**   * No process holds a RESERVED or greater lock on the database file, and
+**   * The database file itself is greater than 0 bytes in size, and
+**   * The first byte of the journal file exists and is not 0x00.
+**
+** If the current size of the database file is 0 but a journal file
+** exists, that is probably an old journal left over from a prior
+** database with the same name. In this case the journal file is
+** just deleted using OsDelete, *pExists is set to 0 and SQLITE_OK
+** is returned.
+**
+** This routine does not check if there is a super-journal filename
+** at the end of the file. If there is, and that super-journal file
+** does not exist, then the journal file is not really hot. In this
+** case this routine will return a false-positive. The pager_playback()
+** routine will discover that the journal file is not really hot and
+** will not roll it back.
+**
+** If a hot-journal file is found to exist, *pExists is set to 1 and
+** SQLITE_OK returned. If no hot-journal file is present, *pExists is
+** set to 0 and SQLITE_OK returned. If an IO error occurs while trying
+** to determine whether or not a hot-journal file exists, the IO error
+** code is returned and the value of *pExists is undefined.
+*/
+static int hasHotJournal(Pager *pPager, int *pExists){
+  sqlite3_vfs * const pVfs = pPager->pVfs;
+  int rc = SQLITE_OK;           /* Return code */
+  int exists = 1;               /* True if a journal file is present */
+  int jrnlOpen = !!isOpen(pPager->jfd);
+
+  assert( pPager->useJournal );
+  assert( isOpen(pPager->fd) );
+  assert( pPager->eState==PAGER_OPEN );
+
+  assert( jrnlOpen==0 || ( sqlite3OsDeviceCharacteristics(pPager->jfd) &
+    SQLITE_IOCAP_UNDELETABLE_WHEN_OPEN
+  ));
+
+  *pExists = 0;
+  if( !jrnlOpen ){
+    rc = sqlite3OsAccess(pVfs, pPager->zJournal, SQLITE_ACCESS_EXISTS, &exists);
+  }
+  if( rc==SQLITE_OK && exists ){
+    int locked = 0;             /* True if some process holds a RESERVED lock */
+
+    /* Race condition here:  Another process might have been holding the
+    ** the RESERVED
