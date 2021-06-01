@@ -58488,4 +58488,187 @@ static int pagerStress(void *p, PgHdr *pPg){
   if( NEVER(pPager->errCode) ) return SQLITE_OK;
   testcase( pPager->doNotSpill & SPILLFLAG_ROLLBACK );
   testcase( pPager->doNotSpill & SPILLFLAG_OFF );
-  testcase( pPager->doNotSp
+  testcase( pPager->doNotSpill & SPILLFLAG_NOSYNC );
+  if( pPager->doNotSpill
+   && ((pPager->doNotSpill & (SPILLFLAG_ROLLBACK|SPILLFLAG_OFF))!=0
+      || (pPg->flags & PGHDR_NEED_SYNC)!=0)
+  ){
+    return SQLITE_OK;
+  }
+
+  pPager->aStat[PAGER_STAT_SPILL]++;
+  pPg->pDirty = 0;
+  if( pagerUseWal(pPager) ){
+    /* Write a single frame for this page to the log. */
+    rc = subjournalPageIfRequired(pPg);
+    if( rc==SQLITE_OK ){
+      rc = pagerWalFrames(pPager, pPg, 0, 0);
+    }
+  }else{
+
+#ifdef SQLITE_ENABLE_BATCH_ATOMIC_WRITE
+    if( pPager->tempFile==0 ){
+      rc = sqlite3JournalCreate(pPager->jfd);
+      if( rc!=SQLITE_OK ) return pager_error(pPager, rc);
+    }
+#endif
+
+    /* Sync the journal file if required. */
+    if( pPg->flags&PGHDR_NEED_SYNC
+     || pPager->eState==PAGER_WRITER_CACHEMOD
+    ){
+      rc = syncJournal(pPager, 1);
+    }
+
+    /* Write the contents of the page out to the database file. */
+    if( rc==SQLITE_OK ){
+      assert( (pPg->flags&PGHDR_NEED_SYNC)==0 );
+      rc = pager_write_pagelist(pPager, pPg);
+    }
+  }
+
+  /* Mark the page as clean. */
+  if( rc==SQLITE_OK ){
+    PAGERTRACE(("STRESS %d page %d\n", PAGERID(pPager), pPg->pgno));
+    sqlite3PcacheMakeClean(pPg);
+  }
+
+  return pager_error(pPager, rc);
+}
+
+/*
+** Flush all unreferenced dirty pages to disk.
+*/
+SQLITE_PRIVATE int sqlite3PagerFlush(Pager *pPager){
+  int rc = pPager->errCode;
+  if( !MEMDB ){
+    PgHdr *pList = sqlite3PcacheDirtyList(pPager->pPCache);
+    assert( assert_pager_state(pPager) );
+    while( rc==SQLITE_OK && pList ){
+      PgHdr *pNext = pList->pDirty;
+      if( pList->nRef==0 ){
+        rc = pagerStress((void*)pPager, pList);
+      }
+      pList = pNext;
+    }
+  }
+
+  return rc;
+}
+
+/*
+** Allocate and initialize a new Pager object and put a pointer to it
+** in *ppPager. The pager should eventually be freed by passing it
+** to sqlite3PagerClose().
+**
+** The zFilename argument is the path to the database file to open.
+** If zFilename is NULL then a randomly-named temporary file is created
+** and used as the file to be cached. Temporary files are be deleted
+** automatically when they are closed. If zFilename is ":memory:" then
+** all information is held in cache. It is never written to disk.
+** This can be used to implement an in-memory database.
+**
+** The nExtra parameter specifies the number of bytes of space allocated
+** along with each page reference. This space is available to the user
+** via the sqlite3PagerGetExtra() API.  When a new page is allocated, the
+** first 8 bytes of this space are zeroed but the remainder is uninitialized.
+** (The extra space is used by btree as the MemPage object.)
+**
+** The flags argument is used to specify properties that affect the
+** operation of the pager. It should be passed some bitwise combination
+** of the PAGER_* flags.
+**
+** The vfsFlags parameter is a bitmask to pass to the flags parameter
+** of the xOpen() method of the supplied VFS when opening files.
+**
+** If the pager object is allocated and the specified file opened
+** successfully, SQLITE_OK is returned and *ppPager set to point to
+** the new pager object. If an error occurs, *ppPager is set to NULL
+** and error code returned. This function may return SQLITE_NOMEM
+** (sqlite3Malloc() is used to allocate memory), SQLITE_CANTOPEN or
+** various SQLITE_IO_XXX errors.
+*/
+SQLITE_PRIVATE int sqlite3PagerOpen(
+  sqlite3_vfs *pVfs,       /* The virtual file system to use */
+  Pager **ppPager,         /* OUT: Return the Pager structure here */
+  const char *zFilename,   /* Name of the database file to open */
+  int nExtra,              /* Extra bytes append to each in-memory page */
+  int flags,               /* flags controlling this file */
+  int vfsFlags,            /* flags passed through to sqlite3_vfs.xOpen() */
+  void (*xReinit)(DbPage*) /* Function to reinitialize pages */
+){
+  u8 *pPtr;
+  Pager *pPager = 0;       /* Pager object to allocate and return */
+  int rc = SQLITE_OK;      /* Return code */
+  int tempFile = 0;        /* True for temp files (incl. in-memory files) */
+  int memDb = 0;           /* True if this is an in-memory file */
+#ifndef SQLITE_OMIT_DESERIALIZE
+  int memJM = 0;           /* Memory journal mode */
+#else
+# define memJM 0
+#endif
+  int readOnly = 0;        /* True if this is a read-only file */
+  int journalFileSize;     /* Bytes to allocate for each journal fd */
+  char *zPathname = 0;     /* Full path to database file */
+  int nPathname = 0;       /* Number of bytes in zPathname */
+  int useJournal = (flags & PAGER_OMIT_JOURNAL)==0; /* False to omit journal */
+  int pcacheSize = sqlite3PcacheSize();       /* Bytes to allocate for PCache */
+  u32 szPageDflt = SQLITE_DEFAULT_PAGE_SIZE;  /* Default page size */
+  const char *zUri = 0;    /* URI args to copy */
+  int nUriByte = 1;        /* Number of bytes of URI args at *zUri */
+  int nUri = 0;            /* Number of URI parameters */
+
+  /* Figure out how much space is required for each journal file-handle
+  ** (there are two of them, the main journal and the sub-journal).  */
+  journalFileSize = ROUND8(sqlite3JournalSize(pVfs));
+
+  /* Set the output variable to NULL in case an error occurs. */
+  *ppPager = 0;
+
+#ifndef SQLITE_OMIT_MEMORYDB
+  if( flags & PAGER_MEMORY ){
+    memDb = 1;
+    if( zFilename && zFilename[0] ){
+      zPathname = sqlite3DbStrDup(0, zFilename);
+      if( zPathname==0  ) return SQLITE_NOMEM_BKPT;
+      nPathname = sqlite3Strlen30(zPathname);
+      zFilename = 0;
+    }
+  }
+#endif
+
+  /* Compute and store the full pathname in an allocated buffer pointed
+  ** to by zPathname, length nPathname. Or, if this is a temporary file,
+  ** leave both nPathname and zPathname set to 0.
+  */
+  if( zFilename && zFilename[0] ){
+    const char *z;
+    nPathname = pVfs->mxPathname+1;
+    zPathname = sqlite3DbMallocRaw(0, nPathname*2);
+    if( zPathname==0 ){
+      return SQLITE_NOMEM_BKPT;
+    }
+    zPathname[0] = 0; /* Make sure initialized even if FullPathname() fails */
+    rc = sqlite3OsFullPathname(pVfs, zFilename, nPathname, zPathname);
+    if( rc!=SQLITE_OK ){
+      if( rc==SQLITE_OK_SYMLINK ){
+        if( vfsFlags & SQLITE_OPEN_NOFOLLOW ){
+          rc = SQLITE_CANTOPEN_SYMLINK;
+        }else{
+          rc = SQLITE_OK;
+        }
+      }
+    }
+    nPathname = sqlite3Strlen30(zPathname);
+    z = zUri = &zFilename[sqlite3Strlen30(zFilename)+1];
+    while( *z ){
+      z += strlen(z)+1;
+      z += strlen(z)+1;
+      nUri++;
+    }
+    nUriByte = (int)(&z[1] - zUri);
+    assert( nUriByte>=1 );
+    if( rc==SQLITE_OK && nPathname+8>pVfs->mxPathname ){
+      /* This branch is taken when the journal path required by
+      ** the database being opened will be more than pVfs->mxPathname
+      ** bytes in length. This means the database cannot be op
