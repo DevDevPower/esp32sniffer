@@ -58671,4 +58671,172 @@ SQLITE_PRIVATE int sqlite3PagerOpen(
     if( rc==SQLITE_OK && nPathname+8>pVfs->mxPathname ){
       /* This branch is taken when the journal path required by
       ** the database being opened will be more than pVfs->mxPathname
-      ** bytes in length. This means the database cannot be op
+      ** bytes in length. This means the database cannot be opened,
+      ** as it will not be possible to open the journal file or even
+      ** check for a hot-journal before reading.
+      */
+      rc = SQLITE_CANTOPEN_BKPT;
+    }
+    if( rc!=SQLITE_OK ){
+      sqlite3DbFree(0, zPathname);
+      return rc;
+    }
+  }
+
+  /* Allocate memory for the Pager structure, PCache object, the
+  ** three file descriptors, the database file name and the journal
+  ** file name. The layout in memory is as follows:
+  **
+  **     Pager object                    (sizeof(Pager) bytes)
+  **     PCache object                   (sqlite3PcacheSize() bytes)
+  **     Database file handle            (pVfs->szOsFile bytes)
+  **     Sub-journal file handle         (journalFileSize bytes)
+  **     Main journal file handle        (journalFileSize bytes)
+  **     Ptr back to the Pager           (sizeof(Pager*) bytes)
+  **     \0\0\0\0 database prefix        (4 bytes)
+  **     Database file name              (nPathname+1 bytes)
+  **     URI query parameters            (nUriByte bytes)
+  **     Journal filename                (nPathname+8+1 bytes)
+  **     WAL filename                    (nPathname+4+1 bytes)
+  **     \0\0\0 terminator               (3 bytes)
+  **
+  ** Some 3rd-party software, over which we have no control, depends on
+  ** the specific order of the filenames and the \0 separators between them
+  ** so that it can (for example) find the database filename given the WAL
+  ** filename without using the sqlite3_filename_database() API.  This is a
+  ** misuse of SQLite and a bug in the 3rd-party software, but the 3rd-party
+  ** software is in widespread use, so we try to avoid changing the filename
+  ** order and formatting if possible.  In particular, the details of the
+  ** filename format expected by 3rd-party software should be as follows:
+  **
+  **   - Main Database Path
+  **   - \0
+  **   - Multiple URI components consisting of:
+  **     - Key
+  **     - \0
+  **     - Value
+  **     - \0
+  **   - \0
+  **   - Journal Path
+  **   - \0
+  **   - WAL Path (zWALName)
+  **   - \0
+  **
+  ** The sqlite3_create_filename() interface and the databaseFilename() utility
+  ** that is used by sqlite3_filename_database() and kin also depend on the
+  ** specific formatting and order of the various filenames, so if the format
+  ** changes here, be sure to change it there as well.
+  */
+  pPtr = (u8 *)sqlite3MallocZero(
+    ROUND8(sizeof(*pPager)) +            /* Pager structure */
+    ROUND8(pcacheSize) +                 /* PCache object */
+    ROUND8(pVfs->szOsFile) +             /* The main db file */
+    journalFileSize * 2 +                /* The two journal files */
+    sizeof(pPager) +                     /* Space to hold a pointer */
+    4 +                                  /* Database prefix */
+    nPathname + 1 +                      /* database filename */
+    nUriByte +                           /* query parameters */
+    nPathname + 8 + 1 +                  /* Journal filename */
+#ifndef SQLITE_OMIT_WAL
+    nPathname + 4 + 1 +                  /* WAL filename */
+#endif
+    3                                    /* Terminator */
+  );
+  assert( EIGHT_BYTE_ALIGNMENT(SQLITE_INT_TO_PTR(journalFileSize)) );
+  if( !pPtr ){
+    sqlite3DbFree(0, zPathname);
+    return SQLITE_NOMEM_BKPT;
+  }
+  pPager = (Pager*)pPtr;                  pPtr += ROUND8(sizeof(*pPager));
+  pPager->pPCache = (PCache*)pPtr;        pPtr += ROUND8(pcacheSize);
+  pPager->fd = (sqlite3_file*)pPtr;       pPtr += ROUND8(pVfs->szOsFile);
+  pPager->sjfd = (sqlite3_file*)pPtr;     pPtr += journalFileSize;
+  pPager->jfd =  (sqlite3_file*)pPtr;     pPtr += journalFileSize;
+  assert( EIGHT_BYTE_ALIGNMENT(pPager->jfd) );
+  memcpy(pPtr, &pPager, sizeof(pPager));  pPtr += sizeof(pPager);
+
+  /* Fill in the Pager.zFilename and pPager.zQueryParam fields */
+                                          pPtr += 4;  /* Skip zero prefix */
+  pPager->zFilename = (char*)pPtr;
+  if( nPathname>0 ){
+    memcpy(pPtr, zPathname, nPathname);   pPtr += nPathname + 1;
+    if( zUri ){
+      memcpy(pPtr, zUri, nUriByte);       pPtr += nUriByte;
+    }else{
+                                          pPtr++;
+    }
+  }
+
+
+  /* Fill in Pager.zJournal */
+  if( nPathname>0 ){
+    pPager->zJournal = (char*)pPtr;
+    memcpy(pPtr, zPathname, nPathname);   pPtr += nPathname;
+    memcpy(pPtr, "-journal",8);           pPtr += 8 + 1;
+#ifdef SQLITE_ENABLE_8_3_NAMES
+    sqlite3FileSuffix3(zFilename,pPager->zJournal);
+    pPtr = (u8*)(pPager->zJournal + sqlite3Strlen30(pPager->zJournal)+1);
+#endif
+  }else{
+    pPager->zJournal = 0;
+  }
+
+#ifndef SQLITE_OMIT_WAL
+  /* Fill in Pager.zWal */
+  if( nPathname>0 ){
+    pPager->zWal = (char*)pPtr;
+    memcpy(pPtr, zPathname, nPathname);   pPtr += nPathname;
+    memcpy(pPtr, "-wal", 4);              pPtr += 4 + 1;
+#ifdef SQLITE_ENABLE_8_3_NAMES
+    sqlite3FileSuffix3(zFilename, pPager->zWal);
+    pPtr = (u8*)(pPager->zWal + sqlite3Strlen30(pPager->zWal)+1);
+#endif
+  }else{
+    pPager->zWal = 0;
+  }
+#endif
+  (void)pPtr;  /* Suppress warning about unused pPtr value */
+
+  if( nPathname ) sqlite3DbFree(0, zPathname);
+  pPager->pVfs = pVfs;
+  pPager->vfsFlags = vfsFlags;
+
+  /* Open the pager file.
+  */
+  if( zFilename && zFilename[0] ){
+    int fout = 0;                    /* VFS flags returned by xOpen() */
+    rc = sqlite3OsOpen(pVfs, pPager->zFilename, pPager->fd, vfsFlags, &fout);
+    assert( !memDb );
+#ifndef SQLITE_OMIT_DESERIALIZE
+    pPager->memVfs = memJM = (fout&SQLITE_OPEN_MEMORY)!=0;
+#endif
+    readOnly = (fout&SQLITE_OPEN_READONLY)!=0;
+
+    /* If the file was successfully opened for read/write access,
+    ** choose a default page size in case we have to create the
+    ** database file. The default page size is the maximum of:
+    **
+    **    + SQLITE_DEFAULT_PAGE_SIZE,
+    **    + The value returned by sqlite3OsSectorSize()
+    **    + The largest page size that can be written atomically.
+    */
+    if( rc==SQLITE_OK ){
+      int iDc = sqlite3OsDeviceCharacteristics(pPager->fd);
+      if( !readOnly ){
+        setSectorSize(pPager);
+        assert(SQLITE_DEFAULT_PAGE_SIZE<=SQLITE_MAX_DEFAULT_PAGE_SIZE);
+        if( szPageDflt<pPager->sectorSize ){
+          if( pPager->sectorSize>SQLITE_MAX_DEFAULT_PAGE_SIZE ){
+            szPageDflt = SQLITE_MAX_DEFAULT_PAGE_SIZE;
+          }else{
+            szPageDflt = (u32)pPager->sectorSize;
+          }
+        }
+#ifdef SQLITE_ENABLE_ATOMIC_WRITE
+        {
+          int ii;
+          assert(SQLITE_IOCAP_ATOMIC512==(512>>8));
+          assert(SQLITE_IOCAP_ATOMIC64K==(65536>>8));
+          assert(SQLITE_MAX_DEFAULT_PAGE_SIZE<=65536);
+          for(ii=szPageDflt; ii<=SQLITE_MAX_DEFAULT_PAGE_SIZE; ii=ii*2){
+            if( iDc&(SQLITE_
