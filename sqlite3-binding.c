@@ -58313,4 +58313,179 @@ static int pager_write_pagelist(Pager *pPager, PgHdr *pList){
     pPager->dbHintSize = pPager->dbSize;
   }
 
-  while( rc=
+  while( rc==SQLITE_OK && pList ){
+    Pgno pgno = pList->pgno;
+
+    /* If there are dirty pages in the page cache with page numbers greater
+    ** than Pager.dbSize, this means sqlite3PagerTruncateImage() was called to
+    ** make the file smaller (presumably by auto-vacuum code). Do not write
+    ** any such pages to the file.
+    **
+    ** Also, do not write out any page that has the PGHDR_DONT_WRITE flag
+    ** set (set by sqlite3PagerDontWrite()).
+    */
+    if( pgno<=pPager->dbSize && 0==(pList->flags&PGHDR_DONT_WRITE) ){
+      i64 offset = (pgno-1)*(i64)pPager->pageSize;   /* Offset to write */
+      char *pData;                                   /* Data to write */
+
+      assert( (pList->flags&PGHDR_NEED_SYNC)==0 );
+      if( pList->pgno==1 ) pager_write_changecounter(pList);
+
+      pData = pList->pData;
+
+      /* Write out the page data. */
+      rc = sqlite3OsWrite(pPager->fd, pData, pPager->pageSize, offset);
+
+      /* If page 1 was just written, update Pager.dbFileVers to match
+      ** the value now stored in the database file. If writing this
+      ** page caused the database file to grow, update dbFileSize.
+      */
+      if( pgno==1 ){
+        memcpy(&pPager->dbFileVers, &pData[24], sizeof(pPager->dbFileVers));
+      }
+      if( pgno>pPager->dbFileSize ){
+        pPager->dbFileSize = pgno;
+      }
+      pPager->aStat[PAGER_STAT_WRITE]++;
+
+      /* Update any backup objects copying the contents of this pager. */
+      sqlite3BackupUpdate(pPager->pBackup, pgno, (u8*)pList->pData);
+
+      PAGERTRACE(("STORE %d page %d hash(%08x)\n",
+                   PAGERID(pPager), pgno, pager_pagehash(pList)));
+      IOTRACE(("PGOUT %p %d\n", pPager, pgno));
+      PAGER_INCR(sqlite3_pager_writedb_count);
+    }else{
+      PAGERTRACE(("NOSTORE %d page %d\n", PAGERID(pPager), pgno));
+    }
+    pager_set_pagehash(pList);
+    pList = pList->pDirty;
+  }
+
+  return rc;
+}
+
+/*
+** Ensure that the sub-journal file is open. If it is already open, this
+** function is a no-op.
+**
+** SQLITE_OK is returned if everything goes according to plan. An
+** SQLITE_IOERR_XXX error code is returned if a call to sqlite3OsOpen()
+** fails.
+*/
+static int openSubJournal(Pager *pPager){
+  int rc = SQLITE_OK;
+  if( !isOpen(pPager->sjfd) ){
+    const int flags =  SQLITE_OPEN_SUBJOURNAL | SQLITE_OPEN_READWRITE
+      | SQLITE_OPEN_CREATE | SQLITE_OPEN_EXCLUSIVE
+      | SQLITE_OPEN_DELETEONCLOSE;
+    int nStmtSpill = sqlite3Config.nStmtSpill;
+    if( pPager->journalMode==PAGER_JOURNALMODE_MEMORY || pPager->subjInMemory ){
+      nStmtSpill = -1;
+    }
+    rc = sqlite3JournalOpen(pPager->pVfs, 0, pPager->sjfd, flags, nStmtSpill);
+  }
+  return rc;
+}
+
+/*
+** Append a record of the current state of page pPg to the sub-journal.
+**
+** If successful, set the bit corresponding to pPg->pgno in the bitvecs
+** for all open savepoints before returning.
+**
+** This function returns SQLITE_OK if everything is successful, an IO
+** error code if the attempt to write to the sub-journal fails, or
+** SQLITE_NOMEM if a malloc fails while setting a bit in a savepoint
+** bitvec.
+*/
+static int subjournalPage(PgHdr *pPg){
+  int rc = SQLITE_OK;
+  Pager *pPager = pPg->pPager;
+  if( pPager->journalMode!=PAGER_JOURNALMODE_OFF ){
+
+    /* Open the sub-journal, if it has not already been opened */
+    assert( pPager->useJournal );
+    assert( isOpen(pPager->jfd) || pagerUseWal(pPager) );
+    assert( isOpen(pPager->sjfd) || pPager->nSubRec==0 );
+    assert( pagerUseWal(pPager)
+         || pageInJournal(pPager, pPg)
+         || pPg->pgno>pPager->dbOrigSize
+    );
+    rc = openSubJournal(pPager);
+
+    /* If the sub-journal was opened successfully (or was already open),
+    ** write the journal record into the file.  */
+    if( rc==SQLITE_OK ){
+      void *pData = pPg->pData;
+      i64 offset = (i64)pPager->nSubRec*(4+pPager->pageSize);
+      char *pData2;
+      pData2 = pData;
+      PAGERTRACE(("STMT-JOURNAL %d page %d\n", PAGERID(pPager), pPg->pgno));
+      rc = write32bits(pPager->sjfd, offset, pPg->pgno);
+      if( rc==SQLITE_OK ){
+        rc = sqlite3OsWrite(pPager->sjfd, pData2, pPager->pageSize, offset+4);
+      }
+    }
+  }
+  if( rc==SQLITE_OK ){
+    pPager->nSubRec++;
+    assert( pPager->nSavepoint>0 );
+    rc = addToSavepointBitvecs(pPager, pPg->pgno);
+  }
+  return rc;
+}
+static int subjournalPageIfRequired(PgHdr *pPg){
+  if( subjRequiresPage(pPg) ){
+    return subjournalPage(pPg);
+  }else{
+    return SQLITE_OK;
+  }
+}
+
+/*
+** This function is called by the pcache layer when it has reached some
+** soft memory limit. The first argument is a pointer to a Pager object
+** (cast as a void*). The pager is always 'purgeable' (not an in-memory
+** database). The second argument is a reference to a page that is
+** currently dirty but has no outstanding references. The page
+** is always associated with the Pager object passed as the first
+** argument.
+**
+** The job of this function is to make pPg clean by writing its contents
+** out to the database file, if possible. This may involve syncing the
+** journal file.
+**
+** If successful, sqlite3PcacheMakeClean() is called on the page and
+** SQLITE_OK returned. If an IO error occurs while trying to make the
+** page clean, the IO error code is returned. If the page cannot be
+** made clean for some other reason, but no error occurs, then SQLITE_OK
+** is returned by sqlite3PcacheMakeClean() is not called.
+*/
+static int pagerStress(void *p, PgHdr *pPg){
+  Pager *pPager = (Pager *)p;
+  int rc = SQLITE_OK;
+
+  assert( pPg->pPager==pPager );
+  assert( pPg->flags&PGHDR_DIRTY );
+
+  /* The doNotSpill NOSYNC bit is set during times when doing a sync of
+  ** journal (and adding a new header) is not allowed.  This occurs
+  ** during calls to sqlite3PagerWrite() while trying to journal multiple
+  ** pages belonging to the same sector.
+  **
+  ** The doNotSpill ROLLBACK and OFF bits inhibits all cache spilling
+  ** regardless of whether or not a sync is required.  This is set during
+  ** a rollback or by user request, respectively.
+  **
+  ** Spilling is also prohibited when in an error state since that could
+  ** lead to database corruption.   In the current implementation it
+  ** is impossible for sqlite3PcacheFetch() to be called with createFlag==3
+  ** while in the error state, hence it is impossible for this routine to
+  ** be called in the error state.  Nevertheless, we include a NEVER()
+  ** test for the error state as a safeguard against future changes.
+  */
+  if( NEVER(pPager->errCode) ) return SQLITE_OK;
+  testcase( pPager->doNotSpill & SPILLFLAG_ROLLBACK );
+  testcase( pPager->doNotSpill & SPILLFLAG_OFF );
+  testcase( pPager->doNotSp
