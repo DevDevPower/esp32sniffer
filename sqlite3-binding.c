@@ -57789,4 +57789,179 @@ SQLITE_PRIVATE void sqlite3PagerPagecount(Pager *pPager, int *pnPage){
 
 
 /*
-** Try to obtain
+** Try to obtain a lock of type locktype on the database file. If
+** a similar or greater lock is already held, this function is a no-op
+** (returning SQLITE_OK immediately).
+**
+** Otherwise, attempt to obtain the lock using sqlite3OsLock(). Invoke
+** the busy callback if the lock is currently not available. Repeat
+** until the busy callback returns false or until the attempt to
+** obtain the lock succeeds.
+**
+** Return SQLITE_OK on success and an error code if we cannot obtain
+** the lock. If the lock is obtained successfully, set the Pager.state
+** variable to locktype before returning.
+*/
+static int pager_wait_on_lock(Pager *pPager, int locktype){
+  int rc;                              /* Return code */
+
+  /* Check that this is either a no-op (because the requested lock is
+  ** already held), or one of the transitions that the busy-handler
+  ** may be invoked during, according to the comment above
+  ** sqlite3PagerSetBusyhandler().
+  */
+  assert( (pPager->eLock>=locktype)
+       || (pPager->eLock==NO_LOCK && locktype==SHARED_LOCK)
+       || (pPager->eLock==RESERVED_LOCK && locktype==EXCLUSIVE_LOCK)
+  );
+
+  do {
+    rc = pagerLockDb(pPager, locktype);
+  }while( rc==SQLITE_BUSY && pPager->xBusyHandler(pPager->pBusyHandlerArg) );
+  return rc;
+}
+
+/*
+** Function assertTruncateConstraint(pPager) checks that one of the
+** following is true for all dirty pages currently in the page-cache:
+**
+**   a) The page number is less than or equal to the size of the
+**      current database image, in pages, OR
+**
+**   b) if the page content were written at this time, it would not
+**      be necessary to write the current content out to the sub-journal.
+**
+** If the condition asserted by this function were not true, and the
+** dirty page were to be discarded from the cache via the pagerStress()
+** routine, pagerStress() would not write the current page content to
+** the database file. If a savepoint transaction were rolled back after
+** this happened, the correct behavior would be to restore the current
+** content of the page. However, since this content is not present in either
+** the database file or the portion of the rollback journal and
+** sub-journal rolled back the content could not be restored and the
+** database image would become corrupt. It is therefore fortunate that
+** this circumstance cannot arise.
+*/
+#if defined(SQLITE_DEBUG)
+static void assertTruncateConstraintCb(PgHdr *pPg){
+  Pager *pPager = pPg->pPager;
+  assert( pPg->flags&PGHDR_DIRTY );
+  if( pPg->pgno>pPager->dbSize ){      /* if (a) is false */
+    Pgno pgno = pPg->pgno;
+    int i;
+    for(i=0; i<pPg->pPager->nSavepoint; i++){
+      PagerSavepoint *p = &pPager->aSavepoint[i];
+      assert( p->nOrig<pgno || sqlite3BitvecTestNotNull(p->pInSavepoint,pgno) );
+    }
+  }
+}
+static void assertTruncateConstraint(Pager *pPager){
+  sqlite3PcacheIterateDirty(pPager->pPCache, assertTruncateConstraintCb);
+}
+#else
+# define assertTruncateConstraint(pPager)
+#endif
+
+/*
+** Truncate the in-memory database file image to nPage pages. This
+** function does not actually modify the database file on disk. It
+** just sets the internal state of the pager object so that the
+** truncation will be done when the current transaction is committed.
+**
+** This function is only called right before committing a transaction.
+** Once this function has been called, the transaction must either be
+** rolled back or committed. It is not safe to call this function and
+** then continue writing to the database.
+*/
+SQLITE_PRIVATE void sqlite3PagerTruncateImage(Pager *pPager, Pgno nPage){
+  assert( pPager->dbSize>=nPage || CORRUPT_DB );
+  assert( pPager->eState>=PAGER_WRITER_CACHEMOD );
+  pPager->dbSize = nPage;
+
+  /* At one point the code here called assertTruncateConstraint() to
+  ** ensure that all pages being truncated away by this operation are,
+  ** if one or more savepoints are open, present in the savepoint
+  ** journal so that they can be restored if the savepoint is rolled
+  ** back. This is no longer necessary as this function is now only
+  ** called right before committing a transaction. So although the
+  ** Pager object may still have open savepoints (Pager.nSavepoint!=0),
+  ** they cannot be rolled back. So the assertTruncateConstraint() call
+  ** is no longer correct. */
+}
+
+
+/*
+** This function is called before attempting a hot-journal rollback. It
+** syncs the journal file to disk, then sets pPager->journalHdr to the
+** size of the journal file so that the pager_playback() routine knows
+** that the entire journal file has been synced.
+**
+** Syncing a hot-journal to disk before attempting to roll it back ensures
+** that if a power-failure occurs during the rollback, the process that
+** attempts rollback following system recovery sees the same journal
+** content as this process.
+**
+** If everything goes as planned, SQLITE_OK is returned. Otherwise,
+** an SQLite error code.
+*/
+static int pagerSyncHotJournal(Pager *pPager){
+  int rc = SQLITE_OK;
+  if( !pPager->noSync ){
+    rc = sqlite3OsSync(pPager->jfd, SQLITE_SYNC_NORMAL);
+  }
+  if( rc==SQLITE_OK ){
+    rc = sqlite3OsFileSize(pPager->jfd, &pPager->journalHdr);
+  }
+  return rc;
+}
+
+#if SQLITE_MAX_MMAP_SIZE>0
+/*
+** Obtain a reference to a memory mapped page object for page number pgno.
+** The new object will use the pointer pData, obtained from xFetch().
+** If successful, set *ppPage to point to the new page reference
+** and return SQLITE_OK. Otherwise, return an SQLite error code and set
+** *ppPage to zero.
+**
+** Page references obtained by calling this function should be released
+** by calling pagerReleaseMapPage().
+*/
+static int pagerAcquireMapPage(
+  Pager *pPager,                  /* Pager object */
+  Pgno pgno,                      /* Page number */
+  void *pData,                    /* xFetch()'d data for this page */
+  PgHdr **ppPage                  /* OUT: Acquired page object */
+){
+  PgHdr *p;                       /* Memory mapped page to return */
+
+  if( pPager->pMmapFreelist ){
+    *ppPage = p = pPager->pMmapFreelist;
+    pPager->pMmapFreelist = p->pDirty;
+    p->pDirty = 0;
+    assert( pPager->nExtra>=8 );
+    memset(p->pExtra, 0, 8);
+  }else{
+    *ppPage = p = (PgHdr *)sqlite3MallocZero(sizeof(PgHdr) + pPager->nExtra);
+    if( p==0 ){
+      sqlite3OsUnfetch(pPager->fd, (i64)(pgno-1) * pPager->pageSize, pData);
+      return SQLITE_NOMEM_BKPT;
+    }
+    p->pExtra = (void *)&p[1];
+    p->flags = PGHDR_MMAP;
+    p->nRef = 1;
+    p->pPager = pPager;
+  }
+
+  assert( p->pExtra==(void *)&p[1] );
+  assert( p->pPage==0 );
+  assert( p->flags==PGHDR_MMAP );
+  assert( p->pPager==pPager );
+  assert( p->nRef==1 );
+
+  p->pgno = pgno;
+  p->pData = pData;
+  pPager->nMmapOut++;
+
+  return SQLITE_OK;
+}
+#en
