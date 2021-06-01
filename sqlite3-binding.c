@@ -57964,4 +57964,199 @@ static int pagerAcquireMapPage(
 
   return SQLITE_OK;
 }
-#en
+#endif
+
+/*
+** Release a reference to page pPg. pPg must have been returned by an
+** earlier call to pagerAcquireMapPage().
+*/
+static void pagerReleaseMapPage(PgHdr *pPg){
+  Pager *pPager = pPg->pPager;
+  pPager->nMmapOut--;
+  pPg->pDirty = pPager->pMmapFreelist;
+  pPager->pMmapFreelist = pPg;
+
+  assert( pPager->fd->pMethods->iVersion>=3 );
+  sqlite3OsUnfetch(pPager->fd, (i64)(pPg->pgno-1)*pPager->pageSize, pPg->pData);
+}
+
+/*
+** Free all PgHdr objects stored in the Pager.pMmapFreelist list.
+*/
+static void pagerFreeMapHdrs(Pager *pPager){
+  PgHdr *p;
+  PgHdr *pNext;
+  for(p=pPager->pMmapFreelist; p; p=pNext){
+    pNext = p->pDirty;
+    sqlite3_free(p);
+  }
+}
+
+/* Verify that the database file has not be deleted or renamed out from
+** under the pager.  Return SQLITE_OK if the database is still where it ought
+** to be on disk.  Return non-zero (SQLITE_READONLY_DBMOVED or some other error
+** code from sqlite3OsAccess()) if the database has gone missing.
+*/
+static int databaseIsUnmoved(Pager *pPager){
+  int bHasMoved = 0;
+  int rc;
+
+  if( pPager->tempFile ) return SQLITE_OK;
+  if( pPager->dbSize==0 ) return SQLITE_OK;
+  assert( pPager->zFilename && pPager->zFilename[0] );
+  rc = sqlite3OsFileControl(pPager->fd, SQLITE_FCNTL_HAS_MOVED, &bHasMoved);
+  if( rc==SQLITE_NOTFOUND ){
+    /* If the HAS_MOVED file-control is unimplemented, assume that the file
+    ** has not been moved.  That is the historical behavior of SQLite: prior to
+    ** version 3.8.3, it never checked */
+    rc = SQLITE_OK;
+  }else if( rc==SQLITE_OK && bHasMoved ){
+    rc = SQLITE_READONLY_DBMOVED;
+  }
+  return rc;
+}
+
+
+/*
+** Shutdown the page cache.  Free all memory and close all files.
+**
+** If a transaction was in progress when this routine is called, that
+** transaction is rolled back.  All outstanding pages are invalidated
+** and their memory is freed.  Any attempt to use a page associated
+** with this page cache after this function returns will likely
+** result in a coredump.
+**
+** This function always succeeds. If a transaction is active an attempt
+** is made to roll it back. If an error occurs during the rollback
+** a hot journal may be left in the filesystem but no error is returned
+** to the caller.
+*/
+SQLITE_PRIVATE int sqlite3PagerClose(Pager *pPager, sqlite3 *db){
+  u8 *pTmp = (u8*)pPager->pTmpSpace;
+  assert( db || pagerUseWal(pPager)==0 );
+  assert( assert_pager_state(pPager) );
+  disable_simulated_io_errors();
+  sqlite3BeginBenignMalloc();
+  pagerFreeMapHdrs(pPager);
+  /* pPager->errCode = 0; */
+  pPager->exclusiveMode = 0;
+#ifndef SQLITE_OMIT_WAL
+  {
+    u8 *a = 0;
+    assert( db || pPager->pWal==0 );
+    if( db && 0==(db->flags & SQLITE_NoCkptOnClose)
+     && SQLITE_OK==databaseIsUnmoved(pPager)
+    ){
+      a = pTmp;
+    }
+    sqlite3WalClose(pPager->pWal, db, pPager->walSyncFlags, pPager->pageSize,a);
+    pPager->pWal = 0;
+  }
+#endif
+  pager_reset(pPager);
+  if( MEMDB ){
+    pager_unlock(pPager);
+  }else{
+    /* If it is open, sync the journal file before calling UnlockAndRollback.
+    ** If this is not done, then an unsynced portion of the open journal
+    ** file may be played back into the database. If a power failure occurs
+    ** while this is happening, the database could become corrupt.
+    **
+    ** If an error occurs while trying to sync the journal, shift the pager
+    ** into the ERROR state. This causes UnlockAndRollback to unlock the
+    ** database and close the journal file without attempting to roll it
+    ** back or finalize it. The next database user will have to do hot-journal
+    ** rollback before accessing the database file.
+    */
+    if( isOpen(pPager->jfd) ){
+      pager_error(pPager, pagerSyncHotJournal(pPager));
+    }
+    pagerUnlockAndRollback(pPager);
+  }
+  sqlite3EndBenignMalloc();
+  enable_simulated_io_errors();
+  PAGERTRACE(("CLOSE %d\n", PAGERID(pPager)));
+  IOTRACE(("CLOSE %p\n", pPager))
+  sqlite3OsClose(pPager->jfd);
+  sqlite3OsClose(pPager->fd);
+  sqlite3PageFree(pTmp);
+  sqlite3PcacheClose(pPager->pPCache);
+  assert( !pPager->aSavepoint && !pPager->pInJournal );
+  assert( !isOpen(pPager->jfd) && !isOpen(pPager->sjfd) );
+
+  sqlite3_free(pPager);
+  return SQLITE_OK;
+}
+
+#if !defined(NDEBUG) || defined(SQLITE_TEST)
+/*
+** Return the page number for page pPg.
+*/
+SQLITE_PRIVATE Pgno sqlite3PagerPagenumber(DbPage *pPg){
+  return pPg->pgno;
+}
+#endif
+
+/*
+** Increment the reference count for page pPg.
+*/
+SQLITE_PRIVATE void sqlite3PagerRef(DbPage *pPg){
+  sqlite3PcacheRef(pPg);
+}
+
+/*
+** Sync the journal. In other words, make sure all the pages that have
+** been written to the journal have actually reached the surface of the
+** disk and can be restored in the event of a hot-journal rollback.
+**
+** If the Pager.noSync flag is set, then this function is a no-op.
+** Otherwise, the actions required depend on the journal-mode and the
+** device characteristics of the file-system, as follows:
+**
+**   * If the journal file is an in-memory journal file, no action need
+**     be taken.
+**
+**   * Otherwise, if the device does not support the SAFE_APPEND property,
+**     then the nRec field of the most recently written journal header
+**     is updated to contain the number of journal records that have
+**     been written following it. If the pager is operating in full-sync
+**     mode, then the journal file is synced before this field is updated.
+**
+**   * If the device does not support the SEQUENTIAL property, then
+**     journal file is synced.
+**
+** Or, in pseudo-code:
+**
+**   if( NOT <in-memory journal> ){
+**     if( NOT SAFE_APPEND ){
+**       if( <full-sync mode> ) xSync(<journal file>);
+**       <update nRec field>
+**     }
+**     if( NOT SEQUENTIAL ) xSync(<journal file>);
+**   }
+**
+** If successful, this routine clears the PGHDR_NEED_SYNC flag of every
+** page currently held in memory before returning SQLITE_OK. If an IO
+** error is encountered, then the IO error code is returned to the caller.
+*/
+static int syncJournal(Pager *pPager, int newHdr){
+  int rc;                         /* Return code */
+
+  assert( pPager->eState==PAGER_WRITER_CACHEMOD
+       || pPager->eState==PAGER_WRITER_DBMOD
+  );
+  assert( assert_pager_state(pPager) );
+  assert( !pagerUseWal(pPager) );
+
+  rc = sqlite3PagerExclusiveLock(pPager);
+  if( rc!=SQLITE_OK ) return rc;
+
+  if( !pPager->noSync ){
+    assert( !pPager->tempFile );
+    if( isOpen(pPager->jfd) && pPager->journalMode!=PAGER_JOURNALMODE_MEMORY ){
+      const int iDc = sqlite3OsDeviceCharacteristics(pPager->fd);
+      assert( isOpen(pPager->jfd) );
+
+      if( 0==(iDc&SQLITE_IOCAP_SAFE_APPEND) ){
+        /* This block deals with an obscure problem. If the last connection
+        ** that wrote to this database was oper
