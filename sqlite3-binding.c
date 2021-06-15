@@ -59699,4 +59699,190 @@ static int pager_open_journal(Pager *pPager){
       return SQLITE_NOMEM_BKPT;
     }
 
-    /* Open the journal file if it is not already open.
+    /* Open the journal file if it is not already open. */
+    if( !isOpen(pPager->jfd) ){
+      if( pPager->journalMode==PAGER_JOURNALMODE_MEMORY ){
+        sqlite3MemJournalOpen(pPager->jfd);
+      }else{
+        int flags = SQLITE_OPEN_READWRITE|SQLITE_OPEN_CREATE;
+        int nSpill;
+
+        if( pPager->tempFile ){
+          flags |= (SQLITE_OPEN_DELETEONCLOSE|SQLITE_OPEN_TEMP_JOURNAL);
+          nSpill = sqlite3Config.nStmtSpill;
+        }else{
+          flags |= SQLITE_OPEN_MAIN_JOURNAL;
+          nSpill = jrnlBufferSize(pPager);
+        }
+
+        /* Verify that the database still has the same name as it did when
+        ** it was originally opened. */
+        rc = databaseIsUnmoved(pPager);
+        if( rc==SQLITE_OK ){
+          rc = sqlite3JournalOpen (
+              pVfs, pPager->zJournal, pPager->jfd, flags, nSpill
+          );
+        }
+      }
+      assert( rc!=SQLITE_OK || isOpen(pPager->jfd) );
+    }
+
+
+    /* Write the first journal header to the journal file and open
+    ** the sub-journal if necessary.
+    */
+    if( rc==SQLITE_OK ){
+      /* TODO: Check if all of these are really required. */
+      pPager->nRec = 0;
+      pPager->journalOff = 0;
+      pPager->setSuper = 0;
+      pPager->journalHdr = 0;
+      rc = writeJournalHdr(pPager);
+    }
+  }
+
+  if( rc!=SQLITE_OK ){
+    sqlite3BitvecDestroy(pPager->pInJournal);
+    pPager->pInJournal = 0;
+    pPager->journalOff = 0;
+  }else{
+    assert( pPager->eState==PAGER_WRITER_LOCKED );
+    pPager->eState = PAGER_WRITER_CACHEMOD;
+  }
+
+  return rc;
+}
+
+/*
+** Begin a write-transaction on the specified pager object. If a
+** write-transaction has already been opened, this function is a no-op.
+**
+** If the exFlag argument is false, then acquire at least a RESERVED
+** lock on the database file. If exFlag is true, then acquire at least
+** an EXCLUSIVE lock. If such a lock is already held, no locking
+** functions need be called.
+**
+** If the subjInMemory argument is non-zero, then any sub-journal opened
+** within this transaction will be opened as an in-memory file. This
+** has no effect if the sub-journal is already opened (as it may be when
+** running in exclusive mode) or if the transaction does not require a
+** sub-journal. If the subjInMemory argument is zero, then any required
+** sub-journal is implemented in-memory if pPager is an in-memory database,
+** or using a temporary file otherwise.
+*/
+SQLITE_PRIVATE int sqlite3PagerBegin(Pager *pPager, int exFlag, int subjInMemory){
+  int rc = SQLITE_OK;
+
+  if( pPager->errCode ) return pPager->errCode;
+  assert( pPager->eState>=PAGER_READER && pPager->eState<PAGER_ERROR );
+  pPager->subjInMemory = (u8)subjInMemory;
+
+  if( pPager->eState==PAGER_READER ){
+    assert( pPager->pInJournal==0 );
+
+    if( pagerUseWal(pPager) ){
+      /* If the pager is configured to use locking_mode=exclusive, and an
+      ** exclusive lock on the database is not already held, obtain it now.
+      */
+      if( pPager->exclusiveMode && sqlite3WalExclusiveMode(pPager->pWal, -1) ){
+        rc = pagerLockDb(pPager, EXCLUSIVE_LOCK);
+        if( rc!=SQLITE_OK ){
+          return rc;
+        }
+        (void)sqlite3WalExclusiveMode(pPager->pWal, 1);
+      }
+
+      /* Grab the write lock on the log file. If successful, upgrade to
+      ** PAGER_RESERVED state. Otherwise, return an error code to the caller.
+      ** The busy-handler is not invoked if another connection already
+      ** holds the write-lock. If possible, the upper layer will call it.
+      */
+      rc = sqlite3WalBeginWriteTransaction(pPager->pWal);
+    }else{
+      /* Obtain a RESERVED lock on the database file. If the exFlag parameter
+      ** is true, then immediately upgrade this to an EXCLUSIVE lock. The
+      ** busy-handler callback can be used when upgrading to the EXCLUSIVE
+      ** lock, but not when obtaining the RESERVED lock.
+      */
+      rc = pagerLockDb(pPager, RESERVED_LOCK);
+      if( rc==SQLITE_OK && exFlag ){
+        rc = pager_wait_on_lock(pPager, EXCLUSIVE_LOCK);
+      }
+    }
+
+    if( rc==SQLITE_OK ){
+      /* Change to WRITER_LOCKED state.
+      **
+      ** WAL mode sets Pager.eState to PAGER_WRITER_LOCKED or CACHEMOD
+      ** when it has an open transaction, but never to DBMOD or FINISHED.
+      ** This is because in those states the code to roll back savepoint
+      ** transactions may copy data from the sub-journal into the database
+      ** file as well as into the page cache. Which would be incorrect in
+      ** WAL mode.
+      */
+      pPager->eState = PAGER_WRITER_LOCKED;
+      pPager->dbHintSize = pPager->dbSize;
+      pPager->dbFileSize = pPager->dbSize;
+      pPager->dbOrigSize = pPager->dbSize;
+      pPager->journalOff = 0;
+    }
+
+    assert( rc==SQLITE_OK || pPager->eState==PAGER_READER );
+    assert( rc!=SQLITE_OK || pPager->eState==PAGER_WRITER_LOCKED );
+    assert( assert_pager_state(pPager) );
+  }
+
+  PAGERTRACE(("TRANSACTION %d\n", PAGERID(pPager)));
+  return rc;
+}
+
+/*
+** Write page pPg onto the end of the rollback journal.
+*/
+static SQLITE_NOINLINE int pagerAddPageToRollbackJournal(PgHdr *pPg){
+  Pager *pPager = pPg->pPager;
+  int rc;
+  u32 cksum;
+  char *pData2;
+  i64 iOff = pPager->journalOff;
+
+  /* We should never write to the journal file the page that
+  ** contains the database locks.  The following assert verifies
+  ** that we do not. */
+  assert( pPg->pgno!=PAGER_SJ_PGNO(pPager) );
+
+  assert( pPager->journalHdr<=pPager->journalOff );
+  pData2 = pPg->pData;
+  cksum = pager_cksum(pPager, (u8*)pData2);
+
+  /* Even if an IO or diskfull error occurs while journalling the
+  ** page in the block above, set the need-sync flag for the page.
+  ** Otherwise, when the transaction is rolled back, the logic in
+  ** playback_one_page() will think that the page needs to be restored
+  ** in the database file. And if an IO error occurs while doing so,
+  ** then corruption may follow.
+  */
+  pPg->flags |= PGHDR_NEED_SYNC;
+
+  rc = write32bits(pPager->jfd, iOff, pPg->pgno);
+  if( rc!=SQLITE_OK ) return rc;
+  rc = sqlite3OsWrite(pPager->jfd, pData2, pPager->pageSize, iOff+4);
+  if( rc!=SQLITE_OK ) return rc;
+  rc = write32bits(pPager->jfd, iOff+pPager->pageSize+4, cksum);
+  if( rc!=SQLITE_OK ) return rc;
+
+  IOTRACE(("JOUT %p %d %lld %d\n", pPager, pPg->pgno,
+           pPager->journalOff, pPager->pageSize));
+  PAGER_INCR(sqlite3_pager_writej_count);
+  PAGERTRACE(("JOURNAL %d page %d needSync=%d hash(%08x)\n",
+       PAGERID(pPager), pPg->pgno,
+       ((pPg->flags&PGHDR_NEED_SYNC)?1:0), pager_pagehash(pPg)));
+
+  pPager->journalOff += 8 + pPager->pageSize;
+  pPager->nRec++;
+  assert( pPager->pInJournal!=0 );
+  rc = sqlite3BitvecSet(pPager->pInJournal, pPg->pgno);
+  testcase( rc==SQLITE_NOMEM );
+  assert( rc==SQLITE_OK || rc==SQLITE_NOMEM );
+  rc |= addToSavepointBitvecs(pPager, pPg->pgno);
+  assert( rc==SQLIT
