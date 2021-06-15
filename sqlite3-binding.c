@@ -59515,4 +59515,188 @@ static int getPageMMap(
   u32 iFrame = 0;                 /* Frame to read from WAL file */
 
   /* It is acceptable to use a read-only (mmap) page for any page except
-  ** page 1 if there is 
+  ** page 1 if there is no write-transaction open or the ACQUIRE_READONLY
+  ** flag was specified by the caller. And so long as the db is not a
+  ** temporary or in-memory database.  */
+  const int bMmapOk = (pgno>1
+   && (pPager->eState==PAGER_READER || (flags & PAGER_GET_READONLY))
+  );
+
+  assert( USEFETCH(pPager) );
+
+  /* Optimization note:  Adding the "pgno<=1" term before "pgno==0" here
+  ** allows the compiler optimizer to reuse the results of the "pgno>1"
+  ** test in the previous statement, and avoid testing pgno==0 in the
+  ** common case where pgno is large. */
+  if( pgno<=1 && pgno==0 ){
+    return SQLITE_CORRUPT_BKPT;
+  }
+  assert( pPager->eState>=PAGER_READER );
+  assert( assert_pager_state(pPager) );
+  assert( pPager->hasHeldSharedLock==1 );
+  assert( pPager->errCode==SQLITE_OK );
+
+  if( bMmapOk && pagerUseWal(pPager) ){
+    rc = sqlite3WalFindFrame(pPager->pWal, pgno, &iFrame);
+    if( rc!=SQLITE_OK ){
+      *ppPage = 0;
+      return rc;
+    }
+  }
+  if( bMmapOk && iFrame==0 ){
+    void *pData = 0;
+    rc = sqlite3OsFetch(pPager->fd,
+        (i64)(pgno-1) * pPager->pageSize, pPager->pageSize, &pData
+    );
+    if( rc==SQLITE_OK && pData ){
+      if( pPager->eState>PAGER_READER || pPager->tempFile ){
+        pPg = sqlite3PagerLookup(pPager, pgno);
+      }
+      if( pPg==0 ){
+        rc = pagerAcquireMapPage(pPager, pgno, pData, &pPg);
+      }else{
+        sqlite3OsUnfetch(pPager->fd, (i64)(pgno-1)*pPager->pageSize, pData);
+      }
+      if( pPg ){
+        assert( rc==SQLITE_OK );
+        *ppPage = pPg;
+        return SQLITE_OK;
+      }
+    }
+    if( rc!=SQLITE_OK ){
+      *ppPage = 0;
+      return rc;
+    }
+  }
+  return getPageNormal(pPager, pgno, ppPage, flags);
+}
+#endif /* SQLITE_MAX_MMAP_SIZE>0 */
+
+/* The page getter method for when the pager is an error state */
+static int getPageError(
+  Pager *pPager,      /* The pager open on the database file */
+  Pgno pgno,          /* Page number to fetch */
+  DbPage **ppPage,    /* Write a pointer to the page here */
+  int flags           /* PAGER_GET_XXX flags */
+){
+  UNUSED_PARAMETER(pgno);
+  UNUSED_PARAMETER(flags);
+  assert( pPager->errCode!=SQLITE_OK );
+  *ppPage = 0;
+  return pPager->errCode;
+}
+
+
+/* Dispatch all page fetch requests to the appropriate getter method.
+*/
+SQLITE_PRIVATE int sqlite3PagerGet(
+  Pager *pPager,      /* The pager open on the database file */
+  Pgno pgno,          /* Page number to fetch */
+  DbPage **ppPage,    /* Write a pointer to the page here */
+  int flags           /* PAGER_GET_XXX flags */
+){
+  /* printf("PAGE %u\n", pgno); fflush(stdout); */
+  return pPager->xGet(pPager, pgno, ppPage, flags);
+}
+
+/*
+** Acquire a page if it is already in the in-memory cache.  Do
+** not read the page from disk.  Return a pointer to the page,
+** or 0 if the page is not in cache.
+**
+** See also sqlite3PagerGet().  The difference between this routine
+** and sqlite3PagerGet() is that _get() will go to the disk and read
+** in the page if the page is not already in cache.  This routine
+** returns NULL if the page is not in cache or if a disk I/O error
+** has ever happened.
+*/
+SQLITE_PRIVATE DbPage *sqlite3PagerLookup(Pager *pPager, Pgno pgno){
+  sqlite3_pcache_page *pPage;
+  assert( pPager!=0 );
+  assert( pgno!=0 );
+  assert( pPager->pPCache!=0 );
+  pPage = sqlite3PcacheFetch(pPager->pPCache, pgno, 0);
+  assert( pPage==0 || pPager->hasHeldSharedLock );
+  if( pPage==0 ) return 0;
+  return sqlite3PcacheFetchFinish(pPager->pPCache, pgno, pPage);
+}
+
+/*
+** Release a page reference.
+**
+** The sqlite3PagerUnref() and sqlite3PagerUnrefNotNull() may only be
+** used if we know that the page being released is not the last page.
+** The btree layer always holds page1 open until the end, so these first
+** to routines can be used to release any page other than BtShared.pPage1.
+**
+** Use sqlite3PagerUnrefPageOne() to release page1.  This latter routine
+** checks the total number of outstanding pages and if the number of
+** pages reaches zero it drops the database lock.
+*/
+SQLITE_PRIVATE void sqlite3PagerUnrefNotNull(DbPage *pPg){
+  TESTONLY( Pager *pPager = pPg->pPager; )
+  assert( pPg!=0 );
+  if( pPg->flags & PGHDR_MMAP ){
+    assert( pPg->pgno!=1 );  /* Page1 is never memory mapped */
+    pagerReleaseMapPage(pPg);
+  }else{
+    sqlite3PcacheRelease(pPg);
+  }
+  /* Do not use this routine to release the last reference to page1 */
+  assert( sqlite3PcacheRefCount(pPager->pPCache)>0 );
+}
+SQLITE_PRIVATE void sqlite3PagerUnref(DbPage *pPg){
+  if( pPg ) sqlite3PagerUnrefNotNull(pPg);
+}
+SQLITE_PRIVATE void sqlite3PagerUnrefPageOne(DbPage *pPg){
+  Pager *pPager;
+  assert( pPg!=0 );
+  assert( pPg->pgno==1 );
+  assert( (pPg->flags & PGHDR_MMAP)==0 ); /* Page1 is never memory mapped */
+  pPager = pPg->pPager;
+  sqlite3PcacheRelease(pPg);
+  pagerUnlockIfUnused(pPager);
+}
+
+/*
+** This function is called at the start of every write transaction.
+** There must already be a RESERVED or EXCLUSIVE lock on the database
+** file when this routine is called.
+**
+** Open the journal file for pager pPager and write a journal header
+** to the start of it. If there are active savepoints, open the sub-journal
+** as well. This function is only used when the journal file is being
+** opened to write a rollback log for a transaction. It is not used
+** when opening a hot journal file to roll it back.
+**
+** If the journal file is already open (as it may be in exclusive mode),
+** then this function just writes a journal header to the start of the
+** already open file.
+**
+** Whether or not the journal file is opened by this function, the
+** Pager.pInJournal bitvec structure is allocated.
+**
+** Return SQLITE_OK if everything is successful. Otherwise, return
+** SQLITE_NOMEM if the attempt to allocate Pager.pInJournal fails, or
+** an IO error code if opening or writing the journal file fails.
+*/
+static int pager_open_journal(Pager *pPager){
+  int rc = SQLITE_OK;                        /* Return code */
+  sqlite3_vfs * const pVfs = pPager->pVfs;   /* Local cache of vfs pointer */
+
+  assert( pPager->eState==PAGER_WRITER_LOCKED );
+  assert( assert_pager_state(pPager) );
+  assert( pPager->pInJournal==0 );
+
+  /* If already in the error state, this function is a no-op.  But on
+  ** the other hand, this routine is never called if we are already in
+  ** an error state. */
+  if( NEVER(pPager->errCode) ) return pPager->errCode;
+
+  if( !pagerUseWal(pPager) && pPager->journalMode!=PAGER_JOURNALMODE_OFF ){
+    pPager->pInJournal = sqlite3BitvecCreate(pPager->dbSize);
+    if( pPager->pInJournal==0 ){
+      return SQLITE_NOMEM_BKPT;
+    }
+
+    /* Open the journal file if it is not already open.
