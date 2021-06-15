@@ -59885,4 +59885,189 @@ static SQLITE_NOINLINE int pagerAddPageToRollbackJournal(PgHdr *pPg){
   testcase( rc==SQLITE_NOMEM );
   assert( rc==SQLITE_OK || rc==SQLITE_NOMEM );
   rc |= addToSavepointBitvecs(pPager, pPg->pgno);
-  assert( rc==SQLIT
+  assert( rc==SQLITE_OK || rc==SQLITE_NOMEM );
+  return rc;
+}
+
+/*
+** Mark a single data page as writeable. The page is written into the
+** main journal or sub-journal as required. If the page is written into
+** one of the journals, the corresponding bit is set in the
+** Pager.pInJournal bitvec and the PagerSavepoint.pInSavepoint bitvecs
+** of any open savepoints as appropriate.
+*/
+static int pager_write(PgHdr *pPg){
+  Pager *pPager = pPg->pPager;
+  int rc = SQLITE_OK;
+
+  /* This routine is not called unless a write-transaction has already
+  ** been started. The journal file may or may not be open at this point.
+  ** It is never called in the ERROR state.
+  */
+  assert( pPager->eState==PAGER_WRITER_LOCKED
+       || pPager->eState==PAGER_WRITER_CACHEMOD
+       || pPager->eState==PAGER_WRITER_DBMOD
+  );
+  assert( assert_pager_state(pPager) );
+  assert( pPager->errCode==0 );
+  assert( pPager->readOnly==0 );
+  CHECK_PAGE(pPg);
+
+  /* The journal file needs to be opened. Higher level routines have already
+  ** obtained the necessary locks to begin the write-transaction, but the
+  ** rollback journal might not yet be open. Open it now if this is the case.
+  **
+  ** This is done before calling sqlite3PcacheMakeDirty() on the page.
+  ** Otherwise, if it were done after calling sqlite3PcacheMakeDirty(), then
+  ** an error might occur and the pager would end up in WRITER_LOCKED state
+  ** with pages marked as dirty in the cache.
+  */
+  if( pPager->eState==PAGER_WRITER_LOCKED ){
+    rc = pager_open_journal(pPager);
+    if( rc!=SQLITE_OK ) return rc;
+  }
+  assert( pPager->eState>=PAGER_WRITER_CACHEMOD );
+  assert( assert_pager_state(pPager) );
+
+  /* Mark the page that is about to be modified as dirty. */
+  sqlite3PcacheMakeDirty(pPg);
+
+  /* If a rollback journal is in use, them make sure the page that is about
+  ** to change is in the rollback journal, or if the page is a new page off
+  ** then end of the file, make sure it is marked as PGHDR_NEED_SYNC.
+  */
+  assert( (pPager->pInJournal!=0) == isOpen(pPager->jfd) );
+  if( pPager->pInJournal!=0
+   && sqlite3BitvecTestNotNull(pPager->pInJournal, pPg->pgno)==0
+  ){
+    assert( pagerUseWal(pPager)==0 );
+    if( pPg->pgno<=pPager->dbOrigSize ){
+      rc = pagerAddPageToRollbackJournal(pPg);
+      if( rc!=SQLITE_OK ){
+        return rc;
+      }
+    }else{
+      if( pPager->eState!=PAGER_WRITER_DBMOD ){
+        pPg->flags |= PGHDR_NEED_SYNC;
+      }
+      PAGERTRACE(("APPEND %d page %d needSync=%d\n",
+              PAGERID(pPager), pPg->pgno,
+             ((pPg->flags&PGHDR_NEED_SYNC)?1:0)));
+    }
+  }
+
+  /* The PGHDR_DIRTY bit is set above when the page was added to the dirty-list
+  ** and before writing the page into the rollback journal.  Wait until now,
+  ** after the page has been successfully journalled, before setting the
+  ** PGHDR_WRITEABLE bit that indicates that the page can be safely modified.
+  */
+  pPg->flags |= PGHDR_WRITEABLE;
+
+  /* If the statement journal is open and the page is not in it,
+  ** then write the page into the statement journal.
+  */
+  if( pPager->nSavepoint>0 ){
+    rc = subjournalPageIfRequired(pPg);
+  }
+
+  /* Update the database size and return. */
+  if( pPager->dbSize<pPg->pgno ){
+    pPager->dbSize = pPg->pgno;
+  }
+  return rc;
+}
+
+/*
+** This is a variant of sqlite3PagerWrite() that runs when the sector size
+** is larger than the page size.  SQLite makes the (reasonable) assumption that
+** all bytes of a sector are written together by hardware.  Hence, all bytes of
+** a sector need to be journalled in case of a power loss in the middle of
+** a write.
+**
+** Usually, the sector size is less than or equal to the page size, in which
+** case pages can be individually written.  This routine only runs in the
+** exceptional case where the page size is smaller than the sector size.
+*/
+static SQLITE_NOINLINE int pagerWriteLargeSector(PgHdr *pPg){
+  int rc = SQLITE_OK;          /* Return code */
+  Pgno nPageCount;             /* Total number of pages in database file */
+  Pgno pg1;                    /* First page of the sector pPg is located on. */
+  int nPage = 0;               /* Number of pages starting at pg1 to journal */
+  int ii;                      /* Loop counter */
+  int needSync = 0;            /* True if any page has PGHDR_NEED_SYNC */
+  Pager *pPager = pPg->pPager; /* The pager that owns pPg */
+  Pgno nPagePerSector = (pPager->sectorSize/pPager->pageSize);
+
+  /* Set the doNotSpill NOSYNC bit to 1. This is because we cannot allow
+  ** a journal header to be written between the pages journaled by
+  ** this function.
+  */
+  assert( !MEMDB );
+  assert( (pPager->doNotSpill & SPILLFLAG_NOSYNC)==0 );
+  pPager->doNotSpill |= SPILLFLAG_NOSYNC;
+
+  /* This trick assumes that both the page-size and sector-size are
+  ** an integer power of 2. It sets variable pg1 to the identifier
+  ** of the first page of the sector pPg is located on.
+  */
+  pg1 = ((pPg->pgno-1) & ~(nPagePerSector-1)) + 1;
+
+  nPageCount = pPager->dbSize;
+  if( pPg->pgno>nPageCount ){
+    nPage = (pPg->pgno - pg1)+1;
+  }else if( (pg1+nPagePerSector-1)>nPageCount ){
+    nPage = nPageCount+1-pg1;
+  }else{
+    nPage = nPagePerSector;
+  }
+  assert(nPage>0);
+  assert(pg1<=pPg->pgno);
+  assert((pg1+nPage)>pPg->pgno);
+
+  for(ii=0; ii<nPage && rc==SQLITE_OK; ii++){
+    Pgno pg = pg1+ii;
+    PgHdr *pPage;
+    if( pg==pPg->pgno || !sqlite3BitvecTest(pPager->pInJournal, pg) ){
+      if( pg!=PAGER_SJ_PGNO(pPager) ){
+        rc = sqlite3PagerGet(pPager, pg, &pPage, 0);
+        if( rc==SQLITE_OK ){
+          rc = pager_write(pPage);
+          if( pPage->flags&PGHDR_NEED_SYNC ){
+            needSync = 1;
+          }
+          sqlite3PagerUnrefNotNull(pPage);
+        }
+      }
+    }else if( (pPage = sqlite3PagerLookup(pPager, pg))!=0 ){
+      if( pPage->flags&PGHDR_NEED_SYNC ){
+        needSync = 1;
+      }
+      sqlite3PagerUnrefNotNull(pPage);
+    }
+  }
+
+  /* If the PGHDR_NEED_SYNC flag is set for any of the nPage pages
+  ** starting at pg1, then it needs to be set for all of them. Because
+  ** writing to any of these nPage pages may damage the others, the
+  ** journal file must contain sync()ed copies of all of them
+  ** before any of them can be written out to the database file.
+  */
+  if( rc==SQLITE_OK && needSync ){
+    assert( !MEMDB );
+    for(ii=0; ii<nPage; ii++){
+      PgHdr *pPage = sqlite3PagerLookup(pPager, pg1+ii);
+      if( pPage ){
+        pPage->flags |= PGHDR_NEED_SYNC;
+        sqlite3PagerUnrefNotNull(pPage);
+      }
+    }
+  }
+
+  assert( (pPager->doNotSpill & SPILLFLAG_NOSYNC)!=0 );
+  pPager->doNotSpill &= ~SPILLFLAG_NOSYNC;
+  return rc;
+}
+
+/*
+** Mark a data page as writeable. This routine must be called before
+** making changes to a page. The caller must check the return value
