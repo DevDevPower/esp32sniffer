@@ -60579,4 +60579,191 @@ SQLITE_PRIVATE int sqlite3PagerCommitPhaseTwo(Pager *pPager){
   }
 
   PAGERTRACE(("COMMIT %d\n", PAGERID(pPager)));
-  rc = pager_end_tra
+  rc = pager_end_transaction(pPager, pPager->setSuper, 1);
+  return pager_error(pPager, rc);
+}
+
+/*
+** If a write transaction is open, then all changes made within the
+** transaction are reverted and the current write-transaction is closed.
+** The pager falls back to PAGER_READER state if successful, or PAGER_ERROR
+** state if an error occurs.
+**
+** If the pager is already in PAGER_ERROR state when this function is called,
+** it returns Pager.errCode immediately. No work is performed in this case.
+**
+** Otherwise, in rollback mode, this function performs two functions:
+**
+**   1) It rolls back the journal file, restoring all database file and
+**      in-memory cache pages to the state they were in when the transaction
+**      was opened, and
+**
+**   2) It finalizes the journal file, so that it is not used for hot
+**      rollback at any point in the future.
+**
+** Finalization of the journal file (task 2) is only performed if the
+** rollback is successful.
+**
+** In WAL mode, all cache-entries containing data modified within the
+** current transaction are either expelled from the cache or reverted to
+** their pre-transaction state by re-reading data from the database or
+** WAL files. The WAL transaction is then closed.
+*/
+SQLITE_PRIVATE int sqlite3PagerRollback(Pager *pPager){
+  int rc = SQLITE_OK;                  /* Return code */
+  PAGERTRACE(("ROLLBACK %d\n", PAGERID(pPager)));
+
+  /* PagerRollback() is a no-op if called in READER or OPEN state. If
+  ** the pager is already in the ERROR state, the rollback is not
+  ** attempted here. Instead, the error code is returned to the caller.
+  */
+  assert( assert_pager_state(pPager) );
+  if( pPager->eState==PAGER_ERROR ) return pPager->errCode;
+  if( pPager->eState<=PAGER_READER ) return SQLITE_OK;
+
+  if( pagerUseWal(pPager) ){
+    int rc2;
+    rc = sqlite3PagerSavepoint(pPager, SAVEPOINT_ROLLBACK, -1);
+    rc2 = pager_end_transaction(pPager, pPager->setSuper, 0);
+    if( rc==SQLITE_OK ) rc = rc2;
+  }else if( !isOpen(pPager->jfd) || pPager->eState==PAGER_WRITER_LOCKED ){
+    int eState = pPager->eState;
+    rc = pager_end_transaction(pPager, 0, 0);
+    if( !MEMDB && eState>PAGER_WRITER_LOCKED ){
+      /* This can happen using journal_mode=off. Move the pager to the error
+      ** state to indicate that the contents of the cache may not be trusted.
+      ** Any active readers will get SQLITE_ABORT.
+      */
+      pPager->errCode = SQLITE_ABORT;
+      pPager->eState = PAGER_ERROR;
+      setGetterMethod(pPager);
+      return rc;
+    }
+  }else{
+    rc = pager_playback(pPager, 0);
+  }
+
+  assert( pPager->eState==PAGER_READER || rc!=SQLITE_OK );
+  assert( rc==SQLITE_OK || rc==SQLITE_FULL || rc==SQLITE_CORRUPT
+          || rc==SQLITE_NOMEM || (rc&0xFF)==SQLITE_IOERR
+          || rc==SQLITE_CANTOPEN
+  );
+
+  /* If an error occurs during a ROLLBACK, we can no longer trust the pager
+  ** cache. So call pager_error() on the way out to make any error persistent.
+  */
+  return pager_error(pPager, rc);
+}
+
+/*
+** Return TRUE if the database file is opened read-only.  Return FALSE
+** if the database is (in theory) writable.
+*/
+SQLITE_PRIVATE u8 sqlite3PagerIsreadonly(Pager *pPager){
+  return pPager->readOnly;
+}
+
+#ifdef SQLITE_DEBUG
+/*
+** Return the sum of the reference counts for all pages held by pPager.
+*/
+SQLITE_PRIVATE int sqlite3PagerRefcount(Pager *pPager){
+  return sqlite3PcacheRefCount(pPager->pPCache);
+}
+#endif
+
+/*
+** Return the approximate number of bytes of memory currently
+** used by the pager and its associated cache.
+*/
+SQLITE_PRIVATE int sqlite3PagerMemUsed(Pager *pPager){
+  int perPageSize = pPager->pageSize + pPager->nExtra
+    + (int)(sizeof(PgHdr) + 5*sizeof(void*));
+  return perPageSize*sqlite3PcachePagecount(pPager->pPCache)
+           + sqlite3MallocSize(pPager)
+           + pPager->pageSize;
+}
+
+/*
+** Return the number of references to the specified page.
+*/
+SQLITE_PRIVATE int sqlite3PagerPageRefcount(DbPage *pPage){
+  return sqlite3PcachePageRefcount(pPage);
+}
+
+#ifdef SQLITE_TEST
+/*
+** This routine is used for testing and analysis only.
+*/
+SQLITE_PRIVATE int *sqlite3PagerStats(Pager *pPager){
+  static int a[11];
+  a[0] = sqlite3PcacheRefCount(pPager->pPCache);
+  a[1] = sqlite3PcachePagecount(pPager->pPCache);
+  a[2] = sqlite3PcacheGetCachesize(pPager->pPCache);
+  a[3] = pPager->eState==PAGER_OPEN ? -1 : (int) pPager->dbSize;
+  a[4] = pPager->eState;
+  a[5] = pPager->errCode;
+  a[6] = pPager->aStat[PAGER_STAT_HIT];
+  a[7] = pPager->aStat[PAGER_STAT_MISS];
+  a[8] = 0;  /* Used to be pPager->nOvfl */
+  a[9] = pPager->nRead;
+  a[10] = pPager->aStat[PAGER_STAT_WRITE];
+  return a;
+}
+#endif
+
+/*
+** Parameter eStat must be one of SQLITE_DBSTATUS_CACHE_HIT, _MISS, _WRITE,
+** or _WRITE+1.  The SQLITE_DBSTATUS_CACHE_WRITE+1 case is a translation
+** of SQLITE_DBSTATUS_CACHE_SPILL.  The _SPILL case is not contiguous because
+** it was added later.
+**
+** Before returning, *pnVal is incremented by the
+** current cache hit or miss count, according to the value of eStat. If the
+** reset parameter is non-zero, the cache hit or miss count is zeroed before
+** returning.
+*/
+SQLITE_PRIVATE void sqlite3PagerCacheStat(Pager *pPager, int eStat, int reset, int *pnVal){
+
+  assert( eStat==SQLITE_DBSTATUS_CACHE_HIT
+       || eStat==SQLITE_DBSTATUS_CACHE_MISS
+       || eStat==SQLITE_DBSTATUS_CACHE_WRITE
+       || eStat==SQLITE_DBSTATUS_CACHE_WRITE+1
+  );
+
+  assert( SQLITE_DBSTATUS_CACHE_HIT+1==SQLITE_DBSTATUS_CACHE_MISS );
+  assert( SQLITE_DBSTATUS_CACHE_HIT+2==SQLITE_DBSTATUS_CACHE_WRITE );
+  assert( PAGER_STAT_HIT==0 && PAGER_STAT_MISS==1
+           && PAGER_STAT_WRITE==2 && PAGER_STAT_SPILL==3 );
+
+  eStat -= SQLITE_DBSTATUS_CACHE_HIT;
+  *pnVal += pPager->aStat[eStat];
+  if( reset ){
+    pPager->aStat[eStat] = 0;
+  }
+}
+
+/*
+** Return true if this is an in-memory or temp-file backed pager.
+*/
+SQLITE_PRIVATE int sqlite3PagerIsMemdb(Pager *pPager){
+  return pPager->tempFile || pPager->memVfs;
+}
+
+/*
+** Check that there are at least nSavepoint savepoints open. If there are
+** currently less than nSavepoints open, then open one or more savepoints
+** to make up the difference. If the number of savepoints is already
+** equal to nSavepoint, then this function is a no-op.
+**
+** If a memory allocation fails, SQLITE_NOMEM is returned. If an error
+** occurs while opening the sub-journal file, then an IO error code is
+** returned. Otherwise, SQLITE_OK.
+*/
+static SQLITE_NOINLINE int pagerOpenSavepoint(Pager *pPager, int nSavepoint){
+  int rc = SQLITE_OK;                       /* Return code */
+  int nCurrent = pPager->nSavepoint;        /* Current number of savepoints */
+  int ii;                                   /* Iterator variable */
+  PagerSavepoint *aNew;                     /* New Pager.aSavepoint array */
+
+  assert( pPager->eState>=PAGER_WRITER
