@@ -61111,4 +61111,200 @@ SQLITE_PRIVATE int sqlite3PagerMovepage(Pager *pPager, DbPage *pPg, Pgno pgno, i
     */
     PgHdr *pPgHdr;
     rc = sqlite3PagerGet(pPager, needSyncPgno, &pPgHdr, 0);
-    if( rc!
+    if( rc!=SQLITE_OK ){
+      if( needSyncPgno<=pPager->dbOrigSize ){
+        assert( pPager->pTmpSpace!=0 );
+        sqlite3BitvecClear(pPager->pInJournal, needSyncPgno, pPager->pTmpSpace);
+      }
+      return rc;
+    }
+    pPgHdr->flags |= PGHDR_NEED_SYNC;
+    sqlite3PcacheMakeDirty(pPgHdr);
+    sqlite3PagerUnrefNotNull(pPgHdr);
+  }
+
+  return SQLITE_OK;
+}
+#endif
+
+/*
+** The page handle passed as the first argument refers to a dirty page
+** with a page number other than iNew. This function changes the page's
+** page number to iNew and sets the value of the PgHdr.flags field to
+** the value passed as the third parameter.
+*/
+SQLITE_PRIVATE void sqlite3PagerRekey(DbPage *pPg, Pgno iNew, u16 flags){
+  assert( pPg->pgno!=iNew );
+  pPg->flags = flags;
+  sqlite3PcacheMove(pPg, iNew);
+}
+
+/*
+** Return a pointer to the data for the specified page.
+*/
+SQLITE_PRIVATE void *sqlite3PagerGetData(DbPage *pPg){
+  assert( pPg->nRef>0 || pPg->pPager->memDb );
+  return pPg->pData;
+}
+
+/*
+** Return a pointer to the Pager.nExtra bytes of "extra" space
+** allocated along with the specified page.
+*/
+SQLITE_PRIVATE void *sqlite3PagerGetExtra(DbPage *pPg){
+  return pPg->pExtra;
+}
+
+/*
+** Get/set the locking-mode for this pager. Parameter eMode must be one
+** of PAGER_LOCKINGMODE_QUERY, PAGER_LOCKINGMODE_NORMAL or
+** PAGER_LOCKINGMODE_EXCLUSIVE. If the parameter is not _QUERY, then
+** the locking-mode is set to the value specified.
+**
+** The returned value is either PAGER_LOCKINGMODE_NORMAL or
+** PAGER_LOCKINGMODE_EXCLUSIVE, indicating the current (possibly updated)
+** locking-mode.
+*/
+SQLITE_PRIVATE int sqlite3PagerLockingMode(Pager *pPager, int eMode){
+  assert( eMode==PAGER_LOCKINGMODE_QUERY
+            || eMode==PAGER_LOCKINGMODE_NORMAL
+            || eMode==PAGER_LOCKINGMODE_EXCLUSIVE );
+  assert( PAGER_LOCKINGMODE_QUERY<0 );
+  assert( PAGER_LOCKINGMODE_NORMAL>=0 && PAGER_LOCKINGMODE_EXCLUSIVE>=0 );
+  assert( pPager->exclusiveMode || 0==sqlite3WalHeapMemory(pPager->pWal) );
+  if( eMode>=0 && !pPager->tempFile && !sqlite3WalHeapMemory(pPager->pWal) ){
+    pPager->exclusiveMode = (u8)eMode;
+  }
+  return (int)pPager->exclusiveMode;
+}
+
+/*
+** Set the journal-mode for this pager. Parameter eMode must be one of:
+**
+**    PAGER_JOURNALMODE_DELETE
+**    PAGER_JOURNALMODE_TRUNCATE
+**    PAGER_JOURNALMODE_PERSIST
+**    PAGER_JOURNALMODE_OFF
+**    PAGER_JOURNALMODE_MEMORY
+**    PAGER_JOURNALMODE_WAL
+**
+** The journalmode is set to the value specified if the change is allowed.
+** The change may be disallowed for the following reasons:
+**
+**   *  An in-memory database can only have its journal_mode set to _OFF
+**      or _MEMORY.
+**
+**   *  Temporary databases cannot have _WAL journalmode.
+**
+** The returned indicate the current (possibly updated) journal-mode.
+*/
+SQLITE_PRIVATE int sqlite3PagerSetJournalMode(Pager *pPager, int eMode){
+  u8 eOld = pPager->journalMode;    /* Prior journalmode */
+
+  /* The eMode parameter is always valid */
+  assert(      eMode==PAGER_JOURNALMODE_DELETE    /* 0 */
+            || eMode==PAGER_JOURNALMODE_PERSIST   /* 1 */
+            || eMode==PAGER_JOURNALMODE_OFF       /* 2 */
+            || eMode==PAGER_JOURNALMODE_TRUNCATE  /* 3 */
+            || eMode==PAGER_JOURNALMODE_MEMORY    /* 4 */
+            || eMode==PAGER_JOURNALMODE_WAL       /* 5 */ );
+
+  /* This routine is only called from the OP_JournalMode opcode, and
+  ** the logic there will never allow a temporary file to be changed
+  ** to WAL mode.
+  */
+  assert( pPager->tempFile==0 || eMode!=PAGER_JOURNALMODE_WAL );
+
+  /* Do allow the journalmode of an in-memory database to be set to
+  ** anything other than MEMORY or OFF
+  */
+  if( MEMDB ){
+    assert( eOld==PAGER_JOURNALMODE_MEMORY || eOld==PAGER_JOURNALMODE_OFF );
+    if( eMode!=PAGER_JOURNALMODE_MEMORY && eMode!=PAGER_JOURNALMODE_OFF ){
+      eMode = eOld;
+    }
+  }
+
+  if( eMode!=eOld ){
+
+    /* Change the journal mode. */
+    assert( pPager->eState!=PAGER_ERROR );
+    pPager->journalMode = (u8)eMode;
+
+    /* When transistioning from TRUNCATE or PERSIST to any other journal
+    ** mode except WAL, unless the pager is in locking_mode=exclusive mode,
+    ** delete the journal file.
+    */
+    assert( (PAGER_JOURNALMODE_TRUNCATE & 5)==1 );
+    assert( (PAGER_JOURNALMODE_PERSIST & 5)==1 );
+    assert( (PAGER_JOURNALMODE_DELETE & 5)==0 );
+    assert( (PAGER_JOURNALMODE_MEMORY & 5)==4 );
+    assert( (PAGER_JOURNALMODE_OFF & 5)==0 );
+    assert( (PAGER_JOURNALMODE_WAL & 5)==5 );
+
+    assert( isOpen(pPager->fd) || pPager->exclusiveMode );
+    if( !pPager->exclusiveMode && (eOld & 5)==1 && (eMode & 1)==0 ){
+      /* In this case we would like to delete the journal file. If it is
+      ** not possible, then that is not a problem. Deleting the journal file
+      ** here is an optimization only.
+      **
+      ** Before deleting the journal file, obtain a RESERVED lock on the
+      ** database file. This ensures that the journal file is not deleted
+      ** while it is in use by some other client.
+      */
+      sqlite3OsClose(pPager->jfd);
+      if( pPager->eLock>=RESERVED_LOCK ){
+        sqlite3OsDelete(pPager->pVfs, pPager->zJournal, 0);
+      }else{
+        int rc = SQLITE_OK;
+        int state = pPager->eState;
+        assert( state==PAGER_OPEN || state==PAGER_READER );
+        if( state==PAGER_OPEN ){
+          rc = sqlite3PagerSharedLock(pPager);
+        }
+        if( pPager->eState==PAGER_READER ){
+          assert( rc==SQLITE_OK );
+          rc = pagerLockDb(pPager, RESERVED_LOCK);
+        }
+        if( rc==SQLITE_OK ){
+          sqlite3OsDelete(pPager->pVfs, pPager->zJournal, 0);
+        }
+        if( rc==SQLITE_OK && state==PAGER_READER ){
+          pagerUnlockDb(pPager, SHARED_LOCK);
+        }else if( state==PAGER_OPEN ){
+          pager_unlock(pPager);
+        }
+        assert( state==pPager->eState );
+      }
+    }else if( eMode==PAGER_JOURNALMODE_OFF ){
+      sqlite3OsClose(pPager->jfd);
+    }
+  }
+
+  /* Return the new journal mode */
+  return (int)pPager->journalMode;
+}
+
+/*
+** Return the current journal mode.
+*/
+SQLITE_PRIVATE int sqlite3PagerGetJournalMode(Pager *pPager){
+  return (int)pPager->journalMode;
+}
+
+/*
+** Return TRUE if the pager is in a state where it is OK to change the
+** journalmode.  Journalmode changes can only happen when the database
+** is unmodified.
+*/
+SQLITE_PRIVATE int sqlite3PagerOkToChangeJournalMode(Pager *pPager){
+  assert( assert_pager_state(pPager) );
+  if( pPager->eState>=PAGER_WRITER_CACHEMOD ) return 0;
+  if( isOpen(pPager->jfd) && pPager->journalOff>0 ) return 0;
+  return 1;
+}
+
+/*
+** Get/set the size-limit used for persistent journal files.
+**
+** Setting the size limit to -1 means no limit is enfor
