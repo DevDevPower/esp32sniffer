@@ -60071,3 +60071,179 @@ static SQLITE_NOINLINE int pagerWriteLargeSector(PgHdr *pPg){
 /*
 ** Mark a data page as writeable. This routine must be called before
 ** making changes to a page. The caller must check the return value
+** of this function and be careful not to change any page data unless
+** this routine returns SQLITE_OK.
+**
+** The difference between this function and pager_write() is that this
+** function also deals with the special case where 2 or more pages
+** fit on a single disk sector. In this case all co-resident pages
+** must have been written to the journal file before returning.
+**
+** If an error occurs, SQLITE_NOMEM or an IO error code is returned
+** as appropriate. Otherwise, SQLITE_OK.
+*/
+SQLITE_PRIVATE int sqlite3PagerWrite(PgHdr *pPg){
+  Pager *pPager = pPg->pPager;
+  assert( (pPg->flags & PGHDR_MMAP)==0 );
+  assert( pPager->eState>=PAGER_WRITER_LOCKED );
+  assert( assert_pager_state(pPager) );
+  if( (pPg->flags & PGHDR_WRITEABLE)!=0 && pPager->dbSize>=pPg->pgno ){
+    if( pPager->nSavepoint ) return subjournalPageIfRequired(pPg);
+    return SQLITE_OK;
+  }else if( pPager->errCode ){
+    return pPager->errCode;
+  }else if( pPager->sectorSize > (u32)pPager->pageSize ){
+    assert( pPager->tempFile==0 );
+    return pagerWriteLargeSector(pPg);
+  }else{
+    return pager_write(pPg);
+  }
+}
+
+/*
+** Return TRUE if the page given in the argument was previously passed
+** to sqlite3PagerWrite().  In other words, return TRUE if it is ok
+** to change the content of the page.
+*/
+#ifndef NDEBUG
+SQLITE_PRIVATE int sqlite3PagerIswriteable(DbPage *pPg){
+  return pPg->flags & PGHDR_WRITEABLE;
+}
+#endif
+
+/*
+** A call to this routine tells the pager that it is not necessary to
+** write the information on page pPg back to the disk, even though
+** that page might be marked as dirty.  This happens, for example, when
+** the page has been added as a leaf of the freelist and so its
+** content no longer matters.
+**
+** The overlying software layer calls this routine when all of the data
+** on the given page is unused. The pager marks the page as clean so
+** that it does not get written to disk.
+**
+** Tests show that this optimization can quadruple the speed of large
+** DELETE operations.
+**
+** This optimization cannot be used with a temp-file, as the page may
+** have been dirty at the start of the transaction. In that case, if
+** memory pressure forces page pPg out of the cache, the data does need
+** to be written out to disk so that it may be read back in if the
+** current transaction is rolled back.
+*/
+SQLITE_PRIVATE void sqlite3PagerDontWrite(PgHdr *pPg){
+  Pager *pPager = pPg->pPager;
+  if( !pPager->tempFile && (pPg->flags&PGHDR_DIRTY) && pPager->nSavepoint==0 ){
+    PAGERTRACE(("DONT_WRITE page %d of %d\n", pPg->pgno, PAGERID(pPager)));
+    IOTRACE(("CLEAN %p %d\n", pPager, pPg->pgno))
+    pPg->flags |= PGHDR_DONT_WRITE;
+    pPg->flags &= ~PGHDR_WRITEABLE;
+    testcase( pPg->flags & PGHDR_NEED_SYNC );
+    pager_set_pagehash(pPg);
+  }
+}
+
+/*
+** This routine is called to increment the value of the database file
+** change-counter, stored as a 4-byte big-endian integer starting at
+** byte offset 24 of the pager file.  The secondary change counter at
+** 92 is also updated, as is the SQLite version number at offset 96.
+**
+** But this only happens if the pPager->changeCountDone flag is false.
+** To avoid excess churning of page 1, the update only happens once.
+** See also the pager_write_changecounter() routine that does an
+** unconditional update of the change counters.
+**
+** If the isDirectMode flag is zero, then this is done by calling
+** sqlite3PagerWrite() on page 1, then modifying the contents of the
+** page data. In this case the file will be updated when the current
+** transaction is committed.
+**
+** The isDirectMode flag may only be non-zero if the library was compiled
+** with the SQLITE_ENABLE_ATOMIC_WRITE macro defined. In this case,
+** if isDirect is non-zero, then the database file is updated directly
+** by writing an updated version of page 1 using a call to the
+** sqlite3OsWrite() function.
+*/
+static int pager_incr_changecounter(Pager *pPager, int isDirectMode){
+  int rc = SQLITE_OK;
+
+  assert( pPager->eState==PAGER_WRITER_CACHEMOD
+       || pPager->eState==PAGER_WRITER_DBMOD
+  );
+  assert( assert_pager_state(pPager) );
+
+  /* Declare and initialize constant integer 'isDirect'. If the
+  ** atomic-write optimization is enabled in this build, then isDirect
+  ** is initialized to the value passed as the isDirectMode parameter
+  ** to this function. Otherwise, it is always set to zero.
+  **
+  ** The idea is that if the atomic-write optimization is not
+  ** enabled at compile time, the compiler can omit the tests of
+  ** 'isDirect' below, as well as the block enclosed in the
+  ** "if( isDirect )" condition.
+  */
+#ifndef SQLITE_ENABLE_ATOMIC_WRITE
+# define DIRECT_MODE 0
+  assert( isDirectMode==0 );
+  UNUSED_PARAMETER(isDirectMode);
+#else
+# define DIRECT_MODE isDirectMode
+#endif
+
+  if( !pPager->changeCountDone && ALWAYS(pPager->dbSize>0) ){
+    PgHdr *pPgHdr;                /* Reference to page 1 */
+
+    assert( !pPager->tempFile && isOpen(pPager->fd) );
+
+    /* Open page 1 of the file for writing. */
+    rc = sqlite3PagerGet(pPager, 1, &pPgHdr, 0);
+    assert( pPgHdr==0 || rc==SQLITE_OK );
+
+    /* If page one was fetched successfully, and this function is not
+    ** operating in direct-mode, make page 1 writable.  When not in
+    ** direct mode, page 1 is always held in cache and hence the PagerGet()
+    ** above is always successful - hence the ALWAYS on rc==SQLITE_OK.
+    */
+    if( !DIRECT_MODE && ALWAYS(rc==SQLITE_OK) ){
+      rc = sqlite3PagerWrite(pPgHdr);
+    }
+
+    if( rc==SQLITE_OK ){
+      /* Actually do the update of the change counter */
+      pager_write_changecounter(pPgHdr);
+
+      /* If running in direct mode, write the contents of page 1 to the file. */
+      if( DIRECT_MODE ){
+        const void *zBuf;
+        assert( pPager->dbFileSize>0 );
+        zBuf = pPgHdr->pData;
+        if( rc==SQLITE_OK ){
+          rc = sqlite3OsWrite(pPager->fd, zBuf, pPager->pageSize, 0);
+          pPager->aStat[PAGER_STAT_WRITE]++;
+        }
+        if( rc==SQLITE_OK ){
+          /* Update the pager's copy of the change-counter. Otherwise, the
+          ** next time a read transaction is opened the cache will be
+          ** flushed (as the change-counter values will not match).  */
+          const void *pCopy = (const void *)&((const char *)zBuf)[24];
+          memcpy(&pPager->dbFileVers, pCopy, sizeof(pPager->dbFileVers));
+          pPager->changeCountDone = 1;
+        }
+      }else{
+        pPager->changeCountDone = 1;
+      }
+    }
+
+    /* Release the page reference. */
+    sqlite3PagerUnref(pPgHdr);
+  }
+  return rc;
+}
+
+/*
+** Sync the database file to disk. This is a no-op for in-memory databases
+** or pages with the Pager.noSync flag set.
+**
+** If successful, or if called on a pager for which it is a no-op, this
+** function returns 
