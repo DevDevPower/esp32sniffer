@@ -61498,4 +61498,205 @@ SQLITE_PRIVATE int sqlite3PagerOpenWal(
 ** Before closing the log file, this function attempts to take an
 ** EXCLUSIVE lock on the database file. If this cannot be obtained, an
 ** error (SQLITE_BUSY) is returned and the log connection is not closed.
-** If successful, the EXCLUSIVE lock is not released before 
+** If successful, the EXCLUSIVE lock is not released before returning.
+*/
+SQLITE_PRIVATE int sqlite3PagerCloseWal(Pager *pPager, sqlite3 *db){
+  int rc = SQLITE_OK;
+
+  assert( pPager->journalMode==PAGER_JOURNALMODE_WAL );
+
+  /* If the log file is not already open, but does exist in the file-system,
+  ** it may need to be checkpointed before the connection can switch to
+  ** rollback mode. Open it now so this can happen.
+  */
+  if( !pPager->pWal ){
+    int logexists = 0;
+    rc = pagerLockDb(pPager, SHARED_LOCK);
+    if( rc==SQLITE_OK ){
+      rc = sqlite3OsAccess(
+          pPager->pVfs, pPager->zWal, SQLITE_ACCESS_EXISTS, &logexists
+      );
+    }
+    if( rc==SQLITE_OK && logexists ){
+      rc = pagerOpenWal(pPager);
+    }
+  }
+
+  /* Checkpoint and close the log. Because an EXCLUSIVE lock is held on
+  ** the database file, the log and log-summary files will be deleted.
+  */
+  if( rc==SQLITE_OK && pPager->pWal ){
+    rc = pagerExclusiveLock(pPager);
+    if( rc==SQLITE_OK ){
+      rc = sqlite3WalClose(pPager->pWal, db, pPager->walSyncFlags,
+                           pPager->pageSize, (u8*)pPager->pTmpSpace);
+      pPager->pWal = 0;
+      pagerFixMaplimit(pPager);
+      if( rc && !pPager->exclusiveMode ) pagerUnlockDb(pPager, SHARED_LOCK);
+    }
+  }
+  return rc;
+}
+
+#ifdef SQLITE_ENABLE_SETLK_TIMEOUT
+/*
+** If pager pPager is a wal-mode database not in exclusive locking mode,
+** invoke the sqlite3WalWriteLock() function on the associated Wal object
+** with the same db and bLock parameters as were passed to this function.
+** Return an SQLite error code if an error occurs, or SQLITE_OK otherwise.
+*/
+SQLITE_PRIVATE int sqlite3PagerWalWriteLock(Pager *pPager, int bLock){
+  int rc = SQLITE_OK;
+  if( pagerUseWal(pPager) && pPager->exclusiveMode==0 ){
+    rc = sqlite3WalWriteLock(pPager->pWal, bLock);
+  }
+  return rc;
+}
+
+/*
+** Set the database handle used by the wal layer to determine if
+** blocking locks are required.
+*/
+SQLITE_PRIVATE void sqlite3PagerWalDb(Pager *pPager, sqlite3 *db){
+  if( pagerUseWal(pPager) ){
+    sqlite3WalDb(pPager->pWal, db);
+  }
+}
+#endif
+
+#ifdef SQLITE_ENABLE_SNAPSHOT
+/*
+** If this is a WAL database, obtain a snapshot handle for the snapshot
+** currently open. Otherwise, return an error.
+*/
+SQLITE_PRIVATE int sqlite3PagerSnapshotGet(Pager *pPager, sqlite3_snapshot **ppSnapshot){
+  int rc = SQLITE_ERROR;
+  if( pPager->pWal ){
+    rc = sqlite3WalSnapshotGet(pPager->pWal, ppSnapshot);
+  }
+  return rc;
+}
+
+/*
+** If this is a WAL database, store a pointer to pSnapshot. Next time a
+** read transaction is opened, attempt to read from the snapshot it
+** identifies. If this is not a WAL database, return an error.
+*/
+SQLITE_PRIVATE int sqlite3PagerSnapshotOpen(
+  Pager *pPager,
+  sqlite3_snapshot *pSnapshot
+){
+  int rc = SQLITE_OK;
+  if( pPager->pWal ){
+    sqlite3WalSnapshotOpen(pPager->pWal, pSnapshot);
+  }else{
+    rc = SQLITE_ERROR;
+  }
+  return rc;
+}
+
+/*
+** If this is a WAL database, call sqlite3WalSnapshotRecover(). If this
+** is not a WAL database, return an error.
+*/
+SQLITE_PRIVATE int sqlite3PagerSnapshotRecover(Pager *pPager){
+  int rc;
+  if( pPager->pWal ){
+    rc = sqlite3WalSnapshotRecover(pPager->pWal);
+  }else{
+    rc = SQLITE_ERROR;
+  }
+  return rc;
+}
+
+/*
+** The caller currently has a read transaction open on the database.
+** If this is not a WAL database, SQLITE_ERROR is returned. Otherwise,
+** this function takes a SHARED lock on the CHECKPOINTER slot and then
+** checks if the snapshot passed as the second argument is still
+** available. If so, SQLITE_OK is returned.
+**
+** If the snapshot is not available, SQLITE_ERROR is returned. Or, if
+** the CHECKPOINTER lock cannot be obtained, SQLITE_BUSY. If any error
+** occurs (any value other than SQLITE_OK is returned), the CHECKPOINTER
+** lock is released before returning.
+*/
+SQLITE_PRIVATE int sqlite3PagerSnapshotCheck(Pager *pPager, sqlite3_snapshot *pSnapshot){
+  int rc;
+  if( pPager->pWal ){
+    rc = sqlite3WalSnapshotCheck(pPager->pWal, pSnapshot);
+  }else{
+    rc = SQLITE_ERROR;
+  }
+  return rc;
+}
+
+/*
+** Release a lock obtained by an earlier successful call to
+** sqlite3PagerSnapshotCheck().
+*/
+SQLITE_PRIVATE void sqlite3PagerSnapshotUnlock(Pager *pPager){
+  assert( pPager->pWal );
+  sqlite3WalSnapshotUnlock(pPager->pWal);
+}
+
+#endif /* SQLITE_ENABLE_SNAPSHOT */
+#endif /* !SQLITE_OMIT_WAL */
+
+#ifdef SQLITE_ENABLE_ZIPVFS
+/*
+** A read-lock must be held on the pager when this function is called. If
+** the pager is in WAL mode and the WAL file currently contains one or more
+** frames, return the size in bytes of the page images stored within the
+** WAL frames. Otherwise, if this is not a WAL database or the WAL file
+** is empty, return 0.
+*/
+SQLITE_PRIVATE int sqlite3PagerWalFramesize(Pager *pPager){
+  assert( pPager->eState>=PAGER_READER );
+  return sqlite3WalFramesize(pPager->pWal);
+}
+#endif
+
+#endif /* SQLITE_OMIT_DISKIO */
+
+/************** End of pager.c ***********************************************/
+/************** Begin file wal.c *********************************************/
+/*
+** 2010 February 1
+**
+** The author disclaims copyright to this source code.  In place of
+** a legal notice, here is a blessing:
+**
+**    May you do good and not evil.
+**    May you find forgiveness for yourself and forgive others.
+**    May you share freely, never taking more than you give.
+**
+*************************************************************************
+**
+** This file contains the implementation of a write-ahead log (WAL) used in
+** "journal_mode=WAL" mode.
+**
+** WRITE-AHEAD LOG (WAL) FILE FORMAT
+**
+** A WAL file consists of a header followed by zero or more "frames".
+** Each frame records the revised content of a single page from the
+** database file.  All changes to the database are recorded by writing
+** frames into the WAL.  Transactions commit when a frame is written that
+** contains a commit marker.  A single WAL can and usually does record
+** multiple transactions.  Periodically, the content of the WAL is
+** transferred back into the database file in an operation called a
+** "checkpoint".
+**
+** A single WAL file can be used multiple times.  In other words, the
+** WAL can fill up with frames and then be checkpointed and then new
+** frames can overwrite the old ones.  A WAL always grows from beginning
+** toward the end.  Checksums and counters attached to each frame are
+** used to determine which frames within the WAL are valid and which
+** are leftovers from prior checkpoints.
+**
+** The WAL header is 32 bytes in size and consists of the following eight
+** big-endian 32-bit unsigned integer values:
+**
+**     0: Magic number.  0x377f0682 or 0x377f0683
+**     4: File format version.  Currently 3007000
+**     8: Database page size. 
