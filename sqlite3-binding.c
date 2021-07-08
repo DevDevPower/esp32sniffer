@@ -61699,4 +61699,138 @@ SQLITE_PRIVATE int sqlite3PagerWalFramesize(Pager *pPager){
 **
 **     0: Magic number.  0x377f0682 or 0x377f0683
 **     4: File format version.  Currently 3007000
-**     8: Database page size. 
+**     8: Database page size.  Example: 1024
+**    12: Checkpoint sequence number
+**    16: Salt-1, random integer incremented with each checkpoint
+**    20: Salt-2, a different random integer changing with each ckpt
+**    24: Checksum-1 (first part of checksum for first 24 bytes of header).
+**    28: Checksum-2 (second part of checksum for first 24 bytes of header).
+**
+** Immediately following the wal-header are zero or more frames. Each
+** frame consists of a 24-byte frame-header followed by a <page-size> bytes
+** of page data. The frame-header is six big-endian 32-bit unsigned
+** integer values, as follows:
+**
+**     0: Page number.
+**     4: For commit records, the size of the database image in pages
+**        after the commit. For all other records, zero.
+**     8: Salt-1 (copied from the header)
+**    12: Salt-2 (copied from the header)
+**    16: Checksum-1.
+**    20: Checksum-2.
+**
+** A frame is considered valid if and only if the following conditions are
+** true:
+**
+**    (1) The salt-1 and salt-2 values in the frame-header match
+**        salt values in the wal-header
+**
+**    (2) The checksum values in the final 8 bytes of the frame-header
+**        exactly match the checksum computed consecutively on the
+**        WAL header and the first 8 bytes and the content of all frames
+**        up to and including the current frame.
+**
+** The checksum is computed using 32-bit big-endian integers if the
+** magic number in the first 4 bytes of the WAL is 0x377f0683 and it
+** is computed using little-endian if the magic number is 0x377f0682.
+** The checksum values are always stored in the frame header in a
+** big-endian format regardless of which byte order is used to compute
+** the checksum.  The checksum is computed by interpreting the input as
+** an even number of unsigned 32-bit integers: x[0] through x[N].  The
+** algorithm used for the checksum is as follows:
+**
+**   for i from 0 to n-1 step 2:
+**     s0 += x[i] + s1;
+**     s1 += x[i+1] + s0;
+**   endfor
+**
+** Note that s0 and s1 are both weighted checksums using fibonacci weights
+** in reverse order (the largest fibonacci weight occurs on the first element
+** of the sequence being summed.)  The s1 value spans all 32-bit
+** terms of the sequence whereas s0 omits the final term.
+**
+** On a checkpoint, the WAL is first VFS.xSync-ed, then valid content of the
+** WAL is transferred into the database, then the database is VFS.xSync-ed.
+** The VFS.xSync operations serve as write barriers - all writes launched
+** before the xSync must complete before any write that launches after the
+** xSync begins.
+**
+** After each checkpoint, the salt-1 value is incremented and the salt-2
+** value is randomized.  This prevents old and new frames in the WAL from
+** being considered valid at the same time and being checkpointing together
+** following a crash.
+**
+** READER ALGORITHM
+**
+** To read a page from the database (call it page number P), a reader
+** first checks the WAL to see if it contains page P.  If so, then the
+** last valid instance of page P that is a followed by a commit frame
+** or is a commit frame itself becomes the value read.  If the WAL
+** contains no copies of page P that are valid and which are a commit
+** frame or are followed by a commit frame, then page P is read from
+** the database file.
+**
+** To start a read transaction, the reader records the index of the last
+** valid frame in the WAL.  The reader uses this recorded "mxFrame" value
+** for all subsequent read operations.  New transactions can be appended
+** to the WAL, but as long as the reader uses its original mxFrame value
+** and ignores the newly appended content, it will see a consistent snapshot
+** of the database from a single point in time.  This technique allows
+** multiple concurrent readers to view different versions of the database
+** content simultaneously.
+**
+** The reader algorithm in the previous paragraphs works correctly, but
+** because frames for page P can appear anywhere within the WAL, the
+** reader has to scan the entire WAL looking for page P frames.  If the
+** WAL is large (multiple megabytes is typical) that scan can be slow,
+** and read performance suffers.  To overcome this problem, a separate
+** data structure called the wal-index is maintained to expedite the
+** search for frames of a particular page.
+**
+** WAL-INDEX FORMAT
+**
+** Conceptually, the wal-index is shared memory, though VFS implementations
+** might choose to implement the wal-index using a mmapped file.  Because
+** the wal-index is shared memory, SQLite does not support journal_mode=WAL
+** on a network filesystem.  All users of the database must be able to
+** share memory.
+**
+** In the default unix and windows implementation, the wal-index is a mmapped
+** file whose name is the database name with a "-shm" suffix added.  For that
+** reason, the wal-index is sometimes called the "shm" file.
+**
+** The wal-index is transient.  After a crash, the wal-index can (and should
+** be) reconstructed from the original WAL file.  In fact, the VFS is required
+** to either truncate or zero the header of the wal-index when the last
+** connection to it closes.  Because the wal-index is transient, it can
+** use an architecture-specific format; it does not have to be cross-platform.
+** Hence, unlike the database and WAL file formats which store all values
+** as big endian, the wal-index can store multi-byte values in the native
+** byte order of the host computer.
+**
+** The purpose of the wal-index is to answer this question quickly:  Given
+** a page number P and a maximum frame index M, return the index of the
+** last frame in the wal before frame M for page P in the WAL, or return
+** NULL if there are no frames for page P in the WAL prior to M.
+**
+** The wal-index consists of a header region, followed by an one or
+** more index blocks.
+**
+** The wal-index header contains the total number of frames within the WAL
+** in the mxFrame field.
+**
+** Each index block except for the first contains information on
+** HASHTABLE_NPAGE frames. The first index block contains information on
+** HASHTABLE_NPAGE_ONE frames. The values of HASHTABLE_NPAGE_ONE and
+** HASHTABLE_NPAGE are selected so that together the wal-index header and
+** first index block are the same size as all other index blocks in the
+** wal-index.  The values are:
+**
+**   HASHTABLE_NPAGE      4096
+**   HASHTABLE_NPAGE_ONE  4062
+**
+** Each index block contains two sections, a page-mapping that contains the
+** database page number associated with each wal frame, and a hash-table
+** that allows readers to query an index block for a specific page number.
+** The page-mapping is an array of HASHTABLE_NPAGE (or HASHTABLE_NPAGE_ONE
+** for the first index block) 32-bit page numbers. The first e
