@@ -61833,4 +61833,145 @@ SQLITE_PRIVATE int sqlite3PagerWalFramesize(Pager *pPager){
 ** database page number associated with each wal frame, and a hash-table
 ** that allows readers to query an index block for a specific page number.
 ** The page-mapping is an array of HASHTABLE_NPAGE (or HASHTABLE_NPAGE_ONE
-** for the first index block) 32-bit page numbers. The first e
+** for the first index block) 32-bit page numbers. The first entry in the
+** first index-block contains the database page number corresponding to the
+** first frame in the WAL file. The first entry in the second index block
+** in the WAL file corresponds to the (HASHTABLE_NPAGE_ONE+1)th frame in
+** the log, and so on.
+**
+** The last index block in a wal-index usually contains less than the full
+** complement of HASHTABLE_NPAGE (or HASHTABLE_NPAGE_ONE) page-numbers,
+** depending on the contents of the WAL file. This does not change the
+** allocated size of the page-mapping array - the page-mapping array merely
+** contains unused entries.
+**
+** Even without using the hash table, the last frame for page P
+** can be found by scanning the page-mapping sections of each index block
+** starting with the last index block and moving toward the first, and
+** within each index block, starting at the end and moving toward the
+** beginning.  The first entry that equals P corresponds to the frame
+** holding the content for that page.
+**
+** The hash table consists of HASHTABLE_NSLOT 16-bit unsigned integers.
+** HASHTABLE_NSLOT = 2*HASHTABLE_NPAGE, and there is one entry in the
+** hash table for each page number in the mapping section, so the hash
+** table is never more than half full.  The expected number of collisions
+** prior to finding a match is 1.  Each entry of the hash table is an
+** 1-based index of an entry in the mapping section of the same
+** index block.   Let K be the 1-based index of the largest entry in
+** the mapping section.  (For index blocks other than the last, K will
+** always be exactly HASHTABLE_NPAGE (4096) and for the last index block
+** K will be (mxFrame%HASHTABLE_NPAGE).)  Unused slots of the hash table
+** contain a value of 0.
+**
+** To look for page P in the hash table, first compute a hash iKey on
+** P as follows:
+**
+**      iKey = (P * 383) % HASHTABLE_NSLOT
+**
+** Then start scanning entries of the hash table, starting with iKey
+** (wrapping around to the beginning when the end of the hash table is
+** reached) until an unused hash slot is found. Let the first unused slot
+** be at index iUnused.  (iUnused might be less than iKey if there was
+** wrap-around.) Because the hash table is never more than half full,
+** the search is guaranteed to eventually hit an unused entry.  Let
+** iMax be the value between iKey and iUnused, closest to iUnused,
+** where aHash[iMax]==P.  If there is no iMax entry (if there exists
+** no hash slot such that aHash[i]==p) then page P is not in the
+** current index block.  Otherwise the iMax-th mapping entry of the
+** current index block corresponds to the last entry that references
+** page P.
+**
+** A hash search begins with the last index block and moves toward the
+** first index block, looking for entries corresponding to page P.  On
+** average, only two or three slots in each index block need to be
+** examined in order to either find the last entry for page P, or to
+** establish that no such entry exists in the block.  Each index block
+** holds over 4000 entries.  So two or three index blocks are sufficient
+** to cover a typical 10 megabyte WAL file, assuming 1K pages.  8 or 10
+** comparisons (on average) suffice to either locate a frame in the
+** WAL or to establish that the frame does not exist in the WAL.  This
+** is much faster than scanning the entire 10MB WAL.
+**
+** Note that entries are added in order of increasing K.  Hence, one
+** reader might be using some value K0 and a second reader that started
+** at a later time (after additional transactions were added to the WAL
+** and to the wal-index) might be using a different value K1, where K1>K0.
+** Both readers can use the same hash table and mapping section to get
+** the correct result.  There may be entries in the hash table with
+** K>K0 but to the first reader, those entries will appear to be unused
+** slots in the hash table and so the first reader will get an answer as
+** if no values greater than K0 had ever been inserted into the hash table
+** in the first place - which is what reader one wants.  Meanwhile, the
+** second reader using K1 will see additional values that were inserted
+** later, which is exactly what reader two wants.
+**
+** When a rollback occurs, the value of K is decreased. Hash table entries
+** that correspond to frames greater than the new K value are removed
+** from the hash table at this point.
+*/
+#ifndef SQLITE_OMIT_WAL
+
+/* #include "wal.h" */
+
+/*
+** Trace output macros
+*/
+#if defined(SQLITE_TEST) && defined(SQLITE_DEBUG)
+SQLITE_PRIVATE int sqlite3WalTrace = 0;
+# define WALTRACE(X)  if(sqlite3WalTrace) sqlite3DebugPrintf X
+#else
+# define WALTRACE(X)
+#endif
+
+/*
+** The maximum (and only) versions of the wal and wal-index formats
+** that may be interpreted by this version of SQLite.
+**
+** If a client begins recovering a WAL file and finds that (a) the checksum
+** values in the wal-header are correct and (b) the version field is not
+** WAL_MAX_VERSION, recovery fails and SQLite returns SQLITE_CANTOPEN.
+**
+** Similarly, if a client successfully reads a wal-index header (i.e. the
+** checksum test is successful) and finds that the version field is not
+** WALINDEX_MAX_VERSION, then no read-transaction is opened and SQLite
+** returns SQLITE_CANTOPEN.
+*/
+#define WAL_MAX_VERSION      3007000
+#define WALINDEX_MAX_VERSION 3007000
+
+/*
+** Index numbers for various locking bytes.   WAL_NREADER is the number
+** of available reader locks and should be at least 3.  The default
+** is SQLITE_SHM_NLOCK==8 and  WAL_NREADER==5.
+**
+** Technically, the various VFSes are free to implement these locks however
+** they see fit.  However, compatibility is encouraged so that VFSes can
+** interoperate.  The standard implemention used on both unix and windows
+** is for the index number to indicate a byte offset into the
+** WalCkptInfo.aLock[] array in the wal-index header.  In other words, all
+** locks are on the shm file.  The WALINDEX_LOCK_OFFSET constant (which
+** should be 120) is the location in the shm file for the first locking
+** byte.
+*/
+#define WAL_WRITE_LOCK         0
+#define WAL_ALL_BUT_WRITE      1
+#define WAL_CKPT_LOCK          1
+#define WAL_RECOVER_LOCK       2
+#define WAL_READ_LOCK(I)       (3+(I))
+#define WAL_NREADER            (SQLITE_SHM_NLOCK-3)
+
+
+/* Object declarations */
+typedef struct WalIndexHdr WalIndexHdr;
+typedef struct WalIterator WalIterator;
+typedef struct WalCkptInfo WalCkptInfo;
+
+
+/*
+** The following object holds a copy of the wal-index header content.
+**
+** The actual header in the wal-index consists of two copies of this
+** object followed by one instance of the WalCkptInfo object.
+** For all versions of SQLite through 3.10.0 and probably beyond,
+** the locking bytes (
