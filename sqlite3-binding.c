@@ -62470,4 +62470,187 @@ static SQLITE_NO_TSAN void walIndexWriteHdr(Wal *pWal){
 }
 
 /*
-** This function encodes a single frame he
+** This function encodes a single frame header and writes it to a buffer
+** supplied by the caller. A frame-header is made up of a series of
+** 4-byte big-endian integers, as follows:
+**
+**     0: Page number.
+**     4: For commit records, the size of the database image in pages
+**        after the commit. For all other records, zero.
+**     8: Salt-1 (copied from the wal-header)
+**    12: Salt-2 (copied from the wal-header)
+**    16: Checksum-1.
+**    20: Checksum-2.
+*/
+static void walEncodeFrame(
+  Wal *pWal,                      /* The write-ahead log */
+  u32 iPage,                      /* Database page number for frame */
+  u32 nTruncate,                  /* New db size (or 0 for non-commit frames) */
+  u8 *aData,                      /* Pointer to page data */
+  u8 *aFrame                      /* OUT: Write encoded frame here */
+){
+  int nativeCksum;                /* True for native byte-order checksums */
+  u32 *aCksum = pWal->hdr.aFrameCksum;
+  assert( WAL_FRAME_HDRSIZE==24 );
+  sqlite3Put4byte(&aFrame[0], iPage);
+  sqlite3Put4byte(&aFrame[4], nTruncate);
+  if( pWal->iReCksum==0 ){
+    memcpy(&aFrame[8], pWal->hdr.aSalt, 8);
+
+    nativeCksum = (pWal->hdr.bigEndCksum==SQLITE_BIGENDIAN);
+    walChecksumBytes(nativeCksum, aFrame, 8, aCksum, aCksum);
+    walChecksumBytes(nativeCksum, aData, pWal->szPage, aCksum, aCksum);
+
+    sqlite3Put4byte(&aFrame[16], aCksum[0]);
+    sqlite3Put4byte(&aFrame[20], aCksum[1]);
+  }else{
+    memset(&aFrame[8], 0, 16);
+  }
+}
+
+/*
+** Check to see if the frame with header in aFrame[] and content
+** in aData[] is valid.  If it is a valid frame, fill *piPage and
+** *pnTruncate and return true.  Return if the frame is not valid.
+*/
+static int walDecodeFrame(
+  Wal *pWal,                      /* The write-ahead log */
+  u32 *piPage,                    /* OUT: Database page number for frame */
+  u32 *pnTruncate,                /* OUT: New db size (or 0 if not commit) */
+  u8 *aData,                      /* Pointer to page data (for checksum) */
+  u8 *aFrame                      /* Frame data */
+){
+  int nativeCksum;                /* True for native byte-order checksums */
+  u32 *aCksum = pWal->hdr.aFrameCksum;
+  u32 pgno;                       /* Page number of the frame */
+  assert( WAL_FRAME_HDRSIZE==24 );
+
+  /* A frame is only valid if the salt values in the frame-header
+  ** match the salt values in the wal-header.
+  */
+  if( memcmp(&pWal->hdr.aSalt, &aFrame[8], 8)!=0 ){
+    return 0;
+  }
+
+  /* A frame is only valid if the page number is creater than zero.
+  */
+  pgno = sqlite3Get4byte(&aFrame[0]);
+  if( pgno==0 ){
+    return 0;
+  }
+
+  /* A frame is only valid if a checksum of the WAL header,
+  ** all prior frams, the first 16 bytes of this frame-header,
+  ** and the frame-data matches the checksum in the last 8
+  ** bytes of this frame-header.
+  */
+  nativeCksum = (pWal->hdr.bigEndCksum==SQLITE_BIGENDIAN);
+  walChecksumBytes(nativeCksum, aFrame, 8, aCksum, aCksum);
+  walChecksumBytes(nativeCksum, aData, pWal->szPage, aCksum, aCksum);
+  if( aCksum[0]!=sqlite3Get4byte(&aFrame[16])
+   || aCksum[1]!=sqlite3Get4byte(&aFrame[20])
+  ){
+    /* Checksum failed. */
+    return 0;
+  }
+
+  /* If we reach this point, the frame is valid.  Return the page number
+  ** and the new database size.
+  */
+  *piPage = pgno;
+  *pnTruncate = sqlite3Get4byte(&aFrame[4]);
+  return 1;
+}
+
+
+#if defined(SQLITE_TEST) && defined(SQLITE_DEBUG)
+/*
+** Names of locks.  This routine is used to provide debugging output and is not
+** a part of an ordinary build.
+*/
+static const char *walLockName(int lockIdx){
+  if( lockIdx==WAL_WRITE_LOCK ){
+    return "WRITE-LOCK";
+  }else if( lockIdx==WAL_CKPT_LOCK ){
+    return "CKPT-LOCK";
+  }else if( lockIdx==WAL_RECOVER_LOCK ){
+    return "RECOVER-LOCK";
+  }else{
+    static char zName[15];
+    sqlite3_snprintf(sizeof(zName), zName, "READ-LOCK[%d]",
+                     lockIdx-WAL_READ_LOCK(0));
+    return zName;
+  }
+}
+#endif /*defined(SQLITE_TEST) || defined(SQLITE_DEBUG) */
+
+
+/*
+** Set or release locks on the WAL.  Locks are either shared or exclusive.
+** A lock cannot be moved directly between shared and exclusive - it must go
+** through the unlocked state first.
+**
+** In locking_mode=EXCLUSIVE, all of these routines become no-ops.
+*/
+static int walLockShared(Wal *pWal, int lockIdx){
+  int rc;
+  if( pWal->exclusiveMode ) return SQLITE_OK;
+  rc = sqlite3OsShmLock(pWal->pDbFd, lockIdx, 1,
+                        SQLITE_SHM_LOCK | SQLITE_SHM_SHARED);
+  WALTRACE(("WAL%p: acquire SHARED-%s %s\n", pWal,
+            walLockName(lockIdx), rc ? "failed" : "ok"));
+  VVA_ONLY( pWal->lockError = (u8)(rc!=SQLITE_OK && (rc&0xFF)!=SQLITE_BUSY); )
+  return rc;
+}
+static void walUnlockShared(Wal *pWal, int lockIdx){
+  if( pWal->exclusiveMode ) return;
+  (void)sqlite3OsShmLock(pWal->pDbFd, lockIdx, 1,
+                         SQLITE_SHM_UNLOCK | SQLITE_SHM_SHARED);
+  WALTRACE(("WAL%p: release SHARED-%s\n", pWal, walLockName(lockIdx)));
+}
+static int walLockExclusive(Wal *pWal, int lockIdx, int n){
+  int rc;
+  if( pWal->exclusiveMode ) return SQLITE_OK;
+  rc = sqlite3OsShmLock(pWal->pDbFd, lockIdx, n,
+                        SQLITE_SHM_LOCK | SQLITE_SHM_EXCLUSIVE);
+  WALTRACE(("WAL%p: acquire EXCLUSIVE-%s cnt=%d %s\n", pWal,
+            walLockName(lockIdx), n, rc ? "failed" : "ok"));
+  VVA_ONLY( pWal->lockError = (u8)(rc!=SQLITE_OK && (rc&0xFF)!=SQLITE_BUSY); )
+  return rc;
+}
+static void walUnlockExclusive(Wal *pWal, int lockIdx, int n){
+  if( pWal->exclusiveMode ) return;
+  (void)sqlite3OsShmLock(pWal->pDbFd, lockIdx, n,
+                         SQLITE_SHM_UNLOCK | SQLITE_SHM_EXCLUSIVE);
+  WALTRACE(("WAL%p: release EXCLUSIVE-%s cnt=%d\n", pWal,
+             walLockName(lockIdx), n));
+}
+
+/*
+** Compute a hash on a page number.  The resulting hash value must land
+** between 0 and (HASHTABLE_NSLOT-1).  The walHashNext() function advances
+** the hash to the next value in the event of a collision.
+*/
+static int walHash(u32 iPage){
+  assert( iPage>0 );
+  assert( (HASHTABLE_NSLOT & (HASHTABLE_NSLOT-1))==0 );
+  return (iPage*HASHTABLE_HASH_1) & (HASHTABLE_NSLOT-1);
+}
+static int walNextHash(int iPriorHash){
+  return (iPriorHash+1)&(HASHTABLE_NSLOT-1);
+}
+
+/*
+** An instance of the WalHashLoc object is used to describe the location
+** of a page hash table in the wal-index.  This becomes the return value
+** from walHashGet().
+*/
+typedef struct WalHashLoc WalHashLoc;
+struct WalHashLoc {
+  volatile ht_slot *aHash;  /* Start of the wal-index hash table */
+  volatile u32 *aPgno;      /* aPgno[1] is the page of first frame indexed */
+  u32 iZero;                /* One less than the frame number of first indexed*/
+};
+
+/*
+*
