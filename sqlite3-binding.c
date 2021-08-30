@@ -63008,4 +63008,173 @@ static int walIndexRecover(Wal *pWal){
         /* If nTruncate is non-zero, this is a commit record. */
         if( nTruncate ){
           pWal->hdr.mxFrame = iFrame;
-          pWal->
+          pWal->hdr.nPage = nTruncate;
+          pWal->hdr.szPage = (u16)((szPage&0xff00) | (szPage>>16));
+          testcase( szPage<=32768 );
+          testcase( szPage>=65536 );
+          aFrameCksum[0] = pWal->hdr.aFrameCksum[0];
+          aFrameCksum[1] = pWal->hdr.aFrameCksum[1];
+        }
+      }
+      pWal->apWiData[iPg] = aShare;
+      nHdr = (iPg==0 ? WALINDEX_HDR_SIZE : 0);
+      nHdr32 = nHdr / sizeof(u32);
+#ifndef SQLITE_SAFER_WALINDEX_RECOVERY
+      /* Memcpy() should work fine here, on all reasonable implementations.
+      ** Technically, memcpy() might change the destination to some
+      ** intermediate value before setting to the final value, and that might
+      ** cause a concurrent reader to malfunction.  Memcpy() is allowed to
+      ** do that, according to the spec, but no memcpy() implementation that
+      ** we know of actually does that, which is why we say that memcpy()
+      ** is safe for this.  Memcpy() is certainly a lot faster.
+      */
+      memcpy(&aShare[nHdr32], &aPrivate[nHdr32], WALINDEX_PGSZ-nHdr);
+#else
+      /* In the event that some platform is found for which memcpy()
+      ** changes the destination to some intermediate value before
+      ** setting the final value, this alternative copy routine is
+      ** provided.
+      */
+      {
+        int i;
+        for(i=nHdr32; i<WALINDEX_PGSZ/sizeof(u32); i++){
+          if( aShare[i]!=aPrivate[i] ){
+            /* Atomic memory operations are not required here because if
+            ** the value needs to be changed, that means it is not being
+            ** accessed concurrently. */
+            aShare[i] = aPrivate[i];
+          }
+        }
+      }
+#endif
+      if( iFrame<=iLast ) break;
+    }
+
+    sqlite3_free(aFrame);
+  }
+
+finished:
+  if( rc==SQLITE_OK ){
+    volatile WalCkptInfo *pInfo;
+    int i;
+    pWal->hdr.aFrameCksum[0] = aFrameCksum[0];
+    pWal->hdr.aFrameCksum[1] = aFrameCksum[1];
+    walIndexWriteHdr(pWal);
+
+    /* Reset the checkpoint-header. This is safe because this thread is
+    ** currently holding locks that exclude all other writers and
+    ** checkpointers. Then set the values of read-mark slots 1 through N.
+    */
+    pInfo = walCkptInfo(pWal);
+    pInfo->nBackfill = 0;
+    pInfo->nBackfillAttempted = pWal->hdr.mxFrame;
+    pInfo->aReadMark[0] = 0;
+    for(i=1; i<WAL_NREADER; i++){
+      rc = walLockExclusive(pWal, WAL_READ_LOCK(i), 1);
+      if( rc==SQLITE_OK ){
+        if( i==1 && pWal->hdr.mxFrame ){
+          pInfo->aReadMark[i] = pWal->hdr.mxFrame;
+        }else{
+          pInfo->aReadMark[i] = READMARK_NOT_USED;
+        }
+        walUnlockExclusive(pWal, WAL_READ_LOCK(i), 1);
+      }else if( rc!=SQLITE_BUSY ){
+        goto recovery_error;
+      }
+    }
+
+    /* If more than one frame was recovered from the log file, report an
+    ** event via sqlite3_log(). This is to help with identifying performance
+    ** problems caused by applications routinely shutting down without
+    ** checkpointing the log file.
+    */
+    if( pWal->hdr.nPage ){
+      sqlite3_log(SQLITE_NOTICE_RECOVER_WAL,
+          "recovered %d frames from WAL file %s",
+          pWal->hdr.mxFrame, pWal->zWalName
+      );
+    }
+  }
+
+recovery_error:
+  WALTRACE(("WAL%p: recovery %s\n", pWal, rc ? "failed" : "ok"));
+  walUnlockExclusive(pWal, iLock, WAL_READ_LOCK(0)-iLock);
+  return rc;
+}
+
+/*
+** Close an open wal-index.
+*/
+static void walIndexClose(Wal *pWal, int isDelete){
+  if( pWal->exclusiveMode==WAL_HEAPMEMORY_MODE || pWal->bShmUnreliable ){
+    int i;
+    for(i=0; i<pWal->nWiData; i++){
+      sqlite3_free((void *)pWal->apWiData[i]);
+      pWal->apWiData[i] = 0;
+    }
+  }
+  if( pWal->exclusiveMode!=WAL_HEAPMEMORY_MODE ){
+    sqlite3OsShmUnmap(pWal->pDbFd, isDelete);
+  }
+}
+
+/*
+** Open a connection to the WAL file zWalName. The database file must
+** already be opened on connection pDbFd. The buffer that zWalName points
+** to must remain valid for the lifetime of the returned Wal* handle.
+**
+** A SHARED lock should be held on the database file when this function
+** is called. The purpose of this SHARED lock is to prevent any other
+** client from unlinking the WAL or wal-index file. If another process
+** were to do this just after this client opened one of these files, the
+** system would be badly broken.
+**
+** If the log file is successfully opened, SQLITE_OK is returned and
+** *ppWal is set to point to a new WAL handle. If an error occurs,
+** an SQLite error code is returned and *ppWal is left unmodified.
+*/
+SQLITE_PRIVATE int sqlite3WalOpen(
+  sqlite3_vfs *pVfs,              /* vfs module to open wal and wal-index */
+  sqlite3_file *pDbFd,            /* The open database file */
+  const char *zWalName,           /* Name of the WAL file */
+  int bNoShm,                     /* True to run in heap-memory mode */
+  i64 mxWalSize,                  /* Truncate WAL to this size on reset */
+  Wal **ppWal                     /* OUT: Allocated Wal handle */
+){
+  int rc;                         /* Return Code */
+  Wal *pRet;                      /* Object to allocate and return */
+  int flags;                      /* Flags passed to OsOpen() */
+
+  assert( zWalName && zWalName[0] );
+  assert( pDbFd );
+
+  /* Verify the values of various constants.  Any changes to the values
+  ** of these constants would result in an incompatible on-disk format
+  ** for the -shm file.  Any change that causes one of these asserts to
+  ** fail is a backward compatibility problem, even if the change otherwise
+  ** works.
+  **
+  ** This table also serves as a helpful cross-reference when trying to
+  ** interpret hex dumps of the -shm file.
+  */
+  assert(    48 ==  sizeof(WalIndexHdr)  );
+  assert(    40 ==  sizeof(WalCkptInfo)  );
+  assert(   120 ==  WALINDEX_LOCK_OFFSET );
+  assert(   136 ==  WALINDEX_HDR_SIZE    );
+  assert(  4096 ==  HASHTABLE_NPAGE      );
+  assert(  4062 ==  HASHTABLE_NPAGE_ONE  );
+  assert(  8192 ==  HASHTABLE_NSLOT      );
+  assert(   383 ==  HASHTABLE_HASH_1     );
+  assert( 32768 ==  WALINDEX_PGSZ        );
+  assert(     8 ==  SQLITE_SHM_NLOCK     );
+  assert(     5 ==  WAL_NREADER          );
+  assert(    24 ==  WAL_FRAME_HDRSIZE    );
+  assert(    32 ==  WAL_HDRSIZE          );
+  assert(   120 ==  WALINDEX_LOCK_OFFSET + WAL_WRITE_LOCK   );
+  assert(   121 ==  WALINDEX_LOCK_OFFSET + WAL_CKPT_LOCK    );
+  assert(   122 ==  WALINDEX_LOCK_OFFSET + WAL_RECOVER_LOCK );
+  assert(   123 ==  WALINDEX_LOCK_OFFSET + WAL_READ_LOCK(0) );
+  assert(   124 ==  WALINDEX_LOCK_OFFSET + WAL_READ_LOCK(1) );
+  assert(   125 ==  WALINDEX_LOCK_OFFSET + WAL_READ_LOCK(2) );
+  assert(   126 ==  WALINDEX_LOCK_OFFSET + WAL_READ_LOCK(3) );
+  assert(   127 ==  WA
