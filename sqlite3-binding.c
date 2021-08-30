@@ -62259,4 +62259,215 @@ struct WalIterator {
 */
 #define HASHTABLE_NPAGE      4096                 /* Must be power of 2 */
 #define HASHTABLE_HASH_1     383                  /* Should be prime */
-#define HASHTABLE_NSLOT      (HASHTABLE_NPAGE*2)  /* Must be 
+#define HASHTABLE_NSLOT      (HASHTABLE_NPAGE*2)  /* Must be a power of 2 */
+
+/*
+** The block of page numbers associated with the first hash-table in a
+** wal-index is smaller than usual. This is so that there is a complete
+** hash-table on each aligned 32KB page of the wal-index.
+*/
+#define HASHTABLE_NPAGE_ONE  (HASHTABLE_NPAGE - (WALINDEX_HDR_SIZE/sizeof(u32)))
+
+/* The wal-index is divided into pages of WALINDEX_PGSZ bytes each. */
+#define WALINDEX_PGSZ   (                                         \
+    sizeof(ht_slot)*HASHTABLE_NSLOT + HASHTABLE_NPAGE*sizeof(u32) \
+)
+
+/*
+** Obtain a pointer to the iPage'th page of the wal-index. The wal-index
+** is broken into pages of WALINDEX_PGSZ bytes. Wal-index pages are
+** numbered from zero.
+**
+** If the wal-index is currently smaller the iPage pages then the size
+** of the wal-index might be increased, but only if it is safe to do
+** so.  It is safe to enlarge the wal-index if pWal->writeLock is true
+** or pWal->exclusiveMode==WAL_HEAPMEMORY_MODE.
+**
+** Three possible result scenarios:
+**
+**   (1)  rc==SQLITE_OK    and *ppPage==Requested-Wal-Index-Page
+**   (2)  rc>=SQLITE_ERROR and *ppPage==NULL
+**   (3)  rc==SQLITE_OK    and *ppPage==NULL  // only if iPage==0
+**
+** Scenario (3) can only occur when pWal->writeLock is false and iPage==0
+*/
+static SQLITE_NOINLINE int walIndexPageRealloc(
+  Wal *pWal,               /* The WAL context */
+  int iPage,               /* The page we seek */
+  volatile u32 **ppPage    /* Write the page pointer here */
+){
+  int rc = SQLITE_OK;
+
+  /* Enlarge the pWal->apWiData[] array if required */
+  if( pWal->nWiData<=iPage ){
+    sqlite3_int64 nByte = sizeof(u32*)*(iPage+1);
+    volatile u32 **apNew;
+    apNew = (volatile u32 **)sqlite3Realloc((void *)pWal->apWiData, nByte);
+    if( !apNew ){
+      *ppPage = 0;
+      return SQLITE_NOMEM_BKPT;
+    }
+    memset((void*)&apNew[pWal->nWiData], 0,
+           sizeof(u32*)*(iPage+1-pWal->nWiData));
+    pWal->apWiData = apNew;
+    pWal->nWiData = iPage+1;
+  }
+
+  /* Request a pointer to the required page from the VFS */
+  assert( pWal->apWiData[iPage]==0 );
+  if( pWal->exclusiveMode==WAL_HEAPMEMORY_MODE ){
+    pWal->apWiData[iPage] = (u32 volatile *)sqlite3MallocZero(WALINDEX_PGSZ);
+    if( !pWal->apWiData[iPage] ) rc = SQLITE_NOMEM_BKPT;
+  }else{
+    rc = sqlite3OsShmMap(pWal->pDbFd, iPage, WALINDEX_PGSZ,
+        pWal->writeLock, (void volatile **)&pWal->apWiData[iPage]
+    );
+    assert( pWal->apWiData[iPage]!=0
+         || rc!=SQLITE_OK
+         || (pWal->writeLock==0 && iPage==0) );
+    testcase( pWal->apWiData[iPage]==0 && rc==SQLITE_OK );
+    if( rc==SQLITE_OK ){
+      if( iPage>0 && sqlite3FaultSim(600) ) rc = SQLITE_NOMEM;
+    }else if( (rc&0xff)==SQLITE_READONLY ){
+      pWal->readOnly |= WAL_SHM_RDONLY;
+      if( rc==SQLITE_READONLY ){
+        rc = SQLITE_OK;
+      }
+    }
+  }
+
+  *ppPage = pWal->apWiData[iPage];
+  assert( iPage==0 || *ppPage || rc!=SQLITE_OK );
+  return rc;
+}
+static int walIndexPage(
+  Wal *pWal,               /* The WAL context */
+  int iPage,               /* The page we seek */
+  volatile u32 **ppPage    /* Write the page pointer here */
+){
+  if( pWal->nWiData<=iPage || (*ppPage = pWal->apWiData[iPage])==0 ){
+    return walIndexPageRealloc(pWal, iPage, ppPage);
+  }
+  return SQLITE_OK;
+}
+
+/*
+** Return a pointer to the WalCkptInfo structure in the wal-index.
+*/
+static volatile WalCkptInfo *walCkptInfo(Wal *pWal){
+  assert( pWal->nWiData>0 && pWal->apWiData[0] );
+  return (volatile WalCkptInfo*)&(pWal->apWiData[0][sizeof(WalIndexHdr)/2]);
+}
+
+/*
+** Return a pointer to the WalIndexHdr structure in the wal-index.
+*/
+static volatile WalIndexHdr *walIndexHdr(Wal *pWal){
+  assert( pWal->nWiData>0 && pWal->apWiData[0] );
+  return (volatile WalIndexHdr*)pWal->apWiData[0];
+}
+
+/*
+** The argument to this macro must be of type u32. On a little-endian
+** architecture, it returns the u32 value that results from interpreting
+** the 4 bytes as a big-endian value. On a big-endian architecture, it
+** returns the value that would be produced by interpreting the 4 bytes
+** of the input value as a little-endian integer.
+*/
+#define BYTESWAP32(x) ( \
+    (((x)&0x000000FF)<<24) + (((x)&0x0000FF00)<<8)  \
+  + (((x)&0x00FF0000)>>8)  + (((x)&0xFF000000)>>24) \
+)
+
+/*
+** Generate or extend an 8 byte checksum based on the data in
+** array aByte[] and the initial values of aIn[0] and aIn[1] (or
+** initial values of 0 and 0 if aIn==NULL).
+**
+** The checksum is written back into aOut[] before returning.
+**
+** nByte must be a positive multiple of 8.
+*/
+static void walChecksumBytes(
+  int nativeCksum, /* True for native byte-order, false for non-native */
+  u8 *a,           /* Content to be checksummed */
+  int nByte,       /* Bytes of content in a[].  Must be a multiple of 8. */
+  const u32 *aIn,  /* Initial checksum value input */
+  u32 *aOut        /* OUT: Final checksum value output */
+){
+  u32 s1, s2;
+  u32 *aData = (u32 *)a;
+  u32 *aEnd = (u32 *)&a[nByte];
+
+  if( aIn ){
+    s1 = aIn[0];
+    s2 = aIn[1];
+  }else{
+    s1 = s2 = 0;
+  }
+
+  assert( nByte>=8 );
+  assert( (nByte&0x00000007)==0 );
+  assert( nByte<=65536 );
+
+  if( nativeCksum ){
+    do {
+      s1 += *aData++ + s2;
+      s2 += *aData++ + s1;
+    }while( aData<aEnd );
+  }else{
+    do {
+      s1 += BYTESWAP32(aData[0]) + s2;
+      s2 += BYTESWAP32(aData[1]) + s1;
+      aData += 2;
+    }while( aData<aEnd );
+  }
+
+  aOut[0] = s1;
+  aOut[1] = s2;
+}
+
+/*
+** If there is the possibility of concurrent access to the SHM file
+** from multiple threads and/or processes, then do a memory barrier.
+*/
+static void walShmBarrier(Wal *pWal){
+  if( pWal->exclusiveMode!=WAL_HEAPMEMORY_MODE ){
+    sqlite3OsShmBarrier(pWal->pDbFd);
+  }
+}
+
+/*
+** Add the SQLITE_NO_TSAN as part of the return-type of a function
+** definition as a hint that the function contains constructs that
+** might give false-positive TSAN warnings.
+**
+** See tag-20200519-1.
+*/
+#if defined(__clang__) && !defined(SQLITE_NO_TSAN)
+# define SQLITE_NO_TSAN __attribute__((no_sanitize_thread))
+#else
+# define SQLITE_NO_TSAN
+#endif
+
+/*
+** Write the header information in pWal->hdr into the wal-index.
+**
+** The checksum on pWal->hdr is updated before it is written.
+*/
+static SQLITE_NO_TSAN void walIndexWriteHdr(Wal *pWal){
+  volatile WalIndexHdr *aHdr = walIndexHdr(pWal);
+  const int nCksum = offsetof(WalIndexHdr, aCksum);
+
+  assert( pWal->writeLock );
+  pWal->hdr.isInit = 1;
+  pWal->hdr.iVersion = WALINDEX_MAX_VERSION;
+  walChecksumBytes(1, (u8*)&pWal->hdr, nCksum, 0, pWal->hdr.aCksum);
+  /* Possible TSAN false-positive.  See tag-20200519-1 */
+  memcpy((void*)&aHdr[1], (const void*)&pWal->hdr, sizeof(WalIndexHdr));
+  walShmBarrier(pWal);
+  memcpy((void*)&aHdr[0], (const void*)&pWal->hdr, sizeof(WalIndexHdr));
+}
+
+/*
+** This function encodes a single frame he
