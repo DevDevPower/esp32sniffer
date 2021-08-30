@@ -62653,4 +62653,183 @@ struct WalHashLoc {
 };
 
 /*
-*
+** Return pointers to the hash table and page number array stored on
+** page iHash of the wal-index. The wal-index is broken into 32KB pages
+** numbered starting from 0.
+**
+** Set output variable pLoc->aHash to point to the start of the hash table
+** in the wal-index file. Set pLoc->iZero to one less than the frame
+** number of the first frame indexed by this hash table. If a
+** slot in the hash table is set to N, it refers to frame number
+** (pLoc->iZero+N) in the log.
+**
+** Finally, set pLoc->aPgno so that pLoc->aPgno[0] is the page number of the
+** first frame indexed by the hash table, frame (pLoc->iZero).
+*/
+static int walHashGet(
+  Wal *pWal,                      /* WAL handle */
+  int iHash,                      /* Find the iHash'th table */
+  WalHashLoc *pLoc                /* OUT: Hash table location */
+){
+  int rc;                         /* Return code */
+
+  rc = walIndexPage(pWal, iHash, &pLoc->aPgno);
+  assert( rc==SQLITE_OK || iHash>0 );
+
+  if( pLoc->aPgno ){
+    pLoc->aHash = (volatile ht_slot *)&pLoc->aPgno[HASHTABLE_NPAGE];
+    if( iHash==0 ){
+      pLoc->aPgno = &pLoc->aPgno[WALINDEX_HDR_SIZE/sizeof(u32)];
+      pLoc->iZero = 0;
+    }else{
+      pLoc->iZero = HASHTABLE_NPAGE_ONE + (iHash-1)*HASHTABLE_NPAGE;
+    }
+  }else if( NEVER(rc==SQLITE_OK) ){
+    rc = SQLITE_ERROR;
+  }
+  return rc;
+}
+
+/*
+** Return the number of the wal-index page that contains the hash-table
+** and page-number array that contain entries corresponding to WAL frame
+** iFrame. The wal-index is broken up into 32KB pages. Wal-index pages
+** are numbered starting from 0.
+*/
+static int walFramePage(u32 iFrame){
+  int iHash = (iFrame+HASHTABLE_NPAGE-HASHTABLE_NPAGE_ONE-1) / HASHTABLE_NPAGE;
+  assert( (iHash==0 || iFrame>HASHTABLE_NPAGE_ONE)
+       && (iHash>=1 || iFrame<=HASHTABLE_NPAGE_ONE)
+       && (iHash<=1 || iFrame>(HASHTABLE_NPAGE_ONE+HASHTABLE_NPAGE))
+       && (iHash>=2 || iFrame<=HASHTABLE_NPAGE_ONE+HASHTABLE_NPAGE)
+       && (iHash<=2 || iFrame>(HASHTABLE_NPAGE_ONE+2*HASHTABLE_NPAGE))
+  );
+  assert( iHash>=0 );
+  return iHash;
+}
+
+/*
+** Return the page number associated with frame iFrame in this WAL.
+*/
+static u32 walFramePgno(Wal *pWal, u32 iFrame){
+  int iHash = walFramePage(iFrame);
+  if( iHash==0 ){
+    return pWal->apWiData[0][WALINDEX_HDR_SIZE/sizeof(u32) + iFrame - 1];
+  }
+  return pWal->apWiData[iHash][(iFrame-1-HASHTABLE_NPAGE_ONE)%HASHTABLE_NPAGE];
+}
+
+/*
+** Remove entries from the hash table that point to WAL slots greater
+** than pWal->hdr.mxFrame.
+**
+** This function is called whenever pWal->hdr.mxFrame is decreased due
+** to a rollback or savepoint.
+**
+** At most only the hash table containing pWal->hdr.mxFrame needs to be
+** updated.  Any later hash tables will be automatically cleared when
+** pWal->hdr.mxFrame advances to the point where those hash tables are
+** actually needed.
+*/
+static void walCleanupHash(Wal *pWal){
+  WalHashLoc sLoc;                /* Hash table location */
+  int iLimit = 0;                 /* Zero values greater than this */
+  int nByte;                      /* Number of bytes to zero in aPgno[] */
+  int i;                          /* Used to iterate through aHash[] */
+
+  assert( pWal->writeLock );
+  testcase( pWal->hdr.mxFrame==HASHTABLE_NPAGE_ONE-1 );
+  testcase( pWal->hdr.mxFrame==HASHTABLE_NPAGE_ONE );
+  testcase( pWal->hdr.mxFrame==HASHTABLE_NPAGE_ONE+1 );
+
+  if( pWal->hdr.mxFrame==0 ) return;
+
+  /* Obtain pointers to the hash-table and page-number array containing
+  ** the entry that corresponds to frame pWal->hdr.mxFrame. It is guaranteed
+  ** that the page said hash-table and array reside on is already mapped.(1)
+  */
+  assert( pWal->nWiData>walFramePage(pWal->hdr.mxFrame) );
+  assert( pWal->apWiData[walFramePage(pWal->hdr.mxFrame)] );
+  i = walHashGet(pWal, walFramePage(pWal->hdr.mxFrame), &sLoc);
+  if( NEVER(i) ) return; /* Defense-in-depth, in case (1) above is wrong */
+
+  /* Zero all hash-table entries that correspond to frame numbers greater
+  ** than pWal->hdr.mxFrame.
+  */
+  iLimit = pWal->hdr.mxFrame - sLoc.iZero;
+  assert( iLimit>0 );
+  for(i=0; i<HASHTABLE_NSLOT; i++){
+    if( sLoc.aHash[i]>iLimit ){
+      sLoc.aHash[i] = 0;
+    }
+  }
+
+  /* Zero the entries in the aPgno array that correspond to frames with
+  ** frame numbers greater than pWal->hdr.mxFrame.
+  */
+  nByte = (int)((char *)sLoc.aHash - (char *)&sLoc.aPgno[iLimit]);
+  assert( nByte>=0 );
+  memset((void *)&sLoc.aPgno[iLimit], 0, nByte);
+
+#ifdef SQLITE_ENABLE_EXPENSIVE_ASSERT
+  /* Verify that the every entry in the mapping region is still reachable
+  ** via the hash table even after the cleanup.
+  */
+  if( iLimit ){
+    int j;           /* Loop counter */
+    int iKey;        /* Hash key */
+    for(j=0; j<iLimit; j++){
+      for(iKey=walHash(sLoc.aPgno[j]);sLoc.aHash[iKey];iKey=walNextHash(iKey)){
+        if( sLoc.aHash[iKey]==j+1 ) break;
+      }
+      assert( sLoc.aHash[iKey]==j+1 );
+    }
+  }
+#endif /* SQLITE_ENABLE_EXPENSIVE_ASSERT */
+}
+
+
+/*
+** Set an entry in the wal-index that will map database page number
+** pPage into WAL frame iFrame.
+*/
+static int walIndexAppend(Wal *pWal, u32 iFrame, u32 iPage){
+  int rc;                         /* Return code */
+  WalHashLoc sLoc;                /* Wal-index hash table location */
+
+  rc = walHashGet(pWal, walFramePage(iFrame), &sLoc);
+
+  /* Assuming the wal-index file was successfully mapped, populate the
+  ** page number array and hash table entry.
+  */
+  if( rc==SQLITE_OK ){
+    int iKey;                     /* Hash table key */
+    int idx;                      /* Value to write to hash-table slot */
+    int nCollide;                 /* Number of hash collisions */
+
+    idx = iFrame - sLoc.iZero;
+    assert( idx <= HASHTABLE_NSLOT/2 + 1 );
+
+    /* If this is the first entry to be added to this hash-table, zero the
+    ** entire hash table and aPgno[] array before proceeding.
+    */
+    if( idx==1 ){
+      int nByte = (int)((u8*)&sLoc.aHash[HASHTABLE_NSLOT] - (u8*)sLoc.aPgno);
+      assert( nByte>=0 );
+      memset((void*)sLoc.aPgno, 0, nByte);
+    }
+
+    /* If the entry in aPgno[] is already set, then the previous writer
+    ** must have exited unexpectedly in the middle of a transaction (after
+    ** writing one or more dirty pages to the WAL to free up memory).
+    ** Remove the remnants of that writers uncommitted transaction from
+    ** the hash-table before writing any new entries.
+    */
+    if( sLoc.aPgno[idx-1] ){
+      walCleanupHash(pWal);
+      assert( !sLoc.aPgno[idx-1] );
+    }
+
+    /* Write the aPgno[] array entry and the hash-table slot. */
+    nCollide = idx;
+    for(iKey=walHas
