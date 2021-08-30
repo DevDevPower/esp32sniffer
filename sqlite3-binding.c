@@ -62102,4 +62102,161 @@ struct WalCkptInfo {
 **  68: | nPage                       |  |
 **      +-----------------------------+  |
 **  72: | aFrameCksum                 |  |
-**      |                  
+**      |                             |  |
+**      +-----------------------------+  |
+**  80: | aSalt                       |  |
+**      |                             |  |
+**      +-----------------------------+  |
+**  88: | aCksum                      |  |
+**      |                             | /
+**      +-----------------------------+
+**  96: | nBackfill                   |
+**      +-----------------------------+
+** 100: | 5 read marks                |
+**      |                             |
+**      |                             |
+**      |                             |
+**      |                             |
+**      +-------+-------+------+------+
+** 120: | Write | Ckpt  | Rcvr | Rd0  | \
+**      +-------+-------+------+------+  ) 8 lock bytes
+**      | Read1 | Read2 | Rd3  | Rd4  | /
+**      +-------+-------+------+------+
+** 128: | nBackfillAttempted          |
+**      +-----------------------------+
+** 132: | (unused padding)            |
+**      +-----------------------------+
+*/
+
+/* A block of WALINDEX_LOCK_RESERVED bytes beginning at
+** WALINDEX_LOCK_OFFSET is reserved for locks. Since some systems
+** only support mandatory file-locks, we do not read or write data
+** from the region of the file on which locks are applied.
+*/
+#define WALINDEX_LOCK_OFFSET (sizeof(WalIndexHdr)*2+offsetof(WalCkptInfo,aLock))
+#define WALINDEX_HDR_SIZE    (sizeof(WalIndexHdr)*2+sizeof(WalCkptInfo))
+
+/* Size of header before each frame in wal */
+#define WAL_FRAME_HDRSIZE 24
+
+/* Size of write ahead log header, including checksum. */
+#define WAL_HDRSIZE 32
+
+/* WAL magic value. Either this value, or the same value with the least
+** significant bit also set (WAL_MAGIC | 0x00000001) is stored in 32-bit
+** big-endian format in the first 4 bytes of a WAL file.
+**
+** If the LSB is set, then the checksums for each frame within the WAL
+** file are calculated by treating all data as an array of 32-bit
+** big-endian words. Otherwise, they are calculated by interpreting
+** all data as 32-bit little-endian words.
+*/
+#define WAL_MAGIC 0x377f0682
+
+/*
+** Return the offset of frame iFrame in the write-ahead log file,
+** assuming a database page size of szPage bytes. The offset returned
+** is to the start of the write-ahead log frame-header.
+*/
+#define walFrameOffset(iFrame, szPage) (                               \
+  WAL_HDRSIZE + ((iFrame)-1)*(i64)((szPage)+WAL_FRAME_HDRSIZE)         \
+)
+
+/*
+** An open write-ahead log file is represented by an instance of the
+** following object.
+*/
+struct Wal {
+  sqlite3_vfs *pVfs;         /* The VFS used to create pDbFd */
+  sqlite3_file *pDbFd;       /* File handle for the database file */
+  sqlite3_file *pWalFd;      /* File handle for WAL file */
+  u32 iCallback;             /* Value to pass to log callback (or 0) */
+  i64 mxWalSize;             /* Truncate WAL to this size upon reset */
+  int nWiData;               /* Size of array apWiData */
+  int szFirstBlock;          /* Size of first block written to WAL file */
+  volatile u32 **apWiData;   /* Pointer to wal-index content in memory */
+  u32 szPage;                /* Database page size */
+  i16 readLock;              /* Which read lock is being held.  -1 for none */
+  u8 syncFlags;              /* Flags to use to sync header writes */
+  u8 exclusiveMode;          /* Non-zero if connection is in exclusive mode */
+  u8 writeLock;              /* True if in a write transaction */
+  u8 ckptLock;               /* True if holding a checkpoint lock */
+  u8 readOnly;               /* WAL_RDWR, WAL_RDONLY, or WAL_SHM_RDONLY */
+  u8 truncateOnCommit;       /* True to truncate WAL file on commit */
+  u8 syncHeader;             /* Fsync the WAL header if true */
+  u8 padToSectorBoundary;    /* Pad transactions out to the next sector */
+  u8 bShmUnreliable;         /* SHM content is read-only and unreliable */
+  WalIndexHdr hdr;           /* Wal-index header for current transaction */
+  u32 minFrame;              /* Ignore wal frames before this one */
+  u32 iReCksum;              /* On commit, recalculate checksums from here */
+  const char *zWalName;      /* Name of WAL file */
+  u32 nCkpt;                 /* Checkpoint sequence counter in the wal-header */
+#ifdef SQLITE_DEBUG
+  u8 lockError;              /* True if a locking error has occurred */
+#endif
+#ifdef SQLITE_ENABLE_SNAPSHOT
+  WalIndexHdr *pSnapshot;    /* Start transaction here if not NULL */
+#endif
+#ifdef SQLITE_ENABLE_SETLK_TIMEOUT
+  sqlite3 *db;
+#endif
+};
+
+/*
+** Candidate values for Wal.exclusiveMode.
+*/
+#define WAL_NORMAL_MODE     0
+#define WAL_EXCLUSIVE_MODE  1
+#define WAL_HEAPMEMORY_MODE 2
+
+/*
+** Possible values for WAL.readOnly
+*/
+#define WAL_RDWR        0    /* Normal read/write connection */
+#define WAL_RDONLY      1    /* The WAL file is readonly */
+#define WAL_SHM_RDONLY  2    /* The SHM file is readonly */
+
+/*
+** Each page of the wal-index mapping contains a hash-table made up of
+** an array of HASHTABLE_NSLOT elements of the following type.
+*/
+typedef u16 ht_slot;
+
+/*
+** This structure is used to implement an iterator that loops through
+** all frames in the WAL in database page order. Where two or more frames
+** correspond to the same database page, the iterator visits only the
+** frame most recently written to the WAL (in other words, the frame with
+** the largest index).
+**
+** The internals of this structure are only accessed by:
+**
+**   walIteratorInit() - Create a new iterator,
+**   walIteratorNext() - Step an iterator,
+**   walIteratorFree() - Free an iterator.
+**
+** This functionality is used by the checkpoint code (see walCheckpoint()).
+*/
+struct WalIterator {
+  u32 iPrior;                     /* Last result returned from the iterator */
+  int nSegment;                   /* Number of entries in aSegment[] */
+  struct WalSegment {
+    int iNext;                    /* Next slot in aIndex[] not yet returned */
+    ht_slot *aIndex;              /* i0, i1, i2... such that aPgno[iN] ascend */
+    u32 *aPgno;                   /* Array of page numbers. */
+    int nEntry;                   /* Nr. of entries in aPgno[] and aIndex[] */
+    int iZero;                    /* Frame number associated with aPgno[0] */
+  } aSegment[1];                  /* One for every 32KB page in the wal-index */
+};
+
+/*
+** Define the parameters of the hash tables in the wal-index file. There
+** is a hash-table following every HASHTABLE_NPAGE page numbers in the
+** wal-index.
+**
+** Changing any of these constants will alter the wal-index format and
+** create incompatibilities.
+*/
+#define HASHTABLE_NPAGE      4096                 /* Must be power of 2 */
+#define HASHTABLE_HASH_1     383                  /* Should be prime */
+#define HASHTABLE_NSLOT      (HASHTABLE_NPAGE*2)  /* Must be 
