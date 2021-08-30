@@ -61974,4 +61974,132 @@ typedef struct WalCkptInfo WalCkptInfo;
 ** The actual header in the wal-index consists of two copies of this
 ** object followed by one instance of the WalCkptInfo object.
 ** For all versions of SQLite through 3.10.0 and probably beyond,
-** the locking bytes (
+** the locking bytes (WalCkptInfo.aLock) start at offset 120 and
+** the total header size is 136 bytes.
+**
+** The szPage value can be any power of 2 between 512 and 32768, inclusive.
+** Or it can be 1 to represent a 65536-byte page.  The latter case was
+** added in 3.7.1 when support for 64K pages was added.
+*/
+struct WalIndexHdr {
+  u32 iVersion;                   /* Wal-index version */
+  u32 unused;                     /* Unused (padding) field */
+  u32 iChange;                    /* Counter incremented each transaction */
+  u8 isInit;                      /* 1 when initialized */
+  u8 bigEndCksum;                 /* True if checksums in WAL are big-endian */
+  u16 szPage;                     /* Database page size in bytes. 1==64K */
+  u32 mxFrame;                    /* Index of last valid frame in the WAL */
+  u32 nPage;                      /* Size of database in pages */
+  u32 aFrameCksum[2];             /* Checksum of last frame in log */
+  u32 aSalt[2];                   /* Two salt values copied from WAL header */
+  u32 aCksum[2];                  /* Checksum over all prior fields */
+};
+
+/*
+** A copy of the following object occurs in the wal-index immediately
+** following the second copy of the WalIndexHdr.  This object stores
+** information used by checkpoint.
+**
+** nBackfill is the number of frames in the WAL that have been written
+** back into the database. (We call the act of moving content from WAL to
+** database "backfilling".)  The nBackfill number is never greater than
+** WalIndexHdr.mxFrame.  nBackfill can only be increased by threads
+** holding the WAL_CKPT_LOCK lock (which includes a recovery thread).
+** However, a WAL_WRITE_LOCK thread can move the value of nBackfill from
+** mxFrame back to zero when the WAL is reset.
+**
+** nBackfillAttempted is the largest value of nBackfill that a checkpoint
+** has attempted to achieve.  Normally nBackfill==nBackfillAtempted, however
+** the nBackfillAttempted is set before any backfilling is done and the
+** nBackfill is only set after all backfilling completes.  So if a checkpoint
+** crashes, nBackfillAttempted might be larger than nBackfill.  The
+** WalIndexHdr.mxFrame must never be less than nBackfillAttempted.
+**
+** The aLock[] field is a set of bytes used for locking.  These bytes should
+** never be read or written.
+**
+** There is one entry in aReadMark[] for each reader lock.  If a reader
+** holds read-lock K, then the value in aReadMark[K] is no greater than
+** the mxFrame for that reader.  The value READMARK_NOT_USED (0xffffffff)
+** for any aReadMark[] means that entry is unused.  aReadMark[0] is
+** a special case; its value is never used and it exists as a place-holder
+** to avoid having to offset aReadMark[] indexs by one.  Readers holding
+** WAL_READ_LOCK(0) always ignore the entire WAL and read all content
+** directly from the database.
+**
+** The value of aReadMark[K] may only be changed by a thread that
+** is holding an exclusive lock on WAL_READ_LOCK(K).  Thus, the value of
+** aReadMark[K] cannot changed while there is a reader is using that mark
+** since the reader will be holding a shared lock on WAL_READ_LOCK(K).
+**
+** The checkpointer may only transfer frames from WAL to database where
+** the frame numbers are less than or equal to every aReadMark[] that is
+** in use (that is, every aReadMark[j] for which there is a corresponding
+** WAL_READ_LOCK(j)).  New readers (usually) pick the aReadMark[] with the
+** largest value and will increase an unused aReadMark[] to mxFrame if there
+** is not already an aReadMark[] equal to mxFrame.  The exception to the
+** previous sentence is when nBackfill equals mxFrame (meaning that everything
+** in the WAL has been backfilled into the database) then new readers
+** will choose aReadMark[0] which has value 0 and hence such reader will
+** get all their all content directly from the database file and ignore
+** the WAL.
+**
+** Writers normally append new frames to the end of the WAL.  However,
+** if nBackfill equals mxFrame (meaning that all WAL content has been
+** written back into the database) and if no readers are using the WAL
+** (in other words, if there are no WAL_READ_LOCK(i) where i>0) then
+** the writer will first "reset" the WAL back to the beginning and start
+** writing new content beginning at frame 1.
+**
+** We assume that 32-bit loads are atomic and so no locks are needed in
+** order to read from any aReadMark[] entries.
+*/
+struct WalCkptInfo {
+  u32 nBackfill;                  /* Number of WAL frames backfilled into DB */
+  u32 aReadMark[WAL_NREADER];     /* Reader marks */
+  u8 aLock[SQLITE_SHM_NLOCK];     /* Reserved space for locks */
+  u32 nBackfillAttempted;         /* WAL frames perhaps written, or maybe not */
+  u32 notUsed0;                   /* Available for future enhancements */
+};
+#define READMARK_NOT_USED  0xffffffff
+
+/*
+** This is a schematic view of the complete 136-byte header of the
+** wal-index file (also known as the -shm file):
+**
+**      +-----------------------------+
+**   0: | iVersion                    | \
+**      +-----------------------------+  |
+**   4: | (unused padding)            |  |
+**      +-----------------------------+  |
+**   8: | iChange                     |  |
+**      +-------+-------+-------------+  |
+**  12: | bInit |  bBig |   szPage    |  |
+**      +-------+-------+-------------+  |
+**  16: | mxFrame                     |  |  First copy of the
+**      +-----------------------------+  |  WalIndexHdr object
+**  20: | nPage                       |  |
+**      +-----------------------------+  |
+**  24: | aFrameCksum                 |  |
+**      |                             |  |
+**      +-----------------------------+  |
+**  32: | aSalt                       |  |
+**      |                             |  |
+**      +-----------------------------+  |
+**  40: | aCksum                      |  |
+**      |                             | /
+**      +-----------------------------+
+**  48: | iVersion                    | \
+**      +-----------------------------+  |
+**  52: | (unused padding)            |  |
+**      +-----------------------------+  |
+**  56: | iChange                     |  |
+**      +-------+-------+-------------+  |
+**  60: | bInit |  bBig |   szPage    |  |
+**      +-------+-------+-------------+  |  Second copy of the
+**  64: | mxFrame                     |  |  WalIndexHdr
+**      +-----------------------------+  |
+**  68: | nPage                       |  |
+**      +-----------------------------+  |
+**  72: | aFrameCksum                 |  |
+**      |                  
