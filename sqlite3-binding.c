@@ -63367,4 +63367,222 @@ static void walMergesort(
   int *pnList                     /* IN/OUT: Number of elements in aList[] */
 ){
   struct Sublist {
-    int nList;                    /* Number of elements
+    int nList;                    /* Number of elements in aList */
+    ht_slot *aList;               /* Pointer to sub-list content */
+  };
+
+  const int nList = *pnList;      /* Size of input list */
+  int nMerge = 0;                 /* Number of elements in list aMerge */
+  ht_slot *aMerge = 0;            /* List to be merged */
+  int iList;                      /* Index into input list */
+  u32 iSub = 0;                   /* Index into aSub array */
+  struct Sublist aSub[13];        /* Array of sub-lists */
+
+  memset(aSub, 0, sizeof(aSub));
+  assert( nList<=HASHTABLE_NPAGE && nList>0 );
+  assert( HASHTABLE_NPAGE==(1<<(ArraySize(aSub)-1)) );
+
+  for(iList=0; iList<nList; iList++){
+    nMerge = 1;
+    aMerge = &aList[iList];
+    for(iSub=0; iList & (1<<iSub); iSub++){
+      struct Sublist *p;
+      assert( iSub<ArraySize(aSub) );
+      p = &aSub[iSub];
+      assert( p->aList && p->nList<=(1<<iSub) );
+      assert( p->aList==&aList[iList&~((2<<iSub)-1)] );
+      walMerge(aContent, p->aList, p->nList, &aMerge, &nMerge, aBuffer);
+    }
+    aSub[iSub].aList = aMerge;
+    aSub[iSub].nList = nMerge;
+  }
+
+  for(iSub++; iSub<ArraySize(aSub); iSub++){
+    if( nList & (1<<iSub) ){
+      struct Sublist *p;
+      assert( iSub<ArraySize(aSub) );
+      p = &aSub[iSub];
+      assert( p->nList<=(1<<iSub) );
+      assert( p->aList==&aList[nList&~((2<<iSub)-1)] );
+      walMerge(aContent, p->aList, p->nList, &aMerge, &nMerge, aBuffer);
+    }
+  }
+  assert( aMerge==aList );
+  *pnList = nMerge;
+
+#ifdef SQLITE_DEBUG
+  {
+    int i;
+    for(i=1; i<*pnList; i++){
+      assert( aContent[aList[i]] > aContent[aList[i-1]] );
+    }
+  }
+#endif
+}
+
+/*
+** Free an iterator allocated by walIteratorInit().
+*/
+static void walIteratorFree(WalIterator *p){
+  sqlite3_free(p);
+}
+
+/*
+** Construct a WalInterator object that can be used to loop over all
+** pages in the WAL following frame nBackfill in ascending order. Frames
+** nBackfill or earlier may be included - excluding them is an optimization
+** only. The caller must hold the checkpoint lock.
+**
+** On success, make *pp point to the newly allocated WalInterator object
+** return SQLITE_OK. Otherwise, return an error code. If this routine
+** returns an error, the value of *pp is undefined.
+**
+** The calling routine should invoke walIteratorFree() to destroy the
+** WalIterator object when it has finished with it.
+*/
+static int walIteratorInit(Wal *pWal, u32 nBackfill, WalIterator **pp){
+  WalIterator *p;                 /* Return value */
+  int nSegment;                   /* Number of segments to merge */
+  u32 iLast;                      /* Last frame in log */
+  sqlite3_int64 nByte;            /* Number of bytes to allocate */
+  int i;                          /* Iterator variable */
+  ht_slot *aTmp;                  /* Temp space used by merge-sort */
+  int rc = SQLITE_OK;             /* Return Code */
+
+  /* This routine only runs while holding the checkpoint lock. And
+  ** it only runs if there is actually content in the log (mxFrame>0).
+  */
+  assert( pWal->ckptLock && pWal->hdr.mxFrame>0 );
+  iLast = pWal->hdr.mxFrame;
+
+  /* Allocate space for the WalIterator object. */
+  nSegment = walFramePage(iLast) + 1;
+  nByte = sizeof(WalIterator)
+        + (nSegment-1)*sizeof(struct WalSegment)
+        + iLast*sizeof(ht_slot);
+  p = (WalIterator *)sqlite3_malloc64(nByte);
+  if( !p ){
+    return SQLITE_NOMEM_BKPT;
+  }
+  memset(p, 0, nByte);
+  p->nSegment = nSegment;
+
+  /* Allocate temporary space used by the merge-sort routine. This block
+  ** of memory will be freed before this function returns.
+  */
+  aTmp = (ht_slot *)sqlite3_malloc64(
+      sizeof(ht_slot) * (iLast>HASHTABLE_NPAGE?HASHTABLE_NPAGE:iLast)
+  );
+  if( !aTmp ){
+    rc = SQLITE_NOMEM_BKPT;
+  }
+
+  for(i=walFramePage(nBackfill+1); rc==SQLITE_OK && i<nSegment; i++){
+    WalHashLoc sLoc;
+
+    rc = walHashGet(pWal, i, &sLoc);
+    if( rc==SQLITE_OK ){
+      int j;                      /* Counter variable */
+      int nEntry;                 /* Number of entries in this segment */
+      ht_slot *aIndex;            /* Sorted index for this segment */
+
+      if( (i+1)==nSegment ){
+        nEntry = (int)(iLast - sLoc.iZero);
+      }else{
+        nEntry = (int)((u32*)sLoc.aHash - (u32*)sLoc.aPgno);
+      }
+      aIndex = &((ht_slot *)&p->aSegment[p->nSegment])[sLoc.iZero];
+      sLoc.iZero++;
+
+      for(j=0; j<nEntry; j++){
+        aIndex[j] = (ht_slot)j;
+      }
+      walMergesort((u32 *)sLoc.aPgno, aTmp, aIndex, &nEntry);
+      p->aSegment[i].iZero = sLoc.iZero;
+      p->aSegment[i].nEntry = nEntry;
+      p->aSegment[i].aIndex = aIndex;
+      p->aSegment[i].aPgno = (u32 *)sLoc.aPgno;
+    }
+  }
+  sqlite3_free(aTmp);
+
+  if( rc!=SQLITE_OK ){
+    walIteratorFree(p);
+    p = 0;
+  }
+  *pp = p;
+  return rc;
+}
+
+#ifdef SQLITE_ENABLE_SETLK_TIMEOUT
+/*
+** Attempt to enable blocking locks. Blocking locks are enabled only if (a)
+** they are supported by the VFS, and (b) the database handle is configured
+** with a busy-timeout. Return 1 if blocking locks are successfully enabled,
+** or 0 otherwise.
+*/
+static int walEnableBlocking(Wal *pWal){
+  int res = 0;
+  if( pWal->db ){
+    int tmout = pWal->db->busyTimeout;
+    if( tmout ){
+      int rc;
+      rc = sqlite3OsFileControl(
+          pWal->pDbFd, SQLITE_FCNTL_LOCK_TIMEOUT, (void*)&tmout
+      );
+      res = (rc==SQLITE_OK);
+    }
+  }
+  return res;
+}
+
+/*
+** Disable blocking locks.
+*/
+static void walDisableBlocking(Wal *pWal){
+  int tmout = 0;
+  sqlite3OsFileControl(pWal->pDbFd, SQLITE_FCNTL_LOCK_TIMEOUT, (void*)&tmout);
+}
+
+/*
+** If parameter bLock is true, attempt to enable blocking locks, take
+** the WRITER lock, and then disable blocking locks. If blocking locks
+** cannot be enabled, no attempt to obtain the WRITER lock is made. Return
+** an SQLite error code if an error occurs, or SQLITE_OK otherwise. It is not
+** an error if blocking locks can not be enabled.
+**
+** If the bLock parameter is false and the WRITER lock is held, release it.
+*/
+SQLITE_PRIVATE int sqlite3WalWriteLock(Wal *pWal, int bLock){
+  int rc = SQLITE_OK;
+  assert( pWal->readLock<0 || bLock==0 );
+  if( bLock ){
+    assert( pWal->db );
+    if( walEnableBlocking(pWal) ){
+      rc = walLockExclusive(pWal, WAL_WRITE_LOCK, 1);
+      if( rc==SQLITE_OK ){
+        pWal->writeLock = 1;
+      }
+      walDisableBlocking(pWal);
+    }
+  }else if( pWal->writeLock ){
+    walUnlockExclusive(pWal, WAL_WRITE_LOCK, 1);
+    pWal->writeLock = 0;
+  }
+  return rc;
+}
+
+/*
+** Set the database handle used to determine if blocking locks are required.
+*/
+SQLITE_PRIVATE void sqlite3WalDb(Wal *pWal, sqlite3 *db){
+  pWal->db = db;
+}
+
+/*
+** Take an exclusive WRITE lock. Blocking if so configured.
+*/
+static int walLockWriter(Wal *pWal){
+  int rc;
+  walEnableBlocking(pWal);
+  rc = walLockExclusive
