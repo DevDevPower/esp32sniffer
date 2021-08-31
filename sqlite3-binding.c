@@ -63585,4 +63585,170 @@ SQLITE_PRIVATE void sqlite3WalDb(Wal *pWal, sqlite3 *db){
 static int walLockWriter(Wal *pWal){
   int rc;
   walEnableBlocking(pWal);
-  rc = walLockExclusive
+  rc = walLockExclusive(pWal, WAL_WRITE_LOCK, 1);
+  walDisableBlocking(pWal);
+  return rc;
+}
+#else
+# define walEnableBlocking(x) 0
+# define walDisableBlocking(x)
+# define walLockWriter(pWal) walLockExclusive((pWal), WAL_WRITE_LOCK, 1)
+# define sqlite3WalDb(pWal, db)
+#endif   /* ifdef SQLITE_ENABLE_SETLK_TIMEOUT */
+
+
+/*
+** Attempt to obtain the exclusive WAL lock defined by parameters lockIdx and
+** n. If the attempt fails and parameter xBusy is not NULL, then it is a
+** busy-handler function. Invoke it and retry the lock until either the
+** lock is successfully obtained or the busy-handler returns 0.
+*/
+static int walBusyLock(
+  Wal *pWal,                      /* WAL connection */
+  int (*xBusy)(void*),            /* Function to call when busy */
+  void *pBusyArg,                 /* Context argument for xBusyHandler */
+  int lockIdx,                    /* Offset of first byte to lock */
+  int n                           /* Number of bytes to lock */
+){
+  int rc;
+  do {
+    rc = walLockExclusive(pWal, lockIdx, n);
+  }while( xBusy && rc==SQLITE_BUSY && xBusy(pBusyArg) );
+#ifdef SQLITE_ENABLE_SETLK_TIMEOUT
+  if( rc==SQLITE_BUSY_TIMEOUT ){
+    walDisableBlocking(pWal);
+    rc = SQLITE_BUSY;
+  }
+#endif
+  return rc;
+}
+
+/*
+** The cache of the wal-index header must be valid to call this function.
+** Return the page-size in bytes used by the database.
+*/
+static int walPagesize(Wal *pWal){
+  return (pWal->hdr.szPage&0xfe00) + ((pWal->hdr.szPage&0x0001)<<16);
+}
+
+/*
+** The following is guaranteed when this function is called:
+**
+**   a) the WRITER lock is held,
+**   b) the entire log file has been checkpointed, and
+**   c) any existing readers are reading exclusively from the database
+**      file - there are no readers that may attempt to read a frame from
+**      the log file.
+**
+** This function updates the shared-memory structures so that the next
+** client to write to the database (which may be this one) does so by
+** writing frames into the start of the log file.
+**
+** The value of parameter salt1 is used as the aSalt[1] value in the
+** new wal-index header. It should be passed a pseudo-random value (i.e.
+** one obtained from sqlite3_randomness()).
+*/
+static void walRestartHdr(Wal *pWal, u32 salt1){
+  volatile WalCkptInfo *pInfo = walCkptInfo(pWal);
+  int i;                          /* Loop counter */
+  u32 *aSalt = pWal->hdr.aSalt;   /* Big-endian salt values */
+  pWal->nCkpt++;
+  pWal->hdr.mxFrame = 0;
+  sqlite3Put4byte((u8*)&aSalt[0], 1 + sqlite3Get4byte((u8*)&aSalt[0]));
+  memcpy(&pWal->hdr.aSalt[1], &salt1, 4);
+  walIndexWriteHdr(pWal);
+  AtomicStore(&pInfo->nBackfill, 0);
+  pInfo->nBackfillAttempted = 0;
+  pInfo->aReadMark[1] = 0;
+  for(i=2; i<WAL_NREADER; i++) pInfo->aReadMark[i] = READMARK_NOT_USED;
+  assert( pInfo->aReadMark[0]==0 );
+}
+
+/*
+** Copy as much content as we can from the WAL back into the database file
+** in response to an sqlite3_wal_checkpoint() request or the equivalent.
+**
+** The amount of information copies from WAL to database might be limited
+** by active readers.  This routine will never overwrite a database page
+** that a concurrent reader might be using.
+**
+** All I/O barrier operations (a.k.a fsyncs) occur in this routine when
+** SQLite is in WAL-mode in synchronous=NORMAL.  That means that if
+** checkpoints are always run by a background thread or background
+** process, foreground threads will never block on a lengthy fsync call.
+**
+** Fsync is called on the WAL before writing content out of the WAL and
+** into the database.  This ensures that if the new content is persistent
+** in the WAL and can be recovered following a power-loss or hard reset.
+**
+** Fsync is also called on the database file if (and only if) the entire
+** WAL content is copied into the database file.  This second fsync makes
+** it safe to delete the WAL since the new content will persist in the
+** database file.
+**
+** This routine uses and updates the nBackfill field of the wal-index header.
+** This is the only routine that will increase the value of nBackfill.
+** (A WAL reset or recovery will revert nBackfill to zero, but not increase
+** its value.)
+**
+** The caller must be holding sufficient locks to ensure that no other
+** checkpoint is running (in any other thread or process) at the same
+** time.
+*/
+static int walCheckpoint(
+  Wal *pWal,                      /* Wal connection */
+  sqlite3 *db,                    /* Check for interrupts on this handle */
+  int eMode,                      /* One of PASSIVE, FULL or RESTART */
+  int (*xBusy)(void*),            /* Function to call when busy */
+  void *pBusyArg,                 /* Context argument for xBusyHandler */
+  int sync_flags,                 /* Flags for OsSync() (or 0) */
+  u8 *zBuf                        /* Temporary buffer to use */
+){
+  int rc = SQLITE_OK;             /* Return code */
+  int szPage;                     /* Database page-size */
+  WalIterator *pIter = 0;         /* Wal iterator context */
+  u32 iDbpage = 0;                /* Next database page to write */
+  u32 iFrame = 0;                 /* Wal frame containing data for iDbpage */
+  u32 mxSafeFrame;                /* Max frame that can be backfilled */
+  u32 mxPage;                     /* Max database page to write */
+  int i;                          /* Loop counter */
+  volatile WalCkptInfo *pInfo;    /* The checkpoint status information */
+
+  szPage = walPagesize(pWal);
+  testcase( szPage<=32768 );
+  testcase( szPage>=65536 );
+  pInfo = walCkptInfo(pWal);
+  if( pInfo->nBackfill<pWal->hdr.mxFrame ){
+
+    /* EVIDENCE-OF: R-62920-47450 The busy-handler callback is never invoked
+    ** in the SQLITE_CHECKPOINT_PASSIVE mode. */
+    assert( eMode!=SQLITE_CHECKPOINT_PASSIVE || xBusy==0 );
+
+    /* Compute in mxSafeFrame the index of the last frame of the WAL that is
+    ** safe to write into the database.  Frames beyond mxSafeFrame might
+    ** overwrite database pages that are in use by active readers and thus
+    ** cannot be backfilled from the WAL.
+    */
+    mxSafeFrame = pWal->hdr.mxFrame;
+    mxPage = pWal->hdr.nPage;
+    for(i=1; i<WAL_NREADER; i++){
+      u32 y = AtomicLoad(pInfo->aReadMark+i);
+      if( mxSafeFrame>y ){
+        assert( y<=pWal->hdr.mxFrame );
+        rc = walBusyLock(pWal, xBusy, pBusyArg, WAL_READ_LOCK(i), 1);
+        if( rc==SQLITE_OK ){
+          u32 iMark = (i==1 ? mxSafeFrame : READMARK_NOT_USED);
+          AtomicStore(pInfo->aReadMark+i, iMark);
+          walUnlockExclusive(pWal, WAL_READ_LOCK(i), 1);
+        }else if( rc==SQLITE_BUSY ){
+          mxSafeFrame = y;
+          xBusy = 0;
+        }else{
+          goto walcheckpoint_out;
+        }
+      }
+    }
+
+    /* Allocate the iterator */
+    if( pInfo->nBackfill<mxSafeFrame ){
+      rc = walIterator
