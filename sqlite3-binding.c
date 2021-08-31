@@ -63177,4 +63177,194 @@ SQLITE_PRIVATE int sqlite3WalOpen(
   assert(   124 ==  WALINDEX_LOCK_OFFSET + WAL_READ_LOCK(1) );
   assert(   125 ==  WALINDEX_LOCK_OFFSET + WAL_READ_LOCK(2) );
   assert(   126 ==  WALINDEX_LOCK_OFFSET + WAL_READ_LOCK(3) );
-  assert(   127 ==  WA
+  assert(   127 ==  WALINDEX_LOCK_OFFSET + WAL_READ_LOCK(4) );
+
+  /* In the amalgamation, the os_unix.c and os_win.c source files come before
+  ** this source file.  Verify that the #defines of the locking byte offsets
+  ** in os_unix.c and os_win.c agree with the WALINDEX_LOCK_OFFSET value.
+  ** For that matter, if the lock offset ever changes from its initial design
+  ** value of 120, we need to know that so there is an assert() to check it.
+  */
+#ifdef WIN_SHM_BASE
+  assert( WIN_SHM_BASE==WALINDEX_LOCK_OFFSET );
+#endif
+#ifdef UNIX_SHM_BASE
+  assert( UNIX_SHM_BASE==WALINDEX_LOCK_OFFSET );
+#endif
+
+
+  /* Allocate an instance of struct Wal to return. */
+  *ppWal = 0;
+  pRet = (Wal*)sqlite3MallocZero(sizeof(Wal) + pVfs->szOsFile);
+  if( !pRet ){
+    return SQLITE_NOMEM_BKPT;
+  }
+
+  pRet->pVfs = pVfs;
+  pRet->pWalFd = (sqlite3_file *)&pRet[1];
+  pRet->pDbFd = pDbFd;
+  pRet->readLock = -1;
+  pRet->mxWalSize = mxWalSize;
+  pRet->zWalName = zWalName;
+  pRet->syncHeader = 1;
+  pRet->padToSectorBoundary = 1;
+  pRet->exclusiveMode = (bNoShm ? WAL_HEAPMEMORY_MODE: WAL_NORMAL_MODE);
+
+  /* Open file handle on the write-ahead log file. */
+  flags = (SQLITE_OPEN_READWRITE|SQLITE_OPEN_CREATE|SQLITE_OPEN_WAL);
+  rc = sqlite3OsOpen(pVfs, zWalName, pRet->pWalFd, flags, &flags);
+  if( rc==SQLITE_OK && flags&SQLITE_OPEN_READONLY ){
+    pRet->readOnly = WAL_RDONLY;
+  }
+
+  if( rc!=SQLITE_OK ){
+    walIndexClose(pRet, 0);
+    sqlite3OsClose(pRet->pWalFd);
+    sqlite3_free(pRet);
+  }else{
+    int iDC = sqlite3OsDeviceCharacteristics(pDbFd);
+    if( iDC & SQLITE_IOCAP_SEQUENTIAL ){ pRet->syncHeader = 0; }
+    if( iDC & SQLITE_IOCAP_POWERSAFE_OVERWRITE ){
+      pRet->padToSectorBoundary = 0;
+    }
+    *ppWal = pRet;
+    WALTRACE(("WAL%d: opened\n", pRet));
+  }
+  return rc;
+}
+
+/*
+** Change the size to which the WAL file is trucated on each reset.
+*/
+SQLITE_PRIVATE void sqlite3WalLimit(Wal *pWal, i64 iLimit){
+  if( pWal ) pWal->mxWalSize = iLimit;
+}
+
+/*
+** Find the smallest page number out of all pages held in the WAL that
+** has not been returned by any prior invocation of this method on the
+** same WalIterator object.   Write into *piFrame the frame index where
+** that page was last written into the WAL.  Write into *piPage the page
+** number.
+**
+** Return 0 on success.  If there are no pages in the WAL with a page
+** number larger than *piPage, then return 1.
+*/
+static int walIteratorNext(
+  WalIterator *p,               /* Iterator */
+  u32 *piPage,                  /* OUT: The page number of the next page */
+  u32 *piFrame                  /* OUT: Wal frame index of next page */
+){
+  u32 iMin;                     /* Result pgno must be greater than iMin */
+  u32 iRet = 0xFFFFFFFF;        /* 0xffffffff is never a valid page number */
+  int i;                        /* For looping through segments */
+
+  iMin = p->iPrior;
+  assert( iMin<0xffffffff );
+  for(i=p->nSegment-1; i>=0; i--){
+    struct WalSegment *pSegment = &p->aSegment[i];
+    while( pSegment->iNext<pSegment->nEntry ){
+      u32 iPg = pSegment->aPgno[pSegment->aIndex[pSegment->iNext]];
+      if( iPg>iMin ){
+        if( iPg<iRet ){
+          iRet = iPg;
+          *piFrame = pSegment->iZero + pSegment->aIndex[pSegment->iNext];
+        }
+        break;
+      }
+      pSegment->iNext++;
+    }
+  }
+
+  *piPage = p->iPrior = iRet;
+  return (iRet==0xFFFFFFFF);
+}
+
+/*
+** This function merges two sorted lists into a single sorted list.
+**
+** aLeft[] and aRight[] are arrays of indices.  The sort key is
+** aContent[aLeft[]] and aContent[aRight[]].  Upon entry, the following
+** is guaranteed for all J<K:
+**
+**        aContent[aLeft[J]] < aContent[aLeft[K]]
+**        aContent[aRight[J]] < aContent[aRight[K]]
+**
+** This routine overwrites aRight[] with a new (probably longer) sequence
+** of indices such that the aRight[] contains every index that appears in
+** either aLeft[] or the old aRight[] and such that the second condition
+** above is still met.
+**
+** The aContent[aLeft[X]] values will be unique for all X.  And the
+** aContent[aRight[X]] values will be unique too.  But there might be
+** one or more combinations of X and Y such that
+**
+**      aLeft[X]!=aRight[Y]  &&  aContent[aLeft[X]] == aContent[aRight[Y]]
+**
+** When that happens, omit the aLeft[X] and use the aRight[Y] index.
+*/
+static void walMerge(
+  const u32 *aContent,            /* Pages in wal - keys for the sort */
+  ht_slot *aLeft,                 /* IN: Left hand input list */
+  int nLeft,                      /* IN: Elements in array *paLeft */
+  ht_slot **paRight,              /* IN/OUT: Right hand input list */
+  int *pnRight,                   /* IN/OUT: Elements in *paRight */
+  ht_slot *aTmp                   /* Temporary buffer */
+){
+  int iLeft = 0;                  /* Current index in aLeft */
+  int iRight = 0;                 /* Current index in aRight */
+  int iOut = 0;                   /* Current index in output buffer */
+  int nRight = *pnRight;
+  ht_slot *aRight = *paRight;
+
+  assert( nLeft>0 && nRight>0 );
+  while( iRight<nRight || iLeft<nLeft ){
+    ht_slot logpage;
+    Pgno dbpage;
+
+    if( (iLeft<nLeft)
+     && (iRight>=nRight || aContent[aLeft[iLeft]]<aContent[aRight[iRight]])
+    ){
+      logpage = aLeft[iLeft++];
+    }else{
+      logpage = aRight[iRight++];
+    }
+    dbpage = aContent[logpage];
+
+    aTmp[iOut++] = logpage;
+    if( iLeft<nLeft && aContent[aLeft[iLeft]]==dbpage ) iLeft++;
+
+    assert( iLeft>=nLeft || aContent[aLeft[iLeft]]>dbpage );
+    assert( iRight>=nRight || aContent[aRight[iRight]]>dbpage );
+  }
+
+  *paRight = aLeft;
+  *pnRight = iOut;
+  memcpy(aLeft, aTmp, sizeof(aTmp[0])*iOut);
+}
+
+/*
+** Sort the elements in list aList using aContent[] as the sort key.
+** Remove elements with duplicate keys, preferring to keep the
+** larger aList[] values.
+**
+** The aList[] entries are indices into aContent[].  The values in
+** aList[] are to be sorted so that for all J<K:
+**
+**      aContent[aList[J]] < aContent[aList[K]]
+**
+** For any X and Y such that
+**
+**      aContent[aList[X]] == aContent[aList[Y]]
+**
+** Keep the larger of the two values aList[X] and aList[Y] and discard
+** the smaller.
+*/
+static void walMergesort(
+  const u32 *aContent,            /* Pages in wal */
+  ht_slot *aBuffer,               /* Buffer of at least *pnList items to use */
+  ht_slot *aList,                 /* IN/OUT: List to sort */
+  int *pnList                     /* IN/OUT: Number of elements in aList[] */
+){
+  struct Sublist {
+    int nList;                    /* Number of elements
