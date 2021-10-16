@@ -63924,4 +63924,171 @@ SQLITE_PRIVATE int sqlite3WalClose(
         pWal->exclusiveMode = WAL_EXCLUSIVE_MODE;
       }
       rc = sqlite3WalCheckpoint(pWal, db,
-          SQLITE_CHECKPOINT_PASSIVE, 0
+          SQLITE_CHECKPOINT_PASSIVE, 0, 0, sync_flags, nBuf, zBuf, 0, 0
+      );
+      if( rc==SQLITE_OK ){
+        int bPersist = -1;
+        sqlite3OsFileControlHint(
+            pWal->pDbFd, SQLITE_FCNTL_PERSIST_WAL, &bPersist
+        );
+        if( bPersist!=1 ){
+          /* Try to delete the WAL file if the checkpoint completed and
+          ** fsyned (rc==SQLITE_OK) and if we are not in persistent-wal
+          ** mode (!bPersist) */
+          isDelete = 1;
+        }else if( pWal->mxWalSize>=0 ){
+          /* Try to truncate the WAL file to zero bytes if the checkpoint
+          ** completed and fsynced (rc==SQLITE_OK) and we are in persistent
+          ** WAL mode (bPersist) and if the PRAGMA journal_size_limit is a
+          ** non-negative value (pWal->mxWalSize>=0).  Note that we truncate
+          ** to zero bytes as truncating to the journal_size_limit might
+          ** leave a corrupt WAL file on disk. */
+          walLimitSize(pWal, 0);
+        }
+      }
+    }
+
+    walIndexClose(pWal, isDelete);
+    sqlite3OsClose(pWal->pWalFd);
+    if( isDelete ){
+      sqlite3BeginBenignMalloc();
+      sqlite3OsDelete(pWal->pVfs, pWal->zWalName, 0);
+      sqlite3EndBenignMalloc();
+    }
+    WALTRACE(("WAL%p: closed\n", pWal));
+    sqlite3_free((void *)pWal->apWiData);
+    sqlite3_free(pWal);
+  }
+  return rc;
+}
+
+/*
+** Try to read the wal-index header.  Return 0 on success and 1 if
+** there is a problem.
+**
+** The wal-index is in shared memory.  Another thread or process might
+** be writing the header at the same time this procedure is trying to
+** read it, which might result in inconsistency.  A dirty read is detected
+** by verifying that both copies of the header are the same and also by
+** a checksum on the header.
+**
+** If and only if the read is consistent and the header is different from
+** pWal->hdr, then pWal->hdr is updated to the content of the new header
+** and *pChanged is set to 1.
+**
+** If the checksum cannot be verified return non-zero. If the header
+** is read successfully and the checksum verified, return zero.
+*/
+static SQLITE_NO_TSAN int walIndexTryHdr(Wal *pWal, int *pChanged){
+  u32 aCksum[2];                  /* Checksum on the header content */
+  WalIndexHdr h1, h2;             /* Two copies of the header content */
+  WalIndexHdr volatile *aHdr;     /* Header in shared memory */
+
+  /* The first page of the wal-index must be mapped at this point. */
+  assert( pWal->nWiData>0 && pWal->apWiData[0] );
+
+  /* Read the header. This might happen concurrently with a write to the
+  ** same area of shared memory on a different CPU in a SMP,
+  ** meaning it is possible that an inconsistent snapshot is read
+  ** from the file. If this happens, return non-zero.
+  **
+  ** tag-20200519-1:
+  ** There are two copies of the header at the beginning of the wal-index.
+  ** When reading, read [0] first then [1].  Writes are in the reverse order.
+  ** Memory barriers are used to prevent the compiler or the hardware from
+  ** reordering the reads and writes.  TSAN and similar tools can sometimes
+  ** give false-positive warnings about these accesses because the tools do not
+  ** account for the double-read and the memory barrier. The use of mutexes
+  ** here would be problematic as the memory being accessed is potentially
+  ** shared among multiple processes and not all mutex implementions work
+  ** reliably in that environment.
+  */
+  aHdr = walIndexHdr(pWal);
+  memcpy(&h1, (void *)&aHdr[0], sizeof(h1)); /* Possible TSAN false-positive */
+  walShmBarrier(pWal);
+  memcpy(&h2, (void *)&aHdr[1], sizeof(h2));
+
+  if( memcmp(&h1, &h2, sizeof(h1))!=0 ){
+    return 1;   /* Dirty read */
+  }
+  if( h1.isInit==0 ){
+    return 1;   /* Malformed header - probably all zeros */
+  }
+  walChecksumBytes(1, (u8*)&h1, sizeof(h1)-sizeof(h1.aCksum), 0, aCksum);
+  if( aCksum[0]!=h1.aCksum[0] || aCksum[1]!=h1.aCksum[1] ){
+    return 1;   /* Checksum does not match */
+  }
+
+  if( memcmp(&pWal->hdr, &h1, sizeof(WalIndexHdr)) ){
+    *pChanged = 1;
+    memcpy(&pWal->hdr, &h1, sizeof(WalIndexHdr));
+    pWal->szPage = (pWal->hdr.szPage&0xfe00) + ((pWal->hdr.szPage&0x0001)<<16);
+    testcase( pWal->szPage<=32768 );
+    testcase( pWal->szPage>=65536 );
+  }
+
+  /* The header was successfully read. Return zero. */
+  return 0;
+}
+
+/*
+** This is the value that walTryBeginRead returns when it needs to
+** be retried.
+*/
+#define WAL_RETRY  (-1)
+
+/*
+** Read the wal-index header from the wal-index and into pWal->hdr.
+** If the wal-header appears to be corrupt, try to reconstruct the
+** wal-index from the WAL before returning.
+**
+** Set *pChanged to 1 if the wal-index header value in pWal->hdr is
+** changed by this operation.  If pWal->hdr is unchanged, set *pChanged
+** to 0.
+**
+** If the wal-index header is successfully read, return SQLITE_OK.
+** Otherwise an SQLite error code.
+*/
+static int walIndexReadHdr(Wal *pWal, int *pChanged){
+  int rc;                         /* Return code */
+  int badHdr;                     /* True if a header read failed */
+  volatile u32 *page0;            /* Chunk of wal-index containing header */
+
+  /* Ensure that page 0 of the wal-index (the page that contains the
+  ** wal-index header) is mapped. Return early if an error occurs here.
+  */
+  assert( pChanged );
+  rc = walIndexPage(pWal, 0, &page0);
+  if( rc!=SQLITE_OK ){
+    assert( rc!=SQLITE_READONLY ); /* READONLY changed to OK in walIndexPage */
+    if( rc==SQLITE_READONLY_CANTINIT ){
+      /* The SQLITE_READONLY_CANTINIT return means that the shared-memory
+      ** was openable but is not writable, and this thread is unable to
+      ** confirm that another write-capable connection has the shared-memory
+      ** open, and hence the content of the shared-memory is unreliable,
+      ** since the shared-memory might be inconsistent with the WAL file
+      ** and there is no writer on hand to fix it. */
+      assert( page0==0 );
+      assert( pWal->writeLock==0 );
+      assert( pWal->readOnly & WAL_SHM_RDONLY );
+      pWal->bShmUnreliable = 1;
+      pWal->exclusiveMode = WAL_HEAPMEMORY_MODE;
+      *pChanged = 1;
+    }else{
+      return rc; /* Any other non-OK return is just an error */
+    }
+  }else{
+    /* page0 can be NULL if the SHM is zero bytes in size and pWal->writeLock
+    ** is zero, which prevents the SHM from growing */
+    testcase( page0!=0 );
+  }
+  assert( page0!=0 || pWal->writeLock==0 );
+
+  /* If the first page of the wal-index has been mapped, try to read the
+  ** wal-index header immediately, without holding any lock. This usually
+  ** works, but may fail if the wal-index header is corrupt or currently
+  ** being modified by another thread or process.
+  */
+  badHdr = (page0 ? walIndexTryHdr(pWal, pChanged) : 1);
+
+  /* If the first attempt failed, it might have been due to a rac
