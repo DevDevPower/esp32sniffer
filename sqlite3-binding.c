@@ -64243,4 +64243,151 @@ static int walBeginShmUnreliable(Wal *pWal, int *pChanged){
   if( szWal<WAL_HDRSIZE ){
     /* If the wal file is too small to contain a wal-header and the
     ** wal-index header has mxFrame==0, then it must be safe to proceed
-    ** reading the database file only. However, the page cach
+    ** reading the database file only. However, the page cache cannot
+    ** be trusted, as a read/write connection may have connected, written
+    ** the db, run a checkpoint, truncated the wal file and disconnected
+    ** since this client's last read transaction.  */
+    *pChanged = 1;
+    rc = (pWal->hdr.mxFrame==0 ? SQLITE_OK : WAL_RETRY);
+    goto begin_unreliable_shm_out;
+  }
+
+  /* Check the salt keys at the start of the wal file still match. */
+  rc = sqlite3OsRead(pWal->pWalFd, aBuf, WAL_HDRSIZE, 0);
+  if( rc!=SQLITE_OK ){
+    goto begin_unreliable_shm_out;
+  }
+  if( memcmp(&pWal->hdr.aSalt, &aBuf[16], 8) ){
+    /* Some writer has wrapped the WAL file while we were not looking.
+    ** Return WAL_RETRY which will cause the in-memory WAL-index to be
+    ** rebuilt. */
+    rc = WAL_RETRY;
+    goto begin_unreliable_shm_out;
+  }
+
+  /* Allocate a buffer to read frames into */
+  assert( (pWal->szPage & (pWal->szPage-1))==0 );
+  assert( pWal->szPage>=512 && pWal->szPage<=65536 );
+  szFrame = pWal->szPage + WAL_FRAME_HDRSIZE;
+  aFrame = (u8 *)sqlite3_malloc64(szFrame);
+  if( aFrame==0 ){
+    rc = SQLITE_NOMEM_BKPT;
+    goto begin_unreliable_shm_out;
+  }
+  aData = &aFrame[WAL_FRAME_HDRSIZE];
+
+  /* Check to see if a complete transaction has been appended to the
+  ** wal file since the heap-memory wal-index was created. If so, the
+  ** heap-memory wal-index is discarded and WAL_RETRY returned to
+  ** the caller.  */
+  aSaveCksum[0] = pWal->hdr.aFrameCksum[0];
+  aSaveCksum[1] = pWal->hdr.aFrameCksum[1];
+  for(iOffset=walFrameOffset(pWal->hdr.mxFrame+1, pWal->szPage);
+      iOffset+szFrame<=szWal;
+      iOffset+=szFrame
+  ){
+    u32 pgno;                   /* Database page number for frame */
+    u32 nTruncate;              /* dbsize field from frame header */
+
+    /* Read and decode the next log frame. */
+    rc = sqlite3OsRead(pWal->pWalFd, aFrame, szFrame, iOffset);
+    if( rc!=SQLITE_OK ) break;
+    if( !walDecodeFrame(pWal, &pgno, &nTruncate, aData, aFrame) ) break;
+
+    /* If nTruncate is non-zero, then a complete transaction has been
+    ** appended to this wal file. Set rc to WAL_RETRY and break out of
+    ** the loop.  */
+    if( nTruncate ){
+      rc = WAL_RETRY;
+      break;
+    }
+  }
+  pWal->hdr.aFrameCksum[0] = aSaveCksum[0];
+  pWal->hdr.aFrameCksum[1] = aSaveCksum[1];
+
+ begin_unreliable_shm_out:
+  sqlite3_free(aFrame);
+  if( rc!=SQLITE_OK ){
+    int i;
+    for(i=0; i<pWal->nWiData; i++){
+      sqlite3_free((void*)pWal->apWiData[i]);
+      pWal->apWiData[i] = 0;
+    }
+    pWal->bShmUnreliable = 0;
+    sqlite3WalEndReadTransaction(pWal);
+    *pChanged = 1;
+  }
+  return rc;
+}
+
+/*
+** Attempt to start a read transaction.  This might fail due to a race or
+** other transient condition.  When that happens, it returns WAL_RETRY to
+** indicate to the caller that it is safe to retry immediately.
+**
+** On success return SQLITE_OK.  On a permanent failure (such an
+** I/O error or an SQLITE_BUSY because another process is running
+** recovery) return a positive error code.
+**
+** The useWal parameter is true to force the use of the WAL and disable
+** the case where the WAL is bypassed because it has been completely
+** checkpointed.  If useWal==0 then this routine calls walIndexReadHdr()
+** to make a copy of the wal-index header into pWal->hdr.  If the
+** wal-index header has changed, *pChanged is set to 1 (as an indication
+** to the caller that the local page cache is obsolete and needs to be
+** flushed.)  When useWal==1, the wal-index header is assumed to already
+** be loaded and the pChanged parameter is unused.
+**
+** The caller must set the cnt parameter to the number of prior calls to
+** this routine during the current read attempt that returned WAL_RETRY.
+** This routine will start taking more aggressive measures to clear the
+** race conditions after multiple WAL_RETRY returns, and after an excessive
+** number of errors will ultimately return SQLITE_PROTOCOL.  The
+** SQLITE_PROTOCOL return indicates that some other process has gone rogue
+** and is not honoring the locking protocol.  There is a vanishingly small
+** chance that SQLITE_PROTOCOL could be returned because of a run of really
+** bad luck when there is lots of contention for the wal-index, but that
+** possibility is so small that it can be safely neglected, we believe.
+**
+** On success, this routine obtains a read lock on
+** WAL_READ_LOCK(pWal->readLock).  The pWal->readLock integer is
+** in the range 0 <= pWal->readLock < WAL_NREADER.  If pWal->readLock==(-1)
+** that means the Wal does not hold any read lock.  The reader must not
+** access any database page that is modified by a WAL frame up to and
+** including frame number aReadMark[pWal->readLock].  The reader will
+** use WAL frames up to and including pWal->hdr.mxFrame if pWal->readLock>0
+** Or if pWal->readLock==0, then the reader will ignore the WAL
+** completely and get all content directly from the database file.
+** If the useWal parameter is 1 then the WAL will never be ignored and
+** this routine will always set pWal->readLock>0 on success.
+** When the read transaction is completed, the caller must release the
+** lock on WAL_READ_LOCK(pWal->readLock) and set pWal->readLock to -1.
+**
+** This routine uses the nBackfill and aReadMark[] fields of the header
+** to select a particular WAL_READ_LOCK() that strives to let the
+** checkpoint process do as much work as possible.  This routine might
+** update values of the aReadMark[] array in the header, but if it does
+** so it takes care to hold an exclusive lock on the corresponding
+** WAL_READ_LOCK() while changing values.
+*/
+static int walTryBeginRead(Wal *pWal, int *pChanged, int useWal, int cnt){
+  volatile WalCkptInfo *pInfo;    /* Checkpoint information in wal-index */
+  u32 mxReadMark;                 /* Largest aReadMark[] value */
+  int mxI;                        /* Index of largest aReadMark[] value */
+  int i;                          /* Loop counter */
+  int rc = SQLITE_OK;             /* Return code  */
+  u32 mxFrame;                    /* Wal frame to lock to */
+
+  assert( pWal->readLock<0 );     /* Not currently locked */
+
+  /* useWal may only be set for read/write connections */
+  assert( (pWal->readOnly & WAL_SHM_RDONLY)==0 || useWal==0 );
+
+  /* Take steps to avoid spinning forever if there is a protocol error.
+  **
+  ** Circumstances that cause a RETRY should only last for the briefest
+  ** instances of time.  No I/O or other system calls are done while the
+  ** locks are held, so the locks should not be held for very long. But
+  ** if we are unlucky, another process that is holding a lock might get
+  ** paged out or take a page-fault that is time-consuming to resolve,
+  ** during the few nanoseconds that it is holding the lock.  In that ca
