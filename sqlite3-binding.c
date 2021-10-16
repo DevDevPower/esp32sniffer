@@ -64911,4 +64911,204 @@ SQLITE_PRIVATE int sqlite3WalReadFrame(
   sz = (sz&0xfe00) + ((sz&0x0001)<<16);
   testcase( sz<=32768 );
   testcase( sz>=65536 );
-  iO
+  iOffset = walFrameOffset(iRead, sz) + WAL_FRAME_HDRSIZE;
+  /* testcase( IS_BIG_INT(iOffset) ); // requires a 4GiB WAL */
+  return sqlite3OsRead(pWal->pWalFd, pOut, (nOut>sz ? sz : nOut), iOffset);
+}
+
+/*
+** Return the size of the database in pages (or zero, if unknown).
+*/
+SQLITE_PRIVATE Pgno sqlite3WalDbsize(Wal *pWal){
+  if( pWal && ALWAYS(pWal->readLock>=0) ){
+    return pWal->hdr.nPage;
+  }
+  return 0;
+}
+
+
+/*
+** This function starts a write transaction on the WAL.
+**
+** A read transaction must have already been started by a prior call
+** to sqlite3WalBeginReadTransaction().
+**
+** If another thread or process has written into the database since
+** the read transaction was started, then it is not possible for this
+** thread to write as doing so would cause a fork.  So this routine
+** returns SQLITE_BUSY in that case and no write transaction is started.
+**
+** There can only be a single writer active at a time.
+*/
+SQLITE_PRIVATE int sqlite3WalBeginWriteTransaction(Wal *pWal){
+  int rc;
+
+#ifdef SQLITE_ENABLE_SETLK_TIMEOUT
+  /* If the write-lock is already held, then it was obtained before the
+  ** read-transaction was even opened, making this call a no-op.
+  ** Return early. */
+  if( pWal->writeLock ){
+    assert( !memcmp(&pWal->hdr,(void *)walIndexHdr(pWal),sizeof(WalIndexHdr)) );
+    return SQLITE_OK;
+  }
+#endif
+
+  /* Cannot start a write transaction without first holding a read
+  ** transaction. */
+  assert( pWal->readLock>=0 );
+  assert( pWal->writeLock==0 && pWal->iReCksum==0 );
+
+  if( pWal->readOnly ){
+    return SQLITE_READONLY;
+  }
+
+  /* Only one writer allowed at a time.  Get the write lock.  Return
+  ** SQLITE_BUSY if unable.
+  */
+  rc = walLockExclusive(pWal, WAL_WRITE_LOCK, 1);
+  if( rc ){
+    return rc;
+  }
+  pWal->writeLock = 1;
+
+  /* If another connection has written to the database file since the
+  ** time the read transaction on this connection was started, then
+  ** the write is disallowed.
+  */
+  if( memcmp(&pWal->hdr, (void *)walIndexHdr(pWal), sizeof(WalIndexHdr))!=0 ){
+    walUnlockExclusive(pWal, WAL_WRITE_LOCK, 1);
+    pWal->writeLock = 0;
+    rc = SQLITE_BUSY_SNAPSHOT;
+  }
+
+  return rc;
+}
+
+/*
+** End a write transaction.  The commit has already been done.  This
+** routine merely releases the lock.
+*/
+SQLITE_PRIVATE int sqlite3WalEndWriteTransaction(Wal *pWal){
+  if( pWal->writeLock ){
+    walUnlockExclusive(pWal, WAL_WRITE_LOCK, 1);
+    pWal->writeLock = 0;
+    pWal->iReCksum = 0;
+    pWal->truncateOnCommit = 0;
+  }
+  return SQLITE_OK;
+}
+
+/*
+** If any data has been written (but not committed) to the log file, this
+** function moves the write-pointer back to the start of the transaction.
+**
+** Additionally, the callback function is invoked for each frame written
+** to the WAL since the start of the transaction. If the callback returns
+** other than SQLITE_OK, it is not invoked again and the error code is
+** returned to the caller.
+**
+** Otherwise, if the callback function does not return an error, this
+** function returns SQLITE_OK.
+*/
+SQLITE_PRIVATE int sqlite3WalUndo(Wal *pWal, int (*xUndo)(void *, Pgno), void *pUndoCtx){
+  int rc = SQLITE_OK;
+  if( ALWAYS(pWal->writeLock) ){
+    Pgno iMax = pWal->hdr.mxFrame;
+    Pgno iFrame;
+
+    /* Restore the clients cache of the wal-index header to the state it
+    ** was in before the client began writing to the database.
+    */
+    memcpy(&pWal->hdr, (void *)walIndexHdr(pWal), sizeof(WalIndexHdr));
+
+    for(iFrame=pWal->hdr.mxFrame+1;
+        ALWAYS(rc==SQLITE_OK) && iFrame<=iMax;
+        iFrame++
+    ){
+      /* This call cannot fail. Unless the page for which the page number
+      ** is passed as the second argument is (a) in the cache and
+      ** (b) has an outstanding reference, then xUndo is either a no-op
+      ** (if (a) is false) or simply expels the page from the cache (if (b)
+      ** is false).
+      **
+      ** If the upper layer is doing a rollback, it is guaranteed that there
+      ** are no outstanding references to any page other than page 1. And
+      ** page 1 is never written to the log until the transaction is
+      ** committed. As a result, the call to xUndo may not fail.
+      */
+      assert( walFramePgno(pWal, iFrame)!=1 );
+      rc = xUndo(pUndoCtx, walFramePgno(pWal, iFrame));
+    }
+    if( iMax!=pWal->hdr.mxFrame ) walCleanupHash(pWal);
+  }
+  return rc;
+}
+
+/*
+** Argument aWalData must point to an array of WAL_SAVEPOINT_NDATA u32
+** values. This function populates the array with values required to
+** "rollback" the write position of the WAL handle back to the current
+** point in the event of a savepoint rollback (via WalSavepointUndo()).
+*/
+SQLITE_PRIVATE void sqlite3WalSavepoint(Wal *pWal, u32 *aWalData){
+  assert( pWal->writeLock );
+  aWalData[0] = pWal->hdr.mxFrame;
+  aWalData[1] = pWal->hdr.aFrameCksum[0];
+  aWalData[2] = pWal->hdr.aFrameCksum[1];
+  aWalData[3] = pWal->nCkpt;
+}
+
+/*
+** Move the write position of the WAL back to the point identified by
+** the values in the aWalData[] array. aWalData must point to an array
+** of WAL_SAVEPOINT_NDATA u32 values that has been previously populated
+** by a call to WalSavepoint().
+*/
+SQLITE_PRIVATE int sqlite3WalSavepointUndo(Wal *pWal, u32 *aWalData){
+  int rc = SQLITE_OK;
+
+  assert( pWal->writeLock );
+  assert( aWalData[3]!=pWal->nCkpt || aWalData[0]<=pWal->hdr.mxFrame );
+
+  if( aWalData[3]!=pWal->nCkpt ){
+    /* This savepoint was opened immediately after the write-transaction
+    ** was started. Right after that, the writer decided to wrap around
+    ** to the start of the log. Update the savepoint values to match.
+    */
+    aWalData[0] = 0;
+    aWalData[3] = pWal->nCkpt;
+  }
+
+  if( aWalData[0]<pWal->hdr.mxFrame ){
+    pWal->hdr.mxFrame = aWalData[0];
+    pWal->hdr.aFrameCksum[0] = aWalData[1];
+    pWal->hdr.aFrameCksum[1] = aWalData[2];
+    walCleanupHash(pWal);
+  }
+
+  return rc;
+}
+
+/*
+** This function is called just before writing a set of frames to the log
+** file (see sqlite3WalFrames()). It checks to see if, instead of appending
+** to the current log file, it is possible to overwrite the start of the
+** existing log file with the new frames (i.e. "reset" the log). If so,
+** it sets pWal->hdr.mxFrame to 0. Otherwise, pWal->hdr.mxFrame is left
+** unchanged.
+**
+** SQLITE_OK is returned if no error is encountered (regardless of whether
+** or not pWal->hdr.mxFrame is modified). An SQLite error code is returned
+** if an error occurs.
+*/
+static int walRestartLog(Wal *pWal){
+  int rc = SQLITE_OK;
+  int cnt;
+
+  if( pWal->readLock==0 ){
+    volatile WalCkptInfo *pInfo = walCkptInfo(pWal);
+    assert( pInfo->nBackfill==pWal->hdr.mxFrame );
+    if( pInfo->nBackfill>0 ){
+      u32 salt1;
+      sqlite3_randomness(4, &salt1);
+      rc
