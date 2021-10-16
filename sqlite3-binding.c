@@ -63751,4 +63751,177 @@ static int walCheckpoint(
 
     /* Allocate the iterator */
     if( pInfo->nBackfill<mxSafeFrame ){
-      rc = walIterator
+      rc = walIteratorInit(pWal, pInfo->nBackfill, &pIter);
+      assert( rc==SQLITE_OK || pIter==0 );
+    }
+
+    if( pIter
+     && (rc = walBusyLock(pWal,xBusy,pBusyArg,WAL_READ_LOCK(0),1))==SQLITE_OK
+    ){
+      u32 nBackfill = pInfo->nBackfill;
+
+      pInfo->nBackfillAttempted = mxSafeFrame;
+
+      /* Sync the WAL to disk */
+      rc = sqlite3OsSync(pWal->pWalFd, CKPT_SYNC_FLAGS(sync_flags));
+
+      /* If the database may grow as a result of this checkpoint, hint
+      ** about the eventual size of the db file to the VFS layer.
+      */
+      if( rc==SQLITE_OK ){
+        i64 nReq = ((i64)mxPage * szPage);
+        i64 nSize;                    /* Current size of database file */
+        sqlite3OsFileControl(pWal->pDbFd, SQLITE_FCNTL_CKPT_START, 0);
+        rc = sqlite3OsFileSize(pWal->pDbFd, &nSize);
+        if( rc==SQLITE_OK && nSize<nReq ){
+          if( (nSize+65536+(i64)pWal->hdr.mxFrame*szPage)<nReq ){
+            /* If the size of the final database is larger than the current
+            ** database plus the amount of data in the wal file, plus the
+            ** maximum size of the pending-byte page (65536 bytes), then
+            ** must be corruption somewhere.  */
+            rc = SQLITE_CORRUPT_BKPT;
+          }else{
+            sqlite3OsFileControlHint(pWal->pDbFd, SQLITE_FCNTL_SIZE_HINT,&nReq);
+          }
+        }
+
+      }
+
+      /* Iterate through the contents of the WAL, copying data to the db file */
+      while( rc==SQLITE_OK && 0==walIteratorNext(pIter, &iDbpage, &iFrame) ){
+        i64 iOffset;
+        assert( walFramePgno(pWal, iFrame)==iDbpage );
+        if( AtomicLoad(&db->u1.isInterrupted) ){
+          rc = db->mallocFailed ? SQLITE_NOMEM_BKPT : SQLITE_INTERRUPT;
+          break;
+        }
+        if( iFrame<=nBackfill || iFrame>mxSafeFrame || iDbpage>mxPage ){
+          continue;
+        }
+        iOffset = walFrameOffset(iFrame, szPage) + WAL_FRAME_HDRSIZE;
+        /* testcase( IS_BIG_INT(iOffset) ); // requires a 4GiB WAL file */
+        rc = sqlite3OsRead(pWal->pWalFd, zBuf, szPage, iOffset);
+        if( rc!=SQLITE_OK ) break;
+        iOffset = (iDbpage-1)*(i64)szPage;
+        testcase( IS_BIG_INT(iOffset) );
+        rc = sqlite3OsWrite(pWal->pDbFd, zBuf, szPage, iOffset);
+        if( rc!=SQLITE_OK ) break;
+      }
+      sqlite3OsFileControl(pWal->pDbFd, SQLITE_FCNTL_CKPT_DONE, 0);
+
+      /* If work was actually accomplished... */
+      if( rc==SQLITE_OK ){
+        if( mxSafeFrame==walIndexHdr(pWal)->mxFrame ){
+          i64 szDb = pWal->hdr.nPage*(i64)szPage;
+          testcase( IS_BIG_INT(szDb) );
+          rc = sqlite3OsTruncate(pWal->pDbFd, szDb);
+          if( rc==SQLITE_OK ){
+            rc = sqlite3OsSync(pWal->pDbFd, CKPT_SYNC_FLAGS(sync_flags));
+          }
+        }
+        if( rc==SQLITE_OK ){
+          AtomicStore(&pInfo->nBackfill, mxSafeFrame);
+        }
+      }
+
+      /* Release the reader lock held while backfilling */
+      walUnlockExclusive(pWal, WAL_READ_LOCK(0), 1);
+    }
+
+    if( rc==SQLITE_BUSY ){
+      /* Reset the return code so as not to report a checkpoint failure
+      ** just because there are active readers.  */
+      rc = SQLITE_OK;
+    }
+  }
+
+  /* If this is an SQLITE_CHECKPOINT_RESTART or TRUNCATE operation, and the
+  ** entire wal file has been copied into the database file, then block
+  ** until all readers have finished using the wal file. This ensures that
+  ** the next process to write to the database restarts the wal file.
+  */
+  if( rc==SQLITE_OK && eMode!=SQLITE_CHECKPOINT_PASSIVE ){
+    assert( pWal->writeLock );
+    if( pInfo->nBackfill<pWal->hdr.mxFrame ){
+      rc = SQLITE_BUSY;
+    }else if( eMode>=SQLITE_CHECKPOINT_RESTART ){
+      u32 salt1;
+      sqlite3_randomness(4, &salt1);
+      assert( pInfo->nBackfill==pWal->hdr.mxFrame );
+      rc = walBusyLock(pWal, xBusy, pBusyArg, WAL_READ_LOCK(1), WAL_NREADER-1);
+      if( rc==SQLITE_OK ){
+        if( eMode==SQLITE_CHECKPOINT_TRUNCATE ){
+          /* IMPLEMENTATION-OF: R-44699-57140 This mode works the same way as
+          ** SQLITE_CHECKPOINT_RESTART with the addition that it also
+          ** truncates the log file to zero bytes just prior to a
+          ** successful return.
+          **
+          ** In theory, it might be safe to do this without updating the
+          ** wal-index header in shared memory, as all subsequent reader or
+          ** writer clients should see that the entire log file has been
+          ** checkpointed and behave accordingly. This seems unsafe though,
+          ** as it would leave the system in a state where the contents of
+          ** the wal-index header do not match the contents of the
+          ** file-system. To avoid this, update the wal-index header to
+          ** indicate that the log file contains zero valid frames.  */
+          walRestartHdr(pWal, salt1);
+          rc = sqlite3OsTruncate(pWal->pWalFd, 0);
+        }
+        walUnlockExclusive(pWal, WAL_READ_LOCK(1), WAL_NREADER-1);
+      }
+    }
+  }
+
+ walcheckpoint_out:
+  walIteratorFree(pIter);
+  return rc;
+}
+
+/*
+** If the WAL file is currently larger than nMax bytes in size, truncate
+** it to exactly nMax bytes. If an error occurs while doing so, ignore it.
+*/
+static void walLimitSize(Wal *pWal, i64 nMax){
+  i64 sz;
+  int rx;
+  sqlite3BeginBenignMalloc();
+  rx = sqlite3OsFileSize(pWal->pWalFd, &sz);
+  if( rx==SQLITE_OK && (sz > nMax ) ){
+    rx = sqlite3OsTruncate(pWal->pWalFd, nMax);
+  }
+  sqlite3EndBenignMalloc();
+  if( rx ){
+    sqlite3_log(rx, "cannot limit WAL size: %s", pWal->zWalName);
+  }
+}
+
+/*
+** Close a connection to a log file.
+*/
+SQLITE_PRIVATE int sqlite3WalClose(
+  Wal *pWal,                      /* Wal to close */
+  sqlite3 *db,                    /* For interrupt flag */
+  int sync_flags,                 /* Flags to pass to OsSync() (or 0) */
+  int nBuf,
+  u8 *zBuf                        /* Buffer of at least nBuf bytes */
+){
+  int rc = SQLITE_OK;
+  if( pWal ){
+    int isDelete = 0;             /* True to unlink wal and wal-index files */
+
+    /* If an EXCLUSIVE lock can be obtained on the database file (using the
+    ** ordinary, rollback-mode locking methods, this guarantees that the
+    ** connection associated with this log file is the only connection to
+    ** the database. In this case checkpoint the database and unlink both
+    ** the wal and wal-index files.
+    **
+    ** The EXCLUSIVE lock is not released before returning.
+    */
+    if( zBuf!=0
+     && SQLITE_OK==(rc = sqlite3OsLock(pWal->pDbFd, SQLITE_LOCK_EXCLUSIVE))
+    ){
+      if( pWal->exclusiveMode==WAL_NORMAL_MODE ){
+        pWal->exclusiveMode = WAL_EXCLUSIVE_MODE;
+      }
+      rc = sqlite3WalCheckpoint(pWal, db,
+          SQLITE_CHECKPOINT_PASSIVE, 0
