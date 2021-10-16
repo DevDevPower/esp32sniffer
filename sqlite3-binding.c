@@ -64728,4 +64728,187 @@ SQLITE_PRIVATE int sqlite3WalBeginReadTransaction(Wal *pWal, int *pChanged){
       **
       **    (2)  A checkpoint as been attempted that wrote frames past
       **         pSnapshot->mxFrame into the database file.  Note that the
-      **         checkpoint nee
+      **         checkpoint need not have completed for this to cause problems.
+      */
+      volatile WalCkptInfo *pInfo = walCkptInfo(pWal);
+
+      assert( pWal->readLock>0 || pWal->hdr.mxFrame==0 );
+      assert( pInfo->aReadMark[pWal->readLock]<=pSnapshot->mxFrame );
+
+      /* Check that the wal file has not been wrapped. Assuming that it has
+      ** not, also check that no checkpointer has attempted to checkpoint any
+      ** frames beyond pSnapshot->mxFrame. If either of these conditions are
+      ** true, return SQLITE_ERROR_SNAPSHOT. Otherwise, overwrite pWal->hdr
+      ** with *pSnapshot and set *pChanged as appropriate for opening the
+      ** snapshot.  */
+      if( !memcmp(pSnapshot->aSalt, pWal->hdr.aSalt, sizeof(pWal->hdr.aSalt))
+       && pSnapshot->mxFrame>=pInfo->nBackfillAttempted
+      ){
+        assert( pWal->readLock>0 );
+        memcpy(&pWal->hdr, pSnapshot, sizeof(WalIndexHdr));
+        *pChanged = bChanged;
+      }else{
+        rc = SQLITE_ERROR_SNAPSHOT;
+      }
+
+      /* A client using a non-current snapshot may not ignore any frames
+      ** from the start of the wal file. This is because, for a system
+      ** where (minFrame < iSnapshot < maxFrame), a checkpointer may
+      ** have omitted to checkpoint a frame earlier than minFrame in
+      ** the file because there exists a frame after iSnapshot that
+      ** is the same database page.  */
+      pWal->minFrame = 1;
+
+      if( rc!=SQLITE_OK ){
+        sqlite3WalEndReadTransaction(pWal);
+      }
+    }
+  }
+
+  /* Release the shared CKPT lock obtained above. */
+  if( pWal->ckptLock ){
+    assert( pSnapshot );
+    walUnlockShared(pWal, WAL_CKPT_LOCK);
+    pWal->ckptLock = 0;
+  }
+#endif
+  return rc;
+}
+
+/*
+** Finish with a read transaction.  All this does is release the
+** read-lock.
+*/
+SQLITE_PRIVATE void sqlite3WalEndReadTransaction(Wal *pWal){
+  sqlite3WalEndWriteTransaction(pWal);
+  if( pWal->readLock>=0 ){
+    walUnlockShared(pWal, WAL_READ_LOCK(pWal->readLock));
+    pWal->readLock = -1;
+  }
+}
+
+/*
+** Search the wal file for page pgno. If found, set *piRead to the frame that
+** contains the page. Otherwise, if pgno is not in the wal file, set *piRead
+** to zero.
+**
+** Return SQLITE_OK if successful, or an error code if an error occurs. If an
+** error does occur, the final value of *piRead is undefined.
+*/
+SQLITE_PRIVATE int sqlite3WalFindFrame(
+  Wal *pWal,                      /* WAL handle */
+  Pgno pgno,                      /* Database page number to read data for */
+  u32 *piRead                     /* OUT: Frame number (or zero) */
+){
+  u32 iRead = 0;                  /* If !=0, WAL frame to return data from */
+  u32 iLast = pWal->hdr.mxFrame;  /* Last page in WAL for this reader */
+  int iHash;                      /* Used to loop through N hash tables */
+  int iMinHash;
+
+  /* This routine is only be called from within a read transaction. */
+  assert( pWal->readLock>=0 || pWal->lockError );
+
+  /* If the "last page" field of the wal-index header snapshot is 0, then
+  ** no data will be read from the wal under any circumstances. Return early
+  ** in this case as an optimization.  Likewise, if pWal->readLock==0,
+  ** then the WAL is ignored by the reader so return early, as if the
+  ** WAL were empty.
+  */
+  if( iLast==0 || (pWal->readLock==0 && pWal->bShmUnreliable==0) ){
+    *piRead = 0;
+    return SQLITE_OK;
+  }
+
+  /* Search the hash table or tables for an entry matching page number
+  ** pgno. Each iteration of the following for() loop searches one
+  ** hash table (each hash table indexes up to HASHTABLE_NPAGE frames).
+  **
+  ** This code might run concurrently to the code in walIndexAppend()
+  ** that adds entries to the wal-index (and possibly to this hash
+  ** table). This means the value just read from the hash
+  ** slot (aHash[iKey]) may have been added before or after the
+  ** current read transaction was opened. Values added after the
+  ** read transaction was opened may have been written incorrectly -
+  ** i.e. these slots may contain garbage data. However, we assume
+  ** that any slots written before the current read transaction was
+  ** opened remain unmodified.
+  **
+  ** For the reasons above, the if(...) condition featured in the inner
+  ** loop of the following block is more stringent that would be required
+  ** if we had exclusive access to the hash-table:
+  **
+  **   (aPgno[iFrame]==pgno):
+  **     This condition filters out normal hash-table collisions.
+  **
+  **   (iFrame<=iLast):
+  **     This condition filters out entries that were added to the hash
+  **     table after the current read-transaction had started.
+  */
+  iMinHash = walFramePage(pWal->minFrame);
+  for(iHash=walFramePage(iLast); iHash>=iMinHash; iHash--){
+    WalHashLoc sLoc;              /* Hash table location */
+    int iKey;                     /* Hash slot index */
+    int nCollide;                 /* Number of hash collisions remaining */
+    int rc;                       /* Error code */
+    u32 iH;
+
+    rc = walHashGet(pWal, iHash, &sLoc);
+    if( rc!=SQLITE_OK ){
+      return rc;
+    }
+    nCollide = HASHTABLE_NSLOT;
+    iKey = walHash(pgno);
+    while( (iH = AtomicLoad(&sLoc.aHash[iKey]))!=0 ){
+      u32 iFrame = iH + sLoc.iZero;
+      if( iFrame<=iLast && iFrame>=pWal->minFrame && sLoc.aPgno[iH-1]==pgno ){
+        assert( iFrame>iRead || CORRUPT_DB );
+        iRead = iFrame;
+      }
+      if( (nCollide--)==0 ){
+        return SQLITE_CORRUPT_BKPT;
+      }
+      iKey = walNextHash(iKey);
+    }
+    if( iRead ) break;
+  }
+
+#ifdef SQLITE_ENABLE_EXPENSIVE_ASSERT
+  /* If expensive assert() statements are available, do a linear search
+  ** of the wal-index file content. Make sure the results agree with the
+  ** result obtained using the hash indexes above.  */
+  {
+    u32 iRead2 = 0;
+    u32 iTest;
+    assert( pWal->bShmUnreliable || pWal->minFrame>0 );
+    for(iTest=iLast; iTest>=pWal->minFrame && iTest>0; iTest--){
+      if( walFramePgno(pWal, iTest)==pgno ){
+        iRead2 = iTest;
+        break;
+      }
+    }
+    assert( iRead==iRead2 );
+  }
+#endif
+
+  *piRead = iRead;
+  return SQLITE_OK;
+}
+
+/*
+** Read the contents of frame iRead from the wal file into buffer pOut
+** (which is nOut bytes in size). Return SQLITE_OK if successful, or an
+** error code otherwise.
+*/
+SQLITE_PRIVATE int sqlite3WalReadFrame(
+  Wal *pWal,                      /* WAL handle */
+  u32 iRead,                      /* Frame to read */
+  int nOut,                       /* Size of buffer pOut in bytes */
+  u8 *pOut                        /* Buffer to write page data to */
+){
+  int sz;
+  i64 iOffset;
+  sz = pWal->hdr.szPage;
+  sz = (sz&0xfe00) + ((sz&0x0001)<<16);
+  testcase( sz<=32768 );
+  testcase( sz>=65536 );
+  iO
