@@ -64091,4 +64091,156 @@ static int walIndexReadHdr(Wal *pWal, int *pChanged){
   */
   badHdr = (page0 ? walIndexTryHdr(pWal, pChanged) : 1);
 
-  /* If the first attempt failed, it might have been due to a rac
+  /* If the first attempt failed, it might have been due to a race
+  ** with a writer.  So get a WRITE lock and try again.
+  */
+  if( badHdr ){
+    if( pWal->bShmUnreliable==0 && (pWal->readOnly & WAL_SHM_RDONLY) ){
+      if( SQLITE_OK==(rc = walLockShared(pWal, WAL_WRITE_LOCK)) ){
+        walUnlockShared(pWal, WAL_WRITE_LOCK);
+        rc = SQLITE_READONLY_RECOVERY;
+      }
+    }else{
+      int bWriteLock = pWal->writeLock;
+      if( bWriteLock || SQLITE_OK==(rc = walLockWriter(pWal)) ){
+        pWal->writeLock = 1;
+        if( SQLITE_OK==(rc = walIndexPage(pWal, 0, &page0)) ){
+          badHdr = walIndexTryHdr(pWal, pChanged);
+          if( badHdr ){
+            /* If the wal-index header is still malformed even while holding
+            ** a WRITE lock, it can only mean that the header is corrupted and
+            ** needs to be reconstructed.  So run recovery to do exactly that.
+            */
+            rc = walIndexRecover(pWal);
+            *pChanged = 1;
+          }
+        }
+        if( bWriteLock==0 ){
+          pWal->writeLock = 0;
+          walUnlockExclusive(pWal, WAL_WRITE_LOCK, 1);
+        }
+      }
+    }
+  }
+
+  /* If the header is read successfully, check the version number to make
+  ** sure the wal-index was not constructed with some future format that
+  ** this version of SQLite cannot understand.
+  */
+  if( badHdr==0 && pWal->hdr.iVersion!=WALINDEX_MAX_VERSION ){
+    rc = SQLITE_CANTOPEN_BKPT;
+  }
+  if( pWal->bShmUnreliable ){
+    if( rc!=SQLITE_OK ){
+      walIndexClose(pWal, 0);
+      pWal->bShmUnreliable = 0;
+      assert( pWal->nWiData>0 && pWal->apWiData[0]==0 );
+      /* walIndexRecover() might have returned SHORT_READ if a concurrent
+      ** writer truncated the WAL out from under it.  If that happens, it
+      ** indicates that a writer has fixed the SHM file for us, so retry */
+      if( rc==SQLITE_IOERR_SHORT_READ ) rc = WAL_RETRY;
+    }
+    pWal->exclusiveMode = WAL_NORMAL_MODE;
+  }
+
+  return rc;
+}
+
+/*
+** Open a transaction in a connection where the shared-memory is read-only
+** and where we cannot verify that there is a separate write-capable connection
+** on hand to keep the shared-memory up-to-date with the WAL file.
+**
+** This can happen, for example, when the shared-memory is implemented by
+** memory-mapping a *-shm file, where a prior writer has shut down and
+** left the *-shm file on disk, and now the present connection is trying
+** to use that database but lacks write permission on the *-shm file.
+** Other scenarios are also possible, depending on the VFS implementation.
+**
+** Precondition:
+**
+**    The *-wal file has been read and an appropriate wal-index has been
+**    constructed in pWal->apWiData[] using heap memory instead of shared
+**    memory.
+**
+** If this function returns SQLITE_OK, then the read transaction has
+** been successfully opened. In this case output variable (*pChanged)
+** is set to true before returning if the caller should discard the
+** contents of the page cache before proceeding. Or, if it returns
+** WAL_RETRY, then the heap memory wal-index has been discarded and
+** the caller should retry opening the read transaction from the
+** beginning (including attempting to map the *-shm file).
+**
+** If an error occurs, an SQLite error code is returned.
+*/
+static int walBeginShmUnreliable(Wal *pWal, int *pChanged){
+  i64 szWal;                      /* Size of wal file on disk in bytes */
+  i64 iOffset;                    /* Current offset when reading wal file */
+  u8 aBuf[WAL_HDRSIZE];           /* Buffer to load WAL header into */
+  u8 *aFrame = 0;                 /* Malloc'd buffer to load entire frame */
+  int szFrame;                    /* Number of bytes in buffer aFrame[] */
+  u8 *aData;                      /* Pointer to data part of aFrame buffer */
+  volatile void *pDummy;          /* Dummy argument for xShmMap */
+  int rc;                         /* Return code */
+  u32 aSaveCksum[2];              /* Saved copy of pWal->hdr.aFrameCksum */
+
+  assert( pWal->bShmUnreliable );
+  assert( pWal->readOnly & WAL_SHM_RDONLY );
+  assert( pWal->nWiData>0 && pWal->apWiData[0] );
+
+  /* Take WAL_READ_LOCK(0). This has the effect of preventing any
+  ** writers from running a checkpoint, but does not stop them
+  ** from running recovery.  */
+  rc = walLockShared(pWal, WAL_READ_LOCK(0));
+  if( rc!=SQLITE_OK ){
+    if( rc==SQLITE_BUSY ) rc = WAL_RETRY;
+    goto begin_unreliable_shm_out;
+  }
+  pWal->readLock = 0;
+
+  /* Check to see if a separate writer has attached to the shared-memory area,
+  ** thus making the shared-memory "reliable" again.  Do this by invoking
+  ** the xShmMap() routine of the VFS and looking to see if the return
+  ** is SQLITE_READONLY instead of SQLITE_READONLY_CANTINIT.
+  **
+  ** If the shared-memory is now "reliable" return WAL_RETRY, which will
+  ** cause the heap-memory WAL-index to be discarded and the actual
+  ** shared memory to be used in its place.
+  **
+  ** This step is important because, even though this connection is holding
+  ** the WAL_READ_LOCK(0) which prevents a checkpoint, a writer might
+  ** have already checkpointed the WAL file and, while the current
+  ** is active, wrap the WAL and start overwriting frames that this
+  ** process wants to use.
+  **
+  ** Once sqlite3OsShmMap() has been called for an sqlite3_file and has
+  ** returned any SQLITE_READONLY value, it must return only SQLITE_READONLY
+  ** or SQLITE_READONLY_CANTINIT or some error for all subsequent invocations,
+  ** even if some external agent does a "chmod" to make the shared-memory
+  ** writable by us, until sqlite3OsShmUnmap() has been called.
+  ** This is a requirement on the VFS implementation.
+   */
+  rc = sqlite3OsShmMap(pWal->pDbFd, 0, WALINDEX_PGSZ, 0, &pDummy);
+  assert( rc!=SQLITE_OK ); /* SQLITE_OK not possible for read-only connection */
+  if( rc!=SQLITE_READONLY_CANTINIT ){
+    rc = (rc==SQLITE_READONLY ? WAL_RETRY : rc);
+    goto begin_unreliable_shm_out;
+  }
+
+  /* We reach this point only if the real shared-memory is still unreliable.
+  ** Assume the in-memory WAL-index substitute is correct and load it
+  ** into pWal->hdr.
+  */
+  memcpy(&pWal->hdr, (void*)walIndexHdr(pWal), sizeof(WalIndexHdr));
+
+  /* Make sure some writer hasn't come in and changed the WAL file out
+  ** from under us, then disconnected, while we were not looking.
+  */
+  rc = sqlite3OsFileSize(pWal->pWalFd, &szWal);
+  if( rc!=SQLITE_OK ){
+    goto begin_unreliable_shm_out;
+  }
+  if( szWal<WAL_HDRSIZE ){
+    /* If the wal file is too small to contain a wal-header and the
+    ** wal-index header has mxFrame==0, then it must be safe to proceed
+    ** reading the database file only. However, the page cach
