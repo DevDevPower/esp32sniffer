@@ -64557,4 +64557,175 @@ static int walTryBeginRead(Wal *pWal, int *pChanged, int useWal, int cnt){
   ** matches the one cached in pWal->hdr, it is guaranteed that the
   ** checkpointer that set nBackfill was not working with a wal-index
   ** header newer than that cached in pWal->hdr. If it were, that could
-  ** cause a problem. The checkpointer could omit
+  ** cause a problem. The checkpointer could omit to checkpoint
+  ** a version of page X that lies before pWal->minFrame (call that version
+  ** A) on the basis that there is a newer version (version B) of the same
+  ** page later in the wal file. But if version B happens to like past
+  ** frame pWal->hdr.mxFrame - then the client would incorrectly assume
+  ** that it can read version A from the database file. However, since
+  ** we can guarantee that the checkpointer that set nBackfill could not
+  ** see any pages past pWal->hdr.mxFrame, this problem does not come up.
+  */
+  pWal->minFrame = AtomicLoad(&pInfo->nBackfill)+1;
+  walShmBarrier(pWal);
+  if( AtomicLoad(pInfo->aReadMark+mxI)!=mxReadMark
+   || memcmp((void *)walIndexHdr(pWal), &pWal->hdr, sizeof(WalIndexHdr))
+  ){
+    walUnlockShared(pWal, WAL_READ_LOCK(mxI));
+    return WAL_RETRY;
+  }else{
+    assert( mxReadMark<=pWal->hdr.mxFrame );
+    pWal->readLock = (i16)mxI;
+  }
+  return rc;
+}
+
+#ifdef SQLITE_ENABLE_SNAPSHOT
+/*
+** Attempt to reduce the value of the WalCkptInfo.nBackfillAttempted
+** variable so that older snapshots can be accessed. To do this, loop
+** through all wal frames from nBackfillAttempted to (nBackfill+1),
+** comparing their content to the corresponding page with the database
+** file, if any. Set nBackfillAttempted to the frame number of the
+** first frame for which the wal file content matches the db file.
+**
+** This is only really safe if the file-system is such that any page
+** writes made by earlier checkpointers were atomic operations, which
+** is not always true. It is also possible that nBackfillAttempted
+** may be left set to a value larger than expected, if a wal frame
+** contains content that duplicate of an earlier version of the same
+** page.
+**
+** SQLITE_OK is returned if successful, or an SQLite error code if an
+** error occurs. It is not an error if nBackfillAttempted cannot be
+** decreased at all.
+*/
+SQLITE_PRIVATE int sqlite3WalSnapshotRecover(Wal *pWal){
+  int rc;
+
+  assert( pWal->readLock>=0 );
+  rc = walLockExclusive(pWal, WAL_CKPT_LOCK, 1);
+  if( rc==SQLITE_OK ){
+    volatile WalCkptInfo *pInfo = walCkptInfo(pWal);
+    int szPage = (int)pWal->szPage;
+    i64 szDb;                   /* Size of db file in bytes */
+
+    rc = sqlite3OsFileSize(pWal->pDbFd, &szDb);
+    if( rc==SQLITE_OK ){
+      void *pBuf1 = sqlite3_malloc(szPage);
+      void *pBuf2 = sqlite3_malloc(szPage);
+      if( pBuf1==0 || pBuf2==0 ){
+        rc = SQLITE_NOMEM;
+      }else{
+        u32 i = pInfo->nBackfillAttempted;
+        for(i=pInfo->nBackfillAttempted; i>AtomicLoad(&pInfo->nBackfill); i--){
+          WalHashLoc sLoc;          /* Hash table location */
+          u32 pgno;                 /* Page number in db file */
+          i64 iDbOff;               /* Offset of db file entry */
+          i64 iWalOff;              /* Offset of wal file entry */
+
+          rc = walHashGet(pWal, walFramePage(i), &sLoc);
+          if( rc!=SQLITE_OK ) break;
+          assert( i - sLoc.iZero - 1 >=0 );
+          pgno = sLoc.aPgno[i-sLoc.iZero-1];
+          iDbOff = (i64)(pgno-1) * szPage;
+
+          if( iDbOff+szPage<=szDb ){
+            iWalOff = walFrameOffset(i, szPage) + WAL_FRAME_HDRSIZE;
+            rc = sqlite3OsRead(pWal->pWalFd, pBuf1, szPage, iWalOff);
+
+            if( rc==SQLITE_OK ){
+              rc = sqlite3OsRead(pWal->pDbFd, pBuf2, szPage, iDbOff);
+            }
+
+            if( rc!=SQLITE_OK || 0==memcmp(pBuf1, pBuf2, szPage) ){
+              break;
+            }
+          }
+
+          pInfo->nBackfillAttempted = i-1;
+        }
+      }
+
+      sqlite3_free(pBuf1);
+      sqlite3_free(pBuf2);
+    }
+    walUnlockExclusive(pWal, WAL_CKPT_LOCK, 1);
+  }
+
+  return rc;
+}
+#endif /* SQLITE_ENABLE_SNAPSHOT */
+
+/*
+** Begin a read transaction on the database.
+**
+** This routine used to be called sqlite3OpenSnapshot() and with good reason:
+** it takes a snapshot of the state of the WAL and wal-index for the current
+** instant in time.  The current thread will continue to use this snapshot.
+** Other threads might append new content to the WAL and wal-index but
+** that extra content is ignored by the current thread.
+**
+** If the database contents have changes since the previous read
+** transaction, then *pChanged is set to 1 before returning.  The
+** Pager layer will use this to know that its cache is stale and
+** needs to be flushed.
+*/
+SQLITE_PRIVATE int sqlite3WalBeginReadTransaction(Wal *pWal, int *pChanged){
+  int rc;                         /* Return code */
+  int cnt = 0;                    /* Number of TryBeginRead attempts */
+#ifdef SQLITE_ENABLE_SNAPSHOT
+  int bChanged = 0;
+  WalIndexHdr *pSnapshot = pWal->pSnapshot;
+#endif
+
+  assert( pWal->ckptLock==0 );
+
+#ifdef SQLITE_ENABLE_SNAPSHOT
+  if( pSnapshot ){
+    if( memcmp(pSnapshot, &pWal->hdr, sizeof(WalIndexHdr))!=0 ){
+      bChanged = 1;
+    }
+
+    /* It is possible that there is a checkpointer thread running
+    ** concurrent with this code. If this is the case, it may be that the
+    ** checkpointer has already determined that it will checkpoint
+    ** snapshot X, where X is later in the wal file than pSnapshot, but
+    ** has not yet set the pInfo->nBackfillAttempted variable to indicate
+    ** its intent. To avoid the race condition this leads to, ensure that
+    ** there is no checkpointer process by taking a shared CKPT lock
+    ** before checking pInfo->nBackfillAttempted.  */
+    (void)walEnableBlocking(pWal);
+    rc = walLockShared(pWal, WAL_CKPT_LOCK);
+    walDisableBlocking(pWal);
+
+    if( rc!=SQLITE_OK ){
+      return rc;
+    }
+    pWal->ckptLock = 1;
+  }
+#endif
+
+  do{
+    rc = walTryBeginRead(pWal, pChanged, 0, ++cnt);
+  }while( rc==WAL_RETRY );
+  testcase( (rc&0xff)==SQLITE_BUSY );
+  testcase( (rc&0xff)==SQLITE_IOERR );
+  testcase( rc==SQLITE_PROTOCOL );
+  testcase( rc==SQLITE_OK );
+
+#ifdef SQLITE_ENABLE_SNAPSHOT
+  if( rc==SQLITE_OK ){
+    if( pSnapshot && memcmp(pSnapshot, &pWal->hdr, sizeof(WalIndexHdr))!=0 ){
+      /* At this point the client has a lock on an aReadMark[] slot holding
+      ** a value equal to or smaller than pSnapshot->mxFrame, but pWal->hdr
+      ** is populated with the wal-index header corresponding to the head
+      ** of the wal file. Verify that pSnapshot is still valid before
+      ** continuing.  Reasons why pSnapshot might no longer be valid:
+      **
+      **    (1)  The WAL file has been reset since the snapshot was taken.
+      **         In this case, the salt will have changed.
+      **
+      **    (2)  A checkpoint as been attempted that wrote frames past
+      **         pSnapshot->mxFrame into the database file.  Note that the
+      **         checkpoint nee
