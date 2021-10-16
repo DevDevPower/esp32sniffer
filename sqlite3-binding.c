@@ -64390,4 +64390,171 @@ static int walTryBeginRead(Wal *pWal, int *pChanged, int useWal, int cnt){
   ** locks are held, so the locks should not be held for very long. But
   ** if we are unlucky, another process that is holding a lock might get
   ** paged out or take a page-fault that is time-consuming to resolve,
-  ** during the few nanoseconds that it is holding the lock.  In that ca
+  ** during the few nanoseconds that it is holding the lock.  In that case,
+  ** it might take longer than normal for the lock to free.
+  **
+  ** After 5 RETRYs, we begin calling sqlite3OsSleep().  The first few
+  ** calls to sqlite3OsSleep() have a delay of 1 microsecond.  Really this
+  ** is more of a scheduler yield than an actual delay.  But on the 10th
+  ** an subsequent retries, the delays start becoming longer and longer,
+  ** so that on the 100th (and last) RETRY we delay for 323 milliseconds.
+  ** The total delay time before giving up is less than 10 seconds.
+  */
+  if( cnt>5 ){
+    int nDelay = 1;                      /* Pause time in microseconds */
+    if( cnt>100 ){
+      VVA_ONLY( pWal->lockError = 1; )
+      return SQLITE_PROTOCOL;
+    }
+    if( cnt>=10 ) nDelay = (cnt-9)*(cnt-9)*39;
+    sqlite3OsSleep(pWal->pVfs, nDelay);
+  }
+
+  if( !useWal ){
+    assert( rc==SQLITE_OK );
+    if( pWal->bShmUnreliable==0 ){
+      rc = walIndexReadHdr(pWal, pChanged);
+    }
+    if( rc==SQLITE_BUSY ){
+      /* If there is not a recovery running in another thread or process
+      ** then convert BUSY errors to WAL_RETRY.  If recovery is known to
+      ** be running, convert BUSY to BUSY_RECOVERY.  There is a race here
+      ** which might cause WAL_RETRY to be returned even if BUSY_RECOVERY
+      ** would be technically correct.  But the race is benign since with
+      ** WAL_RETRY this routine will be called again and will probably be
+      ** right on the second iteration.
+      */
+      if( pWal->apWiData[0]==0 ){
+        /* This branch is taken when the xShmMap() method returns SQLITE_BUSY.
+        ** We assume this is a transient condition, so return WAL_RETRY. The
+        ** xShmMap() implementation used by the default unix and win32 VFS
+        ** modules may return SQLITE_BUSY due to a race condition in the
+        ** code that determines whether or not the shared-memory region
+        ** must be zeroed before the requested page is returned.
+        */
+        rc = WAL_RETRY;
+      }else if( SQLITE_OK==(rc = walLockShared(pWal, WAL_RECOVER_LOCK)) ){
+        walUnlockShared(pWal, WAL_RECOVER_LOCK);
+        rc = WAL_RETRY;
+      }else if( rc==SQLITE_BUSY ){
+        rc = SQLITE_BUSY_RECOVERY;
+      }
+    }
+    if( rc!=SQLITE_OK ){
+      return rc;
+    }
+    else if( pWal->bShmUnreliable ){
+      return walBeginShmUnreliable(pWal, pChanged);
+    }
+  }
+
+  assert( pWal->nWiData>0 );
+  assert( pWal->apWiData[0]!=0 );
+  pInfo = walCkptInfo(pWal);
+  if( !useWal && AtomicLoad(&pInfo->nBackfill)==pWal->hdr.mxFrame
+#ifdef SQLITE_ENABLE_SNAPSHOT
+   && (pWal->pSnapshot==0 || pWal->hdr.mxFrame==0)
+#endif
+  ){
+    /* The WAL has been completely backfilled (or it is empty).
+    ** and can be safely ignored.
+    */
+    rc = walLockShared(pWal, WAL_READ_LOCK(0));
+    walShmBarrier(pWal);
+    if( rc==SQLITE_OK ){
+      if( memcmp((void *)walIndexHdr(pWal), &pWal->hdr, sizeof(WalIndexHdr)) ){
+        /* It is not safe to allow the reader to continue here if frames
+        ** may have been appended to the log before READ_LOCK(0) was obtained.
+        ** When holding READ_LOCK(0), the reader ignores the entire log file,
+        ** which implies that the database file contains a trustworthy
+        ** snapshot. Since holding READ_LOCK(0) prevents a checkpoint from
+        ** happening, this is usually correct.
+        **
+        ** However, if frames have been appended to the log (or if the log
+        ** is wrapped and written for that matter) before the READ_LOCK(0)
+        ** is obtained, that is not necessarily true. A checkpointer may
+        ** have started to backfill the appended frames but crashed before
+        ** it finished. Leaving a corrupt image in the database file.
+        */
+        walUnlockShared(pWal, WAL_READ_LOCK(0));
+        return WAL_RETRY;
+      }
+      pWal->readLock = 0;
+      return SQLITE_OK;
+    }else if( rc!=SQLITE_BUSY ){
+      return rc;
+    }
+  }
+
+  /* If we get this far, it means that the reader will want to use
+  ** the WAL to get at content from recent commits.  The job now is
+  ** to select one of the aReadMark[] entries that is closest to
+  ** but not exceeding pWal->hdr.mxFrame and lock that entry.
+  */
+  mxReadMark = 0;
+  mxI = 0;
+  mxFrame = pWal->hdr.mxFrame;
+#ifdef SQLITE_ENABLE_SNAPSHOT
+  if( pWal->pSnapshot && pWal->pSnapshot->mxFrame<mxFrame ){
+    mxFrame = pWal->pSnapshot->mxFrame;
+  }
+#endif
+  for(i=1; i<WAL_NREADER; i++){
+    u32 thisMark = AtomicLoad(pInfo->aReadMark+i);
+    if( mxReadMark<=thisMark && thisMark<=mxFrame ){
+      assert( thisMark!=READMARK_NOT_USED );
+      mxReadMark = thisMark;
+      mxI = i;
+    }
+  }
+  if( (pWal->readOnly & WAL_SHM_RDONLY)==0
+   && (mxReadMark<mxFrame || mxI==0)
+  ){
+    for(i=1; i<WAL_NREADER; i++){
+      rc = walLockExclusive(pWal, WAL_READ_LOCK(i), 1);
+      if( rc==SQLITE_OK ){
+        AtomicStore(pInfo->aReadMark+i,mxFrame);
+        mxReadMark = mxFrame;
+        mxI = i;
+        walUnlockExclusive(pWal, WAL_READ_LOCK(i), 1);
+        break;
+      }else if( rc!=SQLITE_BUSY ){
+        return rc;
+      }
+    }
+  }
+  if( mxI==0 ){
+    assert( rc==SQLITE_BUSY || (pWal->readOnly & WAL_SHM_RDONLY)!=0 );
+    return rc==SQLITE_BUSY ? WAL_RETRY : SQLITE_READONLY_CANTINIT;
+  }
+
+  rc = walLockShared(pWal, WAL_READ_LOCK(mxI));
+  if( rc ){
+    return rc==SQLITE_BUSY ? WAL_RETRY : rc;
+  }
+  /* Now that the read-lock has been obtained, check that neither the
+  ** value in the aReadMark[] array or the contents of the wal-index
+  ** header have changed.
+  **
+  ** It is necessary to check that the wal-index header did not change
+  ** between the time it was read and when the shared-lock was obtained
+  ** on WAL_READ_LOCK(mxI) was obtained to account for the possibility
+  ** that the log file may have been wrapped by a writer, or that frames
+  ** that occur later in the log than pWal->hdr.mxFrame may have been
+  ** copied into the database by a checkpointer. If either of these things
+  ** happened, then reading the database with the current value of
+  ** pWal->hdr.mxFrame risks reading a corrupted snapshot. So, retry
+  ** instead.
+  **
+  ** Before checking that the live wal-index header has not changed
+  ** since it was read, set Wal.minFrame to the first frame in the wal
+  ** file that has not yet been checkpointed. This client will not need
+  ** to read any frames earlier than minFrame from the wal file - they
+  ** can be safely read directly from the database file.
+  **
+  ** Because a ShmBarrier() call is made between taking the copy of
+  ** nBackfill and checking that the wal-header in shared-memory still
+  ** matches the one cached in pWal->hdr, it is guaranteed that the
+  ** checkpointer that set nBackfill was not working with a wal-index
+  ** header newer than that cached in pWal->hdr. If it were, that could
+  ** cause a problem. The checkpointer could omit
