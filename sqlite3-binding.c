@@ -66123,4 +66123,155 @@ struct MemPage {
   u8 max1bytePayload;  /* min(maxLocal,127) */
   u8 nOverflow;        /* Number of overflow cell bodies in aCell[] */
   u16 maxLocal;        /* Copy of BtShared.maxLocal or BtShared.maxLeaf */
-  u16 minLocal;
+  u16 minLocal;        /* Copy of BtShared.minLocal or BtShared.minLeaf */
+  u16 cellOffset;      /* Index in aData of first cell pointer */
+  int nFree;           /* Number of free bytes on the page. -1 for unknown */
+  u16 nCell;           /* Number of cells on this page, local and ovfl */
+  u16 maskPage;        /* Mask for page offset */
+  u16 aiOvfl[4];       /* Insert the i-th overflow cell before the aiOvfl-th
+                       ** non-overflow cell */
+  u8 *apOvfl[4];       /* Pointers to the body of overflow cells */
+  BtShared *pBt;       /* Pointer to BtShared that this page is part of */
+  u8 *aData;           /* Pointer to disk image of the page data */
+  u8 *aDataEnd;        /* One byte past the end of the entire page - not just
+                       ** the usable space, the entire page.  Used to prevent
+                       ** corruption-induced buffer overflow. */
+  u8 *aCellIdx;        /* The cell index area */
+  u8 *aDataOfst;       /* Same as aData for leaves.  aData+4 for interior */
+  DbPage *pDbPage;     /* Pager page handle */
+  u16 (*xCellSize)(MemPage*,u8*);             /* cellSizePtr method */
+  void (*xParseCell)(MemPage*,u8*,CellInfo*); /* btreeParseCell method */
+};
+
+/*
+** A linked list of the following structures is stored at BtShared.pLock.
+** Locks are added (or upgraded from READ_LOCK to WRITE_LOCK) when a cursor
+** is opened on the table with root page BtShared.iTable. Locks are removed
+** from this list when a transaction is committed or rolled back, or when
+** a btree handle is closed.
+*/
+struct BtLock {
+  Btree *pBtree;        /* Btree handle holding this lock */
+  Pgno iTable;          /* Root page of table */
+  u8 eLock;             /* READ_LOCK or WRITE_LOCK */
+  BtLock *pNext;        /* Next in BtShared.pLock list */
+};
+
+/* Candidate values for BtLock.eLock */
+#define READ_LOCK     1
+#define WRITE_LOCK    2
+
+/* A Btree handle
+**
+** A database connection contains a pointer to an instance of
+** this object for every database file that it has open.  This structure
+** is opaque to the database connection.  The database connection cannot
+** see the internals of this structure and only deals with pointers to
+** this structure.
+**
+** For some database files, the same underlying database cache might be
+** shared between multiple connections.  In that case, each connection
+** has it own instance of this object.  But each instance of this object
+** points to the same BtShared object.  The database cache and the
+** schema associated with the database file are all contained within
+** the BtShared object.
+**
+** All fields in this structure are accessed under sqlite3.mutex.
+** The pBt pointer itself may not be changed while there exists cursors
+** in the referenced BtShared that point back to this Btree since those
+** cursors have to go through this Btree to find their BtShared and
+** they often do so without holding sqlite3.mutex.
+*/
+struct Btree {
+  sqlite3 *db;       /* The database connection holding this btree */
+  BtShared *pBt;     /* Sharable content of this btree */
+  u8 inTrans;        /* TRANS_NONE, TRANS_READ or TRANS_WRITE */
+  u8 sharable;       /* True if we can share pBt with another db */
+  u8 locked;         /* True if db currently has pBt locked */
+  u8 hasIncrblobCur; /* True if there are one or more Incrblob cursors */
+  int wantToLock;    /* Number of nested calls to sqlite3BtreeEnter() */
+  int nBackup;       /* Number of backup operations reading this btree */
+  u32 iBDataVersion; /* Combines with pBt->pPager->iDataVersion */
+  Btree *pNext;      /* List of other sharable Btrees from the same db */
+  Btree *pPrev;      /* Back pointer of the same list */
+#ifdef SQLITE_DEBUG
+  u64 nSeek;         /* Calls to sqlite3BtreeMovetoUnpacked() */
+#endif
+#ifndef SQLITE_OMIT_SHARED_CACHE
+  BtLock lock;       /* Object used to lock page 1 */
+#endif
+};
+
+/*
+** Btree.inTrans may take one of the following values.
+**
+** If the shared-data extension is enabled, there may be multiple users
+** of the Btree structure. At most one of these may open a write transaction,
+** but any number may have active read transactions.
+**
+** These values must match SQLITE_TXN_NONE, SQLITE_TXN_READ, and
+** SQLITE_TXN_WRITE
+*/
+#define TRANS_NONE  0
+#define TRANS_READ  1
+#define TRANS_WRITE 2
+
+#if TRANS_NONE!=SQLITE_TXN_NONE
+# error wrong numeric code for no-transaction
+#endif
+#if TRANS_READ!=SQLITE_TXN_READ
+# error wrong numeric code for read-transaction
+#endif
+#if TRANS_WRITE!=SQLITE_TXN_WRITE
+# error wrong numeric code for write-transaction
+#endif
+
+
+/*
+** An instance of this object represents a single database file.
+**
+** A single database file can be in use at the same time by two
+** or more database connections.  When two or more connections are
+** sharing the same database file, each connection has it own
+** private Btree object for the file and each of those Btrees points
+** to this one BtShared object.  BtShared.nRef is the number of
+** connections currently sharing this database file.
+**
+** Fields in this structure are accessed under the BtShared.mutex
+** mutex, except for nRef and pNext which are accessed under the
+** global SQLITE_MUTEX_STATIC_MAIN mutex.  The pPager field
+** may not be modified once it is initially set as long as nRef>0.
+** The pSchema field may be set once under BtShared.mutex and
+** thereafter is unchanged as long as nRef>0.
+**
+** isPending:
+**
+**   If a BtShared client fails to obtain a write-lock on a database
+**   table (because there exists one or more read-locks on the table),
+**   the shared-cache enters 'pending-lock' state and isPending is
+**   set to true.
+**
+**   The shared-cache leaves the 'pending lock' state when either of
+**   the following occur:
+**
+**     1) The current writer (BtShared.pWriter) concludes its transaction, OR
+**     2) The number of locks held by other connections drops to zero.
+**
+**   while in the 'pending-lock' state, no connection may start a new
+**   transaction.
+**
+**   This feature is included to help prevent writer-starvation.
+*/
+struct BtShared {
+  Pager *pPager;        /* The page cache */
+  sqlite3 *db;          /* Database connection currently using this Btree */
+  BtCursor *pCursor;    /* A list of all open cursors */
+  MemPage *pPage1;      /* First page of the database */
+  u8 openFlags;         /* Flags to sqlite3BtreeOpen() */
+#ifndef SQLITE_OMIT_AUTOVACUUM
+  u8 autoVacuum;        /* True if auto-vacuum is enabled */
+  u8 incrVacuum;        /* True if incr-vacuum is enabled */
+  u8 bDoTruncate;       /* True to truncate db on commit */
+#endif
+  u8 inTransaction;     /* Transaction state */
+  u8 max1bytePayload;   /* Maximum first byte of cell for a 1-byte payload *
