@@ -66402,4 +66402,164 @@ struct BtCursor {
 #define BTCF_Pinned       0x40   /* Cursor is busy and cannot be moved */
 
 /*
-** Potential values for BtCursor.
+** Potential values for BtCursor.eState.
+**
+** CURSOR_INVALID:
+**   Cursor does not point to a valid entry. This can happen (for example)
+**   because the table is empty or because BtreeCursorFirst() has not been
+**   called.
+**
+** CURSOR_VALID:
+**   Cursor points to a valid entry. getPayload() etc. may be called.
+**
+** CURSOR_SKIPNEXT:
+**   Cursor is valid except that the Cursor.skipNext field is non-zero
+**   indicating that the next sqlite3BtreeNext() or sqlite3BtreePrevious()
+**   operation should be a no-op.
+**
+** CURSOR_REQUIRESEEK:
+**   The table that this cursor was opened on still exists, but has been
+**   modified since the cursor was last used. The cursor position is saved
+**   in variables BtCursor.pKey and BtCursor.nKey. When a cursor is in
+**   this state, restoreCursorPosition() can be called to attempt to
+**   seek the cursor to the saved position.
+**
+** CURSOR_FAULT:
+**   An unrecoverable error (an I/O error or a malloc failure) has occurred
+**   on a different connection that shares the BtShared cache with this
+**   cursor.  The error has left the cache in an inconsistent state.
+**   Do nothing else with this cursor.  Any attempt to use the cursor
+**   should return the error code stored in BtCursor.skipNext
+*/
+#define CURSOR_VALID             0
+#define CURSOR_INVALID           1
+#define CURSOR_SKIPNEXT          2
+#define CURSOR_REQUIRESEEK       3
+#define CURSOR_FAULT             4
+
+/*
+** The database page the PENDING_BYTE occupies. This page is never used.
+*/
+#define PENDING_BYTE_PAGE(pBt)  ((Pgno)((PENDING_BYTE/((pBt)->pageSize))+1))
+
+/*
+** These macros define the location of the pointer-map entry for a
+** database page. The first argument to each is the number of usable
+** bytes on each page of the database (often 1024). The second is the
+** page number to look up in the pointer map.
+**
+** PTRMAP_PAGENO returns the database page number of the pointer-map
+** page that stores the required pointer. PTRMAP_PTROFFSET returns
+** the offset of the requested map entry.
+**
+** If the pgno argument passed to PTRMAP_PAGENO is a pointer-map page,
+** then pgno is returned. So (pgno==PTRMAP_PAGENO(pgsz, pgno)) can be
+** used to test if pgno is a pointer-map page. PTRMAP_ISPAGE implements
+** this test.
+*/
+#define PTRMAP_PAGENO(pBt, pgno) ptrmapPageno(pBt, pgno)
+#define PTRMAP_PTROFFSET(pgptrmap, pgno) (5*(pgno-pgptrmap-1))
+#define PTRMAP_ISPAGE(pBt, pgno) (PTRMAP_PAGENO((pBt),(pgno))==(pgno))
+
+/*
+** The pointer map is a lookup table that identifies the parent page for
+** each child page in the database file.  The parent page is the page that
+** contains a pointer to the child.  Every page in the database contains
+** 0 or 1 parent pages.  (In this context 'database page' refers
+** to any page that is not part of the pointer map itself.)  Each pointer map
+** entry consists of a single byte 'type' and a 4 byte parent page number.
+** The PTRMAP_XXX identifiers below are the valid types.
+**
+** The purpose of the pointer map is to facility moving pages from one
+** position in the file to another as part of autovacuum.  When a page
+** is moved, the pointer in its parent must be updated to point to the
+** new location.  The pointer map is used to locate the parent page quickly.
+**
+** PTRMAP_ROOTPAGE: The database page is a root-page. The page-number is not
+**                  used in this case.
+**
+** PTRMAP_FREEPAGE: The database page is an unused (free) page. The page-number
+**                  is not used in this case.
+**
+** PTRMAP_OVERFLOW1: The database page is the first page in a list of
+**                   overflow pages. The page number identifies the page that
+**                   contains the cell with a pointer to this overflow page.
+**
+** PTRMAP_OVERFLOW2: The database page is the second or later page in a list of
+**                   overflow pages. The page-number identifies the previous
+**                   page in the overflow page list.
+**
+** PTRMAP_BTREE: The database page is a non-root btree page. The page number
+**               identifies the parent page in the btree.
+*/
+#define PTRMAP_ROOTPAGE 1
+#define PTRMAP_FREEPAGE 2
+#define PTRMAP_OVERFLOW1 3
+#define PTRMAP_OVERFLOW2 4
+#define PTRMAP_BTREE 5
+
+/* A bunch of assert() statements to check the transaction state variables
+** of handle p (type Btree*) are internally consistent.
+*/
+#define btreeIntegrity(p) \
+  assert( p->pBt->inTransaction!=TRANS_NONE || p->pBt->nTransaction==0 ); \
+  assert( p->pBt->inTransaction>=p->inTrans );
+
+
+/*
+** The ISAUTOVACUUM macro is used within balance_nonroot() to determine
+** if the database supports auto-vacuum or not. Because it is used
+** within an expression that is an argument to another macro
+** (sqliteMallocRaw), it is not possible to use conditional compilation.
+** So, this macro is defined instead.
+*/
+#ifndef SQLITE_OMIT_AUTOVACUUM
+#define ISAUTOVACUUM (pBt->autoVacuum)
+#else
+#define ISAUTOVACUUM 0
+#endif
+
+
+/*
+** This structure is passed around through all the sanity checking routines
+** in order to keep track of some global state information.
+**
+** The aRef[] array is allocated so that there is 1 bit for each page in
+** the database. As the integrity-check proceeds, for each page used in
+** the database the corresponding bit is set. This allows integrity-check to
+** detect pages that are used twice and orphaned pages (both of which
+** indicate corruption).
+*/
+typedef struct IntegrityCk IntegrityCk;
+struct IntegrityCk {
+  BtShared *pBt;    /* The tree being checked out */
+  Pager *pPager;    /* The associated pager.  Also accessible by pBt->pPager */
+  u8 *aPgRef;       /* 1 bit per page in the db (see above) */
+  Pgno nPage;       /* Number of pages in the database */
+  int mxErr;        /* Stop accumulating errors when this reaches zero */
+  int nErr;         /* Number of messages written to zErrMsg so far */
+  int bOomFault;    /* A memory allocation error has occurred */
+  const char *zPfx; /* Error message prefix */
+  Pgno v1;          /* Value for first %u substitution in zPfx */
+  int v2;           /* Value for second %d substitution in zPfx */
+  StrAccum errMsg;  /* Accumulate the error message text here */
+  u32 *heap;        /* Min-heap used for analyzing cell coverage */
+  sqlite3 *db;      /* Database connection running the check */
+};
+
+/*
+** Routines to read or write a two- and four-byte big-endian integer values.
+*/
+#define get2byte(x)   ((x)[0]<<8 | (x)[1])
+#define put2byte(p,v) ((p)[0] = (u8)((v)>>8), (p)[1] = (u8)(v))
+#define get4byte sqlite3Get4byte
+#define put4byte sqlite3Put4byte
+
+/*
+** get2byteAligned(), unlike get2byte(), requires that its argument point to a
+** two-byte aligned address.  get2bytea() is only used for accessing the
+** cell addresses in a btree header.
+*/
+#if SQLITE_BYTEORDER==4321
+# define get2byteAligned(x)  (*(u16*)(x))
+#elif SQLITE_BYTEORDER
