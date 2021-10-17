@@ -65111,4 +65111,168 @@ static int walRestartLog(Wal *pWal){
     if( pInfo->nBackfill>0 ){
       u32 salt1;
       sqlite3_randomness(4, &salt1);
-      rc
+      rc = walLockExclusive(pWal, WAL_READ_LOCK(1), WAL_NREADER-1);
+      if( rc==SQLITE_OK ){
+        /* If all readers are using WAL_READ_LOCK(0) (in other words if no
+        ** readers are currently using the WAL), then the transactions
+        ** frames will overwrite the start of the existing log. Update the
+        ** wal-index header to reflect this.
+        **
+        ** In theory it would be Ok to update the cache of the header only
+        ** at this point. But updating the actual wal-index header is also
+        ** safe and means there is no special case for sqlite3WalUndo()
+        ** to handle if this transaction is rolled back.  */
+        walRestartHdr(pWal, salt1);
+        walUnlockExclusive(pWal, WAL_READ_LOCK(1), WAL_NREADER-1);
+      }else if( rc!=SQLITE_BUSY ){
+        return rc;
+      }
+    }
+    walUnlockShared(pWal, WAL_READ_LOCK(0));
+    pWal->readLock = -1;
+    cnt = 0;
+    do{
+      int notUsed;
+      rc = walTryBeginRead(pWal, &notUsed, 1, ++cnt);
+    }while( rc==WAL_RETRY );
+    assert( (rc&0xff)!=SQLITE_BUSY ); /* BUSY not possible when useWal==1 */
+    testcase( (rc&0xff)==SQLITE_IOERR );
+    testcase( rc==SQLITE_PROTOCOL );
+    testcase( rc==SQLITE_OK );
+  }
+  return rc;
+}
+
+/*
+** Information about the current state of the WAL file and where
+** the next fsync should occur - passed from sqlite3WalFrames() into
+** walWriteToLog().
+*/
+typedef struct WalWriter {
+  Wal *pWal;                   /* The complete WAL information */
+  sqlite3_file *pFd;           /* The WAL file to which we write */
+  sqlite3_int64 iSyncPoint;    /* Fsync at this offset */
+  int syncFlags;               /* Flags for the fsync */
+  int szPage;                  /* Size of one page */
+} WalWriter;
+
+/*
+** Write iAmt bytes of content into the WAL file beginning at iOffset.
+** Do a sync when crossing the p->iSyncPoint boundary.
+**
+** In other words, if iSyncPoint is in between iOffset and iOffset+iAmt,
+** first write the part before iSyncPoint, then sync, then write the
+** rest.
+*/
+static int walWriteToLog(
+  WalWriter *p,              /* WAL to write to */
+  void *pContent,            /* Content to be written */
+  int iAmt,                  /* Number of bytes to write */
+  sqlite3_int64 iOffset      /* Start writing at this offset */
+){
+  int rc;
+  if( iOffset<p->iSyncPoint && iOffset+iAmt>=p->iSyncPoint ){
+    int iFirstAmt = (int)(p->iSyncPoint - iOffset);
+    rc = sqlite3OsWrite(p->pFd, pContent, iFirstAmt, iOffset);
+    if( rc ) return rc;
+    iOffset += iFirstAmt;
+    iAmt -= iFirstAmt;
+    pContent = (void*)(iFirstAmt + (char*)pContent);
+    assert( WAL_SYNC_FLAGS(p->syncFlags)!=0 );
+    rc = sqlite3OsSync(p->pFd, WAL_SYNC_FLAGS(p->syncFlags));
+    if( iAmt==0 || rc ) return rc;
+  }
+  rc = sqlite3OsWrite(p->pFd, pContent, iAmt, iOffset);
+  return rc;
+}
+
+/*
+** Write out a single frame of the WAL
+*/
+static int walWriteOneFrame(
+  WalWriter *p,               /* Where to write the frame */
+  PgHdr *pPage,               /* The page of the frame to be written */
+  int nTruncate,              /* The commit flag.  Usually 0.  >0 for commit */
+  sqlite3_int64 iOffset       /* Byte offset at which to write */
+){
+  int rc;                         /* Result code from subfunctions */
+  void *pData;                    /* Data actually written */
+  u8 aFrame[WAL_FRAME_HDRSIZE];   /* Buffer to assemble frame-header in */
+  pData = pPage->pData;
+  walEncodeFrame(p->pWal, pPage->pgno, nTruncate, pData, aFrame);
+  rc = walWriteToLog(p, aFrame, sizeof(aFrame), iOffset);
+  if( rc ) return rc;
+  /* Write the page data */
+  rc = walWriteToLog(p, pData, p->szPage, iOffset+sizeof(aFrame));
+  return rc;
+}
+
+/*
+** This function is called as part of committing a transaction within which
+** one or more frames have been overwritten. It updates the checksums for
+** all frames written to the wal file by the current transaction starting
+** with the earliest to have been overwritten.
+**
+** SQLITE_OK is returned if successful, or an SQLite error code otherwise.
+*/
+static int walRewriteChecksums(Wal *pWal, u32 iLast){
+  const int szPage = pWal->szPage;/* Database page size */
+  int rc = SQLITE_OK;             /* Return code */
+  u8 *aBuf;                       /* Buffer to load data from wal file into */
+  u8 aFrame[WAL_FRAME_HDRSIZE];   /* Buffer to assemble frame-headers in */
+  u32 iRead;                      /* Next frame to read from wal file */
+  i64 iCksumOff;
+
+  aBuf = sqlite3_malloc(szPage + WAL_FRAME_HDRSIZE);
+  if( aBuf==0 ) return SQLITE_NOMEM_BKPT;
+
+  /* Find the checksum values to use as input for the recalculating the
+  ** first checksum. If the first frame is frame 1 (implying that the current
+  ** transaction restarted the wal file), these values must be read from the
+  ** wal-file header. Otherwise, read them from the frame header of the
+  ** previous frame.  */
+  assert( pWal->iReCksum>0 );
+  if( pWal->iReCksum==1 ){
+    iCksumOff = 24;
+  }else{
+    iCksumOff = walFrameOffset(pWal->iReCksum-1, szPage) + 16;
+  }
+  rc = sqlite3OsRead(pWal->pWalFd, aBuf, sizeof(u32)*2, iCksumOff);
+  pWal->hdr.aFrameCksum[0] = sqlite3Get4byte(aBuf);
+  pWal->hdr.aFrameCksum[1] = sqlite3Get4byte(&aBuf[sizeof(u32)]);
+
+  iRead = pWal->iReCksum;
+  pWal->iReCksum = 0;
+  for(; rc==SQLITE_OK && iRead<=iLast; iRead++){
+    i64 iOff = walFrameOffset(iRead, szPage);
+    rc = sqlite3OsRead(pWal->pWalFd, aBuf, szPage+WAL_FRAME_HDRSIZE, iOff);
+    if( rc==SQLITE_OK ){
+      u32 iPgno, nDbSize;
+      iPgno = sqlite3Get4byte(aBuf);
+      nDbSize = sqlite3Get4byte(&aBuf[4]);
+
+      walEncodeFrame(pWal, iPgno, nDbSize, &aBuf[WAL_FRAME_HDRSIZE], aFrame);
+      rc = sqlite3OsWrite(pWal->pWalFd, aFrame, sizeof(aFrame), iOff);
+    }
+  }
+
+  sqlite3_free(aBuf);
+  return rc;
+}
+
+/*
+** Write a set of frames to the log. The caller must hold the write-lock
+** on the log file (obtained using sqlite3WalBeginWriteTransaction()).
+*/
+SQLITE_PRIVATE int sqlite3WalFrames(
+  Wal *pWal,                      /* Wal handle to write to */
+  int szPage,                     /* Database page-size in bytes */
+  PgHdr *pList,                   /* List of dirty pages to write */
+  Pgno nTruncate,                 /* Database size after this commit */
+  int isCommit,                   /* True if this is a commit */
+  int sync_flags                  /* Flags to pass to OsSync() (or 0) */
+){
+  int rc;                         /* Used to catch return codes */
+  u32 iFrame;                     /* Next frame address */
+  PgHdr *p;                       /* Iterator to run through pList with. */
+  PgHdr *pLast = 0;               /* Last frame i
