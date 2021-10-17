@@ -66274,4 +66274,132 @@ struct BtShared {
   u8 bDoTruncate;       /* True to truncate db on commit */
 #endif
   u8 inTransaction;     /* Transaction state */
-  u8 max1bytePayload;   /* Maximum first byte of cell for a 1-byte payload *
+  u8 max1bytePayload;   /* Maximum first byte of cell for a 1-byte payload */
+  u8 nReserveWanted;    /* Desired number of extra bytes per page */
+  u16 btsFlags;         /* Boolean parameters.  See BTS_* macros below */
+  u16 maxLocal;         /* Maximum local payload in non-LEAFDATA tables */
+  u16 minLocal;         /* Minimum local payload in non-LEAFDATA tables */
+  u16 maxLeaf;          /* Maximum local payload in a LEAFDATA table */
+  u16 minLeaf;          /* Minimum local payload in a LEAFDATA table */
+  u32 pageSize;         /* Total number of bytes on a page */
+  u32 usableSize;       /* Number of usable bytes on each page */
+  int nTransaction;     /* Number of open transactions (read + write) */
+  u32 nPage;            /* Number of pages in the database */
+  void *pSchema;        /* Pointer to space allocated by sqlite3BtreeSchema() */
+  void (*xFreeSchema)(void*);  /* Destructor for BtShared.pSchema */
+  sqlite3_mutex *mutex; /* Non-recursive mutex required to access this object */
+  Bitvec *pHasContent;  /* Set of pages moved to free-list this transaction */
+#ifndef SQLITE_OMIT_SHARED_CACHE
+  int nRef;             /* Number of references to this structure */
+  BtShared *pNext;      /* Next on a list of sharable BtShared structs */
+  BtLock *pLock;        /* List of locks held on this shared-btree struct */
+  Btree *pWriter;       /* Btree with currently open write transaction */
+#endif
+  u8 *pTmpSpace;        /* Temp space sufficient to hold a single cell */
+  int nPreformatSize;   /* Size of last cell written by TransferRow() */
+};
+
+/*
+** Allowed values for BtShared.btsFlags
+*/
+#define BTS_READ_ONLY        0x0001   /* Underlying file is readonly */
+#define BTS_PAGESIZE_FIXED   0x0002   /* Page size can no longer be changed */
+#define BTS_SECURE_DELETE    0x0004   /* PRAGMA secure_delete is enabled */
+#define BTS_OVERWRITE        0x0008   /* Overwrite deleted content with zeros */
+#define BTS_FAST_SECURE      0x000c   /* Combination of the previous two */
+#define BTS_INITIALLY_EMPTY  0x0010   /* Database was empty at trans start */
+#define BTS_NO_WAL           0x0020   /* Do not open write-ahead-log files */
+#define BTS_EXCLUSIVE        0x0040   /* pWriter has an exclusive lock */
+#define BTS_PENDING          0x0080   /* Waiting for read-locks to clear */
+
+/*
+** An instance of the following structure is used to hold information
+** about a cell.  The parseCellPtr() function fills in this structure
+** based on information extract from the raw disk page.
+*/
+struct CellInfo {
+  i64 nKey;      /* The key for INTKEY tables, or nPayload otherwise */
+  u8 *pPayload;  /* Pointer to the start of payload */
+  u32 nPayload;  /* Bytes of payload */
+  u16 nLocal;    /* Amount of payload held locally, not on overflow */
+  u16 nSize;     /* Size of the cell content on the main b-tree page */
+};
+
+/*
+** Maximum depth of an SQLite B-Tree structure. Any B-Tree deeper than
+** this will be declared corrupt. This value is calculated based on a
+** maximum database size of 2^31 pages a minimum fanout of 2 for a
+** root-node and 3 for all other internal nodes.
+**
+** If a tree that appears to be taller than this is encountered, it is
+** assumed that the database is corrupt.
+*/
+#define BTCURSOR_MAX_DEPTH 20
+
+/*
+** A cursor is a pointer to a particular entry within a particular
+** b-tree within a database file.
+**
+** The entry is identified by its MemPage and the index in
+** MemPage.aCell[] of the entry.
+**
+** A single database file can be shared by two more database connections,
+** but cursors cannot be shared.  Each cursor is associated with a
+** particular database connection identified BtCursor.pBtree.db.
+**
+** Fields in this structure are accessed under the BtShared.mutex
+** found at self->pBt->mutex.
+**
+** skipNext meaning:
+** The meaning of skipNext depends on the value of eState:
+**
+**   eState            Meaning of skipNext
+**   VALID             skipNext is meaningless and is ignored
+**   INVALID           skipNext is meaningless and is ignored
+**   SKIPNEXT          sqlite3BtreeNext() is a no-op if skipNext>0 and
+**                     sqlite3BtreePrevious() is no-op if skipNext<0.
+**   REQUIRESEEK       restoreCursorPosition() restores the cursor to
+**                     eState=SKIPNEXT if skipNext!=0
+**   FAULT             skipNext holds the cursor fault error code.
+*/
+struct BtCursor {
+  u8 eState;                /* One of the CURSOR_XXX constants (see below) */
+  u8 curFlags;              /* zero or more BTCF_* flags defined below */
+  u8 curPagerFlags;         /* Flags to send to sqlite3PagerGet() */
+  u8 hints;                 /* As configured by CursorSetHints() */
+  int skipNext;    /* Prev() is noop if negative. Next() is noop if positive.
+                   ** Error code if eState==CURSOR_FAULT */
+  Btree *pBtree;            /* The Btree to which this cursor belongs */
+  Pgno *aOverflow;          /* Cache of overflow page locations */
+  void *pKey;               /* Saved key that was cursor last known position */
+  /* All fields above are zeroed when the cursor is allocated.  See
+  ** sqlite3BtreeCursorZero().  Fields that follow must be manually
+  ** initialized. */
+#define BTCURSOR_FIRST_UNINIT pBt   /* Name of first uninitialized field */
+  BtShared *pBt;            /* The BtShared this cursor points to */
+  BtCursor *pNext;          /* Forms a linked list of all cursors */
+  CellInfo info;            /* A parse of the cell we are pointing at */
+  i64 nKey;                 /* Size of pKey, or last integer key */
+  Pgno pgnoRoot;            /* The root page of this tree */
+  i8 iPage;                 /* Index of current page in apPage */
+  u8 curIntKey;             /* Value of apPage[0]->intKey */
+  u16 ix;                   /* Current index for apPage[iPage] */
+  u16 aiIdx[BTCURSOR_MAX_DEPTH-1];     /* Current index in apPage[i] */
+  struct KeyInfo *pKeyInfo;            /* Arg passed to comparison function */
+  MemPage *pPage;                        /* Current page */
+  MemPage *apPage[BTCURSOR_MAX_DEPTH-1]; /* Stack of parents of current page */
+};
+
+/*
+** Legal values for BtCursor.curFlags
+*/
+#define BTCF_WriteFlag    0x01   /* True if a write cursor */
+#define BTCF_ValidNKey    0x02   /* True if info.nKey is valid */
+#define BTCF_ValidOvfl    0x04   /* True if aOverflow is valid */
+#define BTCF_AtLast       0x08   /* Cursor is pointing ot the last entry */
+#define BTCF_Incrblob     0x10   /* True if an incremental I/O handle */
+#define BTCF_Multiple     0x20   /* Maybe another cursor on the same btree */
+#define BTCF_Pinned       0x40   /* Cursor is busy and cannot be moved */
+
+/*
+** Potential values for BtCursor.
