@@ -65976,4 +65976,151 @@ SQLITE_PRIVATE sqlite3_file *sqlite3WalFile(Wal *pWal){
 ** The flags define the format of this btree page.  The leaf flag means that
 ** this page has no children.  The zerodata flag means that this page carries
 ** only keys and no data.  The intkey flag means that the key is an integer
-** which
+** which is stored in the key size entry of the cell header rather than in
+** the payload area.
+**
+** The cell pointer array begins on the first byte after the page header.
+** The cell pointer array contains zero or more 2-byte numbers which are
+** offsets from the beginning of the page to the cell content in the cell
+** content area.  The cell pointers occur in sorted order.  The system strives
+** to keep free space after the last cell pointer so that new cells can
+** be easily added without having to defragment the page.
+**
+** Cell content is stored at the very end of the page and grows toward the
+** beginning of the page.
+**
+** Unused space within the cell content area is collected into a linked list of
+** freeblocks.  Each freeblock is at least 4 bytes in size.  The byte offset
+** to the first freeblock is given in the header.  Freeblocks occur in
+** increasing order.  Because a freeblock must be at least 4 bytes in size,
+** any group of 3 or fewer unused bytes in the cell content area cannot
+** exist on the freeblock chain.  A group of 3 or fewer free bytes is called
+** a fragment.  The total number of bytes in all fragments is recorded.
+** in the page header at offset 7.
+**
+**    SIZE    DESCRIPTION
+**      2     Byte offset of the next freeblock
+**      2     Bytes in this freeblock
+**
+** Cells are of variable length.  Cells are stored in the cell content area at
+** the end of the page.  Pointers to the cells are in the cell pointer array
+** that immediately follows the page header.  Cells is not necessarily
+** contiguous or in order, but cell pointers are contiguous and in order.
+**
+** Cell content makes use of variable length integers.  A variable
+** length integer is 1 to 9 bytes where the lower 7 bits of each
+** byte are used.  The integer consists of all bytes that have bit 8 set and
+** the first byte with bit 8 clear.  The most significant byte of the integer
+** appears first.  A variable-length integer may not be more than 9 bytes long.
+** As a special case, all 8 bytes of the 9th byte are used as data.  This
+** allows a 64-bit integer to be encoded in 9 bytes.
+**
+**    0x00                      becomes  0x00000000
+**    0x7f                      becomes  0x0000007f
+**    0x81 0x00                 becomes  0x00000080
+**    0x82 0x00                 becomes  0x00000100
+**    0x80 0x7f                 becomes  0x0000007f
+**    0x8a 0x91 0xd1 0xac 0x78  becomes  0x12345678
+**    0x81 0x81 0x81 0x81 0x01  becomes  0x10204081
+**
+** Variable length integers are used for rowids and to hold the number of
+** bytes of key and data in a btree cell.
+**
+** The content of a cell looks like this:
+**
+**    SIZE    DESCRIPTION
+**      4     Page number of the left child. Omitted if leaf flag is set.
+**     var    Number of bytes of data. Omitted if the zerodata flag is set.
+**     var    Number of bytes of key. Or the key itself if intkey flag is set.
+**      *     Payload
+**      4     First page of the overflow chain.  Omitted if no overflow
+**
+** Overflow pages form a linked list.  Each page except the last is completely
+** filled with data (pagesize - 4 bytes).  The last page can have as little
+** as 1 byte of data.
+**
+**    SIZE    DESCRIPTION
+**      4     Page number of next overflow page
+**      *     Data
+**
+** Freelist pages come in two subtypes: trunk pages and leaf pages.  The
+** file header points to the first in a linked list of trunk page.  Each trunk
+** page points to multiple leaf pages.  The content of a leaf page is
+** unspecified.  A trunk page looks like this:
+**
+**    SIZE    DESCRIPTION
+**      4     Page number of next trunk page
+**      4     Number of leaf pointers on this page
+**      *     zero or more pages numbers of leaves
+*/
+/* #include "sqliteInt.h" */
+
+
+/* The following value is the maximum cell size assuming a maximum page
+** size give above.
+*/
+#define MX_CELL_SIZE(pBt)  ((int)(pBt->pageSize-8))
+
+/* The maximum number of cells on a single page of the database.  This
+** assumes a minimum cell size of 6 bytes  (4 bytes for the cell itself
+** plus 2 bytes for the index to the cell in the page header).  Such
+** small cells will be rare, but they are possible.
+*/
+#define MX_CELL(pBt) ((pBt->pageSize-8)/6)
+
+/* Forward declarations */
+typedef struct MemPage MemPage;
+typedef struct BtLock BtLock;
+typedef struct CellInfo CellInfo;
+
+/*
+** This is a magic string that appears at the beginning of every
+** SQLite database in order to identify the file as a real database.
+**
+** You can change this value at compile-time by specifying a
+** -DSQLITE_FILE_HEADER="..." on the compiler command-line.  The
+** header must be exactly 16 bytes including the zero-terminator so
+** the string itself should be 15 characters long.  If you change
+** the header, then your custom library will not be able to read
+** databases generated by the standard tools and the standard tools
+** will not be able to read databases created by your custom library.
+*/
+#ifndef SQLITE_FILE_HEADER /* 123456789 123456 */
+#  define SQLITE_FILE_HEADER "SQLite format 3"
+#endif
+
+/*
+** Page type flags.  An ORed combination of these flags appear as the
+** first byte of on-disk image of every BTree page.
+*/
+#define PTF_INTKEY    0x01
+#define PTF_ZERODATA  0x02
+#define PTF_LEAFDATA  0x04
+#define PTF_LEAF      0x08
+
+/*
+** An instance of this object stores information about each a single database
+** page that has been loaded into memory.  The information in this object
+** is derived from the raw on-disk page content.
+**
+** As each database page is loaded into memory, the pager allocats an
+** instance of this object and zeros the first 8 bytes.  (This is the
+** "extra" information associated with each page of the pager.)
+**
+** Access to all fields of this structure is controlled by the mutex
+** stored in MemPage.pBt->mutex.
+*/
+struct MemPage {
+  u8 isInit;           /* True if previously initialized. MUST BE FIRST! */
+  u8 intKey;           /* True if table b-trees.  False for index b-trees */
+  u8 intKeyLeaf;       /* True if the leaf of an intKey table */
+  Pgno pgno;           /* Page number for this page */
+  /* Only the first 8 bytes (above) are zeroed by pager.c when a new page
+  ** is allocated. All fields that follow must be initialized before use */
+  u8 leaf;             /* True if a leaf page */
+  u8 hdrOffset;        /* 100 for page 1.  0 otherwise */
+  u8 childPtrSize;     /* 0 if leaf==1.  4 if leaf==0 */
+  u8 max1bytePayload;  /* min(maxLocal,127) */
+  u8 nOverflow;        /* Number of overflow cell bodies in aCell[] */
+  u16 maxLocal;        /* Copy of BtShared.maxLocal or BtShared.maxLeaf */
+  u16 minLocal;
