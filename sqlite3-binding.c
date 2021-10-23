@@ -68352,4 +68352,172 @@ static void ptrmapPutOvflPtr(MemPage *pPage, MemPage *pSrc, u8 *pCell,int *pRC){
 ** page so that there are no free-blocks on the free-block list.
 **
 ** Parameter nMaxFrag is the maximum amount of fragmented space that may be
-** present in the page after this routine re
+** present in the page after this routine returns.
+**
+** EVIDENCE-OF: R-44582-60138 SQLite may from time to time reorganize a
+** b-tree page so that there are no freeblocks or fragment bytes, all
+** unused bytes are contained in the unallocated space region, and all
+** cells are packed tightly at the end of the page.
+*/
+static int defragmentPage(MemPage *pPage, int nMaxFrag){
+  int i;                     /* Loop counter */
+  int pc;                    /* Address of the i-th cell */
+  int hdr;                   /* Offset to the page header */
+  int size;                  /* Size of a cell */
+  int usableSize;            /* Number of usable bytes on a page */
+  int cellOffset;            /* Offset to the cell pointer array */
+  int cbrk;                  /* Offset to the cell content area */
+  int nCell;                 /* Number of cells on the page */
+  unsigned char *data;       /* The page data */
+  unsigned char *temp;       /* Temp area for cell content */
+  unsigned char *src;        /* Source of content */
+  int iCellFirst;            /* First allowable cell index */
+  int iCellLast;             /* Last possible cell index */
+  int iCellStart;            /* First cell offset in input */
+
+  assert( sqlite3PagerIswriteable(pPage->pDbPage) );
+  assert( pPage->pBt!=0 );
+  assert( pPage->pBt->usableSize <= SQLITE_MAX_PAGE_SIZE );
+  assert( pPage->nOverflow==0 );
+  assert( sqlite3_mutex_held(pPage->pBt->mutex) );
+  temp = 0;
+  src = data = pPage->aData;
+  hdr = pPage->hdrOffset;
+  cellOffset = pPage->cellOffset;
+  nCell = pPage->nCell;
+  assert( nCell==get2byte(&data[hdr+3]) || CORRUPT_DB );
+  iCellFirst = cellOffset + 2*nCell;
+  usableSize = pPage->pBt->usableSize;
+
+  /* This block handles pages with two or fewer free blocks and nMaxFrag
+  ** or fewer fragmented bytes. In this case it is faster to move the
+  ** two (or one) blocks of cells using memmove() and add the required
+  ** offsets to each pointer in the cell-pointer array than it is to
+  ** reconstruct the entire page.  */
+  if( (int)data[hdr+7]<=nMaxFrag ){
+    int iFree = get2byte(&data[hdr+1]);
+    if( iFree>usableSize-4 ) return SQLITE_CORRUPT_PAGE(pPage);
+    if( iFree ){
+      int iFree2 = get2byte(&data[iFree]);
+      if( iFree2>usableSize-4 ) return SQLITE_CORRUPT_PAGE(pPage);
+      if( 0==iFree2 || (data[iFree2]==0 && data[iFree2+1]==0) ){
+        u8 *pEnd = &data[cellOffset + nCell*2];
+        u8 *pAddr;
+        int sz2 = 0;
+        int sz = get2byte(&data[iFree+2]);
+        int top = get2byte(&data[hdr+5]);
+        if( top>=iFree ){
+          return SQLITE_CORRUPT_PAGE(pPage);
+        }
+        if( iFree2 ){
+          if( iFree+sz>iFree2 ) return SQLITE_CORRUPT_PAGE(pPage);
+          sz2 = get2byte(&data[iFree2+2]);
+          if( iFree2+sz2 > usableSize ) return SQLITE_CORRUPT_PAGE(pPage);
+          memmove(&data[iFree+sz+sz2], &data[iFree+sz], iFree2-(iFree+sz));
+          sz += sz2;
+        }else if( iFree+sz>usableSize ){
+          return SQLITE_CORRUPT_PAGE(pPage);
+        }
+
+        cbrk = top+sz;
+        assert( cbrk+(iFree-top) <= usableSize );
+        memmove(&data[cbrk], &data[top], iFree-top);
+        for(pAddr=&data[cellOffset]; pAddr<pEnd; pAddr+=2){
+          pc = get2byte(pAddr);
+          if( pc<iFree ){ put2byte(pAddr, pc+sz); }
+          else if( pc<iFree2 ){ put2byte(pAddr, pc+sz2); }
+        }
+        goto defragment_out;
+      }
+    }
+  }
+
+  cbrk = usableSize;
+  iCellLast = usableSize - 4;
+  iCellStart = get2byte(&data[hdr+5]);
+  for(i=0; i<nCell; i++){
+    u8 *pAddr;     /* The i-th cell pointer */
+    pAddr = &data[cellOffset + i*2];
+    pc = get2byte(pAddr);
+    testcase( pc==iCellFirst );
+    testcase( pc==iCellLast );
+    /* These conditions have already been verified in btreeInitPage()
+    ** if PRAGMA cell_size_check=ON.
+    */
+    if( pc<iCellStart || pc>iCellLast ){
+      return SQLITE_CORRUPT_PAGE(pPage);
+    }
+    assert( pc>=iCellStart && pc<=iCellLast );
+    size = pPage->xCellSize(pPage, &src[pc]);
+    cbrk -= size;
+    if( cbrk<iCellStart || pc+size>usableSize ){
+      return SQLITE_CORRUPT_PAGE(pPage);
+    }
+    assert( cbrk+size<=usableSize && cbrk>=iCellStart );
+    testcase( cbrk+size==usableSize );
+    testcase( pc+size==usableSize );
+    put2byte(pAddr, cbrk);
+    if( temp==0 ){
+      if( cbrk==pc ) continue;
+      temp = sqlite3PagerTempSpace(pPage->pBt->pPager);
+      memcpy(&temp[iCellStart], &data[iCellStart], usableSize - iCellStart);
+      src = temp;
+    }
+    memcpy(&data[cbrk], &src[pc], size);
+  }
+  data[hdr+7] = 0;
+
+ defragment_out:
+  assert( pPage->nFree>=0 );
+  if( data[hdr+7]+cbrk-iCellFirst!=pPage->nFree ){
+    return SQLITE_CORRUPT_PAGE(pPage);
+  }
+  assert( cbrk>=iCellFirst );
+  put2byte(&data[hdr+5], cbrk);
+  data[hdr+1] = 0;
+  data[hdr+2] = 0;
+  memset(&data[iCellFirst], 0, cbrk-iCellFirst);
+  assert( sqlite3PagerIswriteable(pPage->pDbPage) );
+  return SQLITE_OK;
+}
+
+/*
+** Search the free-list on page pPg for space to store a cell nByte bytes in
+** size. If one can be found, return a pointer to the space and remove it
+** from the free-list.
+**
+** If no suitable space can be found on the free-list, return NULL.
+**
+** This function may detect corruption within pPg.  If corruption is
+** detected then *pRc is set to SQLITE_CORRUPT and NULL is returned.
+**
+** Slots on the free list that are between 1 and 3 bytes larger than nByte
+** will be ignored if adding the extra space to the fragmentation count
+** causes the fragmentation count to exceed 60.
+*/
+static u8 *pageFindSlot(MemPage *pPg, int nByte, int *pRc){
+  const int hdr = pPg->hdrOffset;            /* Offset to page header */
+  u8 * const aData = pPg->aData;             /* Page data */
+  int iAddr = hdr + 1;                       /* Address of ptr to pc */
+  u8 *pTmp = &aData[iAddr];                  /* Temporary ptr into aData[] */
+  int pc = get2byte(pTmp);                   /* Address of a free slot */
+  int x;                                     /* Excess size of the slot */
+  int maxPC = pPg->pBt->usableSize - nByte;  /* Max address for a usable slot */
+  int size;                                  /* Size of the free slot */
+
+  assert( pc>0 );
+  while( pc<=maxPC ){
+    /* EVIDENCE-OF: R-22710-53328 The third and fourth bytes of each
+    ** freeblock form a big-endian integer which is the size of the freeblock
+    ** in bytes, including the 4-byte header. */
+    pTmp = &aData[pc+2];
+    size = get2byte(pTmp);
+    if( (x = size - nByte)>=0 ){
+      testcase( x==4 );
+      testcase( x==3 );
+      if( x<4 ){
+        /* EVIDENCE-OF: R-11498-58022 In a well-formed b-tree page, the total
+        ** number of bytes in fragments may not exceed 60. */
+        if( aData[hdr+7]>57 ) return 0;
+
+        /* Remove the slot from the free-list. Update t
