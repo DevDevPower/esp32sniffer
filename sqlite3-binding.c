@@ -67376,4 +67376,180 @@ static int cursorOwnsBtShared(BtCursor *p){
 #endif
 
 /*
-** Invalidate t
+** Invalidate the overflow cache of the cursor passed as the first argument.
+** on the shared btree structure pBt.
+*/
+#define invalidateOverflowCache(pCur) (pCur->curFlags &= ~BTCF_ValidOvfl)
+
+/*
+** Invalidate the overflow page-list cache for all cursors opened
+** on the shared btree structure pBt.
+*/
+static void invalidateAllOverflowCache(BtShared *pBt){
+  BtCursor *p;
+  assert( sqlite3_mutex_held(pBt->mutex) );
+  for(p=pBt->pCursor; p; p=p->pNext){
+    invalidateOverflowCache(p);
+  }
+}
+
+#ifndef SQLITE_OMIT_INCRBLOB
+/*
+** This function is called before modifying the contents of a table
+** to invalidate any incrblob cursors that are open on the
+** row or one of the rows being modified.
+**
+** If argument isClearTable is true, then the entire contents of the
+** table is about to be deleted. In this case invalidate all incrblob
+** cursors open on any row within the table with root-page pgnoRoot.
+**
+** Otherwise, if argument isClearTable is false, then the row with
+** rowid iRow is being replaced or deleted. In this case invalidate
+** only those incrblob cursors open on that specific row.
+*/
+static void invalidateIncrblobCursors(
+  Btree *pBtree,          /* The database file to check */
+  Pgno pgnoRoot,          /* The table that might be changing */
+  i64 iRow,               /* The rowid that might be changing */
+  int isClearTable        /* True if all rows are being deleted */
+){
+  BtCursor *p;
+  assert( pBtree->hasIncrblobCur );
+  assert( sqlite3BtreeHoldsMutex(pBtree) );
+  pBtree->hasIncrblobCur = 0;
+  for(p=pBtree->pBt->pCursor; p; p=p->pNext){
+    if( (p->curFlags & BTCF_Incrblob)!=0 ){
+      pBtree->hasIncrblobCur = 1;
+      if( p->pgnoRoot==pgnoRoot && (isClearTable || p->info.nKey==iRow) ){
+        p->eState = CURSOR_INVALID;
+      }
+    }
+  }
+}
+
+#else
+  /* Stub function when INCRBLOB is omitted */
+  #define invalidateIncrblobCursors(w,x,y,z)
+#endif /* SQLITE_OMIT_INCRBLOB */
+
+/*
+** Set bit pgno of the BtShared.pHasContent bitvec. This is called
+** when a page that previously contained data becomes a free-list leaf
+** page.
+**
+** The BtShared.pHasContent bitvec exists to work around an obscure
+** bug caused by the interaction of two useful IO optimizations surrounding
+** free-list leaf pages:
+**
+**   1) When all data is deleted from a page and the page becomes
+**      a free-list leaf page, the page is not written to the database
+**      (as free-list leaf pages contain no meaningful data). Sometimes
+**      such a page is not even journalled (as it will not be modified,
+**      why bother journalling it?).
+**
+**   2) When a free-list leaf page is reused, its content is not read
+**      from the database or written to the journal file (why should it
+**      be, if it is not at all meaningful?).
+**
+** By themselves, these optimizations work fine and provide a handy
+** performance boost to bulk delete or insert operations. However, if
+** a page is moved to the free-list and then reused within the same
+** transaction, a problem comes up. If the page is not journalled when
+** it is moved to the free-list and it is also not journalled when it
+** is extracted from the free-list and reused, then the original data
+** may be lost. In the event of a rollback, it may not be possible
+** to restore the database to its original configuration.
+**
+** The solution is the BtShared.pHasContent bitvec. Whenever a page is
+** moved to become a free-list leaf page, the corresponding bit is
+** set in the bitvec. Whenever a leaf page is extracted from the free-list,
+** optimization 2 above is omitted if the corresponding bit is already
+** set in BtShared.pHasContent. The contents of the bitvec are cleared
+** at the end of every transaction.
+*/
+static int btreeSetHasContent(BtShared *pBt, Pgno pgno){
+  int rc = SQLITE_OK;
+  if( !pBt->pHasContent ){
+    assert( pgno<=pBt->nPage );
+    pBt->pHasContent = sqlite3BitvecCreate(pBt->nPage);
+    if( !pBt->pHasContent ){
+      rc = SQLITE_NOMEM_BKPT;
+    }
+  }
+  if( rc==SQLITE_OK && pgno<=sqlite3BitvecSize(pBt->pHasContent) ){
+    rc = sqlite3BitvecSet(pBt->pHasContent, pgno);
+  }
+  return rc;
+}
+
+/*
+** Query the BtShared.pHasContent vector.
+**
+** This function is called when a free-list leaf page is removed from the
+** free-list for reuse. It returns false if it is safe to retrieve the
+** page from the pager layer with the 'no-content' flag set. True otherwise.
+*/
+static int btreeGetHasContent(BtShared *pBt, Pgno pgno){
+  Bitvec *p = pBt->pHasContent;
+  return p && (pgno>sqlite3BitvecSize(p) || sqlite3BitvecTestNotNull(p, pgno));
+}
+
+/*
+** Clear (destroy) the BtShared.pHasContent bitvec. This should be
+** invoked at the conclusion of each write-transaction.
+*/
+static void btreeClearHasContent(BtShared *pBt){
+  sqlite3BitvecDestroy(pBt->pHasContent);
+  pBt->pHasContent = 0;
+}
+
+/*
+** Release all of the apPage[] pages for a cursor.
+*/
+static void btreeReleaseAllCursorPages(BtCursor *pCur){
+  int i;
+  if( pCur->iPage>=0 ){
+    for(i=0; i<pCur->iPage; i++){
+      releasePageNotNull(pCur->apPage[i]);
+    }
+    releasePageNotNull(pCur->pPage);
+    pCur->iPage = -1;
+  }
+}
+
+/*
+** The cursor passed as the only argument must point to a valid entry
+** when this function is called (i.e. have eState==CURSOR_VALID). This
+** function saves the current cursor key in variables pCur->nKey and
+** pCur->pKey. SQLITE_OK is returned if successful or an SQLite error
+** code otherwise.
+**
+** If the cursor is open on an intkey table, then the integer key
+** (the rowid) is stored in pCur->nKey and pCur->pKey is left set to
+** NULL. If the cursor is open on a non-intkey table, then pCur->pKey is
+** set to point to a malloced buffer pCur->nKey bytes in size containing
+** the key.
+*/
+static int saveCursorKey(BtCursor *pCur){
+  int rc = SQLITE_OK;
+  assert( CURSOR_VALID==pCur->eState );
+  assert( 0==pCur->pKey );
+  assert( cursorHoldsMutex(pCur) );
+
+  if( pCur->curIntKey ){
+    /* Only the rowid is required for a table btree */
+    pCur->nKey = sqlite3BtreeIntegerKey(pCur);
+  }else{
+    /* For an index btree, save the complete key content. It is possible
+    ** that the current key is corrupt. In that case, it is possible that
+    ** the sqlite3VdbeRecordUnpack() function may overread the buffer by
+    ** up to the size of 1 varint plus 1 8-byte value when the cursor
+    ** position is restored. Hence the 17 bytes of padding allocated
+    ** below. */
+    void *pKey;
+    pCur->nKey = sqlite3BtreePayloadSize(pCur);
+    pKey = sqlite3Malloc( pCur->nKey + 9 + 8 );
+    if( pKey ){
+      rc = sqlite3BtreePayload(pCur, 0, (int)pCur->nKey, pKey);
+      if( rc==SQLITE_OK ){
+        memset(((u8
