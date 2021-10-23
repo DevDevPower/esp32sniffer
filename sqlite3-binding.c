@@ -68691,4 +68691,184 @@ static int freeSpace(MemPage *pPage, u16 iStart, u16 iSize){
   hdr = pPage->hdrOffset;
   iPtr = hdr + 1;
   if( data[iPtr+1]==0 && data[iPtr]==0 ){
-    iFreeBlk = 0;  /* Shortcut for the case when the fr
+    iFreeBlk = 0;  /* Shortcut for the case when the freelist is empty */
+  }else{
+    while( (iFreeBlk = get2byte(&data[iPtr]))<iStart ){
+      if( iFreeBlk<iPtr+4 ){
+        if( iFreeBlk==0 ) break; /* TH3: corrupt082.100 */
+        return SQLITE_CORRUPT_PAGE(pPage);
+      }
+      iPtr = iFreeBlk;
+    }
+    if( iFreeBlk>pPage->pBt->usableSize-4 ){ /* TH3: corrupt081.100 */
+      return SQLITE_CORRUPT_PAGE(pPage);
+    }
+    assert( iFreeBlk>iPtr || iFreeBlk==0 || CORRUPT_DB );
+
+    /* At this point:
+    **    iFreeBlk:   First freeblock after iStart, or zero if none
+    **    iPtr:       The address of a pointer to iFreeBlk
+    **
+    ** Check to see if iFreeBlk should be coalesced onto the end of iStart.
+    */
+    if( iFreeBlk && iEnd+3>=iFreeBlk ){
+      nFrag = iFreeBlk - iEnd;
+      if( iEnd>iFreeBlk ) return SQLITE_CORRUPT_PAGE(pPage);
+      iEnd = iFreeBlk + get2byte(&data[iFreeBlk+2]);
+      if( iEnd > pPage->pBt->usableSize ){
+        return SQLITE_CORRUPT_PAGE(pPage);
+      }
+      iSize = iEnd - iStart;
+      iFreeBlk = get2byte(&data[iFreeBlk]);
+    }
+
+    /* If iPtr is another freeblock (that is, if iPtr is not the freelist
+    ** pointer in the page header) then check to see if iStart should be
+    ** coalesced onto the end of iPtr.
+    */
+    if( iPtr>hdr+1 ){
+      int iPtrEnd = iPtr + get2byte(&data[iPtr+2]);
+      if( iPtrEnd+3>=iStart ){
+        if( iPtrEnd>iStart ) return SQLITE_CORRUPT_PAGE(pPage);
+        nFrag += iStart - iPtrEnd;
+        iSize = iEnd - iPtr;
+        iStart = iPtr;
+      }
+    }
+    if( nFrag>data[hdr+7] ) return SQLITE_CORRUPT_PAGE(pPage);
+    data[hdr+7] -= nFrag;
+  }
+  pTmp = &data[hdr+5];
+  x = get2byte(pTmp);
+  if( iStart<=x ){
+    /* The new freeblock is at the beginning of the cell content area,
+    ** so just extend the cell content area rather than create another
+    ** freelist entry */
+    if( iStart<x ) return SQLITE_CORRUPT_PAGE(pPage);
+    if( iPtr!=hdr+1 ) return SQLITE_CORRUPT_PAGE(pPage);
+    put2byte(&data[hdr+1], iFreeBlk);
+    put2byte(&data[hdr+5], iEnd);
+  }else{
+    /* Insert the new freeblock into the freelist */
+    put2byte(&data[iPtr], iStart);
+  }
+  if( pPage->pBt->btsFlags & BTS_FAST_SECURE ){
+    /* Overwrite deleted information with zeros when the secure_delete
+    ** option is enabled */
+    memset(&data[iStart], 0, iSize);
+  }
+  put2byte(&data[iStart], iFreeBlk);
+  put2byte(&data[iStart+2], iSize);
+  pPage->nFree += iOrigSize;
+  return SQLITE_OK;
+}
+
+/*
+** Decode the flags byte (the first byte of the header) for a page
+** and initialize fields of the MemPage structure accordingly.
+**
+** Only the following combinations are supported.  Anything different
+** indicates a corrupt database files:
+**
+**         PTF_ZERODATA
+**         PTF_ZERODATA | PTF_LEAF
+**         PTF_LEAFDATA | PTF_INTKEY
+**         PTF_LEAFDATA | PTF_INTKEY | PTF_LEAF
+*/
+static int decodeFlags(MemPage *pPage, int flagByte){
+  BtShared *pBt;     /* A copy of pPage->pBt */
+
+  assert( pPage->hdrOffset==(pPage->pgno==1 ? 100 : 0) );
+  assert( sqlite3_mutex_held(pPage->pBt->mutex) );
+  pPage->leaf = (u8)(flagByte>>3);  assert( PTF_LEAF == 1<<3 );
+  flagByte &= ~PTF_LEAF;
+  pPage->childPtrSize = 4-4*pPage->leaf;
+  pBt = pPage->pBt;
+  if( flagByte==(PTF_LEAFDATA | PTF_INTKEY) ){
+    /* EVIDENCE-OF: R-07291-35328 A value of 5 (0x05) means the page is an
+    ** interior table b-tree page. */
+    assert( (PTF_LEAFDATA|PTF_INTKEY)==5 );
+    /* EVIDENCE-OF: R-26900-09176 A value of 13 (0x0d) means the page is a
+    ** leaf table b-tree page. */
+    assert( (PTF_LEAFDATA|PTF_INTKEY|PTF_LEAF)==13 );
+    pPage->intKey = 1;
+    if( pPage->leaf ){
+      pPage->intKeyLeaf = 1;
+      pPage->xCellSize = cellSizePtrTableLeaf;
+      pPage->xParseCell = btreeParseCellPtr;
+    }else{
+      pPage->intKeyLeaf = 0;
+      pPage->xCellSize = cellSizePtrNoPayload;
+      pPage->xParseCell = btreeParseCellPtrNoPayload;
+    }
+    pPage->maxLocal = pBt->maxLeaf;
+    pPage->minLocal = pBt->minLeaf;
+  }else if( flagByte==PTF_ZERODATA ){
+    /* EVIDENCE-OF: R-43316-37308 A value of 2 (0x02) means the page is an
+    ** interior index b-tree page. */
+    assert( (PTF_ZERODATA)==2 );
+    /* EVIDENCE-OF: R-59615-42828 A value of 10 (0x0a) means the page is a
+    ** leaf index b-tree page. */
+    assert( (PTF_ZERODATA|PTF_LEAF)==10 );
+    pPage->intKey = 0;
+    pPage->intKeyLeaf = 0;
+    pPage->xCellSize = cellSizePtr;
+    pPage->xParseCell = btreeParseCellPtrIndex;
+    pPage->maxLocal = pBt->maxLocal;
+    pPage->minLocal = pBt->minLocal;
+  }else{
+    /* EVIDENCE-OF: R-47608-56469 Any other value for the b-tree page type is
+    ** an error. */
+    pPage->intKey = 0;
+    pPage->intKeyLeaf = 0;
+    pPage->xCellSize = cellSizePtr;
+    pPage->xParseCell = btreeParseCellPtrIndex;
+    return SQLITE_CORRUPT_PAGE(pPage);
+  }
+  pPage->max1bytePayload = pBt->max1bytePayload;
+  return SQLITE_OK;
+}
+
+/*
+** Compute the amount of freespace on the page.  In other words, fill
+** in the pPage->nFree field.
+*/
+static int btreeComputeFreeSpace(MemPage *pPage){
+  int pc;            /* Address of a freeblock within pPage->aData[] */
+  u8 hdr;            /* Offset to beginning of page header */
+  u8 *data;          /* Equal to pPage->aData */
+  int usableSize;    /* Amount of usable space on each page */
+  int nFree;         /* Number of unused bytes on the page */
+  int top;           /* First byte of the cell content area */
+  int iCellFirst;    /* First allowable cell or freeblock offset */
+  int iCellLast;     /* Last possible cell or freeblock offset */
+
+  assert( pPage->pBt!=0 );
+  assert( pPage->pBt->db!=0 );
+  assert( sqlite3_mutex_held(pPage->pBt->mutex) );
+  assert( pPage->pgno==sqlite3PagerPagenumber(pPage->pDbPage) );
+  assert( pPage == sqlite3PagerGetExtra(pPage->pDbPage) );
+  assert( pPage->aData == sqlite3PagerGetData(pPage->pDbPage) );
+  assert( pPage->isInit==1 );
+  assert( pPage->nFree<0 );
+
+  usableSize = pPage->pBt->usableSize;
+  hdr = pPage->hdrOffset;
+  data = pPage->aData;
+  /* EVIDENCE-OF: R-58015-48175 The two-byte integer at offset 5 designates
+  ** the start of the cell content area. A zero value for this integer is
+  ** interpreted as 65536. */
+  top = get2byteNotZero(&data[hdr+5]);
+  iCellFirst = hdr + 8 + pPage->childPtrSize + 2*pPage->nCell;
+  iCellLast = usableSize - 4;
+
+  /* Compute the total free space on the page
+  ** EVIDENCE-OF: R-23588-34450 The two-byte integer at offset 1 gives the
+  ** start of the first freeblock on the page, or is zero if there are no
+  ** freeblocks. */
+  pc = get2byte(&data[hdr+1]);
+  nFree = data[hdr+7] + top;  /* Init nFree to non-freeblock free space */
+  if( pc>0 ){
+    u32 next, size;
+    if( pc<top ){
+      /* EVIDENCE-OF: R-55530-52930 In a wel
