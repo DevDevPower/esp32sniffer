@@ -69063,4 +69063,202 @@ static MemPage *btreePageFromDbPage(DbPage *pDbPage, Pgno pgno, BtShared *pBt){
 ** Get a page from the pager.  Initialize the MemPage.pBt and
 ** MemPage.aData elements if needed.  See also: btreeGetUnusedPage().
 **
-** If the PAGER_GET_NOCONTE
+** If the PAGER_GET_NOCONTENT flag is set, it means that we do not care
+** about the content of the page at this time.  So do not go to the disk
+** to fetch the content.  Just fill in the content with zeros for now.
+** If in the future we call sqlite3PagerWrite() on this page, that
+** means we have started to be concerned about content and the disk
+** read should occur at that point.
+*/
+static int btreeGetPage(
+  BtShared *pBt,       /* The btree */
+  Pgno pgno,           /* Number of the page to fetch */
+  MemPage **ppPage,    /* Return the page in this parameter */
+  int flags            /* PAGER_GET_NOCONTENT or PAGER_GET_READONLY */
+){
+  int rc;
+  DbPage *pDbPage;
+
+  assert( flags==0 || flags==PAGER_GET_NOCONTENT || flags==PAGER_GET_READONLY );
+  assert( sqlite3_mutex_held(pBt->mutex) );
+  rc = sqlite3PagerGet(pBt->pPager, pgno, (DbPage**)&pDbPage, flags);
+  if( rc ) return rc;
+  *ppPage = btreePageFromDbPage(pDbPage, pgno, pBt);
+  return SQLITE_OK;
+}
+
+/*
+** Retrieve a page from the pager cache. If the requested page is not
+** already in the pager cache return NULL. Initialize the MemPage.pBt and
+** MemPage.aData elements if needed.
+*/
+static MemPage *btreePageLookup(BtShared *pBt, Pgno pgno){
+  DbPage *pDbPage;
+  assert( sqlite3_mutex_held(pBt->mutex) );
+  pDbPage = sqlite3PagerLookup(pBt->pPager, pgno);
+  if( pDbPage ){
+    return btreePageFromDbPage(pDbPage, pgno, pBt);
+  }
+  return 0;
+}
+
+/*
+** Return the size of the database file in pages. If there is any kind of
+** error, return ((unsigned int)-1).
+*/
+static Pgno btreePagecount(BtShared *pBt){
+  return pBt->nPage;
+}
+SQLITE_PRIVATE Pgno sqlite3BtreeLastPage(Btree *p){
+  assert( sqlite3BtreeHoldsMutex(p) );
+  return btreePagecount(p->pBt);
+}
+
+/*
+** Get a page from the pager and initialize it.
+**
+** If pCur!=0 then the page is being fetched as part of a moveToChild()
+** call.  Do additional sanity checking on the page in this case.
+** And if the fetch fails, this routine must decrement pCur->iPage.
+**
+** The page is fetched as read-write unless pCur is not NULL and is
+** a read-only cursor.
+**
+** If an error occurs, then *ppPage is undefined. It
+** may remain unchanged, or it may be set to an invalid value.
+*/
+static int getAndInitPage(
+  BtShared *pBt,                  /* The database file */
+  Pgno pgno,                      /* Number of the page to get */
+  MemPage **ppPage,               /* Write the page pointer here */
+  BtCursor *pCur,                 /* Cursor to receive the page, or NULL */
+  int bReadOnly                   /* True for a read-only page */
+){
+  int rc;
+  DbPage *pDbPage;
+  assert( sqlite3_mutex_held(pBt->mutex) );
+  assert( pCur==0 || ppPage==&pCur->pPage );
+  assert( pCur==0 || bReadOnly==pCur->curPagerFlags );
+  assert( pCur==0 || pCur->iPage>0 );
+
+  if( pgno>btreePagecount(pBt) ){
+    rc = SQLITE_CORRUPT_BKPT;
+    goto getAndInitPage_error1;
+  }
+  rc = sqlite3PagerGet(pBt->pPager, pgno, (DbPage**)&pDbPage, bReadOnly);
+  if( rc ){
+    goto getAndInitPage_error1;
+  }
+  *ppPage = (MemPage*)sqlite3PagerGetExtra(pDbPage);
+  if( (*ppPage)->isInit==0 ){
+    btreePageFromDbPage(pDbPage, pgno, pBt);
+    rc = btreeInitPage(*ppPage);
+    if( rc!=SQLITE_OK ){
+      goto getAndInitPage_error2;
+    }
+  }
+  assert( (*ppPage)->pgno==pgno || CORRUPT_DB );
+  assert( (*ppPage)->aData==sqlite3PagerGetData(pDbPage) );
+
+  /* If obtaining a child page for a cursor, we must verify that the page is
+  ** compatible with the root page. */
+  if( pCur && ((*ppPage)->nCell<1 || (*ppPage)->intKey!=pCur->curIntKey) ){
+    rc = SQLITE_CORRUPT_PGNO(pgno);
+    goto getAndInitPage_error2;
+  }
+  return SQLITE_OK;
+
+getAndInitPage_error2:
+  releasePage(*ppPage);
+getAndInitPage_error1:
+  if( pCur ){
+    pCur->iPage--;
+    pCur->pPage = pCur->apPage[pCur->iPage];
+  }
+  testcase( pgno==0 );
+  assert( pgno!=0 || rc==SQLITE_CORRUPT
+                  || rc==SQLITE_IOERR_NOMEM
+                  || rc==SQLITE_NOMEM );
+  return rc;
+}
+
+/*
+** Release a MemPage.  This should be called once for each prior
+** call to btreeGetPage.
+**
+** Page1 is a special case and must be released using releasePageOne().
+*/
+static void releasePageNotNull(MemPage *pPage){
+  assert( pPage->aData );
+  assert( pPage->pBt );
+  assert( pPage->pDbPage!=0 );
+  assert( sqlite3PagerGetExtra(pPage->pDbPage) == (void*)pPage );
+  assert( sqlite3PagerGetData(pPage->pDbPage)==pPage->aData );
+  assert( sqlite3_mutex_held(pPage->pBt->mutex) );
+  sqlite3PagerUnrefNotNull(pPage->pDbPage);
+}
+static void releasePage(MemPage *pPage){
+  if( pPage ) releasePageNotNull(pPage);
+}
+static void releasePageOne(MemPage *pPage){
+  assert( pPage!=0 );
+  assert( pPage->aData );
+  assert( pPage->pBt );
+  assert( pPage->pDbPage!=0 );
+  assert( sqlite3PagerGetExtra(pPage->pDbPage) == (void*)pPage );
+  assert( sqlite3PagerGetData(pPage->pDbPage)==pPage->aData );
+  assert( sqlite3_mutex_held(pPage->pBt->mutex) );
+  sqlite3PagerUnrefPageOne(pPage->pDbPage);
+}
+
+/*
+** Get an unused page.
+**
+** This works just like btreeGetPage() with the addition:
+**
+**   *  If the page is already in use for some other purpose, immediately
+**      release it and return an SQLITE_CURRUPT error.
+**   *  Make sure the isInit flag is clear
+*/
+static int btreeGetUnusedPage(
+  BtShared *pBt,       /* The btree */
+  Pgno pgno,           /* Number of the page to fetch */
+  MemPage **ppPage,    /* Return the page in this parameter */
+  int flags            /* PAGER_GET_NOCONTENT or PAGER_GET_READONLY */
+){
+  int rc = btreeGetPage(pBt, pgno, ppPage, flags);
+  if( rc==SQLITE_OK ){
+    if( sqlite3PagerPageRefcount((*ppPage)->pDbPage)>1 ){
+      releasePage(*ppPage);
+      *ppPage = 0;
+      return SQLITE_CORRUPT_BKPT;
+    }
+    (*ppPage)->isInit = 0;
+  }else{
+    *ppPage = 0;
+  }
+  return rc;
+}
+
+
+/*
+** During a rollback, when the pager reloads information into the cache
+** so that the cache is restored to its original state at the start of
+** the transaction, for each page restored this routine is called.
+**
+** This routine needs to reset the extra data section at the end of the
+** page to agree with the restored data.
+*/
+static void pageReinit(DbPage *pData){
+  MemPage *pPage;
+  pPage = (MemPage *)sqlite3PagerGetExtra(pData);
+  assert( sqlite3PagerPageRefcount(pData)>0 );
+  if( pPage->isInit ){
+    assert( sqlite3_mutex_held(pPage->pBt->mutex) );
+    pPage->isInit = 0;
+    if( sqlite3PagerPageRefcount(pData)>1 ){
+      /* pPage might not be a btree page;  it might be an overflow page
+      ** or ptrmap page or a free page.  In those cases, the following
+      ** call to btreeInitPage() will likely return SQLITE_CORRUPT.
+      ** But no harm is done by this.  And it is very important that
+      ** btr
