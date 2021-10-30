@@ -68871,4 +68871,196 @@ static int btreeComputeFreeSpace(MemPage *pPage){
   if( pc>0 ){
     u32 next, size;
     if( pc<top ){
-      /* EVIDENCE-OF: R-55530-52930 In a wel
+      /* EVIDENCE-OF: R-55530-52930 In a well-formed b-tree page, there will
+      ** always be at least one cell before the first freeblock.
+      */
+      return SQLITE_CORRUPT_PAGE(pPage);
+    }
+    while( 1 ){
+      if( pc>iCellLast ){
+        /* Freeblock off the end of the page */
+        return SQLITE_CORRUPT_PAGE(pPage);
+      }
+      next = get2byte(&data[pc]);
+      size = get2byte(&data[pc+2]);
+      nFree = nFree + size;
+      if( next<=pc+size+3 ) break;
+      pc = next;
+    }
+    if( next>0 ){
+      /* Freeblock not in ascending order */
+      return SQLITE_CORRUPT_PAGE(pPage);
+    }
+    if( pc+size>(unsigned int)usableSize ){
+      /* Last freeblock extends past page end */
+      return SQLITE_CORRUPT_PAGE(pPage);
+    }
+  }
+
+  /* At this point, nFree contains the sum of the offset to the start
+  ** of the cell-content area plus the number of free bytes within
+  ** the cell-content area. If this is greater than the usable-size
+  ** of the page, then the page must be corrupted. This check also
+  ** serves to verify that the offset to the start of the cell-content
+  ** area, according to the page header, lies within the page.
+  */
+  if( nFree>usableSize || nFree<iCellFirst ){
+    return SQLITE_CORRUPT_PAGE(pPage);
+  }
+  pPage->nFree = (u16)(nFree - iCellFirst);
+  return SQLITE_OK;
+}
+
+/*
+** Do additional sanity check after btreeInitPage() if
+** PRAGMA cell_size_check=ON
+*/
+static SQLITE_NOINLINE int btreeCellSizeCheck(MemPage *pPage){
+  int iCellFirst;    /* First allowable cell or freeblock offset */
+  int iCellLast;     /* Last possible cell or freeblock offset */
+  int i;             /* Index into the cell pointer array */
+  int sz;            /* Size of a cell */
+  int pc;            /* Address of a freeblock within pPage->aData[] */
+  u8 *data;          /* Equal to pPage->aData */
+  int usableSize;    /* Maximum usable space on the page */
+  int cellOffset;    /* Start of cell content area */
+
+  iCellFirst = pPage->cellOffset + 2*pPage->nCell;
+  usableSize = pPage->pBt->usableSize;
+  iCellLast = usableSize - 4;
+  data = pPage->aData;
+  cellOffset = pPage->cellOffset;
+  if( !pPage->leaf ) iCellLast--;
+  for(i=0; i<pPage->nCell; i++){
+    pc = get2byteAligned(&data[cellOffset+i*2]);
+    testcase( pc==iCellFirst );
+    testcase( pc==iCellLast );
+    if( pc<iCellFirst || pc>iCellLast ){
+      return SQLITE_CORRUPT_PAGE(pPage);
+    }
+    sz = pPage->xCellSize(pPage, &data[pc]);
+    testcase( pc+sz==usableSize );
+    if( pc+sz>usableSize ){
+      return SQLITE_CORRUPT_PAGE(pPage);
+    }
+  }
+  return SQLITE_OK;
+}
+
+/*
+** Initialize the auxiliary information for a disk block.
+**
+** Return SQLITE_OK on success.  If we see that the page does
+** not contain a well-formed database page, then return
+** SQLITE_CORRUPT.  Note that a return of SQLITE_OK does not
+** guarantee that the page is well-formed.  It only shows that
+** we failed to detect any corruption.
+*/
+static int btreeInitPage(MemPage *pPage){
+  u8 *data;          /* Equal to pPage->aData */
+  BtShared *pBt;        /* The main btree structure */
+
+  assert( pPage->pBt!=0 );
+  assert( pPage->pBt->db!=0 );
+  assert( sqlite3_mutex_held(pPage->pBt->mutex) );
+  assert( pPage->pgno==sqlite3PagerPagenumber(pPage->pDbPage) );
+  assert( pPage == sqlite3PagerGetExtra(pPage->pDbPage) );
+  assert( pPage->aData == sqlite3PagerGetData(pPage->pDbPage) );
+  assert( pPage->isInit==0 );
+
+  pBt = pPage->pBt;
+  data = pPage->aData + pPage->hdrOffset;
+  /* EVIDENCE-OF: R-28594-02890 The one-byte flag at offset 0 indicating
+  ** the b-tree page type. */
+  if( decodeFlags(pPage, data[0]) ){
+    return SQLITE_CORRUPT_PAGE(pPage);
+  }
+  assert( pBt->pageSize>=512 && pBt->pageSize<=65536 );
+  pPage->maskPage = (u16)(pBt->pageSize - 1);
+  pPage->nOverflow = 0;
+  pPage->cellOffset = pPage->hdrOffset + 8 + pPage->childPtrSize;
+  pPage->aCellIdx = data + pPage->childPtrSize + 8;
+  pPage->aDataEnd = pPage->aData + pBt->pageSize;
+  pPage->aDataOfst = pPage->aData + pPage->childPtrSize;
+  /* EVIDENCE-OF: R-37002-32774 The two-byte integer at offset 3 gives the
+  ** number of cells on the page. */
+  pPage->nCell = get2byte(&data[3]);
+  if( pPage->nCell>MX_CELL(pBt) ){
+    /* To many cells for a single page.  The page must be corrupt */
+    return SQLITE_CORRUPT_PAGE(pPage);
+  }
+  testcase( pPage->nCell==MX_CELL(pBt) );
+  /* EVIDENCE-OF: R-24089-57979 If a page contains no cells (which is only
+  ** possible for a root page of a table that contains no rows) then the
+  ** offset to the cell content area will equal the page size minus the
+  ** bytes of reserved space. */
+  assert( pPage->nCell>0
+       || get2byteNotZero(&data[5])==(int)pBt->usableSize
+       || CORRUPT_DB );
+  pPage->nFree = -1;  /* Indicate that this value is yet uncomputed */
+  pPage->isInit = 1;
+  if( pBt->db->flags & SQLITE_CellSizeCk ){
+    return btreeCellSizeCheck(pPage);
+  }
+  return SQLITE_OK;
+}
+
+/*
+** Set up a raw page so that it looks like a database page holding
+** no entries.
+*/
+static void zeroPage(MemPage *pPage, int flags){
+  unsigned char *data = pPage->aData;
+  BtShared *pBt = pPage->pBt;
+  u8 hdr = pPage->hdrOffset;
+  u16 first;
+
+  assert( sqlite3PagerPagenumber(pPage->pDbPage)==pPage->pgno || CORRUPT_DB );
+  assert( sqlite3PagerGetExtra(pPage->pDbPage) == (void*)pPage );
+  assert( sqlite3PagerGetData(pPage->pDbPage) == data );
+  assert( sqlite3PagerIswriteable(pPage->pDbPage) );
+  assert( sqlite3_mutex_held(pBt->mutex) );
+  if( pBt->btsFlags & BTS_FAST_SECURE ){
+    memset(&data[hdr], 0, pBt->usableSize - hdr);
+  }
+  data[hdr] = (char)flags;
+  first = hdr + ((flags&PTF_LEAF)==0 ? 12 : 8);
+  memset(&data[hdr+1], 0, 4);
+  data[hdr+7] = 0;
+  put2byte(&data[hdr+5], pBt->usableSize);
+  pPage->nFree = (u16)(pBt->usableSize - first);
+  decodeFlags(pPage, flags);
+  pPage->cellOffset = first;
+  pPage->aDataEnd = &data[pBt->pageSize];
+  pPage->aCellIdx = &data[first];
+  pPage->aDataOfst = &data[pPage->childPtrSize];
+  pPage->nOverflow = 0;
+  assert( pBt->pageSize>=512 && pBt->pageSize<=65536 );
+  pPage->maskPage = (u16)(pBt->pageSize - 1);
+  pPage->nCell = 0;
+  pPage->isInit = 1;
+}
+
+
+/*
+** Convert a DbPage obtained from the pager into a MemPage used by
+** the btree layer.
+*/
+static MemPage *btreePageFromDbPage(DbPage *pDbPage, Pgno pgno, BtShared *pBt){
+  MemPage *pPage = (MemPage*)sqlite3PagerGetExtra(pDbPage);
+  if( pgno!=pPage->pgno ){
+    pPage->aData = sqlite3PagerGetData(pDbPage);
+    pPage->pDbPage = pDbPage;
+    pPage->pBt = pBt;
+    pPage->pgno = pgno;
+    pPage->hdrOffset = pgno==1 ? 100 : 0;
+  }
+  assert( pPage->aData==sqlite3PagerGetData(pDbPage) );
+  return pPage;
+}
+
+/*
+** Get a page from the pager.  Initialize the MemPage.pBt and
+** MemPage.aData elements if needed.  See also: btreeGetUnusedPage().
+**
+** If the PAGER_GET_NOCONTE
