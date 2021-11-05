@@ -70253,3 +70253,199 @@ static int countValidCursors(BtShared *pBt, int wrOnly){
 */
 static void unlockBtreeIfUnused(BtShared *pBt){
   assert( sqlite3_mutex_held(pBt->mutex) );
+  assert( countValidCursors(pBt,0)==0 || pBt->inTransaction>TRANS_NONE );
+  if( pBt->inTransaction==TRANS_NONE && pBt->pPage1!=0 ){
+    MemPage *pPage1 = pBt->pPage1;
+    assert( pPage1->aData );
+    assert( sqlite3PagerRefcount(pBt->pPager)==1 );
+    pBt->pPage1 = 0;
+    releasePageOne(pPage1);
+  }
+}
+
+/*
+** If pBt points to an empty file then convert that empty file
+** into a new empty database by initializing the first page of
+** the database.
+*/
+static int newDatabase(BtShared *pBt){
+  MemPage *pP1;
+  unsigned char *data;
+  int rc;
+
+  assert( sqlite3_mutex_held(pBt->mutex) );
+  if( pBt->nPage>0 ){
+    return SQLITE_OK;
+  }
+  pP1 = pBt->pPage1;
+  assert( pP1!=0 );
+  data = pP1->aData;
+  rc = sqlite3PagerWrite(pP1->pDbPage);
+  if( rc ) return rc;
+  memcpy(data, zMagicHeader, sizeof(zMagicHeader));
+  assert( sizeof(zMagicHeader)==16 );
+  data[16] = (u8)((pBt->pageSize>>8)&0xff);
+  data[17] = (u8)((pBt->pageSize>>16)&0xff);
+  data[18] = 1;
+  data[19] = 1;
+  assert( pBt->usableSize<=pBt->pageSize && pBt->usableSize+255>=pBt->pageSize);
+  data[20] = (u8)(pBt->pageSize - pBt->usableSize);
+  data[21] = 64;
+  data[22] = 32;
+  data[23] = 32;
+  memset(&data[24], 0, 100-24);
+  zeroPage(pP1, PTF_INTKEY|PTF_LEAF|PTF_LEAFDATA );
+  pBt->btsFlags |= BTS_PAGESIZE_FIXED;
+#ifndef SQLITE_OMIT_AUTOVACUUM
+  assert( pBt->autoVacuum==1 || pBt->autoVacuum==0 );
+  assert( pBt->incrVacuum==1 || pBt->incrVacuum==0 );
+  put4byte(&data[36 + 4*4], pBt->autoVacuum);
+  put4byte(&data[36 + 7*4], pBt->incrVacuum);
+#endif
+  pBt->nPage = 1;
+  data[31] = 1;
+  return SQLITE_OK;
+}
+
+/*
+** Initialize the first page of the database file (creating a database
+** consisting of a single page and no schema objects). Return SQLITE_OK
+** if successful, or an SQLite error code otherwise.
+*/
+SQLITE_PRIVATE int sqlite3BtreeNewDb(Btree *p){
+  int rc;
+  sqlite3BtreeEnter(p);
+  p->pBt->nPage = 0;
+  rc = newDatabase(p->pBt);
+  sqlite3BtreeLeave(p);
+  return rc;
+}
+
+/*
+** Attempt to start a new transaction. A write-transaction
+** is started if the second argument is nonzero, otherwise a read-
+** transaction.  If the second argument is 2 or more and exclusive
+** transaction is started, meaning that no other process is allowed
+** to access the database.  A preexisting transaction may not be
+** upgraded to exclusive by calling this routine a second time - the
+** exclusivity flag only works for a new transaction.
+**
+** A write-transaction must be started before attempting any
+** changes to the database.  None of the following routines
+** will work unless a transaction is started first:
+**
+**      sqlite3BtreeCreateTable()
+**      sqlite3BtreeCreateIndex()
+**      sqlite3BtreeClearTable()
+**      sqlite3BtreeDropTable()
+**      sqlite3BtreeInsert()
+**      sqlite3BtreeDelete()
+**      sqlite3BtreeUpdateMeta()
+**
+** If an initial attempt to acquire the lock fails because of lock contention
+** and the database was previously unlocked, then invoke the busy handler
+** if there is one.  But if there was previously a read-lock, do not
+** invoke the busy handler - just return SQLITE_BUSY.  SQLITE_BUSY is
+** returned when there is already a read-lock in order to avoid a deadlock.
+**
+** Suppose there are two processes A and B.  A has a read lock and B has
+** a reserved lock.  B tries to promote to exclusive but is blocked because
+** of A's read lock.  A tries to promote to reserved but is blocked by B.
+** One or the other of the two processes must give way or there can be
+** no progress.  By returning SQLITE_BUSY and not invoking the busy callback
+** when A already has a read lock, we encourage A to give up and let B
+** proceed.
+*/
+SQLITE_PRIVATE int sqlite3BtreeBeginTrans(Btree *p, int wrflag, int *pSchemaVersion){
+  BtShared *pBt = p->pBt;
+  Pager *pPager = pBt->pPager;
+  int rc = SQLITE_OK;
+
+  sqlite3BtreeEnter(p);
+  btreeIntegrity(p);
+
+  /* If the btree is already in a write-transaction, or it
+  ** is already in a read-transaction and a read-transaction
+  ** is requested, this is a no-op.
+  */
+  if( p->inTrans==TRANS_WRITE || (p->inTrans==TRANS_READ && !wrflag) ){
+    goto trans_begun;
+  }
+  assert( pBt->inTransaction==TRANS_WRITE || IfNotOmitAV(pBt->bDoTruncate)==0 );
+
+  if( (p->db->flags & SQLITE_ResetDatabase)
+   && sqlite3PagerIsreadonly(pPager)==0
+  ){
+    pBt->btsFlags &= ~BTS_READ_ONLY;
+  }
+
+  /* Write transactions are not possible on a read-only database */
+  if( (pBt->btsFlags & BTS_READ_ONLY)!=0 && wrflag ){
+    rc = SQLITE_READONLY;
+    goto trans_begun;
+  }
+
+#ifndef SQLITE_OMIT_SHARED_CACHE
+  {
+    sqlite3 *pBlock = 0;
+    /* If another database handle has already opened a write transaction
+    ** on this shared-btree structure and a second write transaction is
+    ** requested, return SQLITE_LOCKED.
+    */
+    if( (wrflag && pBt->inTransaction==TRANS_WRITE)
+     || (pBt->btsFlags & BTS_PENDING)!=0
+    ){
+      pBlock = pBt->pWriter->db;
+    }else if( wrflag>1 ){
+      BtLock *pIter;
+      for(pIter=pBt->pLock; pIter; pIter=pIter->pNext){
+        if( pIter->pBtree!=p ){
+          pBlock = pIter->pBtree->db;
+          break;
+        }
+      }
+    }
+    if( pBlock ){
+      sqlite3ConnectionBlocked(p->db, pBlock);
+      rc = SQLITE_LOCKED_SHAREDCACHE;
+      goto trans_begun;
+    }
+  }
+#endif
+
+  /* Any read-only or read-write transaction implies a read-lock on
+  ** page 1. So if some other shared-cache client already has a write-lock
+  ** on page 1, the transaction cannot be opened. */
+  rc = querySharedCacheTableLock(p, SCHEMA_ROOT, READ_LOCK);
+  if( SQLITE_OK!=rc ) goto trans_begun;
+
+  pBt->btsFlags &= ~BTS_INITIALLY_EMPTY;
+  if( pBt->nPage==0 ) pBt->btsFlags |= BTS_INITIALLY_EMPTY;
+  do {
+    sqlite3PagerWalDb(pPager, p->db);
+
+#ifdef SQLITE_ENABLE_SETLK_TIMEOUT
+    /* If transitioning from no transaction directly to a write transaction,
+    ** block for the WRITER lock first if possible. */
+    if( pBt->pPage1==0 && wrflag ){
+      assert( pBt->inTransaction==TRANS_NONE );
+      rc = sqlite3PagerWalWriteLock(pPager, 1);
+      if( rc!=SQLITE_BUSY && rc!=SQLITE_OK ) break;
+    }
+#endif
+
+    /* Call lockBtree() until either pBt->pPage1 is populated or
+    ** lockBtree() returns something other than SQLITE_OK. lockBtree()
+    ** may return SQLITE_OK but leave pBt->pPage1 set to 0 if after
+    ** reading page 1 it discovers that the page-size of the database
+    ** file is not pBt->pageSize. In this case lockBtree() will update
+    ** pBt->pageSize to the page-size of the file on disk.
+    */
+    while( pBt->pPage1==0 && SQLITE_OK==(rc = lockBtree(pBt)) );
+
+    if( rc==SQLITE_OK && wrflag ){
+      if( (pBt->btsFlags & BTS_READ_ONLY)!=0 ){
+        rc = SQLITE_READONLY;
+      }else{
+        rc = sqlite3PagerBegin(pPager, wrflag>1, sqlite3TempInMemory(p->db));
+        if( rc==SQLITE_OK
