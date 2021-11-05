@@ -69650,4 +69650,208 @@ static SQLITE_NOINLINE int allocateTempSpace(BtShared *pBt){
     return SQLITE_NOMEM_BKPT;
   }
 
-  /* One of the uses of pBt->pTmpSpace is to format c
+  /* One of the uses of pBt->pTmpSpace is to format cells before
+  ** inserting them into a leaf page (function fillInCell()). If
+  ** a cell is less than 4 bytes in size, it is rounded up to 4 bytes
+  ** by the various routines that manipulate binary cells. Which
+  ** can mean that fillInCell() only initializes the first 2 or 3
+  ** bytes of pTmpSpace, but that the first 4 bytes are copied from
+  ** it into a database page. This is not actually a problem, but it
+  ** does cause a valgrind error when the 1 or 2 bytes of unitialized
+  ** data is passed to system call write(). So to avoid this error,
+  ** zero the first 4 bytes of temp space here.
+  **
+  ** Also:  Provide four bytes of initialized space before the
+  ** beginning of pTmpSpace as an area available to prepend the
+  ** left-child pointer to the beginning of a cell.
+  */
+  memset(pBt->pTmpSpace, 0, 8);
+  pBt->pTmpSpace += 4;
+  return SQLITE_OK;
+}
+
+/*
+** Free the pBt->pTmpSpace allocation
+*/
+static void freeTempSpace(BtShared *pBt){
+  if( pBt->pTmpSpace ){
+    pBt->pTmpSpace -= 4;
+    sqlite3PageFree(pBt->pTmpSpace);
+    pBt->pTmpSpace = 0;
+  }
+}
+
+/*
+** Close an open database and invalidate all cursors.
+*/
+SQLITE_PRIVATE int sqlite3BtreeClose(Btree *p){
+  BtShared *pBt = p->pBt;
+
+  /* Close all cursors opened via this handle.  */
+  assert( sqlite3_mutex_held(p->db->mutex) );
+  sqlite3BtreeEnter(p);
+
+  /* Verify that no other cursors have this Btree open */
+#ifdef SQLITE_DEBUG
+  {
+    BtCursor *pCur = pBt->pCursor;
+    while( pCur ){
+      BtCursor *pTmp = pCur;
+      pCur = pCur->pNext;
+      assert( pTmp->pBtree!=p );
+
+    }
+  }
+#endif
+
+  /* Rollback any active transaction and free the handle structure.
+  ** The call to sqlite3BtreeRollback() drops any table-locks held by
+  ** this handle.
+  */
+  sqlite3BtreeRollback(p, SQLITE_OK, 0);
+  sqlite3BtreeLeave(p);
+
+  /* If there are still other outstanding references to the shared-btree
+  ** structure, return now. The remainder of this procedure cleans
+  ** up the shared-btree.
+  */
+  assert( p->wantToLock==0 && p->locked==0 );
+  if( !p->sharable || removeFromSharingList(pBt) ){
+    /* The pBt is no longer on the sharing list, so we can access
+    ** it without having to hold the mutex.
+    **
+    ** Clean out and delete the BtShared object.
+    */
+    assert( !pBt->pCursor );
+    sqlite3PagerClose(pBt->pPager, p->db);
+    if( pBt->xFreeSchema && pBt->pSchema ){
+      pBt->xFreeSchema(pBt->pSchema);
+    }
+    sqlite3DbFree(0, pBt->pSchema);
+    freeTempSpace(pBt);
+    sqlite3_free(pBt);
+  }
+
+#ifndef SQLITE_OMIT_SHARED_CACHE
+  assert( p->wantToLock==0 );
+  assert( p->locked==0 );
+  if( p->pPrev ) p->pPrev->pNext = p->pNext;
+  if( p->pNext ) p->pNext->pPrev = p->pPrev;
+#endif
+
+  sqlite3_free(p);
+  return SQLITE_OK;
+}
+
+/*
+** Change the "soft" limit on the number of pages in the cache.
+** Unused and unmodified pages will be recycled when the number of
+** pages in the cache exceeds this soft limit.  But the size of the
+** cache is allowed to grow larger than this limit if it contains
+** dirty pages or pages still in active use.
+*/
+SQLITE_PRIVATE int sqlite3BtreeSetCacheSize(Btree *p, int mxPage){
+  BtShared *pBt = p->pBt;
+  assert( sqlite3_mutex_held(p->db->mutex) );
+  sqlite3BtreeEnter(p);
+  sqlite3PagerSetCachesize(pBt->pPager, mxPage);
+  sqlite3BtreeLeave(p);
+  return SQLITE_OK;
+}
+
+/*
+** Change the "spill" limit on the number of pages in the cache.
+** If the number of pages exceeds this limit during a write transaction,
+** the pager might attempt to "spill" pages to the journal early in
+** order to free up memory.
+**
+** The value returned is the current spill size.  If zero is passed
+** as an argument, no changes are made to the spill size setting, so
+** using mxPage of 0 is a way to query the current spill size.
+*/
+SQLITE_PRIVATE int sqlite3BtreeSetSpillSize(Btree *p, int mxPage){
+  BtShared *pBt = p->pBt;
+  int res;
+  assert( sqlite3_mutex_held(p->db->mutex) );
+  sqlite3BtreeEnter(p);
+  res = sqlite3PagerSetSpillsize(pBt->pPager, mxPage);
+  sqlite3BtreeLeave(p);
+  return res;
+}
+
+#if SQLITE_MAX_MMAP_SIZE>0
+/*
+** Change the limit on the amount of the database file that may be
+** memory mapped.
+*/
+SQLITE_PRIVATE int sqlite3BtreeSetMmapLimit(Btree *p, sqlite3_int64 szMmap){
+  BtShared *pBt = p->pBt;
+  assert( sqlite3_mutex_held(p->db->mutex) );
+  sqlite3BtreeEnter(p);
+  sqlite3PagerSetMmapLimit(pBt->pPager, szMmap);
+  sqlite3BtreeLeave(p);
+  return SQLITE_OK;
+}
+#endif /* SQLITE_MAX_MMAP_SIZE>0 */
+
+/*
+** Change the way data is synced to disk in order to increase or decrease
+** how well the database resists damage due to OS crashes and power
+** failures.  Level 1 is the same as asynchronous (no syncs() occur and
+** there is a high probability of damage)  Level 2 is the default.  There
+** is a very low but non-zero probability of damage.  Level 3 reduces the
+** probability of damage to near zero but with a write performance reduction.
+*/
+#ifndef SQLITE_OMIT_PAGER_PRAGMAS
+SQLITE_PRIVATE int sqlite3BtreeSetPagerFlags(
+  Btree *p,              /* The btree to set the safety level on */
+  unsigned pgFlags       /* Various PAGER_* flags */
+){
+  BtShared *pBt = p->pBt;
+  assert( sqlite3_mutex_held(p->db->mutex) );
+  sqlite3BtreeEnter(p);
+  sqlite3PagerSetFlags(pBt->pPager, pgFlags);
+  sqlite3BtreeLeave(p);
+  return SQLITE_OK;
+}
+#endif
+
+/*
+** Change the default pages size and the number of reserved bytes per page.
+** Or, if the page size has already been fixed, return SQLITE_READONLY
+** without changing anything.
+**
+** The page size must be a power of 2 between 512 and 65536.  If the page
+** size supplied does not meet this constraint then the page size is not
+** changed.
+**
+** Page sizes are constrained to be a power of two so that the region
+** of the database file used for locking (beginning at PENDING_BYTE,
+** the first byte past the 1GB boundary, 0x40000000) needs to occur
+** at the beginning of a page.
+**
+** If parameter nReserve is less than zero, then the number of reserved
+** bytes per page is left unchanged.
+**
+** If the iFix!=0 then the BTS_PAGESIZE_FIXED flag is set so that the page size
+** and autovacuum mode can no longer be changed.
+*/
+SQLITE_PRIVATE int sqlite3BtreeSetPageSize(Btree *p, int pageSize, int nReserve, int iFix){
+  int rc = SQLITE_OK;
+  int x;
+  BtShared *pBt = p->pBt;
+  assert( nReserve>=0 && nReserve<=255 );
+  sqlite3BtreeEnter(p);
+  pBt->nReserveWanted = nReserve;
+  x = pBt->pageSize - pBt->usableSize;
+  if( nReserve<x ) nReserve = x;
+  if( pBt->btsFlags & BTS_PAGESIZE_FIXED ){
+    sqlite3BtreeLeave(p);
+    return SQLITE_READONLY;
+  }
+  assert( nReserve>=0 && nReserve<=255 );
+  if( pageSize>=512 && pageSize<=SQLITE_MAX_PAGE_SIZE &&
+        ((pageSize-1)&pageSize)==0 ){
+    assert( (pageSize & 7)==0 );
+    assert( !pBt->pCursor );
+    if( nRe
