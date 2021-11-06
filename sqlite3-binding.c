@@ -70659,4 +70659,205 @@ static int relocatePage(
       eType==PTRMAP_BTREE || eType==PTRMAP_ROOTPAGE );
   assert( sqlite3_mutex_held(pBt->mutex) );
   assert( pDbPage->pBt==pBt );
-  if( iDbPage<3 ) return 
+  if( iDbPage<3 ) return SQLITE_CORRUPT_BKPT;
+
+  /* Move page iDbPage from its current location to page number iFreePage */
+  TRACE(("AUTOVACUUM: Moving %d to free page %d (ptr page %d type %d)\n",
+      iDbPage, iFreePage, iPtrPage, eType));
+  rc = sqlite3PagerMovepage(pPager, pDbPage->pDbPage, iFreePage, isCommit);
+  if( rc!=SQLITE_OK ){
+    return rc;
+  }
+  pDbPage->pgno = iFreePage;
+
+  /* If pDbPage was a btree-page, then it may have child pages and/or cells
+  ** that point to overflow pages. The pointer map entries for all these
+  ** pages need to be changed.
+  **
+  ** If pDbPage is an overflow page, then the first 4 bytes may store a
+  ** pointer to a subsequent overflow page. If this is the case, then
+  ** the pointer map needs to be updated for the subsequent overflow page.
+  */
+  if( eType==PTRMAP_BTREE || eType==PTRMAP_ROOTPAGE ){
+    rc = setChildPtrmaps(pDbPage);
+    if( rc!=SQLITE_OK ){
+      return rc;
+    }
+  }else{
+    Pgno nextOvfl = get4byte(pDbPage->aData);
+    if( nextOvfl!=0 ){
+      ptrmapPut(pBt, nextOvfl, PTRMAP_OVERFLOW2, iFreePage, &rc);
+      if( rc!=SQLITE_OK ){
+        return rc;
+      }
+    }
+  }
+
+  /* Fix the database pointer on page iPtrPage that pointed at iDbPage so
+  ** that it points at iFreePage. Also fix the pointer map entry for
+  ** iPtrPage.
+  */
+  if( eType!=PTRMAP_ROOTPAGE ){
+    rc = btreeGetPage(pBt, iPtrPage, &pPtrPage, 0);
+    if( rc!=SQLITE_OK ){
+      return rc;
+    }
+    rc = sqlite3PagerWrite(pPtrPage->pDbPage);
+    if( rc!=SQLITE_OK ){
+      releasePage(pPtrPage);
+      return rc;
+    }
+    rc = modifyPagePointer(pPtrPage, iDbPage, iFreePage, eType);
+    releasePage(pPtrPage);
+    if( rc==SQLITE_OK ){
+      ptrmapPut(pBt, iFreePage, eType, iPtrPage, &rc);
+    }
+  }
+  return rc;
+}
+
+/* Forward declaration required by incrVacuumStep(). */
+static int allocateBtreePage(BtShared *, MemPage **, Pgno *, Pgno, u8);
+
+/*
+** Perform a single step of an incremental-vacuum. If successful, return
+** SQLITE_OK. If there is no work to do (and therefore no point in
+** calling this function again), return SQLITE_DONE. Or, if an error
+** occurs, return some other error code.
+**
+** More specifically, this function attempts to re-organize the database so
+** that the last page of the file currently in use is no longer in use.
+**
+** Parameter nFin is the number of pages that this database would contain
+** were this function called until it returns SQLITE_DONE.
+**
+** If the bCommit parameter is non-zero, this function assumes that the
+** caller will keep calling incrVacuumStep() until it returns SQLITE_DONE
+** or an error. bCommit is passed true for an auto-vacuum-on-commit
+** operation, or false for an incremental vacuum.
+*/
+static int incrVacuumStep(BtShared *pBt, Pgno nFin, Pgno iLastPg, int bCommit){
+  Pgno nFreeList;           /* Number of pages still on the free-list */
+  int rc;
+
+  assert( sqlite3_mutex_held(pBt->mutex) );
+  assert( iLastPg>nFin );
+
+  if( !PTRMAP_ISPAGE(pBt, iLastPg) && iLastPg!=PENDING_BYTE_PAGE(pBt) ){
+    u8 eType;
+    Pgno iPtrPage;
+
+    nFreeList = get4byte(&pBt->pPage1->aData[36]);
+    if( nFreeList==0 ){
+      return SQLITE_DONE;
+    }
+
+    rc = ptrmapGet(pBt, iLastPg, &eType, &iPtrPage);
+    if( rc!=SQLITE_OK ){
+      return rc;
+    }
+    if( eType==PTRMAP_ROOTPAGE ){
+      return SQLITE_CORRUPT_BKPT;
+    }
+
+    if( eType==PTRMAP_FREEPAGE ){
+      if( bCommit==0 ){
+        /* Remove the page from the files free-list. This is not required
+        ** if bCommit is non-zero. In that case, the free-list will be
+        ** truncated to zero after this function returns, so it doesn't
+        ** matter if it still contains some garbage entries.
+        */
+        Pgno iFreePg;
+        MemPage *pFreePg;
+        rc = allocateBtreePage(pBt, &pFreePg, &iFreePg, iLastPg, BTALLOC_EXACT);
+        if( rc!=SQLITE_OK ){
+          return rc;
+        }
+        assert( iFreePg==iLastPg );
+        releasePage(pFreePg);
+      }
+    } else {
+      Pgno iFreePg;             /* Index of free page to move pLastPg to */
+      MemPage *pLastPg;
+      u8 eMode = BTALLOC_ANY;   /* Mode parameter for allocateBtreePage() */
+      Pgno iNear = 0;           /* nearby parameter for allocateBtreePage() */
+
+      rc = btreeGetPage(pBt, iLastPg, &pLastPg, 0);
+      if( rc!=SQLITE_OK ){
+        return rc;
+      }
+
+      /* If bCommit is zero, this loop runs exactly once and page pLastPg
+      ** is swapped with the first free page pulled off the free list.
+      **
+      ** On the other hand, if bCommit is greater than zero, then keep
+      ** looping until a free-page located within the first nFin pages
+      ** of the file is found.
+      */
+      if( bCommit==0 ){
+        eMode = BTALLOC_LE;
+        iNear = nFin;
+      }
+      do {
+        MemPage *pFreePg;
+        Pgno dbSize = btreePagecount(pBt);
+        rc = allocateBtreePage(pBt, &pFreePg, &iFreePg, iNear, eMode);
+        if( rc!=SQLITE_OK ){
+          releasePage(pLastPg);
+          return rc;
+        }
+        releasePage(pFreePg);
+        if( iFreePg>dbSize ){
+          releasePage(pLastPg);
+          return SQLITE_CORRUPT_BKPT;
+        }
+      }while( bCommit && iFreePg>nFin );
+      assert( iFreePg<iLastPg );
+
+      rc = relocatePage(pBt, pLastPg, eType, iPtrPage, iFreePg, bCommit);
+      releasePage(pLastPg);
+      if( rc!=SQLITE_OK ){
+        return rc;
+      }
+    }
+  }
+
+  if( bCommit==0 ){
+    do {
+      iLastPg--;
+    }while( iLastPg==PENDING_BYTE_PAGE(pBt) || PTRMAP_ISPAGE(pBt, iLastPg) );
+    pBt->bDoTruncate = 1;
+    pBt->nPage = iLastPg;
+  }
+  return SQLITE_OK;
+}
+
+/*
+** The database opened by the first argument is an auto-vacuum database
+** nOrig pages in size containing nFree free pages. Return the expected
+** size of the database in pages following an auto-vacuum operation.
+*/
+static Pgno finalDbSize(BtShared *pBt, Pgno nOrig, Pgno nFree){
+  int nEntry;                     /* Number of entries on one ptrmap page */
+  Pgno nPtrmap;                   /* Number of PtrMap pages to be freed */
+  Pgno nFin;                      /* Return value */
+
+  nEntry = pBt->usableSize/5;
+  nPtrmap = (nFree-nOrig+PTRMAP_PAGENO(pBt, nOrig)+nEntry)/nEntry;
+  nFin = nOrig - nFree - nPtrmap;
+  if( nOrig>PENDING_BYTE_PAGE(pBt) && nFin<PENDING_BYTE_PAGE(pBt) ){
+    nFin--;
+  }
+  while( PTRMAP_ISPAGE(pBt, nFin) || nFin==PENDING_BYTE_PAGE(pBt) ){
+    nFin--;
+  }
+
+  return nFin;
+}
+
+/*
+** A write-transaction must be opened before calling this function.
+** It performs a single unit of work towards an incremental vacuum.
+**
+** If the incremental vacuum is finished after this function has run,
+** SQLIT
