@@ -70448,4 +70448,215 @@ SQLITE_PRIVATE int sqlite3BtreeBeginTrans(Btree *p, int wrflag, int *pSchemaVers
         rc = SQLITE_READONLY;
       }else{
         rc = sqlite3PagerBegin(pPager, wrflag>1, sqlite3TempInMemory(p->db));
-        if( rc==SQLITE_OK
+        if( rc==SQLITE_OK ){
+          rc = newDatabase(pBt);
+        }else if( rc==SQLITE_BUSY_SNAPSHOT && pBt->inTransaction==TRANS_NONE ){
+          /* if there was no transaction opened when this function was
+          ** called and SQLITE_BUSY_SNAPSHOT is returned, change the error
+          ** code to SQLITE_BUSY. */
+          rc = SQLITE_BUSY;
+        }
+      }
+    }
+
+    if( rc!=SQLITE_OK ){
+      (void)sqlite3PagerWalWriteLock(pPager, 0);
+      unlockBtreeIfUnused(pBt);
+    }
+  }while( (rc&0xFF)==SQLITE_BUSY && pBt->inTransaction==TRANS_NONE &&
+          btreeInvokeBusyHandler(pBt) );
+  sqlite3PagerWalDb(pPager, 0);
+#ifdef SQLITE_ENABLE_SETLK_TIMEOUT
+  if( rc==SQLITE_BUSY_TIMEOUT ) rc = SQLITE_BUSY;
+#endif
+
+  if( rc==SQLITE_OK ){
+    if( p->inTrans==TRANS_NONE ){
+      pBt->nTransaction++;
+#ifndef SQLITE_OMIT_SHARED_CACHE
+      if( p->sharable ){
+        assert( p->lock.pBtree==p && p->lock.iTable==1 );
+        p->lock.eLock = READ_LOCK;
+        p->lock.pNext = pBt->pLock;
+        pBt->pLock = &p->lock;
+      }
+#endif
+    }
+    p->inTrans = (wrflag?TRANS_WRITE:TRANS_READ);
+    if( p->inTrans>pBt->inTransaction ){
+      pBt->inTransaction = p->inTrans;
+    }
+    if( wrflag ){
+      MemPage *pPage1 = pBt->pPage1;
+#ifndef SQLITE_OMIT_SHARED_CACHE
+      assert( !pBt->pWriter );
+      pBt->pWriter = p;
+      pBt->btsFlags &= ~BTS_EXCLUSIVE;
+      if( wrflag>1 ) pBt->btsFlags |= BTS_EXCLUSIVE;
+#endif
+
+      /* If the db-size header field is incorrect (as it may be if an old
+      ** client has been writing the database file), update it now. Doing
+      ** this sooner rather than later means the database size can safely
+      ** re-read the database size from page 1 if a savepoint or transaction
+      ** rollback occurs within the transaction.
+      */
+      if( pBt->nPage!=get4byte(&pPage1->aData[28]) ){
+        rc = sqlite3PagerWrite(pPage1->pDbPage);
+        if( rc==SQLITE_OK ){
+          put4byte(&pPage1->aData[28], pBt->nPage);
+        }
+      }
+    }
+  }
+
+trans_begun:
+  if( rc==SQLITE_OK ){
+    if( pSchemaVersion ){
+      *pSchemaVersion = get4byte(&pBt->pPage1->aData[40]);
+    }
+    if( wrflag ){
+      /* This call makes sure that the pager has the correct number of
+      ** open savepoints. If the second parameter is greater than 0 and
+      ** the sub-journal is not already open, then it will be opened here.
+      */
+      rc = sqlite3PagerOpenSavepoint(pPager, p->db->nSavepoint);
+    }
+  }
+
+  btreeIntegrity(p);
+  sqlite3BtreeLeave(p);
+  return rc;
+}
+
+#ifndef SQLITE_OMIT_AUTOVACUUM
+
+/*
+** Set the pointer-map entries for all children of page pPage. Also, if
+** pPage contains cells that point to overflow pages, set the pointer
+** map entries for the overflow pages as well.
+*/
+static int setChildPtrmaps(MemPage *pPage){
+  int i;                             /* Counter variable */
+  int nCell;                         /* Number of cells in page pPage */
+  int rc;                            /* Return code */
+  BtShared *pBt = pPage->pBt;
+  Pgno pgno = pPage->pgno;
+
+  assert( sqlite3_mutex_held(pPage->pBt->mutex) );
+  rc = pPage->isInit ? SQLITE_OK : btreeInitPage(pPage);
+  if( rc!=SQLITE_OK ) return rc;
+  nCell = pPage->nCell;
+
+  for(i=0; i<nCell; i++){
+    u8 *pCell = findCell(pPage, i);
+
+    ptrmapPutOvflPtr(pPage, pPage, pCell, &rc);
+
+    if( !pPage->leaf ){
+      Pgno childPgno = get4byte(pCell);
+      ptrmapPut(pBt, childPgno, PTRMAP_BTREE, pgno, &rc);
+    }
+  }
+
+  if( !pPage->leaf ){
+    Pgno childPgno = get4byte(&pPage->aData[pPage->hdrOffset+8]);
+    ptrmapPut(pBt, childPgno, PTRMAP_BTREE, pgno, &rc);
+  }
+
+  return rc;
+}
+
+/*
+** Somewhere on pPage is a pointer to page iFrom.  Modify this pointer so
+** that it points to iTo. Parameter eType describes the type of pointer to
+** be modified, as  follows:
+**
+** PTRMAP_BTREE:     pPage is a btree-page. The pointer points at a child
+**                   page of pPage.
+**
+** PTRMAP_OVERFLOW1: pPage is a btree-page. The pointer points at an overflow
+**                   page pointed to by one of the cells on pPage.
+**
+** PTRMAP_OVERFLOW2: pPage is an overflow-page. The pointer points at the next
+**                   overflow page in the list.
+*/
+static int modifyPagePointer(MemPage *pPage, Pgno iFrom, Pgno iTo, u8 eType){
+  assert( sqlite3_mutex_held(pPage->pBt->mutex) );
+  assert( sqlite3PagerIswriteable(pPage->pDbPage) );
+  if( eType==PTRMAP_OVERFLOW2 ){
+    /* The pointer is always the first 4 bytes of the page in this case.  */
+    if( get4byte(pPage->aData)!=iFrom ){
+      return SQLITE_CORRUPT_PAGE(pPage);
+    }
+    put4byte(pPage->aData, iTo);
+  }else{
+    int i;
+    int nCell;
+    int rc;
+
+    rc = pPage->isInit ? SQLITE_OK : btreeInitPage(pPage);
+    if( rc ) return rc;
+    nCell = pPage->nCell;
+
+    for(i=0; i<nCell; i++){
+      u8 *pCell = findCell(pPage, i);
+      if( eType==PTRMAP_OVERFLOW1 ){
+        CellInfo info;
+        pPage->xParseCell(pPage, pCell, &info);
+        if( info.nLocal<info.nPayload ){
+          if( pCell+info.nSize > pPage->aData+pPage->pBt->usableSize ){
+            return SQLITE_CORRUPT_PAGE(pPage);
+          }
+          if( iFrom==get4byte(pCell+info.nSize-4) ){
+            put4byte(pCell+info.nSize-4, iTo);
+            break;
+          }
+        }
+      }else{
+        if( get4byte(pCell)==iFrom ){
+          put4byte(pCell, iTo);
+          break;
+        }
+      }
+    }
+
+    if( i==nCell ){
+      if( eType!=PTRMAP_BTREE ||
+          get4byte(&pPage->aData[pPage->hdrOffset+8])!=iFrom ){
+        return SQLITE_CORRUPT_PAGE(pPage);
+      }
+      put4byte(&pPage->aData[pPage->hdrOffset+8], iTo);
+    }
+  }
+  return SQLITE_OK;
+}
+
+
+/*
+** Move the open database page pDbPage to location iFreePage in the
+** database. The pDbPage reference remains valid.
+**
+** The isCommit flag indicates that there is no need to remember that
+** the journal needs to be sync()ed before database page pDbPage->pgno
+** can be written to. The caller has already promised not to write to that
+** page.
+*/
+static int relocatePage(
+  BtShared *pBt,           /* Btree */
+  MemPage *pDbPage,        /* Open page to move */
+  u8 eType,                /* Pointer map 'type' entry for pDbPage */
+  Pgno iPtrPage,           /* Pointer map 'page-no' entry for pDbPage */
+  Pgno iFreePage,          /* The location to move pDbPage to */
+  int isCommit             /* isCommit flag passed to sqlite3PagerMovepage */
+){
+  MemPage *pPtrPage;   /* The page that contains a pointer to pDbPage */
+  Pgno iDbPage = pDbPage->pgno;
+  Pager *pPager = pBt->pPager;
+  int rc;
+
+  assert( eType==PTRMAP_OVERFLOW2 || eType==PTRMAP_OVERFLOW1 ||
+      eType==PTRMAP_BTREE || eType==PTRMAP_ROOTPAGE );
+  assert( sqlite3_mutex_held(pBt->mutex) );
+  assert( pDbPage->pBt==pBt );
+  if( iDbPage<3 ) return 
