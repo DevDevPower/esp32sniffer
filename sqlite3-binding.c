@@ -71413,4 +71413,214 @@ static int btreeCursor(
 
   /* Assert that the caller has opened the required transaction. */
   assert( p->inTrans>TRANS_NONE );
-  assert( wr
+  assert( wrFlag==0 || p->inTrans==TRANS_WRITE );
+  assert( pBt->pPage1 && pBt->pPage1->aData );
+  assert( wrFlag==0 || (pBt->btsFlags & BTS_READ_ONLY)==0 );
+
+  if( iTable<=1 ){
+    if( iTable<1 ){
+      return SQLITE_CORRUPT_BKPT;
+    }else if( btreePagecount(pBt)==0 ){
+      assert( wrFlag==0 );
+      iTable = 0;
+    }
+  }
+
+  /* Now that no other errors can occur, finish filling in the BtCursor
+  ** variables and link the cursor into the BtShared list.  */
+  pCur->pgnoRoot = iTable;
+  pCur->iPage = -1;
+  pCur->pKeyInfo = pKeyInfo;
+  pCur->pBtree = p;
+  pCur->pBt = pBt;
+  pCur->curFlags = 0;
+  /* If there are two or more cursors on the same btree, then all such
+  ** cursors *must* have the BTCF_Multiple flag set. */
+  for(pX=pBt->pCursor; pX; pX=pX->pNext){
+    if( pX->pgnoRoot==iTable ){
+      pX->curFlags |= BTCF_Multiple;
+      pCur->curFlags = BTCF_Multiple;
+    }
+  }
+  pCur->eState = CURSOR_INVALID;
+  pCur->pNext = pBt->pCursor;
+  pBt->pCursor = pCur;
+  if( wrFlag ){
+    pCur->curFlags |= BTCF_WriteFlag;
+    pCur->curPagerFlags = 0;
+    if( pBt->pTmpSpace==0 ) return allocateTempSpace(pBt);
+  }else{
+    pCur->curPagerFlags = PAGER_GET_READONLY;
+  }
+  return SQLITE_OK;
+}
+static int btreeCursorWithLock(
+  Btree *p,                              /* The btree */
+  Pgno iTable,                           /* Root page of table to open */
+  int wrFlag,                            /* 1 to write. 0 read-only */
+  struct KeyInfo *pKeyInfo,              /* First arg to comparison function */
+  BtCursor *pCur                         /* Space for new cursor */
+){
+  int rc;
+  sqlite3BtreeEnter(p);
+  rc = btreeCursor(p, iTable, wrFlag, pKeyInfo, pCur);
+  sqlite3BtreeLeave(p);
+  return rc;
+}
+SQLITE_PRIVATE int sqlite3BtreeCursor(
+  Btree *p,                                   /* The btree */
+  Pgno iTable,                                /* Root page of table to open */
+  int wrFlag,                                 /* 1 to write. 0 read-only */
+  struct KeyInfo *pKeyInfo,                   /* First arg to xCompare() */
+  BtCursor *pCur                              /* Write new cursor here */
+){
+  if( p->sharable ){
+    return btreeCursorWithLock(p, iTable, wrFlag, pKeyInfo, pCur);
+  }else{
+    return btreeCursor(p, iTable, wrFlag, pKeyInfo, pCur);
+  }
+}
+
+/*
+** Return the size of a BtCursor object in bytes.
+**
+** This interfaces is needed so that users of cursors can preallocate
+** sufficient storage to hold a cursor.  The BtCursor object is opaque
+** to users so they cannot do the sizeof() themselves - they must call
+** this routine.
+*/
+SQLITE_PRIVATE int sqlite3BtreeCursorSize(void){
+  return ROUND8(sizeof(BtCursor));
+}
+
+/*
+** Initialize memory that will be converted into a BtCursor object.
+**
+** The simple approach here would be to memset() the entire object
+** to zero.  But it turns out that the apPage[] and aiIdx[] arrays
+** do not need to be zeroed and they are large, so we can save a lot
+** of run-time by skipping the initialization of those elements.
+*/
+SQLITE_PRIVATE void sqlite3BtreeCursorZero(BtCursor *p){
+  memset(p, 0, offsetof(BtCursor, BTCURSOR_FIRST_UNINIT));
+}
+
+/*
+** Close a cursor.  The read lock on the database file is released
+** when the last cursor is closed.
+*/
+SQLITE_PRIVATE int sqlite3BtreeCloseCursor(BtCursor *pCur){
+  Btree *pBtree = pCur->pBtree;
+  if( pBtree ){
+    BtShared *pBt = pCur->pBt;
+    sqlite3BtreeEnter(pBtree);
+    assert( pBt->pCursor!=0 );
+    if( pBt->pCursor==pCur ){
+      pBt->pCursor = pCur->pNext;
+    }else{
+      BtCursor *pPrev = pBt->pCursor;
+      do{
+        if( pPrev->pNext==pCur ){
+          pPrev->pNext = pCur->pNext;
+          break;
+        }
+        pPrev = pPrev->pNext;
+      }while( ALWAYS(pPrev) );
+    }
+    btreeReleaseAllCursorPages(pCur);
+    unlockBtreeIfUnused(pBt);
+    sqlite3_free(pCur->aOverflow);
+    sqlite3_free(pCur->pKey);
+    if( (pBt->openFlags & BTREE_SINGLE) && pBt->pCursor==0 ){
+      /* Since the BtShared is not sharable, there is no need to
+      ** worry about the missing sqlite3BtreeLeave() call here.  */
+      assert( pBtree->sharable==0 );
+      sqlite3BtreeClose(pBtree);
+    }else{
+      sqlite3BtreeLeave(pBtree);
+    }
+    pCur->pBtree = 0;
+  }
+  return SQLITE_OK;
+}
+
+/*
+** Make sure the BtCursor* given in the argument has a valid
+** BtCursor.info structure.  If it is not already valid, call
+** btreeParseCell() to fill it in.
+**
+** BtCursor.info is a cache of the information in the current cell.
+** Using this cache reduces the number of calls to btreeParseCell().
+*/
+#ifndef NDEBUG
+  static int cellInfoEqual(CellInfo *a, CellInfo *b){
+    if( a->nKey!=b->nKey ) return 0;
+    if( a->pPayload!=b->pPayload ) return 0;
+    if( a->nPayload!=b->nPayload ) return 0;
+    if( a->nLocal!=b->nLocal ) return 0;
+    if( a->nSize!=b->nSize ) return 0;
+    return 1;
+  }
+  static void assertCellInfo(BtCursor *pCur){
+    CellInfo info;
+    memset(&info, 0, sizeof(info));
+    btreeParseCell(pCur->pPage, pCur->ix, &info);
+    assert( CORRUPT_DB || cellInfoEqual(&info, &pCur->info) );
+  }
+#else
+  #define assertCellInfo(x)
+#endif
+static SQLITE_NOINLINE void getCellInfo(BtCursor *pCur){
+  if( pCur->info.nSize==0 ){
+    pCur->curFlags |= BTCF_ValidNKey;
+    btreeParseCell(pCur->pPage,pCur->ix,&pCur->info);
+  }else{
+    assertCellInfo(pCur);
+  }
+}
+
+#ifndef NDEBUG  /* The next routine used only within assert() statements */
+/*
+** Return true if the given BtCursor is valid.  A valid cursor is one
+** that is currently pointing to a row in a (non-empty) table.
+** This is a verification routine is used only within assert() statements.
+*/
+SQLITE_PRIVATE int sqlite3BtreeCursorIsValid(BtCursor *pCur){
+  return pCur && pCur->eState==CURSOR_VALID;
+}
+#endif /* NDEBUG */
+SQLITE_PRIVATE int sqlite3BtreeCursorIsValidNN(BtCursor *pCur){
+  assert( pCur!=0 );
+  return pCur->eState==CURSOR_VALID;
+}
+
+/*
+** Return the value of the integer key or "rowid" for a table btree.
+** This routine is only valid for a cursor that is pointing into a
+** ordinary table btree.  If the cursor points to an index btree or
+** is invalid, the result of this routine is undefined.
+*/
+SQLITE_PRIVATE i64 sqlite3BtreeIntegerKey(BtCursor *pCur){
+  assert( cursorHoldsMutex(pCur) );
+  assert( pCur->eState==CURSOR_VALID );
+  assert( pCur->curIntKey );
+  getCellInfo(pCur);
+  return pCur->info.nKey;
+}
+
+/*
+** Pin or unpin a cursor.
+*/
+SQLITE_PRIVATE void sqlite3BtreeCursorPin(BtCursor *pCur){
+  assert( (pCur->curFlags & BTCF_Pinned)==0 );
+  pCur->curFlags |= BTCF_Pinned;
+}
+SQLITE_PRIVATE void sqlite3BtreeCursorUnpin(BtCursor *pCur){
+  assert( (pCur->curFlags & BTCF_Pinned)!=0 );
+  pCur->curFlags &= ~BTCF_Pinned;
+}
+
+#ifdef SQLITE_ENABLE_OFFSET_SQL_FUNC
+/*
+** Return the offset into the database file for the start of the
+** payload to
