@@ -71255,4 +71255,162 @@ SQLITE_PRIVATE int sqlite3BtreeRollback(Btree *p, int tripCode, int writeOnly){
     ** sure pPage1->aData is set correctly. */
     if( btreeGetPage(pBt, 1, &pPage1, 0)==SQLITE_OK ){
       btreeSetNPage(pBt, pPage1);
-      releasePage
+      releasePageOne(pPage1);
+    }
+    assert( countValidCursors(pBt, 1)==0 );
+    pBt->inTransaction = TRANS_READ;
+    btreeClearHasContent(pBt);
+  }
+
+  btreeEndTransaction(p);
+  sqlite3BtreeLeave(p);
+  return rc;
+}
+
+/*
+** Start a statement subtransaction. The subtransaction can be rolled
+** back independently of the main transaction. You must start a transaction
+** before starting a subtransaction. The subtransaction is ended automatically
+** if the main transaction commits or rolls back.
+**
+** Statement subtransactions are used around individual SQL statements
+** that are contained within a BEGIN...COMMIT block.  If a constraint
+** error occurs within the statement, the effect of that one statement
+** can be rolled back without having to rollback the entire transaction.
+**
+** A statement sub-transaction is implemented as an anonymous savepoint. The
+** value passed as the second parameter is the total number of savepoints,
+** including the new anonymous savepoint, open on the B-Tree. i.e. if there
+** are no active savepoints and no other statement-transactions open,
+** iStatement is 1. This anonymous savepoint can be released or rolled back
+** using the sqlite3BtreeSavepoint() function.
+*/
+SQLITE_PRIVATE int sqlite3BtreeBeginStmt(Btree *p, int iStatement){
+  int rc;
+  BtShared *pBt = p->pBt;
+  sqlite3BtreeEnter(p);
+  assert( p->inTrans==TRANS_WRITE );
+  assert( (pBt->btsFlags & BTS_READ_ONLY)==0 );
+  assert( iStatement>0 );
+  assert( iStatement>p->db->nSavepoint );
+  assert( pBt->inTransaction==TRANS_WRITE );
+  /* At the pager level, a statement transaction is a savepoint with
+  ** an index greater than all savepoints created explicitly using
+  ** SQL statements. It is illegal to open, release or rollback any
+  ** such savepoints while the statement transaction savepoint is active.
+  */
+  rc = sqlite3PagerOpenSavepoint(pBt->pPager, iStatement);
+  sqlite3BtreeLeave(p);
+  return rc;
+}
+
+/*
+** The second argument to this function, op, is always SAVEPOINT_ROLLBACK
+** or SAVEPOINT_RELEASE. This function either releases or rolls back the
+** savepoint identified by parameter iSavepoint, depending on the value
+** of op.
+**
+** Normally, iSavepoint is greater than or equal to zero. However, if op is
+** SAVEPOINT_ROLLBACK, then iSavepoint may also be -1. In this case the
+** contents of the entire transaction are rolled back. This is different
+** from a normal transaction rollback, as no locks are released and the
+** transaction remains open.
+*/
+SQLITE_PRIVATE int sqlite3BtreeSavepoint(Btree *p, int op, int iSavepoint){
+  int rc = SQLITE_OK;
+  if( p && p->inTrans==TRANS_WRITE ){
+    BtShared *pBt = p->pBt;
+    assert( op==SAVEPOINT_RELEASE || op==SAVEPOINT_ROLLBACK );
+    assert( iSavepoint>=0 || (iSavepoint==-1 && op==SAVEPOINT_ROLLBACK) );
+    sqlite3BtreeEnter(p);
+    if( op==SAVEPOINT_ROLLBACK ){
+      rc = saveAllCursors(pBt, 0, 0);
+    }
+    if( rc==SQLITE_OK ){
+      rc = sqlite3PagerSavepoint(pBt->pPager, op, iSavepoint);
+    }
+    if( rc==SQLITE_OK ){
+      if( iSavepoint<0 && (pBt->btsFlags & BTS_INITIALLY_EMPTY)!=0 ){
+        pBt->nPage = 0;
+      }
+      rc = newDatabase(pBt);
+      btreeSetNPage(pBt, pBt->pPage1);
+
+      /* pBt->nPage might be zero if the database was corrupt when
+      ** the transaction was started. Otherwise, it must be at least 1.  */
+      assert( CORRUPT_DB || pBt->nPage>0 );
+    }
+    sqlite3BtreeLeave(p);
+  }
+  return rc;
+}
+
+/*
+** Create a new cursor for the BTree whose root is on the page
+** iTable. If a read-only cursor is requested, it is assumed that
+** the caller already has at least a read-only transaction open
+** on the database already. If a write-cursor is requested, then
+** the caller is assumed to have an open write transaction.
+**
+** If the BTREE_WRCSR bit of wrFlag is clear, then the cursor can only
+** be used for reading.  If the BTREE_WRCSR bit is set, then the cursor
+** can be used for reading or for writing if other conditions for writing
+** are also met.  These are the conditions that must be met in order
+** for writing to be allowed:
+**
+** 1:  The cursor must have been opened with wrFlag containing BTREE_WRCSR
+**
+** 2:  Other database connections that share the same pager cache
+**     but which are not in the READ_UNCOMMITTED state may not have
+**     cursors open with wrFlag==0 on the same table.  Otherwise
+**     the changes made by this write cursor would be visible to
+**     the read cursors in the other database connection.
+**
+** 3:  The database must be writable (not on read-only media)
+**
+** 4:  There must be an active transaction.
+**
+** The BTREE_FORDELETE bit of wrFlag may optionally be set if BTREE_WRCSR
+** is set.  If FORDELETE is set, that is a hint to the implementation that
+** this cursor will only be used to seek to and delete entries of an index
+** as part of a larger DELETE statement.  The FORDELETE hint is not used by
+** this implementation.  But in a hypothetical alternative storage engine
+** in which index entries are automatically deleted when corresponding table
+** rows are deleted, the FORDELETE flag is a hint that all SEEK and DELETE
+** operations on this cursor can be no-ops and all READ operations can
+** return a null row (2-bytes: 0x01 0x00).
+**
+** No checking is done to make sure that page iTable really is the
+** root page of a b-tree.  If it is not, then the cursor acquired
+** will not work correctly.
+**
+** It is assumed that the sqlite3BtreeCursorZero() has been called
+** on pCur to initialize the memory space prior to invoking this routine.
+*/
+static int btreeCursor(
+  Btree *p,                              /* The btree */
+  Pgno iTable,                           /* Root page of table to open */
+  int wrFlag,                            /* 1 to write. 0 read-only */
+  struct KeyInfo *pKeyInfo,              /* First arg to comparison function */
+  BtCursor *pCur                         /* Space for new cursor */
+){
+  BtShared *pBt = p->pBt;                /* Shared b-tree handle */
+  BtCursor *pX;                          /* Looping over other all cursors */
+
+  assert( sqlite3BtreeHoldsMutex(p) );
+  assert( wrFlag==0
+       || wrFlag==BTREE_WRCSR
+       || wrFlag==(BTREE_WRCSR|BTREE_FORDELETE)
+  );
+
+  /* The following assert statements verify that if this is a sharable
+  ** b-tree database, the connection is holding the required table locks,
+  ** and that no other connection has any open cursor that conflicts with
+  ** this lock.  The iTable<1 term disables the check for corrupt schemas. */
+  assert( hasSharedCacheTableLock(p, iTable, pKeyInfo!=0, (wrFlag?2:1))
+          || iTable<1 );
+  assert( wrFlag==0 || !hasReadConflicts(p, iTable) );
+
+  /* Assert that the caller has opened the required transaction. */
+  assert( p->inTrans>TRANS_NONE );
+  assert( wr
