@@ -71994,4 +71994,189 @@ static int accessPayload(
 }
 
 /*
-** Read part of the payload for the row at which that cur
+** Read part of the payload for the row at which that cursor pCur is currently
+** pointing.  "amt" bytes will be transferred into pBuf[].  The transfer
+** begins at "offset".
+**
+** pCur can be pointing to either a table or an index b-tree.
+** If pointing to a table btree, then the content section is read.  If
+** pCur is pointing to an index b-tree then the key section is read.
+**
+** For sqlite3BtreePayload(), the caller must ensure that pCur is pointing
+** to a valid row in the table.  For sqlite3BtreePayloadChecked(), the
+** cursor might be invalid or might need to be restored before being read.
+**
+** Return SQLITE_OK on success or an error code if anything goes
+** wrong.  An error is returned if "offset+amt" is larger than
+** the available payload.
+*/
+SQLITE_PRIVATE int sqlite3BtreePayload(BtCursor *pCur, u32 offset, u32 amt, void *pBuf){
+  assert( cursorHoldsMutex(pCur) );
+  assert( pCur->eState==CURSOR_VALID );
+  assert( pCur->iPage>=0 && pCur->pPage );
+  return accessPayload(pCur, offset, amt, (unsigned char*)pBuf, 0);
+}
+
+/*
+** This variant of sqlite3BtreePayload() works even if the cursor has not
+** in the CURSOR_VALID state.  It is only used by the sqlite3_blob_read()
+** interface.
+*/
+#ifndef SQLITE_OMIT_INCRBLOB
+static SQLITE_NOINLINE int accessPayloadChecked(
+  BtCursor *pCur,
+  u32 offset,
+  u32 amt,
+  void *pBuf
+){
+  int rc;
+  if ( pCur->eState==CURSOR_INVALID ){
+    return SQLITE_ABORT;
+  }
+  assert( cursorOwnsBtShared(pCur) );
+  rc = btreeRestoreCursorPosition(pCur);
+  return rc ? rc : accessPayload(pCur, offset, amt, pBuf, 0);
+}
+SQLITE_PRIVATE int sqlite3BtreePayloadChecked(BtCursor *pCur, u32 offset, u32 amt, void *pBuf){
+  if( pCur->eState==CURSOR_VALID ){
+    assert( cursorOwnsBtShared(pCur) );
+    return accessPayload(pCur, offset, amt, pBuf, 0);
+  }else{
+    return accessPayloadChecked(pCur, offset, amt, pBuf);
+  }
+}
+#endif /* SQLITE_OMIT_INCRBLOB */
+
+/*
+** Return a pointer to payload information from the entry that the
+** pCur cursor is pointing to.  The pointer is to the beginning of
+** the key if index btrees (pPage->intKey==0) and is the data for
+** table btrees (pPage->intKey==1). The number of bytes of available
+** key/data is written into *pAmt.  If *pAmt==0, then the value
+** returned will not be a valid pointer.
+**
+** This routine is an optimization.  It is common for the entire key
+** and data to fit on the local page and for there to be no overflow
+** pages.  When that is so, this routine can be used to access the
+** key and data without making a copy.  If the key and/or data spills
+** onto overflow pages, then accessPayload() must be used to reassemble
+** the key/data and copy it into a preallocated buffer.
+**
+** The pointer returned by this routine looks directly into the cached
+** page of the database.  The data might change or move the next time
+** any btree routine is called.
+*/
+static const void *fetchPayload(
+  BtCursor *pCur,      /* Cursor pointing to entry to read from */
+  u32 *pAmt            /* Write the number of available bytes here */
+){
+  int amt;
+  assert( pCur!=0 && pCur->iPage>=0 && pCur->pPage);
+  assert( pCur->eState==CURSOR_VALID );
+  assert( sqlite3_mutex_held(pCur->pBtree->db->mutex) );
+  assert( cursorOwnsBtShared(pCur) );
+  assert( pCur->ix<pCur->pPage->nCell || CORRUPT_DB );
+  assert( pCur->info.nSize>0 );
+  assert( pCur->info.pPayload>pCur->pPage->aData || CORRUPT_DB );
+  assert( pCur->info.pPayload<pCur->pPage->aDataEnd ||CORRUPT_DB);
+  amt = pCur->info.nLocal;
+  if( amt>(int)(pCur->pPage->aDataEnd - pCur->info.pPayload) ){
+    /* There is too little space on the page for the expected amount
+    ** of local content. Database must be corrupt. */
+    assert( CORRUPT_DB );
+    amt = MAX(0, (int)(pCur->pPage->aDataEnd - pCur->info.pPayload));
+  }
+  *pAmt = (u32)amt;
+  return (void*)pCur->info.pPayload;
+}
+
+
+/*
+** For the entry that cursor pCur is point to, return as
+** many bytes of the key or data as are available on the local
+** b-tree page.  Write the number of available bytes into *pAmt.
+**
+** The pointer returned is ephemeral.  The key/data may move
+** or be destroyed on the next call to any Btree routine,
+** including calls from other threads against the same cache.
+** Hence, a mutex on the BtShared should be held prior to calling
+** this routine.
+**
+** These routines is used to get quick access to key and data
+** in the common case where no overflow pages are used.
+*/
+SQLITE_PRIVATE const void *sqlite3BtreePayloadFetch(BtCursor *pCur, u32 *pAmt){
+  return fetchPayload(pCur, pAmt);
+}
+
+
+/*
+** Move the cursor down to a new child page.  The newPgno argument is the
+** page number of the child page to move to.
+**
+** This function returns SQLITE_CORRUPT if the page-header flags field of
+** the new child page does not match the flags field of the parent (i.e.
+** if an intkey page appears to be the parent of a non-intkey page, or
+** vice-versa).
+*/
+static int moveToChild(BtCursor *pCur, u32 newPgno){
+  BtShared *pBt = pCur->pBt;
+
+  assert( cursorOwnsBtShared(pCur) );
+  assert( pCur->eState==CURSOR_VALID );
+  assert( pCur->iPage<BTCURSOR_MAX_DEPTH );
+  assert( pCur->iPage>=0 );
+  if( pCur->iPage>=(BTCURSOR_MAX_DEPTH-1) ){
+    return SQLITE_CORRUPT_BKPT;
+  }
+  pCur->info.nSize = 0;
+  pCur->curFlags &= ~(BTCF_ValidNKey|BTCF_ValidOvfl);
+  pCur->aiIdx[pCur->iPage] = pCur->ix;
+  pCur->apPage[pCur->iPage] = pCur->pPage;
+  pCur->ix = 0;
+  pCur->iPage++;
+  return getAndInitPage(pBt, newPgno, &pCur->pPage, pCur, pCur->curPagerFlags);
+}
+
+#ifdef SQLITE_DEBUG
+/*
+** Page pParent is an internal (non-leaf) tree page. This function
+** asserts that page number iChild is the left-child if the iIdx'th
+** cell in page pParent. Or, if iIdx is equal to the total number of
+** cells in pParent, that page number iChild is the right-child of
+** the page.
+*/
+static void assertParentIndex(MemPage *pParent, int iIdx, Pgno iChild){
+  if( CORRUPT_DB ) return;  /* The conditions tested below might not be true
+                            ** in a corrupt database */
+  assert( iIdx<=pParent->nCell );
+  if( iIdx==pParent->nCell ){
+    assert( get4byte(&pParent->aData[pParent->hdrOffset+8])==iChild );
+  }else{
+    assert( get4byte(findCell(pParent, iIdx))==iChild );
+  }
+}
+#else
+#  define assertParentIndex(x,y,z)
+#endif
+
+/*
+** Move the cursor up to the parent page.
+**
+** pCur->idx is set to the cell index that contains the pointer
+** to the page we are coming from.  If we are coming from the
+** right-most child page then pCur->idx is set to one more than
+** the largest cell index.
+*/
+static void moveToParent(BtCursor *pCur){
+  MemPage *pLeaf;
+  assert( cursorOwnsBtShared(pCur) );
+  assert( pCur->eState==CURSOR_VALID );
+  assert( pCur->iPage>0 );
+  assert( pCur->pPage );
+  assertParentIndex(
+    pCur->apPage[pCur->iPage-1],
+    pCur->aiIdx[pCur->iPage-1],
+    pCur->pPage->pgno
+  );
+  testc
