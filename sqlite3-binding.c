@@ -72179,4 +72179,196 @@ static void moveToParent(BtCursor *pCur){
     pCur->aiIdx[pCur->iPage-1],
     pCur->pPage->pgno
   );
-  testc
+  testcase( pCur->aiIdx[pCur->iPage-1] > pCur->apPage[pCur->iPage-1]->nCell );
+  pCur->info.nSize = 0;
+  pCur->curFlags &= ~(BTCF_ValidNKey|BTCF_ValidOvfl);
+  pCur->ix = pCur->aiIdx[pCur->iPage-1];
+  pLeaf = pCur->pPage;
+  pCur->pPage = pCur->apPage[--pCur->iPage];
+  releasePageNotNull(pLeaf);
+}
+
+/*
+** Move the cursor to point to the root page of its b-tree structure.
+**
+** If the table has a virtual root page, then the cursor is moved to point
+** to the virtual root page instead of the actual root page. A table has a
+** virtual root page when the actual root page contains no cells and a
+** single child page. This can only happen with the table rooted at page 1.
+**
+** If the b-tree structure is empty, the cursor state is set to
+** CURSOR_INVALID and this routine returns SQLITE_EMPTY. Otherwise,
+** the cursor is set to point to the first cell located on the root
+** (or virtual root) page and the cursor state is set to CURSOR_VALID.
+**
+** If this function returns successfully, it may be assumed that the
+** page-header flags indicate that the [virtual] root-page is the expected
+** kind of b-tree page (i.e. if when opening the cursor the caller did not
+** specify a KeyInfo structure the flags byte is set to 0x05 or 0x0D,
+** indicating a table b-tree, or if the caller did specify a KeyInfo
+** structure the flags byte is set to 0x02 or 0x0A, indicating an index
+** b-tree).
+*/
+static int moveToRoot(BtCursor *pCur){
+  MemPage *pRoot;
+  int rc = SQLITE_OK;
+
+  assert( cursorOwnsBtShared(pCur) );
+  assert( CURSOR_INVALID < CURSOR_REQUIRESEEK );
+  assert( CURSOR_VALID   < CURSOR_REQUIRESEEK );
+  assert( CURSOR_FAULT   > CURSOR_REQUIRESEEK );
+  assert( pCur->eState < CURSOR_REQUIRESEEK || pCur->iPage<0 );
+  assert( pCur->pgnoRoot>0 || pCur->iPage<0 );
+
+  if( pCur->iPage>=0 ){
+    if( pCur->iPage ){
+      releasePageNotNull(pCur->pPage);
+      while( --pCur->iPage ){
+        releasePageNotNull(pCur->apPage[pCur->iPage]);
+      }
+      pRoot = pCur->pPage = pCur->apPage[0];
+      goto skip_init;
+    }
+  }else if( pCur->pgnoRoot==0 ){
+    pCur->eState = CURSOR_INVALID;
+    return SQLITE_EMPTY;
+  }else{
+    assert( pCur->iPage==(-1) );
+    if( pCur->eState>=CURSOR_REQUIRESEEK ){
+      if( pCur->eState==CURSOR_FAULT ){
+        assert( pCur->skipNext!=SQLITE_OK );
+        return pCur->skipNext;
+      }
+      sqlite3BtreeClearCursor(pCur);
+    }
+    rc = getAndInitPage(pCur->pBtree->pBt, pCur->pgnoRoot, &pCur->pPage,
+                        0, pCur->curPagerFlags);
+    if( rc!=SQLITE_OK ){
+      pCur->eState = CURSOR_INVALID;
+      return rc;
+    }
+    pCur->iPage = 0;
+    pCur->curIntKey = pCur->pPage->intKey;
+  }
+  pRoot = pCur->pPage;
+  assert( pRoot->pgno==pCur->pgnoRoot || CORRUPT_DB );
+
+  /* If pCur->pKeyInfo is not NULL, then the caller that opened this cursor
+  ** expected to open it on an index b-tree. Otherwise, if pKeyInfo is
+  ** NULL, the caller expects a table b-tree. If this is not the case,
+  ** return an SQLITE_CORRUPT error.
+  **
+  ** Earlier versions of SQLite assumed that this test could not fail
+  ** if the root page was already loaded when this function was called (i.e.
+  ** if pCur->iPage>=0). But this is not so if the database is corrupted
+  ** in such a way that page pRoot is linked into a second b-tree table
+  ** (or the freelist).  */
+  assert( pRoot->intKey==1 || pRoot->intKey==0 );
+  if( pRoot->isInit==0 || (pCur->pKeyInfo==0)!=pRoot->intKey ){
+    return SQLITE_CORRUPT_PAGE(pCur->pPage);
+  }
+
+skip_init:
+  pCur->ix = 0;
+  pCur->info.nSize = 0;
+  pCur->curFlags &= ~(BTCF_AtLast|BTCF_ValidNKey|BTCF_ValidOvfl);
+
+  if( pRoot->nCell>0 ){
+    pCur->eState = CURSOR_VALID;
+  }else if( !pRoot->leaf ){
+    Pgno subpage;
+    if( pRoot->pgno!=1 ) return SQLITE_CORRUPT_BKPT;
+    subpage = get4byte(&pRoot->aData[pRoot->hdrOffset+8]);
+    pCur->eState = CURSOR_VALID;
+    rc = moveToChild(pCur, subpage);
+  }else{
+    pCur->eState = CURSOR_INVALID;
+    rc = SQLITE_EMPTY;
+  }
+  return rc;
+}
+
+/*
+** Move the cursor down to the left-most leaf entry beneath the
+** entry to which it is currently pointing.
+**
+** The left-most leaf is the one with the smallest key - the first
+** in ascending order.
+*/
+static int moveToLeftmost(BtCursor *pCur){
+  Pgno pgno;
+  int rc = SQLITE_OK;
+  MemPage *pPage;
+
+  assert( cursorOwnsBtShared(pCur) );
+  assert( pCur->eState==CURSOR_VALID );
+  while( rc==SQLITE_OK && !(pPage = pCur->pPage)->leaf ){
+    assert( pCur->ix<pPage->nCell );
+    pgno = get4byte(findCell(pPage, pCur->ix));
+    rc = moveToChild(pCur, pgno);
+  }
+  return rc;
+}
+
+/*
+** Move the cursor down to the right-most leaf entry beneath the
+** page to which it is currently pointing.  Notice the difference
+** between moveToLeftmost() and moveToRightmost().  moveToLeftmost()
+** finds the left-most entry beneath the *entry* whereas moveToRightmost()
+** finds the right-most entry beneath the *page*.
+**
+** The right-most entry is the one with the largest key - the last
+** key in ascending order.
+*/
+static int moveToRightmost(BtCursor *pCur){
+  Pgno pgno;
+  int rc = SQLITE_OK;
+  MemPage *pPage = 0;
+
+  assert( cursorOwnsBtShared(pCur) );
+  assert( pCur->eState==CURSOR_VALID );
+  while( !(pPage = pCur->pPage)->leaf ){
+    pgno = get4byte(&pPage->aData[pPage->hdrOffset+8]);
+    pCur->ix = pPage->nCell;
+    rc = moveToChild(pCur, pgno);
+    if( rc ) return rc;
+  }
+  pCur->ix = pPage->nCell-1;
+  assert( pCur->info.nSize==0 );
+  assert( (pCur->curFlags & BTCF_ValidNKey)==0 );
+  return SQLITE_OK;
+}
+
+/* Move the cursor to the first entry in the table.  Return SQLITE_OK
+** on success.  Set *pRes to 0 if the cursor actually points to something
+** or set *pRes to 1 if the table is empty.
+*/
+SQLITE_PRIVATE int sqlite3BtreeFirst(BtCursor *pCur, int *pRes){
+  int rc;
+
+  assert( cursorOwnsBtShared(pCur) );
+  assert( sqlite3_mutex_held(pCur->pBtree->db->mutex) );
+  rc = moveToRoot(pCur);
+  if( rc==SQLITE_OK ){
+    assert( pCur->pPage->nCell>0 );
+    *pRes = 0;
+    rc = moveToLeftmost(pCur);
+  }else if( rc==SQLITE_EMPTY ){
+    assert( pCur->pgnoRoot==0 || pCur->pPage->nCell==0 );
+    *pRes = 1;
+    rc = SQLITE_OK;
+  }
+  return rc;
+}
+
+/* Move the cursor to the last entry in the table.  Return SQLITE_OK
+** on success.  Set *pRes to 0 if the cursor actually points to something
+** or set *pRes to 1 if the table is empty.
+*/
+SQLITE_PRIVATE int sqlite3BtreeLast(BtCursor *pCur, int *pRes){
+  int rc;
+
+  assert( cursorOwnsBtShared(pCur) );
+  assert( sqlite3_mutex_held(pCur->pBtree->db->mutex) );
+
+  /* If the cursor already points to the last entry, this is a no-op.
