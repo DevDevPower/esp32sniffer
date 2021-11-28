@@ -72371,4 +72371,207 @@ SQLITE_PRIVATE int sqlite3BtreeLast(BtCursor *pCur, int *pRes){
   assert( cursorOwnsBtShared(pCur) );
   assert( sqlite3_mutex_held(pCur->pBtree->db->mutex) );
 
-  /* If the cursor already points to the last entry, this is a no-op.
+  /* If the cursor already points to the last entry, this is a no-op. */
+  if( CURSOR_VALID==pCur->eState && (pCur->curFlags & BTCF_AtLast)!=0 ){
+#ifdef SQLITE_DEBUG
+    /* This block serves to assert() that the cursor really does point
+    ** to the last entry in the b-tree. */
+    int ii;
+    for(ii=0; ii<pCur->iPage; ii++){
+      assert( pCur->aiIdx[ii]==pCur->apPage[ii]->nCell );
+    }
+    assert( pCur->ix==pCur->pPage->nCell-1 || CORRUPT_DB );
+    testcase( pCur->ix!=pCur->pPage->nCell-1 );
+    /* ^-- dbsqlfuzz b92b72e4de80b5140c30ab71372ca719b8feb618 */
+    assert( pCur->pPage->leaf );
+#endif
+    *pRes = 0;
+    return SQLITE_OK;
+  }
+
+  rc = moveToRoot(pCur);
+  if( rc==SQLITE_OK ){
+    assert( pCur->eState==CURSOR_VALID );
+    *pRes = 0;
+    rc = moveToRightmost(pCur);
+    if( rc==SQLITE_OK ){
+      pCur->curFlags |= BTCF_AtLast;
+    }else{
+      pCur->curFlags &= ~BTCF_AtLast;
+    }
+  }else if( rc==SQLITE_EMPTY ){
+    assert( pCur->pgnoRoot==0 || pCur->pPage->nCell==0 );
+    *pRes = 1;
+    rc = SQLITE_OK;
+  }
+  return rc;
+}
+
+/* Move the cursor so that it points to an entry in a table (a.k.a INTKEY)
+** table near the key intKey.   Return a success code.
+**
+** If an exact match is not found, then the cursor is always
+** left pointing at a leaf page which would hold the entry if it
+** were present.  The cursor might point to an entry that comes
+** before or after the key.
+**
+** An integer is written into *pRes which is the result of
+** comparing the key with the entry to which the cursor is
+** pointing.  The meaning of the integer written into
+** *pRes is as follows:
+**
+**     *pRes<0      The cursor is left pointing at an entry that
+**                  is smaller than intKey or if the table is empty
+**                  and the cursor is therefore left point to nothing.
+**
+**     *pRes==0     The cursor is left pointing at an entry that
+**                  exactly matches intKey.
+**
+**     *pRes>0      The cursor is left pointing at an entry that
+**                  is larger than intKey.
+*/
+SQLITE_PRIVATE int sqlite3BtreeTableMoveto(
+  BtCursor *pCur,          /* The cursor to be moved */
+  i64 intKey,              /* The table key */
+  int biasRight,           /* If true, bias the search to the high end */
+  int *pRes                /* Write search results here */
+){
+  int rc;
+
+  assert( cursorOwnsBtShared(pCur) );
+  assert( sqlite3_mutex_held(pCur->pBtree->db->mutex) );
+  assert( pRes );
+  assert( pCur->pKeyInfo==0 );
+  assert( pCur->eState!=CURSOR_VALID || pCur->curIntKey!=0 );
+
+  /* If the cursor is already positioned at the point we are trying
+  ** to move to, then just return without doing any work */
+  if( pCur->eState==CURSOR_VALID && (pCur->curFlags & BTCF_ValidNKey)!=0 ){
+    if( pCur->info.nKey==intKey ){
+      *pRes = 0;
+      return SQLITE_OK;
+    }
+    if( pCur->info.nKey<intKey ){
+      if( (pCur->curFlags & BTCF_AtLast)!=0 ){
+        *pRes = -1;
+        return SQLITE_OK;
+      }
+      /* If the requested key is one more than the previous key, then
+      ** try to get there using sqlite3BtreeNext() rather than a full
+      ** binary search.  This is an optimization only.  The correct answer
+      ** is still obtained without this case, only a little more slowely */
+      if( pCur->info.nKey+1==intKey ){
+        *pRes = 0;
+        rc = sqlite3BtreeNext(pCur, 0);
+        if( rc==SQLITE_OK ){
+          getCellInfo(pCur);
+          if( pCur->info.nKey==intKey ){
+            return SQLITE_OK;
+          }
+        }else if( rc!=SQLITE_DONE ){
+          return rc;
+        }
+      }
+    }
+  }
+
+#ifdef SQLITE_DEBUG
+  pCur->pBtree->nSeek++;   /* Performance measurement during testing */
+#endif
+
+  rc = moveToRoot(pCur);
+  if( rc ){
+    if( rc==SQLITE_EMPTY ){
+      assert( pCur->pgnoRoot==0 || pCur->pPage->nCell==0 );
+      *pRes = -1;
+      return SQLITE_OK;
+    }
+    return rc;
+  }
+  assert( pCur->pPage );
+  assert( pCur->pPage->isInit );
+  assert( pCur->eState==CURSOR_VALID );
+  assert( pCur->pPage->nCell > 0 );
+  assert( pCur->iPage==0 || pCur->apPage[0]->intKey==pCur->curIntKey );
+  assert( pCur->curIntKey );
+
+  for(;;){
+    int lwr, upr, idx, c;
+    Pgno chldPg;
+    MemPage *pPage = pCur->pPage;
+    u8 *pCell;                          /* Pointer to current cell in pPage */
+
+    /* pPage->nCell must be greater than zero. If this is the root-page
+    ** the cursor would have been INVALID above and this for(;;) loop
+    ** not run. If this is not the root-page, then the moveToChild() routine
+    ** would have already detected db corruption. Similarly, pPage must
+    ** be the right kind (index or table) of b-tree page. Otherwise
+    ** a moveToChild() or moveToRoot() call would have detected corruption.  */
+    assert( pPage->nCell>0 );
+    assert( pPage->intKey );
+    lwr = 0;
+    upr = pPage->nCell-1;
+    assert( biasRight==0 || biasRight==1 );
+    idx = upr>>(1-biasRight); /* idx = biasRight ? upr : (lwr+upr)/2; */
+    for(;;){
+      i64 nCellKey;
+      pCell = findCellPastPtr(pPage, idx);
+      if( pPage->intKeyLeaf ){
+        while( 0x80 <= *(pCell++) ){
+          if( pCell>=pPage->aDataEnd ){
+            return SQLITE_CORRUPT_PAGE(pPage);
+          }
+        }
+      }
+      getVarint(pCell, (u64*)&nCellKey);
+      if( nCellKey<intKey ){
+        lwr = idx+1;
+        if( lwr>upr ){ c = -1; break; }
+      }else if( nCellKey>intKey ){
+        upr = idx-1;
+        if( lwr>upr ){ c = +1; break; }
+      }else{
+        assert( nCellKey==intKey );
+        pCur->ix = (u16)idx;
+        if( !pPage->leaf ){
+          lwr = idx;
+          goto moveto_table_next_layer;
+        }else{
+          pCur->curFlags |= BTCF_ValidNKey;
+          pCur->info.nKey = nCellKey;
+          pCur->info.nSize = 0;
+          *pRes = 0;
+          return SQLITE_OK;
+        }
+      }
+      assert( lwr+upr>=0 );
+      idx = (lwr+upr)>>1;  /* idx = (lwr+upr)/2; */
+    }
+    assert( lwr==upr+1 || !pPage->leaf );
+    assert( pPage->isInit );
+    if( pPage->leaf ){
+      assert( pCur->ix<pCur->pPage->nCell );
+      pCur->ix = (u16)idx;
+      *pRes = c;
+      rc = SQLITE_OK;
+      goto moveto_table_finish;
+    }
+moveto_table_next_layer:
+    if( lwr>=pPage->nCell ){
+      chldPg = get4byte(&pPage->aData[pPage->hdrOffset+8]);
+    }else{
+      chldPg = get4byte(findCell(pPage, lwr));
+    }
+    pCur->ix = (u16)lwr;
+    rc = moveToChild(pCur, chldPg);
+    if( rc ) break;
+  }
+moveto_table_finish:
+  pCur->info.nSize = 0;
+  assert( (pCur->curFlags & BTCF_ValidOvfl)==0 );
+  return rc;
+}
+
+/*
+** Compare the "idx"-th cell on the page the cursor pCur is currently
+** pointin
