@@ -72574,4 +72574,199 @@ moveto_table_finish:
 
 /*
 ** Compare the "idx"-th cell on the page the cursor pCur is currently
-** pointin
+** pointing to to pIdxKey using xRecordCompare.  Return negative or
+** zero if the cell is less than or equal pIdxKey.  Return positive
+** if unknown.
+**
+**    Return value negative:     Cell at pCur[idx] less than pIdxKey
+**
+**    Return value is zero:      Cell at pCur[idx] equals pIdxKey
+**
+**    Return value positive:     Nothing is known about the relationship
+**                               of the cell at pCur[idx] and pIdxKey.
+**
+** This routine is part of an optimization.  It is always safe to return
+** a positive value as that will cause the optimization to be skipped.
+*/
+static int indexCellCompare(
+  BtCursor *pCur,
+  int idx,
+  UnpackedRecord *pIdxKey,
+  RecordCompare xRecordCompare
+){
+  MemPage *pPage = pCur->pPage;
+  int c;
+  int nCell;  /* Size of the pCell cell in bytes */
+  u8 *pCell = findCellPastPtr(pPage, idx);
+
+  nCell = pCell[0];
+  if( nCell<=pPage->max1bytePayload ){
+    /* This branch runs if the record-size field of the cell is a
+    ** single byte varint and the record fits entirely on the main
+    ** b-tree page.  */
+    testcase( pCell+nCell+1==pPage->aDataEnd );
+    c = xRecordCompare(nCell, (void*)&pCell[1], pIdxKey);
+  }else if( !(pCell[1] & 0x80)
+    && (nCell = ((nCell&0x7f)<<7) + pCell[1])<=pPage->maxLocal
+  ){
+    /* The record-size field is a 2 byte varint and the record
+    ** fits entirely on the main b-tree page.  */
+    testcase( pCell+nCell+2==pPage->aDataEnd );
+    c = xRecordCompare(nCell, (void*)&pCell[2], pIdxKey);
+  }else{
+    /* If the record extends into overflow pages, do not attempt
+    ** the optimization. */
+    c = 99;
+  }
+  return c;
+}
+
+/*
+** Return true (non-zero) if pCur is current pointing to the last
+** page of a table.
+*/
+static int cursorOnLastPage(BtCursor *pCur){
+  int i;
+  assert( pCur->eState==CURSOR_VALID );
+  for(i=0; i<pCur->iPage; i++){
+    MemPage *pPage = pCur->apPage[i];
+    if( pCur->aiIdx[i]<pPage->nCell ) return 0;
+  }
+  return 1;
+}
+
+/* Move the cursor so that it points to an entry in an index table
+** near the key pIdxKey.   Return a success code.
+**
+** If an exact match is not found, then the cursor is always
+** left pointing at a leaf page which would hold the entry if it
+** were present.  The cursor might point to an entry that comes
+** before or after the key.
+**
+** An integer is written into *pRes which is the result of
+** comparing the key with the entry to which the cursor is
+** pointing.  The meaning of the integer written into
+** *pRes is as follows:
+**
+**     *pRes<0      The cursor is left pointing at an entry that
+**                  is smaller than pIdxKey or if the table is empty
+**                  and the cursor is therefore left point to nothing.
+**
+**     *pRes==0     The cursor is left pointing at an entry that
+**                  exactly matches pIdxKey.
+**
+**     *pRes>0      The cursor is left pointing at an entry that
+**                  is larger than pIdxKey.
+**
+** The pIdxKey->eqSeen field is set to 1 if there
+** exists an entry in the table that exactly matches pIdxKey.
+*/
+SQLITE_PRIVATE int sqlite3BtreeIndexMoveto(
+  BtCursor *pCur,          /* The cursor to be moved */
+  UnpackedRecord *pIdxKey, /* Unpacked index key */
+  int *pRes                /* Write search results here */
+){
+  int rc;
+  RecordCompare xRecordCompare;
+
+  assert( cursorOwnsBtShared(pCur) );
+  assert( sqlite3_mutex_held(pCur->pBtree->db->mutex) );
+  assert( pRes );
+  assert( pCur->pKeyInfo!=0 );
+
+#ifdef SQLITE_DEBUG
+  pCur->pBtree->nSeek++;   /* Performance measurement during testing */
+#endif
+
+  xRecordCompare = sqlite3VdbeFindCompare(pIdxKey);
+  pIdxKey->errCode = 0;
+  assert( pIdxKey->default_rc==1
+       || pIdxKey->default_rc==0
+       || pIdxKey->default_rc==-1
+  );
+
+
+  /* Check to see if we can skip a lot of work.  Two cases:
+  **
+  **    (1) If the cursor is already pointing to the very last cell
+  **        in the table and the pIdxKey search key is greater than or
+  **        equal to that last cell, then no movement is required.
+  **
+  **    (2) If the cursor is on the last page of the table and the first
+  **        cell on that last page is less than or equal to the pIdxKey
+  **        search key, then we can start the search on the current page
+  **        without needing to go back to root.
+  */
+  if( pCur->eState==CURSOR_VALID
+   && pCur->pPage->leaf
+   && cursorOnLastPage(pCur)
+  ){
+    int c;
+    if( pCur->ix==pCur->pPage->nCell-1
+     && (c = indexCellCompare(pCur, pCur->ix, pIdxKey, xRecordCompare))<=0
+     && pIdxKey->errCode==SQLITE_OK
+    ){
+      *pRes = c;
+      return SQLITE_OK;  /* Cursor already pointing at the correct spot */
+    }
+    if( pCur->iPage>0
+     && indexCellCompare(pCur, 0, pIdxKey, xRecordCompare)<=0
+     && pIdxKey->errCode==SQLITE_OK
+    ){
+      pCur->curFlags &= ~BTCF_ValidOvfl;
+      if( !pCur->pPage->isInit ){
+        return SQLITE_CORRUPT_BKPT;
+      }
+      goto bypass_moveto_root;  /* Start search on the current page */
+    }
+    pIdxKey->errCode = SQLITE_OK;
+  }
+
+  rc = moveToRoot(pCur);
+  if( rc ){
+    if( rc==SQLITE_EMPTY ){
+      assert( pCur->pgnoRoot==0 || pCur->pPage->nCell==0 );
+      *pRes = -1;
+      return SQLITE_OK;
+    }
+    return rc;
+  }
+
+bypass_moveto_root:
+  assert( pCur->pPage );
+  assert( pCur->pPage->isInit );
+  assert( pCur->eState==CURSOR_VALID );
+  assert( pCur->pPage->nCell > 0 );
+  assert( pCur->curIntKey==0 );
+  assert( pIdxKey!=0 );
+  for(;;){
+    int lwr, upr, idx, c;
+    Pgno chldPg;
+    MemPage *pPage = pCur->pPage;
+    u8 *pCell;                          /* Pointer to current cell in pPage */
+
+    /* pPage->nCell must be greater than zero. If this is the root-page
+    ** the cursor would have been INVALID above and this for(;;) loop
+    ** not run. If this is not the root-page, then the moveToChild() routine
+    ** would have already detected db corruption. Similarly, pPage must
+    ** be the right kind (index or table) of b-tree page. Otherwise
+    ** a moveToChild() or moveToRoot() call would have detected corruption.  */
+    assert( pPage->nCell>0 );
+    assert( pPage->intKey==0 );
+    lwr = 0;
+    upr = pPage->nCell-1;
+    idx = upr>>1; /* idx = (lwr+upr)/2; */
+    for(;;){
+      int nCell;  /* Size of the pCell cell in bytes */
+      pCell = findCellPastPtr(pPage, idx);
+
+      /* The maximum supported page-size is 65536 bytes. This means that
+      ** the maximum number of record bytes stored on an index B-Tree
+      ** page is less than 16384 bytes and may be stored as a 2-byte
+      ** varint. This information is used to attempt to avoid parsing
+      ** the entire cell by checking for the cases where the record is
+      ** stored entirely within the b-tree page by inspecting the first
+      ** 2 bytes of the cell.
+      */
+      nCell = pCell[0];
+      if( n
