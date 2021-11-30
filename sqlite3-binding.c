@@ -72952,4 +72952,204 @@ static SQLITE_NOINLINE int btreeNext(BtCursor *pCur){
   if( !pPage->isInit || sqlite3FaultSim(412) ){
     /* The only known way for this to happen is for there to be a
     ** recursive SQL function that does a DELETE operation as part of a
-    ** SELECT which deletes 
+    ** SELECT which deletes content out from under an active cursor
+    ** in a corrupt database file where the table being DELETE-ed from
+    ** has pages in common with the table being queried.  See TH3
+    ** module cov1/btree78.test testcase 220 (2018-06-08) for an
+    ** example. */
+    return SQLITE_CORRUPT_BKPT;
+  }
+
+  if( idx>=pPage->nCell ){
+    if( !pPage->leaf ){
+      rc = moveToChild(pCur, get4byte(&pPage->aData[pPage->hdrOffset+8]));
+      if( rc ) return rc;
+      return moveToLeftmost(pCur);
+    }
+    do{
+      if( pCur->iPage==0 ){
+        pCur->eState = CURSOR_INVALID;
+        return SQLITE_DONE;
+      }
+      moveToParent(pCur);
+      pPage = pCur->pPage;
+    }while( pCur->ix>=pPage->nCell );
+    if( pPage->intKey ){
+      return sqlite3BtreeNext(pCur, 0);
+    }else{
+      return SQLITE_OK;
+    }
+  }
+  if( pPage->leaf ){
+    return SQLITE_OK;
+  }else{
+    return moveToLeftmost(pCur);
+  }
+}
+SQLITE_PRIVATE int sqlite3BtreeNext(BtCursor *pCur, int flags){
+  MemPage *pPage;
+  UNUSED_PARAMETER( flags );  /* Used in COMDB2 but not native SQLite */
+  assert( cursorOwnsBtShared(pCur) );
+  assert( flags==0 || flags==1 );
+  pCur->info.nSize = 0;
+  pCur->curFlags &= ~(BTCF_ValidNKey|BTCF_ValidOvfl);
+  if( pCur->eState!=CURSOR_VALID ) return btreeNext(pCur);
+  pPage = pCur->pPage;
+  if( (++pCur->ix)>=pPage->nCell ){
+    pCur->ix--;
+    return btreeNext(pCur);
+  }
+  if( pPage->leaf ){
+    return SQLITE_OK;
+  }else{
+    return moveToLeftmost(pCur);
+  }
+}
+
+/*
+** Step the cursor to the back to the previous entry in the database.
+** Return values:
+**
+**     SQLITE_OK     success
+**     SQLITE_DONE   the cursor is already on the first element of the table
+**     otherwise     some kind of error occurred
+**
+** The main entry point is sqlite3BtreePrevious().  That routine is optimized
+** for the common case of merely decrementing the cell counter BtCursor.aiIdx
+** to the previous cell on the current page.  The (slower) btreePrevious()
+** helper routine is called when it is necessary to move to a different page
+** or to restore the cursor.
+**
+** If bit 0x01 of the F argument to sqlite3BtreePrevious(C,F) is 1, then
+** the cursor corresponds to an SQL index and this routine could have been
+** skipped if the SQL index had been a unique index.  The F argument is a
+** hint to the implement.  The native SQLite btree implementation does not
+** use this hint, but COMDB2 does.
+*/
+static SQLITE_NOINLINE int btreePrevious(BtCursor *pCur){
+  int rc;
+  MemPage *pPage;
+
+  assert( cursorOwnsBtShared(pCur) );
+  assert( (pCur->curFlags & (BTCF_AtLast|BTCF_ValidOvfl|BTCF_ValidNKey))==0 );
+  assert( pCur->info.nSize==0 );
+  if( pCur->eState!=CURSOR_VALID ){
+    rc = restoreCursorPosition(pCur);
+    if( rc!=SQLITE_OK ){
+      return rc;
+    }
+    if( CURSOR_INVALID==pCur->eState ){
+      return SQLITE_DONE;
+    }
+    if( CURSOR_SKIPNEXT==pCur->eState ){
+      pCur->eState = CURSOR_VALID;
+      if( pCur->skipNext<0 ) return SQLITE_OK;
+    }
+  }
+
+  pPage = pCur->pPage;
+  assert( pPage->isInit );
+  if( !pPage->leaf ){
+    int idx = pCur->ix;
+    rc = moveToChild(pCur, get4byte(findCell(pPage, idx)));
+    if( rc ) return rc;
+    rc = moveToRightmost(pCur);
+  }else{
+    while( pCur->ix==0 ){
+      if( pCur->iPage==0 ){
+        pCur->eState = CURSOR_INVALID;
+        return SQLITE_DONE;
+      }
+      moveToParent(pCur);
+    }
+    assert( pCur->info.nSize==0 );
+    assert( (pCur->curFlags & (BTCF_ValidOvfl))==0 );
+
+    pCur->ix--;
+    pPage = pCur->pPage;
+    if( pPage->intKey && !pPage->leaf ){
+      rc = sqlite3BtreePrevious(pCur, 0);
+    }else{
+      rc = SQLITE_OK;
+    }
+  }
+  return rc;
+}
+SQLITE_PRIVATE int sqlite3BtreePrevious(BtCursor *pCur, int flags){
+  assert( cursorOwnsBtShared(pCur) );
+  assert( flags==0 || flags==1 );
+  UNUSED_PARAMETER( flags );  /* Used in COMDB2 but not native SQLite */
+  pCur->curFlags &= ~(BTCF_AtLast|BTCF_ValidOvfl|BTCF_ValidNKey);
+  pCur->info.nSize = 0;
+  if( pCur->eState!=CURSOR_VALID
+   || pCur->ix==0
+   || pCur->pPage->leaf==0
+  ){
+    return btreePrevious(pCur);
+  }
+  pCur->ix--;
+  return SQLITE_OK;
+}
+
+/*
+** Allocate a new page from the database file.
+**
+** The new page is marked as dirty.  (In other words, sqlite3PagerWrite()
+** has already been called on the new page.)  The new page has also
+** been referenced and the calling routine is responsible for calling
+** sqlite3PagerUnref() on the new page when it is done.
+**
+** SQLITE_OK is returned on success.  Any other return value indicates
+** an error.  *ppPage is set to NULL in the event of an error.
+**
+** If the "nearby" parameter is not 0, then an effort is made to
+** locate a page close to the page number "nearby".  This can be used in an
+** attempt to keep related pages close to each other in the database file,
+** which in turn can make database access faster.
+**
+** If the eMode parameter is BTALLOC_EXACT and the nearby page exists
+** anywhere on the free-list, then it is guaranteed to be returned.  If
+** eMode is BTALLOC_LT then the page returned will be less than or equal
+** to nearby if any such page exists.  If eMode is BTALLOC_ANY then there
+** are no restrictions on which page is returned.
+*/
+static int allocateBtreePage(
+  BtShared *pBt,         /* The btree */
+  MemPage **ppPage,      /* Store pointer to the allocated page here */
+  Pgno *pPgno,           /* Store the page number here */
+  Pgno nearby,           /* Search for a page near this one */
+  u8 eMode               /* BTALLOC_EXACT, BTALLOC_LT, or BTALLOC_ANY */
+){
+  MemPage *pPage1;
+  int rc;
+  u32 n;     /* Number of pages on the freelist */
+  u32 k;     /* Number of leaves on the trunk of the freelist */
+  MemPage *pTrunk = 0;
+  MemPage *pPrevTrunk = 0;
+  Pgno mxPage;     /* Total size of the database file */
+
+  assert( sqlite3_mutex_held(pBt->mutex) );
+  assert( eMode==BTALLOC_ANY || (nearby>0 && IfNotOmitAV(pBt->autoVacuum)) );
+  pPage1 = pBt->pPage1;
+  mxPage = btreePagecount(pBt);
+  /* EVIDENCE-OF: R-05119-02637 The 4-byte big-endian integer at offset 36
+  ** stores stores the total number of pages on the freelist. */
+  n = get4byte(&pPage1->aData[36]);
+  testcase( n==mxPage-1 );
+  if( n>=mxPage ){
+    return SQLITE_CORRUPT_BKPT;
+  }
+  if( n>0 ){
+    /* There are pages on the freelist.  Reuse one of those pages. */
+    Pgno iTrunk;
+    u8 searchList = 0; /* If the free-list must be searched for 'nearby' */
+    u32 nSearch = 0;   /* Count of the number of search attempts */
+
+    /* If eMode==BTALLOC_EXACT and a query of the pointer-map
+    ** shows that the page 'nearby' is somewhere on the free-list, then
+    ** the entire-list will be searched for that page.
+    */
+#ifndef SQLITE_OMIT_AUTOVACUUM
+    if( eMode==BTALLOC_EXACT ){
+      if( nearby<=mxPage ){
+        u8 
