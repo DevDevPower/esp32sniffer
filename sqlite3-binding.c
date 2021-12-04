@@ -74934,4 +74934,202 @@ static int balance_nonroot(
     */
     if( pOld->aData[0]!=apOld[0]->aData[0] ){
       rc = SQLITE_CORRUPT_BKPT;
-      go
+      goto balance_cleanup;
+    }
+
+    /* Load b.apCell[] with pointers to all cells in pOld.  If pOld
+    ** contains overflow cells, include them in the b.apCell[] array
+    ** in the correct spot.
+    **
+    ** Note that when there are multiple overflow cells, it is always the
+    ** case that they are sequential and adjacent.  This invariant arises
+    ** because multiple overflows can only occurs when inserting divider
+    ** cells into a parent on a prior balance, and divider cells are always
+    ** adjacent and are inserted in order.  There is an assert() tagged
+    ** with "NOTE 1" in the overflow cell insertion loop to prove this
+    ** invariant.
+    **
+    ** This must be done in advance.  Once the balance starts, the cell
+    ** offset section of the btree page will be overwritten and we will no
+    ** long be able to find the cells if a pointer to each cell is not saved
+    ** first.
+    */
+    memset(&b.szCell[b.nCell], 0, sizeof(b.szCell[0])*(limit+pOld->nOverflow));
+    if( pOld->nOverflow>0 ){
+      if( NEVER(limit<pOld->aiOvfl[0]) ){
+        rc = SQLITE_CORRUPT_BKPT;
+        goto balance_cleanup;
+      }
+      limit = pOld->aiOvfl[0];
+      for(j=0; j<limit; j++){
+        b.apCell[b.nCell] = aData + (maskPage & get2byteAligned(piCell));
+        piCell += 2;
+        b.nCell++;
+      }
+      for(k=0; k<pOld->nOverflow; k++){
+        assert( k==0 || pOld->aiOvfl[k-1]+1==pOld->aiOvfl[k] );/* NOTE 1 */
+        b.apCell[b.nCell] = pOld->apOvfl[k];
+        b.nCell++;
+      }
+    }
+    piEnd = aData + pOld->cellOffset + 2*pOld->nCell;
+    while( piCell<piEnd ){
+      assert( b.nCell<nMaxCells );
+      b.apCell[b.nCell] = aData + (maskPage & get2byteAligned(piCell));
+      piCell += 2;
+      b.nCell++;
+    }
+    assert( (b.nCell-nCellAtStart)==(pOld->nCell+pOld->nOverflow) );
+
+    cntOld[i] = b.nCell;
+    if( i<nOld-1 && !leafData){
+      u16 sz = (u16)szNew[i];
+      u8 *pTemp;
+      assert( b.nCell<nMaxCells );
+      b.szCell[b.nCell] = sz;
+      pTemp = &aSpace1[iSpace1];
+      iSpace1 += sz;
+      assert( sz<=pBt->maxLocal+23 );
+      assert( iSpace1 <= (int)pBt->pageSize );
+      memcpy(pTemp, apDiv[i], sz);
+      b.apCell[b.nCell] = pTemp+leafCorrection;
+      assert( leafCorrection==0 || leafCorrection==4 );
+      b.szCell[b.nCell] = b.szCell[b.nCell] - leafCorrection;
+      if( !pOld->leaf ){
+        assert( leafCorrection==0 );
+        assert( pOld->hdrOffset==0 || CORRUPT_DB );
+        /* The right pointer of the child page pOld becomes the left
+        ** pointer of the divider cell */
+        memcpy(b.apCell[b.nCell], &pOld->aData[8], 4);
+      }else{
+        assert( leafCorrection==4 );
+        while( b.szCell[b.nCell]<4 ){
+          /* Do not allow any cells smaller than 4 bytes. If a smaller cell
+          ** does exist, pad it with 0x00 bytes. */
+          assert( b.szCell[b.nCell]==3 || CORRUPT_DB );
+          assert( b.apCell[b.nCell]==&aSpace1[iSpace1-3] || CORRUPT_DB );
+          aSpace1[iSpace1++] = 0x00;
+          b.szCell[b.nCell]++;
+        }
+      }
+      b.nCell++;
+    }
+  }
+
+  /*
+  ** Figure out the number of pages needed to hold all b.nCell cells.
+  ** Store this number in "k".  Also compute szNew[] which is the total
+  ** size of all cells on the i-th page and cntNew[] which is the index
+  ** in b.apCell[] of the cell that divides page i from page i+1.
+  ** cntNew[k] should equal b.nCell.
+  **
+  ** Values computed by this block:
+  **
+  **           k: The total number of sibling pages
+  **    szNew[i]: Spaced used on the i-th sibling page.
+  **   cntNew[i]: Index in b.apCell[] and b.szCell[] for the first cell to
+  **              the right of the i-th sibling page.
+  ** usableSpace: Number of bytes of space available on each sibling.
+  **
+  */
+  usableSpace = pBt->usableSize - 12 + leafCorrection;
+  for(i=k=0; i<nOld; i++, k++){
+    MemPage *p = apOld[i];
+    b.apEnd[k] = p->aDataEnd;
+    b.ixNx[k] = cntOld[i];
+    if( k && b.ixNx[k]==b.ixNx[k-1] ){
+      k--;  /* Omit b.ixNx[] entry for child pages with no cells */
+    }
+    if( !leafData ){
+      k++;
+      b.apEnd[k] = pParent->aDataEnd;
+      b.ixNx[k] = cntOld[i]+1;
+    }
+    assert( p->nFree>=0 );
+    szNew[i] = usableSpace - p->nFree;
+    for(j=0; j<p->nOverflow; j++){
+      szNew[i] += 2 + p->xCellSize(p, p->apOvfl[j]);
+    }
+    cntNew[i] = cntOld[i];
+  }
+  k = nOld;
+  for(i=0; i<k; i++){
+    int sz;
+    while( szNew[i]>usableSpace ){
+      if( i+1>=k ){
+        k = i+2;
+        if( k>NB+2 ){ rc = SQLITE_CORRUPT_BKPT; goto balance_cleanup; }
+        szNew[k-1] = 0;
+        cntNew[k-1] = b.nCell;
+      }
+      sz = 2 + cachedCellSize(&b, cntNew[i]-1);
+      szNew[i] -= sz;
+      if( !leafData ){
+        if( cntNew[i]<b.nCell ){
+          sz = 2 + cachedCellSize(&b, cntNew[i]);
+        }else{
+          sz = 0;
+        }
+      }
+      szNew[i+1] += sz;
+      cntNew[i]--;
+    }
+    while( cntNew[i]<b.nCell ){
+      sz = 2 + cachedCellSize(&b, cntNew[i]);
+      if( szNew[i]+sz>usableSpace ) break;
+      szNew[i] += sz;
+      cntNew[i]++;
+      if( !leafData ){
+        if( cntNew[i]<b.nCell ){
+          sz = 2 + cachedCellSize(&b, cntNew[i]);
+        }else{
+          sz = 0;
+        }
+      }
+      szNew[i+1] -= sz;
+    }
+    if( cntNew[i]>=b.nCell ){
+      k = i+1;
+    }else if( cntNew[i] <= (i>0 ? cntNew[i-1] : 0) ){
+      rc = SQLITE_CORRUPT_BKPT;
+      goto balance_cleanup;
+    }
+  }
+
+  /*
+  ** The packing computed by the previous block is biased toward the siblings
+  ** on the left side (siblings with smaller keys). The left siblings are
+  ** always nearly full, while the right-most sibling might be nearly empty.
+  ** The next block of code attempts to adjust the packing of siblings to
+  ** get a better balance.
+  **
+  ** This adjustment is more than an optimization.  The packing above might
+  ** be so out of balance as to be illegal.  For example, the right-most
+  ** sibling might be completely empty.  This adjustment is not optional.
+  */
+  for(i=k-1; i>0; i--){
+    int szRight = szNew[i];  /* Size of sibling on the right */
+    int szLeft = szNew[i-1]; /* Size of sibling on the left */
+    int r;              /* Index of right-most cell in left sibling */
+    int d;              /* Index of first cell to the left of right sibling */
+
+    r = cntNew[i-1] - 1;
+    d = r + 1 - leafData;
+    (void)cachedCellSize(&b, d);
+    do{
+      assert( d<nMaxCells );
+      assert( r<nMaxCells );
+      (void)cachedCellSize(&b, r);
+      if( szRight!=0
+       && (bBulk || szRight+b.szCell[d]+2 > szLeft-(b.szCell[r]+(i==k-1?0:2)))){
+        break;
+      }
+      szRight += b.szCell[d] + 2;
+      szLeft -= b.szCell[r] + 2;
+      cntNew[i-1] = r;
+      r--;
+      d--;
+    }while( r>=0 );
+    szNew[i] = szRight;
+    szNew[i-1] = szLeft;
+    if( cntNew[i-1] <= (i>
