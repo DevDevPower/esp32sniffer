@@ -74602,4 +74602,162 @@ static int balance_quick(MemPage *pParent, MemPage *pPage, u8 *pSpace){
 /*
 ** This function does not contribute anything to the operation of SQLite.
 ** it is sometimes activated temporarily while debugging code responsible
-** for setting pointer-map entries
+** for setting pointer-map entries.
+*/
+static int ptrmapCheckPages(MemPage **apPage, int nPage){
+  int i, j;
+  for(i=0; i<nPage; i++){
+    Pgno n;
+    u8 e;
+    MemPage *pPage = apPage[i];
+    BtShared *pBt = pPage->pBt;
+    assert( pPage->isInit );
+
+    for(j=0; j<pPage->nCell; j++){
+      CellInfo info;
+      u8 *z;
+
+      z = findCell(pPage, j);
+      pPage->xParseCell(pPage, z, &info);
+      if( info.nLocal<info.nPayload ){
+        Pgno ovfl = get4byte(&z[info.nSize-4]);
+        ptrmapGet(pBt, ovfl, &e, &n);
+        assert( n==pPage->pgno && e==PTRMAP_OVERFLOW1 );
+      }
+      if( !pPage->leaf ){
+        Pgno child = get4byte(z);
+        ptrmapGet(pBt, child, &e, &n);
+        assert( n==pPage->pgno && e==PTRMAP_BTREE );
+      }
+    }
+    if( !pPage->leaf ){
+      Pgno child = get4byte(&pPage->aData[pPage->hdrOffset+8]);
+      ptrmapGet(pBt, child, &e, &n);
+      assert( n==pPage->pgno && e==PTRMAP_BTREE );
+    }
+  }
+  return 1;
+}
+#endif
+
+/*
+** This function is used to copy the contents of the b-tree node stored
+** on page pFrom to page pTo. If page pFrom was not a leaf page, then
+** the pointer-map entries for each child page are updated so that the
+** parent page stored in the pointer map is page pTo. If pFrom contained
+** any cells with overflow page pointers, then the corresponding pointer
+** map entries are also updated so that the parent page is page pTo.
+**
+** If pFrom is currently carrying any overflow cells (entries in the
+** MemPage.apOvfl[] array), they are not copied to pTo.
+**
+** Before returning, page pTo is reinitialized using btreeInitPage().
+**
+** The performance of this function is not critical. It is only used by
+** the balance_shallower() and balance_deeper() procedures, neither of
+** which are called often under normal circumstances.
+*/
+static void copyNodeContent(MemPage *pFrom, MemPage *pTo, int *pRC){
+  if( (*pRC)==SQLITE_OK ){
+    BtShared * const pBt = pFrom->pBt;
+    u8 * const aFrom = pFrom->aData;
+    u8 * const aTo = pTo->aData;
+    int const iFromHdr = pFrom->hdrOffset;
+    int const iToHdr = ((pTo->pgno==1) ? 100 : 0);
+    int rc;
+    int iData;
+
+
+    assert( pFrom->isInit );
+    assert( pFrom->nFree>=iToHdr );
+    assert( get2byte(&aFrom[iFromHdr+5]) <= (int)pBt->usableSize );
+
+    /* Copy the b-tree node content from page pFrom to page pTo. */
+    iData = get2byte(&aFrom[iFromHdr+5]);
+    memcpy(&aTo[iData], &aFrom[iData], pBt->usableSize-iData);
+    memcpy(&aTo[iToHdr], &aFrom[iFromHdr], pFrom->cellOffset + 2*pFrom->nCell);
+
+    /* Reinitialize page pTo so that the contents of the MemPage structure
+    ** match the new data. The initialization of pTo can actually fail under
+    ** fairly obscure circumstances, even though it is a copy of initialized
+    ** page pFrom.
+    */
+    pTo->isInit = 0;
+    rc = btreeInitPage(pTo);
+    if( rc==SQLITE_OK ) rc = btreeComputeFreeSpace(pTo);
+    if( rc!=SQLITE_OK ){
+      *pRC = rc;
+      return;
+    }
+
+    /* If this is an auto-vacuum database, update the pointer-map entries
+    ** for any b-tree or overflow pages that pTo now contains the pointers to.
+    */
+    if( ISAUTOVACUUM ){
+      *pRC = setChildPtrmaps(pTo);
+    }
+  }
+}
+
+/*
+** This routine redistributes cells on the iParentIdx'th child of pParent
+** (hereafter "the page") and up to 2 siblings so that all pages have about the
+** same amount of free space. Usually a single sibling on either side of the
+** page are used in the balancing, though both siblings might come from one
+** side if the page is the first or last child of its parent. If the page
+** has fewer than 2 siblings (something which can only happen if the page
+** is a root page or a child of a root page) then all available siblings
+** participate in the balancing.
+**
+** The number of siblings of the page might be increased or decreased by
+** one or two in an effort to keep pages nearly full but not over full.
+**
+** Note that when this routine is called, some of the cells on the page
+** might not actually be stored in MemPage.aData[]. This can happen
+** if the page is overfull. This routine ensures that all cells allocated
+** to the page and its siblings fit into MemPage.aData[] before returning.
+**
+** In the course of balancing the page and its siblings, cells may be
+** inserted into or removed from the parent page (pParent). Doing so
+** may cause the parent page to become overfull or underfull. If this
+** happens, it is the responsibility of the caller to invoke the correct
+** balancing routine to fix this problem (see the balance() routine).
+**
+** If this routine fails for any reason, it might leave the database
+** in a corrupted state. So if this routine fails, the database should
+** be rolled back.
+**
+** The third argument to this function, aOvflSpace, is a pointer to a
+** buffer big enough to hold one page. If while inserting cells into the parent
+** page (pParent) the parent page becomes overfull, this buffer is
+** used to store the parent's overflow cells. Because this function inserts
+** a maximum of four divider cells into the parent page, and the maximum
+** size of a cell stored within an internal node is always less than 1/4
+** of the page-size, the aOvflSpace[] buffer is guaranteed to be large
+** enough for all overflow cells.
+**
+** If aOvflSpace is set to a null pointer, this function returns
+** SQLITE_NOMEM.
+*/
+static int balance_nonroot(
+  MemPage *pParent,               /* Parent page of siblings being balanced */
+  int iParentIdx,                 /* Index of "the page" in pParent */
+  u8 *aOvflSpace,                 /* page-size bytes of space for parent ovfl */
+  int isRoot,                     /* True if pParent is a root-page */
+  int bBulk                       /* True if this call is part of a bulk load */
+){
+  BtShared *pBt;               /* The whole database */
+  int nMaxCells = 0;           /* Allocated size of apCell, szCell, aFrom. */
+  int nNew = 0;                /* Number of pages in apNew[] */
+  int nOld;                    /* Number of pages in apOld[] */
+  int i, j, k;                 /* Loop counters */
+  int nxDiv;                   /* Next divider slot in pParent->aCell[] */
+  int rc = SQLITE_OK;          /* The return code */
+  u16 leafCorrection;          /* 4 if pPage is a leaf.  0 if not */
+  int leafData;                /* True if pPage is a leaf of a LEAFDATA tree */
+  int usableSpace;             /* Bytes in pPage beyond the header */
+  int pageFlags;               /* Value of pPage->aData[0] */
+  int iSpace1 = 0;             /* First unused byte of aSpace1[] */
+  int iOvflSpace = 0;          /* First unused byte of aOvflSpace[] */
+  int szScratch;               /* Size of scratch memory requested */
+  MemPage *apOld[NB];        
