@@ -74760,4 +74760,178 @@ static int balance_nonroot(
   int iSpace1 = 0;             /* First unused byte of aSpace1[] */
   int iOvflSpace = 0;          /* First unused byte of aOvflSpace[] */
   int szScratch;               /* Size of scratch memory requested */
-  MemPage *apOld[NB];        
+  MemPage *apOld[NB];          /* pPage and up to two siblings */
+  MemPage *apNew[NB+2];        /* pPage and up to NB siblings after balancing */
+  u8 *pRight;                  /* Location in parent of right-sibling pointer */
+  u8 *apDiv[NB-1];             /* Divider cells in pParent */
+  int cntNew[NB+2];            /* Index in b.paCell[] of cell after i-th page */
+  int cntOld[NB+2];            /* Old index in b.apCell[] */
+  int szNew[NB+2];             /* Combined size of cells placed on i-th page */
+  u8 *aSpace1;                 /* Space for copies of dividers cells */
+  Pgno pgno;                   /* Temp var to store a page number in */
+  u8 abDone[NB+2];             /* True after i'th new page is populated */
+  Pgno aPgno[NB+2];            /* Page numbers of new pages before shuffling */
+  CellArray b;                 /* Parsed information on cells being balanced */
+
+  memset(abDone, 0, sizeof(abDone));
+  memset(&b, 0, sizeof(b));
+  pBt = pParent->pBt;
+  assert( sqlite3_mutex_held(pBt->mutex) );
+  assert( sqlite3PagerIswriteable(pParent->pDbPage) );
+
+  /* At this point pParent may have at most one overflow cell. And if
+  ** this overflow cell is present, it must be the cell with
+  ** index iParentIdx. This scenario comes about when this function
+  ** is called (indirectly) from sqlite3BtreeDelete().
+  */
+  assert( pParent->nOverflow==0 || pParent->nOverflow==1 );
+  assert( pParent->nOverflow==0 || pParent->aiOvfl[0]==iParentIdx );
+
+  if( !aOvflSpace ){
+    return SQLITE_NOMEM_BKPT;
+  }
+  assert( pParent->nFree>=0 );
+
+  /* Find the sibling pages to balance. Also locate the cells in pParent
+  ** that divide the siblings. An attempt is made to find NN siblings on
+  ** either side of pPage. More siblings are taken from one side, however,
+  ** if there are fewer than NN siblings on the other side. If pParent
+  ** has NB or fewer children then all children of pParent are taken.
+  **
+  ** This loop also drops the divider cells from the parent page. This
+  ** way, the remainder of the function does not have to deal with any
+  ** overflow cells in the parent page, since if any existed they will
+  ** have already been removed.
+  */
+  i = pParent->nOverflow + pParent->nCell;
+  if( i<2 ){
+    nxDiv = 0;
+  }else{
+    assert( bBulk==0 || bBulk==1 );
+    if( iParentIdx==0 ){
+      nxDiv = 0;
+    }else if( iParentIdx==i ){
+      nxDiv = i-2+bBulk;
+    }else{
+      nxDiv = iParentIdx-1;
+    }
+    i = 2-bBulk;
+  }
+  nOld = i+1;
+  if( (i+nxDiv-pParent->nOverflow)==pParent->nCell ){
+    pRight = &pParent->aData[pParent->hdrOffset+8];
+  }else{
+    pRight = findCell(pParent, i+nxDiv-pParent->nOverflow);
+  }
+  pgno = get4byte(pRight);
+  while( 1 ){
+    if( rc==SQLITE_OK ){
+      rc = getAndInitPage(pBt, pgno, &apOld[i], 0, 0);
+    }
+    if( rc ){
+      memset(apOld, 0, (i+1)*sizeof(MemPage*));
+      goto balance_cleanup;
+    }
+    if( apOld[i]->nFree<0 ){
+      rc = btreeComputeFreeSpace(apOld[i]);
+      if( rc ){
+        memset(apOld, 0, (i)*sizeof(MemPage*));
+        goto balance_cleanup;
+      }
+    }
+    nMaxCells += apOld[i]->nCell + ArraySize(pParent->apOvfl);
+    if( (i--)==0 ) break;
+
+    if( pParent->nOverflow && i+nxDiv==pParent->aiOvfl[0] ){
+      apDiv[i] = pParent->apOvfl[0];
+      pgno = get4byte(apDiv[i]);
+      szNew[i] = pParent->xCellSize(pParent, apDiv[i]);
+      pParent->nOverflow = 0;
+    }else{
+      apDiv[i] = findCell(pParent, i+nxDiv-pParent->nOverflow);
+      pgno = get4byte(apDiv[i]);
+      szNew[i] = pParent->xCellSize(pParent, apDiv[i]);
+
+      /* Drop the cell from the parent page. apDiv[i] still points to
+      ** the cell within the parent, even though it has been dropped.
+      ** This is safe because dropping a cell only overwrites the first
+      ** four bytes of it, and this function does not need the first
+      ** four bytes of the divider cell. So the pointer is safe to use
+      ** later on.
+      **
+      ** But not if we are in secure-delete mode. In secure-delete mode,
+      ** the dropCell() routine will overwrite the entire cell with zeroes.
+      ** In this case, temporarily copy the cell into the aOvflSpace[]
+      ** buffer. It will be copied out again as soon as the aSpace[] buffer
+      ** is allocated.  */
+      if( pBt->btsFlags & BTS_FAST_SECURE ){
+        int iOff;
+
+        /* If the following if() condition is not true, the db is corrupted.
+        ** The call to dropCell() below will detect this.  */
+        iOff = SQLITE_PTR_TO_INT(apDiv[i]) - SQLITE_PTR_TO_INT(pParent->aData);
+        if( (iOff+szNew[i])<=(int)pBt->usableSize ){
+          memcpy(&aOvflSpace[iOff], apDiv[i], szNew[i]);
+          apDiv[i] = &aOvflSpace[apDiv[i]-pParent->aData];
+        }
+      }
+      dropCell(pParent, i+nxDiv-pParent->nOverflow, szNew[i], &rc);
+    }
+  }
+
+  /* Make nMaxCells a multiple of 4 in order to preserve 8-byte
+  ** alignment */
+  nMaxCells = (nMaxCells + 3)&~3;
+
+  /*
+  ** Allocate space for memory structures
+  */
+  szScratch =
+       nMaxCells*sizeof(u8*)                       /* b.apCell */
+     + nMaxCells*sizeof(u16)                       /* b.szCell */
+     + pBt->pageSize;                              /* aSpace1 */
+
+  assert( szScratch<=7*(int)pBt->pageSize );
+  b.apCell = sqlite3StackAllocRaw(0, szScratch );
+  if( b.apCell==0 ){
+    rc = SQLITE_NOMEM_BKPT;
+    goto balance_cleanup;
+  }
+  b.szCell = (u16*)&b.apCell[nMaxCells];
+  aSpace1 = (u8*)&b.szCell[nMaxCells];
+  assert( EIGHT_BYTE_ALIGNMENT(aSpace1) );
+
+  /*
+  ** Load pointers to all cells on sibling pages and the divider cells
+  ** into the local b.apCell[] array.  Make copies of the divider cells
+  ** into space obtained from aSpace1[]. The divider cells have already
+  ** been removed from pParent.
+  **
+  ** If the siblings are on leaf pages, then the child pointers of the
+  ** divider cells are stripped from the cells before they are copied
+  ** into aSpace1[].  In this way, all cells in b.apCell[] are without
+  ** child pointers.  If siblings are not leaves, then all cell in
+  ** b.apCell[] include child pointers.  Either way, all cells in b.apCell[]
+  ** are alike.
+  **
+  ** leafCorrection:  4 if pPage is a leaf.  0 if pPage is not a leaf.
+  **       leafData:  1 if pPage holds key+data and pParent holds only keys.
+  */
+  b.pRef = apOld[0];
+  leafCorrection = b.pRef->leaf*4;
+  leafData = b.pRef->intKeyLeaf;
+  for(i=0; i<nOld; i++){
+    MemPage *pOld = apOld[i];
+    int limit = pOld->nCell;
+    u8 *aData = pOld->aData;
+    u16 maskPage = pOld->maskPage;
+    u8 *piCell = aData + pOld->cellOffset;
+    u8 *piEnd;
+    VVA_ONLY( int nCellAtStart = b.nCell; )
+
+    /* Verify that all sibling pages are of the same "type" (table-leaf,
+    ** table-interior, index-leaf, or index-interior).
+    */
+    if( pOld->aData[0]!=apOld[0]->aData[0] ){
+      rc = SQLITE_CORRUPT_BKPT;
+      go
