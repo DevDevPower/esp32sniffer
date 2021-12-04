@@ -74235,4 +74235,185 @@ static int rebuildPage(
 ** Argument pCellptr points to the first entry in the cell-pointer array
 ** (part of page pPg) to populate. After cell apCell[0] is written to the
 ** page body, a 16-bit offset is written to pCellptr. And so on, for each
-** cell in the arr
+** cell in the array. It is the responsibility of the caller to ensure
+** that it is safe to overwrite this part of the cell-pointer array.
+**
+** When this function is called, *ppData points to the start of the
+** content area on page pPg. If the size of the content area is extended,
+** *ppData is updated to point to the new start of the content area
+** before returning.
+**
+** Finally, argument pBegin points to the byte immediately following the
+** end of the space required by this page for the cell-pointer area (for
+** all cells - not just those inserted by the current call). If the content
+** area must be extended to before this point in order to accomodate all
+** cells in apCell[], then the cells do not fit and non-zero is returned.
+*/
+static int pageInsertArray(
+  MemPage *pPg,                   /* Page to add cells to */
+  u8 *pBegin,                     /* End of cell-pointer array */
+  u8 **ppData,                    /* IN/OUT: Page content-area pointer */
+  u8 *pCellptr,                   /* Pointer to cell-pointer area */
+  int iFirst,                     /* Index of first cell to add */
+  int nCell,                      /* Number of cells to add to pPg */
+  CellArray *pCArray              /* Array of cells */
+){
+  int i = iFirst;                 /* Loop counter - cell index to insert */
+  u8 *aData = pPg->aData;         /* Complete page */
+  u8 *pData = *ppData;            /* Content area.  A subset of aData[] */
+  int iEnd = iFirst + nCell;      /* End of loop. One past last cell to ins */
+  int k;                          /* Current slot in pCArray->apEnd[] */
+  u8 *pEnd;                       /* Maximum extent of cell data */
+  assert( CORRUPT_DB || pPg->hdrOffset==0 );    /* Never called on page 1 */
+  if( iEnd<=iFirst ) return 0;
+  for(k=0; pCArray->ixNx[k]<=i && ALWAYS(k<NB*2); k++){}
+  pEnd = pCArray->apEnd[k];
+  while( 1 /*Exit by break*/ ){
+    int sz, rc;
+    u8 *pSlot;
+    assert( pCArray->szCell[i]!=0 );
+    sz = pCArray->szCell[i];
+    if( (aData[1]==0 && aData[2]==0) || (pSlot = pageFindSlot(pPg,sz,&rc))==0 ){
+      if( (pData - pBegin)<sz ) return 1;
+      pData -= sz;
+      pSlot = pData;
+    }
+    /* pSlot and pCArray->apCell[i] will never overlap on a well-formed
+    ** database.  But they might for a corrupt database.  Hence use memmove()
+    ** since memcpy() sends SIGABORT with overlapping buffers on OpenBSD */
+    assert( (pSlot+sz)<=pCArray->apCell[i]
+         || pSlot>=(pCArray->apCell[i]+sz)
+         || CORRUPT_DB );
+    if( (uptr)(pCArray->apCell[i]+sz)>(uptr)pEnd
+     && (uptr)(pCArray->apCell[i])<(uptr)pEnd
+    ){
+      assert( CORRUPT_DB );
+      (void)SQLITE_CORRUPT_BKPT;
+      return 1;
+    }
+    memmove(pSlot, pCArray->apCell[i], sz);
+    put2byte(pCellptr, (pSlot - aData));
+    pCellptr += 2;
+    i++;
+    if( i>=iEnd ) break;
+    if( pCArray->ixNx[k]<=i ){
+      k++;
+      pEnd = pCArray->apEnd[k];
+    }
+  }
+  *ppData = pData;
+  return 0;
+}
+
+/*
+** The pCArray object contains pointers to b-tree cells and their sizes.
+**
+** This function adds the space associated with each cell in the array
+** that is currently stored within the body of pPg to the pPg free-list.
+** The cell-pointers and other fields of the page are not updated.
+**
+** This function returns the total number of cells added to the free-list.
+*/
+static int pageFreeArray(
+  MemPage *pPg,                   /* Page to edit */
+  int iFirst,                     /* First cell to delete */
+  int nCell,                      /* Cells to delete */
+  CellArray *pCArray              /* Array of cells */
+){
+  u8 * const aData = pPg->aData;
+  u8 * const pEnd = &aData[pPg->pBt->usableSize];
+  u8 * const pStart = &aData[pPg->hdrOffset + 8 + pPg->childPtrSize];
+  int nRet = 0;
+  int i;
+  int iEnd = iFirst + nCell;
+  u8 *pFree = 0;
+  int szFree = 0;
+
+  for(i=iFirst; i<iEnd; i++){
+    u8 *pCell = pCArray->apCell[i];
+    if( SQLITE_WITHIN(pCell, pStart, pEnd) ){
+      int sz;
+      /* No need to use cachedCellSize() here.  The sizes of all cells that
+      ** are to be freed have already been computing while deciding which
+      ** cells need freeing */
+      sz = pCArray->szCell[i];  assert( sz>0 );
+      if( pFree!=(pCell + sz) ){
+        if( pFree ){
+          assert( pFree>aData && (pFree - aData)<65536 );
+          freeSpace(pPg, (u16)(pFree - aData), szFree);
+        }
+        pFree = pCell;
+        szFree = sz;
+        if( pFree+sz>pEnd ){
+          return 0;
+        }
+      }else{
+        pFree = pCell;
+        szFree += sz;
+      }
+      nRet++;
+    }
+  }
+  if( pFree ){
+    assert( pFree>aData && (pFree - aData)<65536 );
+    freeSpace(pPg, (u16)(pFree - aData), szFree);
+  }
+  return nRet;
+}
+
+/*
+** pCArray contains pointers to and sizes of all cells in the page being
+** balanced.  The current page, pPg, has pPg->nCell cells starting with
+** pCArray->apCell[iOld].  After balancing, this page should hold nNew cells
+** starting at apCell[iNew].
+**
+** This routine makes the necessary adjustments to pPg so that it contains
+** the correct cells after being balanced.
+**
+** The pPg->nFree field is invalid when this function returns. It is the
+** responsibility of the caller to set it correctly.
+*/
+static int editPage(
+  MemPage *pPg,                   /* Edit this page */
+  int iOld,                       /* Index of first cell currently on page */
+  int iNew,                       /* Index of new first cell on page */
+  int nNew,                       /* Final number of cells on page */
+  CellArray *pCArray              /* Array of cells and sizes */
+){
+  u8 * const aData = pPg->aData;
+  const int hdr = pPg->hdrOffset;
+  u8 *pBegin = &pPg->aCellIdx[nNew * 2];
+  int nCell = pPg->nCell;       /* Cells stored on pPg */
+  u8 *pData;
+  u8 *pCellptr;
+  int i;
+  int iOldEnd = iOld + pPg->nCell + pPg->nOverflow;
+  int iNewEnd = iNew + nNew;
+
+#ifdef SQLITE_DEBUG
+  u8 *pTmp = sqlite3PagerTempSpace(pPg->pBt->pPager);
+  memcpy(pTmp, aData, pPg->pBt->usableSize);
+#endif
+
+  /* Remove cells from the start and end of the page */
+  assert( nCell>=0 );
+  if( iOld<iNew ){
+    int nShift = pageFreeArray(pPg, iOld, iNew-iOld, pCArray);
+    if( NEVER(nShift>nCell) ) return SQLITE_CORRUPT_BKPT;
+    memmove(pPg->aCellIdx, &pPg->aCellIdx[nShift*2], nCell*2);
+    nCell -= nShift;
+  }
+  if( iNewEnd < iOldEnd ){
+    int nTail = pageFreeArray(pPg, iNewEnd, iOldEnd - iNewEnd, pCArray);
+    assert( nCell>=nTail );
+    nCell -= nTail;
+  }
+
+  pData = &aData[get2byteNotZero(&aData[hdr+5])];
+  if( pData<pBegin ) goto editpage_fail;
+  if( pData>pPg->aDataEnd ) goto editpage_fail;
+
+  /* Add cells to the start of the page */
+  if( iNew<iOld ){
+    int nAdd = MIN(nNew,iOld-iNew);
+    assert( (iOld-iNew)<nN
