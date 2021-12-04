@@ -73516,4 +73516,183 @@ static int freePage2(BtShared *pBt, MemPage *pMemPage, Pgno iPage){
       ** Note that the trunk page is not really full until it contains
       ** usableSize/4 - 2 entries, not usableSize/4 - 8 entries as we have
       ** coded.  But due to a coding error in versions of SQLite prior to
-      ** 3.6.0
+      ** 3.6.0, databases with freelist trunk pages holding more than
+      ** usableSize/4 - 8 entries will be reported as corrupt.  In order
+      ** to maintain backwards compatibility with older versions of SQLite,
+      ** we will continue to restrict the number of entries to usableSize/4 - 8
+      ** for now.  At some point in the future (once everyone has upgraded
+      ** to 3.6.0 or later) we should consider fixing the conditional above
+      ** to read "usableSize/4-2" instead of "usableSize/4-8".
+      **
+      ** EVIDENCE-OF: R-19920-11576 However, newer versions of SQLite still
+      ** avoid using the last six entries in the freelist trunk page array in
+      ** order that database files created by newer versions of SQLite can be
+      ** read by older versions of SQLite.
+      */
+      rc = sqlite3PagerWrite(pTrunk->pDbPage);
+      if( rc==SQLITE_OK ){
+        put4byte(&pTrunk->aData[4], nLeaf+1);
+        put4byte(&pTrunk->aData[8+nLeaf*4], iPage);
+        if( pPage && (pBt->btsFlags & BTS_SECURE_DELETE)==0 ){
+          sqlite3PagerDontWrite(pPage->pDbPage);
+        }
+        rc = btreeSetHasContent(pBt, iPage);
+      }
+      TRACE(("FREE-PAGE: %d leaf on trunk page %d\n",pPage->pgno,pTrunk->pgno));
+      goto freepage_out;
+    }
+  }
+
+  /* If control flows to this point, then it was not possible to add the
+  ** the page being freed as a leaf page of the first trunk in the free-list.
+  ** Possibly because the free-list is empty, or possibly because the
+  ** first trunk in the free-list is full. Either way, the page being freed
+  ** will become the new first trunk page in the free-list.
+  */
+  if( pPage==0 && SQLITE_OK!=(rc = btreeGetPage(pBt, iPage, &pPage, 0)) ){
+    goto freepage_out;
+  }
+  rc = sqlite3PagerWrite(pPage->pDbPage);
+  if( rc!=SQLITE_OK ){
+    goto freepage_out;
+  }
+  put4byte(pPage->aData, iTrunk);
+  put4byte(&pPage->aData[4], 0);
+  put4byte(&pPage1->aData[32], iPage);
+  TRACE(("FREE-PAGE: %d new trunk page replacing %d\n", pPage->pgno, iTrunk));
+
+freepage_out:
+  if( pPage ){
+    pPage->isInit = 0;
+  }
+  releasePage(pPage);
+  releasePage(pTrunk);
+  return rc;
+}
+static void freePage(MemPage *pPage, int *pRC){
+  if( (*pRC)==SQLITE_OK ){
+    *pRC = freePage2(pPage->pBt, pPage, pPage->pgno);
+  }
+}
+
+/*
+** Free the overflow pages associated with the given Cell.
+*/
+static SQLITE_NOINLINE int clearCellOverflow(
+  MemPage *pPage,          /* The page that contains the Cell */
+  unsigned char *pCell,    /* First byte of the Cell */
+  CellInfo *pInfo          /* Size information about the cell */
+){
+  BtShared *pBt;
+  Pgno ovflPgno;
+  int rc;
+  int nOvfl;
+  u32 ovflPageSize;
+
+  assert( sqlite3_mutex_held(pPage->pBt->mutex) );
+  assert( pInfo->nLocal!=pInfo->nPayload );
+  testcase( pCell + pInfo->nSize == pPage->aDataEnd );
+  testcase( pCell + (pInfo->nSize-1) == pPage->aDataEnd );
+  if( pCell + pInfo->nSize > pPage->aDataEnd ){
+    /* Cell extends past end of page */
+    return SQLITE_CORRUPT_PAGE(pPage);
+  }
+  ovflPgno = get4byte(pCell + pInfo->nSize - 4);
+  pBt = pPage->pBt;
+  assert( pBt->usableSize > 4 );
+  ovflPageSize = pBt->usableSize - 4;
+  nOvfl = (pInfo->nPayload - pInfo->nLocal + ovflPageSize - 1)/ovflPageSize;
+  assert( nOvfl>0 ||
+    (CORRUPT_DB && (pInfo->nPayload + ovflPageSize)<ovflPageSize)
+  );
+  while( nOvfl-- ){
+    Pgno iNext = 0;
+    MemPage *pOvfl = 0;
+    if( ovflPgno<2 || ovflPgno>btreePagecount(pBt) ){
+      /* 0 is not a legal page number and page 1 cannot be an
+      ** overflow page. Therefore if ovflPgno<2 or past the end of the
+      ** file the database must be corrupt. */
+      return SQLITE_CORRUPT_BKPT;
+    }
+    if( nOvfl ){
+      rc = getOverflowPage(pBt, ovflPgno, &pOvfl, &iNext);
+      if( rc ) return rc;
+    }
+
+    if( ( pOvfl || ((pOvfl = btreePageLookup(pBt, ovflPgno))!=0) )
+     && sqlite3PagerPageRefcount(pOvfl->pDbPage)!=1
+    ){
+      /* There is no reason any cursor should have an outstanding reference
+      ** to an overflow page belonging to a cell that is being deleted/updated.
+      ** So if there exists more than one reference to this page, then it
+      ** must not really be an overflow page and the database must be corrupt.
+      ** It is helpful to detect this before calling freePage2(), as
+      ** freePage2() may zero the page contents if secure-delete mode is
+      ** enabled. If this 'overflow' page happens to be a page that the
+      ** caller is iterating through or using in some other way, this
+      ** can be problematic.
+      */
+      rc = SQLITE_CORRUPT_BKPT;
+    }else{
+      rc = freePage2(pBt, pOvfl, ovflPgno);
+    }
+
+    if( pOvfl ){
+      sqlite3PagerUnref(pOvfl->pDbPage);
+    }
+    if( rc ) return rc;
+    ovflPgno = iNext;
+  }
+  return SQLITE_OK;
+}
+
+/* Call xParseCell to compute the size of a cell.  If the cell contains
+** overflow, then invoke cellClearOverflow to clear out that overflow.
+** STore the result code (SQLITE_OK or some error code) in rc.
+**
+** Implemented as macro to force inlining for performance.
+*/
+#define BTREE_CLEAR_CELL(rc, pPage, pCell, sInfo)   \
+  pPage->xParseCell(pPage, pCell, &sInfo);          \
+  if( sInfo.nLocal!=sInfo.nPayload ){               \
+    rc = clearCellOverflow(pPage, pCell, &sInfo);   \
+  }else{                                            \
+    rc = SQLITE_OK;                                 \
+  }
+
+
+/*
+** Create the byte sequence used to represent a cell on page pPage
+** and write that byte sequence into pCell[].  Overflow pages are
+** allocated and filled in as necessary.  The calling procedure
+** is responsible for making sure sufficient space has been allocated
+** for pCell[].
+**
+** Note that pCell does not necessary need to point to the pPage->aData
+** area.  pCell might point to some temporary storage.  The cell will
+** be constructed in this temporary area then copied into pPage->aData
+** later.
+*/
+static int fillInCell(
+  MemPage *pPage,                /* The page that contains the cell */
+  unsigned char *pCell,          /* Complete text of the cell */
+  const BtreePayload *pX,        /* Payload with which to construct the cell */
+  int *pnSize                    /* Write cell size here */
+){
+  int nPayload;
+  const u8 *pSrc;
+  int nSrc, n, rc, mn;
+  int spaceLeft;
+  MemPage *pToRelease;
+  unsigned char *pPrior;
+  unsigned char *pPayload;
+  BtShared *pBt;
+  Pgno pgnoOvfl;
+  int nHeader;
+
+  assert( sqlite3_mutex_held(pPage->pBt->mutex) );
+
+  /* pPage is not necessarily writeable since pCell might be auxiliary
+  ** buffer space that is separate from the pPage buffer area */
+  assert( pCell<pPage->aData || pCell>=&pPage->aData[pPage->pBt->pageSize]
+            || sqlite3PagerIswriteabl
