@@ -74055,4 +74055,184 @@ static void insertCell(
 ** to overflow cells.  In other words, some apCel[] pointers might not point
 ** to content area of the pages.
 **
-** A szCell[] of zero means the size of that cell has
+** A szCell[] of zero means the size of that cell has not yet been computed.
+**
+** The cells come from as many as four different pages:
+**
+**             -----------
+**             | Parent  |
+**             -----------
+**            /     |     \
+**           /      |      \
+**  ---------   ---------   ---------
+**  |Child-1|   |Child-2|   |Child-3|
+**  ---------   ---------   ---------
+**
+** The order of cells is in the array is for an index btree is:
+**
+**       1.  All cells from Child-1 in order
+**       2.  The first divider cell from Parent
+**       3.  All cells from Child-2 in order
+**       4.  The second divider cell from Parent
+**       5.  All cells from Child-3 in order
+**
+** For a table-btree (with rowids) the items 2 and 4 are empty because
+** content exists only in leaves and there are no divider cells.
+**
+** For an index btree, the apEnd[] array holds pointer to the end of page
+** for Child-1, the Parent, Child-2, the Parent (again), and Child-3,
+** respectively. The ixNx[] array holds the number of cells contained in
+** each of these 5 stages, and all stages to the left.  Hence:
+**
+**    ixNx[0] = Number of cells in Child-1.
+**    ixNx[1] = Number of cells in Child-1 plus 1 for first divider.
+**    ixNx[2] = Number of cells in Child-1 and Child-2 + 1 for 1st divider.
+**    ixNx[3] = Number of cells in Child-1 and Child-2 + both divider cells
+**    ixNx[4] = Total number of cells.
+**
+** For a table-btree, the concept is similar, except only apEnd[0]..apEnd[2]
+** are used and they point to the leaf pages only, and the ixNx value are:
+**
+**    ixNx[0] = Number of cells in Child-1.
+**    ixNx[1] = Number of cells in Child-1 and Child-2.
+**    ixNx[2] = Total number of cells.
+**
+** Sometimes when deleting, a child page can have zero cells.  In those
+** cases, ixNx[] entries with higher indexes, and the corresponding apEnd[]
+** entries, shift down.  The end result is that each ixNx[] entry should
+** be larger than the previous
+*/
+typedef struct CellArray CellArray;
+struct CellArray {
+  int nCell;              /* Number of cells in apCell[] */
+  MemPage *pRef;          /* Reference page */
+  u8 **apCell;            /* All cells begin balanced */
+  u16 *szCell;            /* Local size of all cells in apCell[] */
+  u8 *apEnd[NB*2];        /* MemPage.aDataEnd values */
+  int ixNx[NB*2];         /* Index of at which we move to the next apEnd[] */
+};
+
+/*
+** Make sure the cell sizes at idx, idx+1, ..., idx+N-1 have been
+** computed.
+*/
+static void populateCellCache(CellArray *p, int idx, int N){
+  assert( idx>=0 && idx+N<=p->nCell );
+  while( N>0 ){
+    assert( p->apCell[idx]!=0 );
+    if( p->szCell[idx]==0 ){
+      p->szCell[idx] = p->pRef->xCellSize(p->pRef, p->apCell[idx]);
+    }else{
+      assert( CORRUPT_DB ||
+              p->szCell[idx]==p->pRef->xCellSize(p->pRef, p->apCell[idx]) );
+    }
+    idx++;
+    N--;
+  }
+}
+
+/*
+** Return the size of the Nth element of the cell array
+*/
+static SQLITE_NOINLINE u16 computeCellSize(CellArray *p, int N){
+  assert( N>=0 && N<p->nCell );
+  assert( p->szCell[N]==0 );
+  p->szCell[N] = p->pRef->xCellSize(p->pRef, p->apCell[N]);
+  return p->szCell[N];
+}
+static u16 cachedCellSize(CellArray *p, int N){
+  assert( N>=0 && N<p->nCell );
+  if( p->szCell[N] ) return p->szCell[N];
+  return computeCellSize(p, N);
+}
+
+/*
+** Array apCell[] contains pointers to nCell b-tree page cells. The
+** szCell[] array contains the size in bytes of each cell. This function
+** replaces the current contents of page pPg with the contents of the cell
+** array.
+**
+** Some of the cells in apCell[] may currently be stored in pPg. This
+** function works around problems caused by this by making a copy of any
+** such cells before overwriting the page data.
+**
+** The MemPage.nFree field is invalidated by this function. It is the
+** responsibility of the caller to set it correctly.
+*/
+static int rebuildPage(
+  CellArray *pCArray,             /* Content to be added to page pPg */
+  int iFirst,                     /* First cell in pCArray to use */
+  int nCell,                      /* Final number of cells on page */
+  MemPage *pPg                    /* The page to be reconstructed */
+){
+  const int hdr = pPg->hdrOffset;          /* Offset of header on pPg */
+  u8 * const aData = pPg->aData;           /* Pointer to data for pPg */
+  const int usableSize = pPg->pBt->usableSize;
+  u8 * const pEnd = &aData[usableSize];
+  int i = iFirst;                 /* Which cell to copy from pCArray*/
+  u32 j;                          /* Start of cell content area */
+  int iEnd = i+nCell;             /* Loop terminator */
+  u8 *pCellptr = pPg->aCellIdx;
+  u8 *pTmp = sqlite3PagerTempSpace(pPg->pBt->pPager);
+  u8 *pData;
+  int k;                          /* Current slot in pCArray->apEnd[] */
+  u8 *pSrcEnd;                    /* Current pCArray->apEnd[k] value */
+
+  assert( i<iEnd );
+  j = get2byte(&aData[hdr+5]);
+  if( j>(u32)usableSize ){ j = 0; }
+  memcpy(&pTmp[j], &aData[j], usableSize - j);
+
+  for(k=0; pCArray->ixNx[k]<=i && ALWAYS(k<NB*2); k++){}
+  pSrcEnd = pCArray->apEnd[k];
+
+  pData = pEnd;
+  while( 1/*exit by break*/ ){
+    u8 *pCell = pCArray->apCell[i];
+    u16 sz = pCArray->szCell[i];
+    assert( sz>0 );
+    if( SQLITE_WITHIN(pCell,aData+j,pEnd) ){
+      if( ((uptr)(pCell+sz))>(uptr)pEnd ) return SQLITE_CORRUPT_BKPT;
+      pCell = &pTmp[pCell - aData];
+    }else if( (uptr)(pCell+sz)>(uptr)pSrcEnd
+           && (uptr)(pCell)<(uptr)pSrcEnd
+    ){
+      return SQLITE_CORRUPT_BKPT;
+    }
+
+    pData -= sz;
+    put2byte(pCellptr, (pData - aData));
+    pCellptr += 2;
+    if( pData < pCellptr ) return SQLITE_CORRUPT_BKPT;
+    memmove(pData, pCell, sz);
+    assert( sz==pPg->xCellSize(pPg, pCell) || CORRUPT_DB );
+    i++;
+    if( i>=iEnd ) break;
+    if( pCArray->ixNx[k]<=i ){
+      k++;
+      pSrcEnd = pCArray->apEnd[k];
+    }
+  }
+
+  /* The pPg->nFree field is now set incorrectly. The caller will fix it. */
+  pPg->nCell = nCell;
+  pPg->nOverflow = 0;
+
+  put2byte(&aData[hdr+1], 0);
+  put2byte(&aData[hdr+3], pPg->nCell);
+  put2byte(&aData[hdr+5], pData - aData);
+  aData[hdr+7] = 0x00;
+  return SQLITE_OK;
+}
+
+/*
+** The pCArray objects contains pointers to b-tree cells and the cell sizes.
+** This function attempts to add the cells stored in the array to page pPg.
+** If it cannot (because the page needs to be defragmented before the cells
+** will fit), non-zero is returned. Otherwise, if the cells are added
+** successfully, zero is returned.
+**
+** Argument pCellptr points to the first entry in the cell-pointer array
+** (part of page pPg) to populate. After cell apCell[0] is written to the
+** page body, a 16-bit offset is written to pCellptr. And so on, for each
+** cell in the arr
