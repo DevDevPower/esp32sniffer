@@ -73895,3 +73895,164 @@ static void dropCell(MemPage *pPage, int idx, int sz, int *pRC){
     return;
   }
   rc = freeSpace(pPage, pc, sz);
+  if( rc ){
+    *pRC = rc;
+    return;
+  }
+  pPage->nCell--;
+  if( pPage->nCell==0 ){
+    memset(&data[hdr+1], 0, 4);
+    data[hdr+7] = 0;
+    put2byte(&data[hdr+5], pPage->pBt->usableSize);
+    pPage->nFree = pPage->pBt->usableSize - pPage->hdrOffset
+                       - pPage->childPtrSize - 8;
+  }else{
+    memmove(ptr, ptr+2, 2*(pPage->nCell - idx));
+    put2byte(&data[hdr+3], pPage->nCell);
+    pPage->nFree += 2;
+  }
+}
+
+/*
+** Insert a new cell on pPage at cell index "i".  pCell points to the
+** content of the cell.
+**
+** If the cell content will fit on the page, then put it there.  If it
+** will not fit, then make a copy of the cell content into pTemp if
+** pTemp is not null.  Regardless of pTemp, allocate a new entry
+** in pPage->apOvfl[] and make it point to the cell content (either
+** in pTemp or the original pCell) and also record its index.
+** Allocating a new entry in pPage->aCell[] implies that
+** pPage->nOverflow is incremented.
+**
+** *pRC must be SQLITE_OK when this routine is called.
+*/
+static void insertCell(
+  MemPage *pPage,   /* Page into which we are copying */
+  int i,            /* New cell becomes the i-th cell of the page */
+  u8 *pCell,        /* Content of the new cell */
+  int sz,           /* Bytes of content in pCell */
+  u8 *pTemp,        /* Temp storage space for pCell, if needed */
+  Pgno iChild,      /* If non-zero, replace first 4 bytes with this value */
+  int *pRC          /* Read and write return code from here */
+){
+  int idx = 0;      /* Where to write new cell content in data[] */
+  int j;            /* Loop counter */
+  u8 *data;         /* The content of the whole page */
+  u8 *pIns;         /* The point in pPage->aCellIdx[] where no cell inserted */
+
+  assert( *pRC==SQLITE_OK );
+  assert( i>=0 && i<=pPage->nCell+pPage->nOverflow );
+  assert( MX_CELL(pPage->pBt)<=10921 );
+  assert( pPage->nCell<=MX_CELL(pPage->pBt) || CORRUPT_DB );
+  assert( pPage->nOverflow<=ArraySize(pPage->apOvfl) );
+  assert( ArraySize(pPage->apOvfl)==ArraySize(pPage->aiOvfl) );
+  assert( sqlite3_mutex_held(pPage->pBt->mutex) );
+  assert( sz==pPage->xCellSize(pPage, pCell) || CORRUPT_DB );
+  assert( pPage->nFree>=0 );
+  if( pPage->nOverflow || sz+2>pPage->nFree ){
+    if( pTemp ){
+      memcpy(pTemp, pCell, sz);
+      pCell = pTemp;
+    }
+    if( iChild ){
+      put4byte(pCell, iChild);
+    }
+    j = pPage->nOverflow++;
+    /* Comparison against ArraySize-1 since we hold back one extra slot
+    ** as a contingency.  In other words, never need more than 3 overflow
+    ** slots but 4 are allocated, just to be safe. */
+    assert( j < ArraySize(pPage->apOvfl)-1 );
+    pPage->apOvfl[j] = pCell;
+    pPage->aiOvfl[j] = (u16)i;
+
+    /* When multiple overflows occur, they are always sequential and in
+    ** sorted order.  This invariants arise because multiple overflows can
+    ** only occur when inserting divider cells into the parent page during
+    ** balancing, and the dividers are adjacent and sorted.
+    */
+    assert( j==0 || pPage->aiOvfl[j-1]<(u16)i ); /* Overflows in sorted order */
+    assert( j==0 || i==pPage->aiOvfl[j-1]+1 );   /* Overflows are sequential */
+  }else{
+    int rc = sqlite3PagerWrite(pPage->pDbPage);
+    if( rc!=SQLITE_OK ){
+      *pRC = rc;
+      return;
+    }
+    assert( sqlite3PagerIswriteable(pPage->pDbPage) );
+    data = pPage->aData;
+    assert( &data[pPage->cellOffset]==pPage->aCellIdx );
+    rc = allocateSpace(pPage, sz, &idx);
+    if( rc ){ *pRC = rc; return; }
+    /* The allocateSpace() routine guarantees the following properties
+    ** if it returns successfully */
+    assert( idx >= 0 );
+    assert( idx >= pPage->cellOffset+2*pPage->nCell+2 || CORRUPT_DB );
+    assert( idx+sz <= (int)pPage->pBt->usableSize );
+    pPage->nFree -= (u16)(2 + sz);
+    if( iChild ){
+      /* In a corrupt database where an entry in the cell index section of
+      ** a btree page has a value of 3 or less, the pCell value might point
+      ** as many as 4 bytes in front of the start of the aData buffer for
+      ** the source page.  Make sure this does not cause problems by not
+      ** reading the first 4 bytes */
+      memcpy(&data[idx+4], pCell+4, sz-4);
+      put4byte(&data[idx], iChild);
+    }else{
+      memcpy(&data[idx], pCell, sz);
+    }
+    pIns = pPage->aCellIdx + i*2;
+    memmove(pIns+2, pIns, 2*(pPage->nCell - i));
+    put2byte(pIns, idx);
+    pPage->nCell++;
+    /* increment the cell count */
+    if( (++data[pPage->hdrOffset+4])==0 ) data[pPage->hdrOffset+3]++;
+    assert( get2byte(&data[pPage->hdrOffset+3])==pPage->nCell || CORRUPT_DB );
+#ifndef SQLITE_OMIT_AUTOVACUUM
+    if( pPage->pBt->autoVacuum ){
+      /* The cell may contain a pointer to an overflow page. If so, write
+      ** the entry for the overflow page into the pointer map.
+      */
+      ptrmapPutOvflPtr(pPage, pPage, pCell, pRC);
+    }
+#endif
+  }
+}
+
+/*
+** The following parameters determine how many adjacent pages get involved
+** in a balancing operation.  NN is the number of neighbors on either side
+** of the page that participate in the balancing operation.  NB is the
+** total number of pages that participate, including the target page and
+** NN neighbors on either side.
+**
+** The minimum value of NN is 1 (of course).  Increasing NN above 1
+** (to 2 or 3) gives a modest improvement in SELECT and DELETE performance
+** in exchange for a larger degradation in INSERT and UPDATE performance.
+** The value of NN appears to give the best results overall.
+**
+** (Later:) The description above makes it seem as if these values are
+** tunable - as if you could change them and recompile and it would all work.
+** But that is unlikely.  NB has been 3 since the inception of SQLite and
+** we have never tested any other value.
+*/
+#define NN 1             /* Number of neighbors on either side of pPage */
+#define NB 3             /* (NN*2+1): Total pages involved in the balance */
+
+/*
+** A CellArray object contains a cache of pointers and sizes for a
+** consecutive sequence of cells that might be held on multiple pages.
+**
+** The cells in this array are the divider cell or cells from the pParent
+** page plus up to three child pages.  There are a total of nCell cells.
+**
+** pRef is a pointer to one of the pages that contributes cells.  This is
+** used to access information such as MemPage.intKey and MemPage.pBt->pageSize
+** which should be common to all pages that contribute cells to this array.
+**
+** apCell[] and szCell[] hold, respectively, pointers to the start of each
+** cell and the size of each cell.  Some of the apCell[] pointers might refer
+** to overflow cells.  In other words, some apCel[] pointers might not point
+** to content area of the pages.
+**
+** A szCell[] of zero means the size of that cell has
