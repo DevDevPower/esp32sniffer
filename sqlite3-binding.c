@@ -73340,4 +73340,180 @@ static int allocateBtreePage(
           }
           put4byte(&aData[4], k-1);
           noContent = !btreeGetHasContent(pBt, *pPgno)? PAGER_GET_NOCONTENT : 0;
-          rc = btreeGetUnusedPage(pBt, *p
+          rc = btreeGetUnusedPage(pBt, *pPgno, ppPage, noContent);
+          if( rc==SQLITE_OK ){
+            rc = sqlite3PagerWrite((*ppPage)->pDbPage);
+            if( rc!=SQLITE_OK ){
+              releasePage(*ppPage);
+              *ppPage = 0;
+            }
+          }
+          searchList = 0;
+        }
+      }
+      releasePage(pPrevTrunk);
+      pPrevTrunk = 0;
+    }while( searchList );
+  }else{
+    /* There are no pages on the freelist, so append a new page to the
+    ** database image.
+    **
+    ** Normally, new pages allocated by this block can be requested from the
+    ** pager layer with the 'no-content' flag set. This prevents the pager
+    ** from trying to read the pages content from disk. However, if the
+    ** current transaction has already run one or more incremental-vacuum
+    ** steps, then the page we are about to allocate may contain content
+    ** that is required in the event of a rollback. In this case, do
+    ** not set the no-content flag. This causes the pager to load and journal
+    ** the current page content before overwriting it.
+    **
+    ** Note that the pager will not actually attempt to load or journal
+    ** content for any page that really does lie past the end of the database
+    ** file on disk. So the effects of disabling the no-content optimization
+    ** here are confined to those pages that lie between the end of the
+    ** database image and the end of the database file.
+    */
+    int bNoContent = (0==IfNotOmitAV(pBt->bDoTruncate))? PAGER_GET_NOCONTENT:0;
+
+    rc = sqlite3PagerWrite(pBt->pPage1->pDbPage);
+    if( rc ) return rc;
+    pBt->nPage++;
+    if( pBt->nPage==PENDING_BYTE_PAGE(pBt) ) pBt->nPage++;
+
+#ifndef SQLITE_OMIT_AUTOVACUUM
+    if( pBt->autoVacuum && PTRMAP_ISPAGE(pBt, pBt->nPage) ){
+      /* If *pPgno refers to a pointer-map page, allocate two new pages
+      ** at the end of the file instead of one. The first allocated page
+      ** becomes a new pointer-map page, the second is used by the caller.
+      */
+      MemPage *pPg = 0;
+      TRACE(("ALLOCATE: %d from end of file (pointer-map page)\n", pBt->nPage));
+      assert( pBt->nPage!=PENDING_BYTE_PAGE(pBt) );
+      rc = btreeGetUnusedPage(pBt, pBt->nPage, &pPg, bNoContent);
+      if( rc==SQLITE_OK ){
+        rc = sqlite3PagerWrite(pPg->pDbPage);
+        releasePage(pPg);
+      }
+      if( rc ) return rc;
+      pBt->nPage++;
+      if( pBt->nPage==PENDING_BYTE_PAGE(pBt) ){ pBt->nPage++; }
+    }
+#endif
+    put4byte(28 + (u8*)pBt->pPage1->aData, pBt->nPage);
+    *pPgno = pBt->nPage;
+
+    assert( *pPgno!=PENDING_BYTE_PAGE(pBt) );
+    rc = btreeGetUnusedPage(pBt, *pPgno, ppPage, bNoContent);
+    if( rc ) return rc;
+    rc = sqlite3PagerWrite((*ppPage)->pDbPage);
+    if( rc!=SQLITE_OK ){
+      releasePage(*ppPage);
+      *ppPage = 0;
+    }
+    TRACE(("ALLOCATE: %d from end of file\n", *pPgno));
+  }
+
+  assert( CORRUPT_DB || *pPgno!=PENDING_BYTE_PAGE(pBt) );
+
+end_allocate_page:
+  releasePage(pTrunk);
+  releasePage(pPrevTrunk);
+  assert( rc!=SQLITE_OK || sqlite3PagerPageRefcount((*ppPage)->pDbPage)<=1 );
+  assert( rc!=SQLITE_OK || (*ppPage)->isInit==0 );
+  return rc;
+}
+
+/*
+** This function is used to add page iPage to the database file free-list.
+** It is assumed that the page is not already a part of the free-list.
+**
+** The value passed as the second argument to this function is optional.
+** If the caller happens to have a pointer to the MemPage object
+** corresponding to page iPage handy, it may pass it as the second value.
+** Otherwise, it may pass NULL.
+**
+** If a pointer to a MemPage object is passed as the second argument,
+** its reference count is not altered by this function.
+*/
+static int freePage2(BtShared *pBt, MemPage *pMemPage, Pgno iPage){
+  MemPage *pTrunk = 0;                /* Free-list trunk page */
+  Pgno iTrunk = 0;                    /* Page number of free-list trunk page */
+  MemPage *pPage1 = pBt->pPage1;      /* Local reference to page 1 */
+  MemPage *pPage;                     /* Page being freed. May be NULL. */
+  int rc;                             /* Return Code */
+  u32 nFree;                          /* Initial number of pages on free-list */
+
+  assert( sqlite3_mutex_held(pBt->mutex) );
+  assert( CORRUPT_DB || iPage>1 );
+  assert( !pMemPage || pMemPage->pgno==iPage );
+
+  if( iPage<2 || iPage>pBt->nPage ){
+    return SQLITE_CORRUPT_BKPT;
+  }
+  if( pMemPage ){
+    pPage = pMemPage;
+    sqlite3PagerRef(pPage->pDbPage);
+  }else{
+    pPage = btreePageLookup(pBt, iPage);
+  }
+
+  /* Increment the free page count on pPage1 */
+  rc = sqlite3PagerWrite(pPage1->pDbPage);
+  if( rc ) goto freepage_out;
+  nFree = get4byte(&pPage1->aData[36]);
+  put4byte(&pPage1->aData[36], nFree+1);
+
+  if( pBt->btsFlags & BTS_SECURE_DELETE ){
+    /* If the secure_delete option is enabled, then
+    ** always fully overwrite deleted information with zeros.
+    */
+    if( (!pPage && ((rc = btreeGetPage(pBt, iPage, &pPage, 0))!=0) )
+     ||            ((rc = sqlite3PagerWrite(pPage->pDbPage))!=0)
+    ){
+      goto freepage_out;
+    }
+    memset(pPage->aData, 0, pPage->pBt->pageSize);
+  }
+
+  /* If the database supports auto-vacuum, write an entry in the pointer-map
+  ** to indicate that the page is free.
+  */
+  if( ISAUTOVACUUM ){
+    ptrmapPut(pBt, iPage, PTRMAP_FREEPAGE, 0, &rc);
+    if( rc ) goto freepage_out;
+  }
+
+  /* Now manipulate the actual database free-list structure. There are two
+  ** possibilities. If the free-list is currently empty, or if the first
+  ** trunk page in the free-list is full, then this page will become a
+  ** new free-list trunk page. Otherwise, it will become a leaf of the
+  ** first trunk page in the current free-list. This block tests if it
+  ** is possible to add the page as a new free-list leaf.
+  */
+  if( nFree!=0 ){
+    u32 nLeaf;                /* Initial number of leaf cells on trunk page */
+
+    iTrunk = get4byte(&pPage1->aData[32]);
+    if( iTrunk>btreePagecount(pBt) ){
+      rc = SQLITE_CORRUPT_BKPT;
+      goto freepage_out;
+    }
+    rc = btreeGetPage(pBt, iTrunk, &pTrunk, 0);
+    if( rc!=SQLITE_OK ){
+      goto freepage_out;
+    }
+
+    nLeaf = get4byte(&pTrunk->aData[4]);
+    assert( pBt->usableSize>32 );
+    if( nLeaf > (u32)pBt->usableSize/4 - 2 ){
+      rc = SQLITE_CORRUPT_BKPT;
+      goto freepage_out;
+    }
+    if( nLeaf < (u32)pBt->usableSize/4 - 8 ){
+      /* In this case there is room on the trunk page to insert the page
+      ** being freed as a new leaf.
+      **
+      ** Note that the trunk page is not really full until it contains
+      ** usableSize/4 - 2 entries, not usableSize/4 - 8 entries as we have
+      ** coded.  But due to a coding error in versions of SQLite prior to
+      ** 3.6.0
