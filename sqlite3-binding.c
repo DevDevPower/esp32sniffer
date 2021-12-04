@@ -73695,4 +73695,203 @@ static int fillInCell(
   /* pPage is not necessarily writeable since pCell might be auxiliary
   ** buffer space that is separate from the pPage buffer area */
   assert( pCell<pPage->aData || pCell>=&pPage->aData[pPage->pBt->pageSize]
-            || sqlite3PagerIswriteabl
+            || sqlite3PagerIswriteable(pPage->pDbPage) );
+
+  /* Fill in the header. */
+  nHeader = pPage->childPtrSize;
+  if( pPage->intKey ){
+    nPayload = pX->nData + pX->nZero;
+    pSrc = pX->pData;
+    nSrc = pX->nData;
+    assert( pPage->intKeyLeaf ); /* fillInCell() only called for leaves */
+    nHeader += putVarint32(&pCell[nHeader], nPayload);
+    nHeader += putVarint(&pCell[nHeader], *(u64*)&pX->nKey);
+  }else{
+    assert( pX->nKey<=0x7fffffff && pX->pKey!=0 );
+    nSrc = nPayload = (int)pX->nKey;
+    pSrc = pX->pKey;
+    nHeader += putVarint32(&pCell[nHeader], nPayload);
+  }
+
+  /* Fill in the payload */
+  pPayload = &pCell[nHeader];
+  if( nPayload<=pPage->maxLocal ){
+    /* This is the common case where everything fits on the btree page
+    ** and no overflow pages are required. */
+    n = nHeader + nPayload;
+    testcase( n==3 );
+    testcase( n==4 );
+    if( n<4 ) n = 4;
+    *pnSize = n;
+    assert( nSrc<=nPayload );
+    testcase( nSrc<nPayload );
+    memcpy(pPayload, pSrc, nSrc);
+    memset(pPayload+nSrc, 0, nPayload-nSrc);
+    return SQLITE_OK;
+  }
+
+  /* If we reach this point, it means that some of the content will need
+  ** to spill onto overflow pages.
+  */
+  mn = pPage->minLocal;
+  n = mn + (nPayload - mn) % (pPage->pBt->usableSize - 4);
+  testcase( n==pPage->maxLocal );
+  testcase( n==pPage->maxLocal+1 );
+  if( n > pPage->maxLocal ) n = mn;
+  spaceLeft = n;
+  *pnSize = n + nHeader + 4;
+  pPrior = &pCell[nHeader+n];
+  pToRelease = 0;
+  pgnoOvfl = 0;
+  pBt = pPage->pBt;
+
+  /* At this point variables should be set as follows:
+  **
+  **   nPayload           Total payload size in bytes
+  **   pPayload           Begin writing payload here
+  **   spaceLeft          Space available at pPayload.  If nPayload>spaceLeft,
+  **                      that means content must spill into overflow pages.
+  **   *pnSize            Size of the local cell (not counting overflow pages)
+  **   pPrior             Where to write the pgno of the first overflow page
+  **
+  ** Use a call to btreeParseCellPtr() to verify that the values above
+  ** were computed correctly.
+  */
+#ifdef SQLITE_DEBUG
+  {
+    CellInfo info;
+    pPage->xParseCell(pPage, pCell, &info);
+    assert( nHeader==(int)(info.pPayload - pCell) );
+    assert( info.nKey==pX->nKey );
+    assert( *pnSize == info.nSize );
+    assert( spaceLeft == info.nLocal );
+  }
+#endif
+
+  /* Write the payload into the local Cell and any extra into overflow pages */
+  while( 1 ){
+    n = nPayload;
+    if( n>spaceLeft ) n = spaceLeft;
+
+    /* If pToRelease is not zero than pPayload points into the data area
+    ** of pToRelease.  Make sure pToRelease is still writeable. */
+    assert( pToRelease==0 || sqlite3PagerIswriteable(pToRelease->pDbPage) );
+
+    /* If pPayload is part of the data area of pPage, then make sure pPage
+    ** is still writeable */
+    assert( pPayload<pPage->aData || pPayload>=&pPage->aData[pBt->pageSize]
+            || sqlite3PagerIswriteable(pPage->pDbPage) );
+
+    if( nSrc>=n ){
+      memcpy(pPayload, pSrc, n);
+    }else if( nSrc>0 ){
+      n = nSrc;
+      memcpy(pPayload, pSrc, n);
+    }else{
+      memset(pPayload, 0, n);
+    }
+    nPayload -= n;
+    if( nPayload<=0 ) break;
+    pPayload += n;
+    pSrc += n;
+    nSrc -= n;
+    spaceLeft -= n;
+    if( spaceLeft==0 ){
+      MemPage *pOvfl = 0;
+#ifndef SQLITE_OMIT_AUTOVACUUM
+      Pgno pgnoPtrmap = pgnoOvfl; /* Overflow page pointer-map entry page */
+      if( pBt->autoVacuum ){
+        do{
+          pgnoOvfl++;
+        } while(
+          PTRMAP_ISPAGE(pBt, pgnoOvfl) || pgnoOvfl==PENDING_BYTE_PAGE(pBt)
+        );
+      }
+#endif
+      rc = allocateBtreePage(pBt, &pOvfl, &pgnoOvfl, pgnoOvfl, 0);
+#ifndef SQLITE_OMIT_AUTOVACUUM
+      /* If the database supports auto-vacuum, and the second or subsequent
+      ** overflow page is being allocated, add an entry to the pointer-map
+      ** for that page now.
+      **
+      ** If this is the first overflow page, then write a partial entry
+      ** to the pointer-map. If we write nothing to this pointer-map slot,
+      ** then the optimistic overflow chain processing in clearCell()
+      ** may misinterpret the uninitialized values and delete the
+      ** wrong pages from the database.
+      */
+      if( pBt->autoVacuum && rc==SQLITE_OK ){
+        u8 eType = (pgnoPtrmap?PTRMAP_OVERFLOW2:PTRMAP_OVERFLOW1);
+        ptrmapPut(pBt, pgnoOvfl, eType, pgnoPtrmap, &rc);
+        if( rc ){
+          releasePage(pOvfl);
+        }
+      }
+#endif
+      if( rc ){
+        releasePage(pToRelease);
+        return rc;
+      }
+
+      /* If pToRelease is not zero than pPrior points into the data area
+      ** of pToRelease.  Make sure pToRelease is still writeable. */
+      assert( pToRelease==0 || sqlite3PagerIswriteable(pToRelease->pDbPage) );
+
+      /* If pPrior is part of the data area of pPage, then make sure pPage
+      ** is still writeable */
+      assert( pPrior<pPage->aData || pPrior>=&pPage->aData[pBt->pageSize]
+            || sqlite3PagerIswriteable(pPage->pDbPage) );
+
+      put4byte(pPrior, pgnoOvfl);
+      releasePage(pToRelease);
+      pToRelease = pOvfl;
+      pPrior = pOvfl->aData;
+      put4byte(pPrior, 0);
+      pPayload = &pOvfl->aData[4];
+      spaceLeft = pBt->usableSize - 4;
+    }
+  }
+  releasePage(pToRelease);
+  return SQLITE_OK;
+}
+
+/*
+** Remove the i-th cell from pPage.  This routine effects pPage only.
+** The cell content is not freed or deallocated.  It is assumed that
+** the cell content has been copied someplace else.  This routine just
+** removes the reference to the cell from pPage.
+**
+** "sz" must be the number of bytes in the cell.
+*/
+static void dropCell(MemPage *pPage, int idx, int sz, int *pRC){
+  u32 pc;         /* Offset to cell content of cell being deleted */
+  u8 *data;       /* pPage->aData */
+  u8 *ptr;        /* Used to move bytes around within data[] */
+  int rc;         /* The return code */
+  int hdr;        /* Beginning of the header.  0 most pages.  100 page 1 */
+
+  if( *pRC ) return;
+  assert( idx>=0 );
+  assert( idx<pPage->nCell );
+  assert( CORRUPT_DB || sz==cellSize(pPage, idx) );
+  assert( sqlite3PagerIswriteable(pPage->pDbPage) );
+  assert( sqlite3_mutex_held(pPage->pBt->mutex) );
+  assert( pPage->nFree>=0 );
+  data = pPage->aData;
+  ptr = &pPage->aCellIdx[2*idx];
+  assert( pPage->pBt->usableSize > (u32)(ptr-data) );
+  pc = get2byte(ptr);
+  hdr = pPage->hdrOffset;
+#if 0  /* Not required.  Omit for efficiency */
+  if( pc<hdr+pPage->nCell*2 ){
+    *pRC = SQLITE_CORRUPT_BKPT;
+    return;
+  }
+#endif
+  testcase( pc==(u32)get2byte(&data[hdr+5]) );
+  testcase( pc+sz==pPage->pBt->usableSize );
+  if( pc+sz > pPage->pBt->usableSize ){
+    *pRC = SQLITE_CORRUPT_BKPT;
+    return;
+  }
+  rc = freeSpace(pPage, pc, sz);
