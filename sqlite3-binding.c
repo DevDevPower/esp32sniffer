@@ -74416,4 +74416,190 @@ static int editPage(
   /* Add cells to the start of the page */
   if( iNew<iOld ){
     int nAdd = MIN(nNew,iOld-iNew);
-    assert( (iOld-iNew)<nN
+    assert( (iOld-iNew)<nNew || nCell==0 || CORRUPT_DB );
+    assert( nAdd>=0 );
+    pCellptr = pPg->aCellIdx;
+    memmove(&pCellptr[nAdd*2], pCellptr, nCell*2);
+    if( pageInsertArray(
+          pPg, pBegin, &pData, pCellptr,
+          iNew, nAdd, pCArray
+    ) ) goto editpage_fail;
+    nCell += nAdd;
+  }
+
+  /* Add any overflow cells */
+  for(i=0; i<pPg->nOverflow; i++){
+    int iCell = (iOld + pPg->aiOvfl[i]) - iNew;
+    if( iCell>=0 && iCell<nNew ){
+      pCellptr = &pPg->aCellIdx[iCell * 2];
+      if( nCell>iCell ){
+        memmove(&pCellptr[2], pCellptr, (nCell - iCell) * 2);
+      }
+      nCell++;
+      cachedCellSize(pCArray, iCell+iNew);
+      if( pageInsertArray(
+            pPg, pBegin, &pData, pCellptr,
+            iCell+iNew, 1, pCArray
+      ) ) goto editpage_fail;
+    }
+  }
+
+  /* Append cells to the end of the page */
+  assert( nCell>=0 );
+  pCellptr = &pPg->aCellIdx[nCell*2];
+  if( pageInsertArray(
+        pPg, pBegin, &pData, pCellptr,
+        iNew+nCell, nNew-nCell, pCArray
+  ) ) goto editpage_fail;
+
+  pPg->nCell = nNew;
+  pPg->nOverflow = 0;
+
+  put2byte(&aData[hdr+3], pPg->nCell);
+  put2byte(&aData[hdr+5], pData - aData);
+
+#ifdef SQLITE_DEBUG
+  for(i=0; i<nNew && !CORRUPT_DB; i++){
+    u8 *pCell = pCArray->apCell[i+iNew];
+    int iOff = get2byteAligned(&pPg->aCellIdx[i*2]);
+    if( SQLITE_WITHIN(pCell, aData, &aData[pPg->pBt->usableSize]) ){
+      pCell = &pTmp[pCell - aData];
+    }
+    assert( 0==memcmp(pCell, &aData[iOff],
+            pCArray->pRef->xCellSize(pCArray->pRef, pCArray->apCell[i+iNew])) );
+  }
+#endif
+
+  return SQLITE_OK;
+ editpage_fail:
+  /* Unable to edit this page. Rebuild it from scratch instead. */
+  populateCellCache(pCArray, iNew, nNew);
+  return rebuildPage(pCArray, iNew, nNew, pPg);
+}
+
+
+#ifndef SQLITE_OMIT_QUICKBALANCE
+/*
+** This version of balance() handles the common special case where
+** a new entry is being inserted on the extreme right-end of the
+** tree, in other words, when the new entry will become the largest
+** entry in the tree.
+**
+** Instead of trying to balance the 3 right-most leaf pages, just add
+** a new page to the right-hand side and put the one new entry in
+** that page.  This leaves the right side of the tree somewhat
+** unbalanced.  But odds are that we will be inserting new entries
+** at the end soon afterwards so the nearly empty page will quickly
+** fill up.  On average.
+**
+** pPage is the leaf page which is the right-most page in the tree.
+** pParent is its parent.  pPage must have a single overflow entry
+** which is also the right-most entry on the page.
+**
+** The pSpace buffer is used to store a temporary copy of the divider
+** cell that will be inserted into pParent. Such a cell consists of a 4
+** byte page number followed by a variable length integer. In other
+** words, at most 13 bytes. Hence the pSpace buffer must be at
+** least 13 bytes in size.
+*/
+static int balance_quick(MemPage *pParent, MemPage *pPage, u8 *pSpace){
+  BtShared *const pBt = pPage->pBt;    /* B-Tree Database */
+  MemPage *pNew;                       /* Newly allocated page */
+  int rc;                              /* Return Code */
+  Pgno pgnoNew;                        /* Page number of pNew */
+
+  assert( sqlite3_mutex_held(pPage->pBt->mutex) );
+  assert( sqlite3PagerIswriteable(pParent->pDbPage) );
+  assert( pPage->nOverflow==1 );
+
+  if( pPage->nCell==0 ) return SQLITE_CORRUPT_BKPT;  /* dbfuzz001.test */
+  assert( pPage->nFree>=0 );
+  assert( pParent->nFree>=0 );
+
+  /* Allocate a new page. This page will become the right-sibling of
+  ** pPage. Make the parent page writable, so that the new divider cell
+  ** may be inserted. If both these operations are successful, proceed.
+  */
+  rc = allocateBtreePage(pBt, &pNew, &pgnoNew, 0, 0);
+
+  if( rc==SQLITE_OK ){
+
+    u8 *pOut = &pSpace[4];
+    u8 *pCell = pPage->apOvfl[0];
+    u16 szCell = pPage->xCellSize(pPage, pCell);
+    u8 *pStop;
+    CellArray b;
+
+    assert( sqlite3PagerIswriteable(pNew->pDbPage) );
+    assert( CORRUPT_DB || pPage->aData[0]==(PTF_INTKEY|PTF_LEAFDATA|PTF_LEAF) );
+    zeroPage(pNew, PTF_INTKEY|PTF_LEAFDATA|PTF_LEAF);
+    b.nCell = 1;
+    b.pRef = pPage;
+    b.apCell = &pCell;
+    b.szCell = &szCell;
+    b.apEnd[0] = pPage->aDataEnd;
+    b.ixNx[0] = 2;
+    rc = rebuildPage(&b, 0, 1, pNew);
+    if( NEVER(rc) ){
+      releasePage(pNew);
+      return rc;
+    }
+    pNew->nFree = pBt->usableSize - pNew->cellOffset - 2 - szCell;
+
+    /* If this is an auto-vacuum database, update the pointer map
+    ** with entries for the new page, and any pointer from the
+    ** cell on the page to an overflow page. If either of these
+    ** operations fails, the return code is set, but the contents
+    ** of the parent page are still manipulated by thh code below.
+    ** That is Ok, at this point the parent page is guaranteed to
+    ** be marked as dirty. Returning an error code will cause a
+    ** rollback, undoing any changes made to the parent page.
+    */
+    if( ISAUTOVACUUM ){
+      ptrmapPut(pBt, pgnoNew, PTRMAP_BTREE, pParent->pgno, &rc);
+      if( szCell>pNew->minLocal ){
+        ptrmapPutOvflPtr(pNew, pNew, pCell, &rc);
+      }
+    }
+
+    /* Create a divider cell to insert into pParent. The divider cell
+    ** consists of a 4-byte page number (the page number of pPage) and
+    ** a variable length key value (which must be the same value as the
+    ** largest key on pPage).
+    **
+    ** To find the largest key value on pPage, first find the right-most
+    ** cell on pPage. The first two fields of this cell are the
+    ** record-length (a variable length integer at most 32-bits in size)
+    ** and the key value (a variable length integer, may have any value).
+    ** The first of the while(...) loops below skips over the record-length
+    ** field. The second while(...) loop copies the key value from the
+    ** cell on pPage into the pSpace buffer.
+    */
+    pCell = findCell(pPage, pPage->nCell-1);
+    pStop = &pCell[9];
+    while( (*(pCell++)&0x80) && pCell<pStop );
+    pStop = &pCell[9];
+    while( ((*(pOut++) = *(pCell++))&0x80) && pCell<pStop );
+
+    /* Insert the new divider cell into pParent. */
+    if( rc==SQLITE_OK ){
+      insertCell(pParent, pParent->nCell, pSpace, (int)(pOut-pSpace),
+                   0, pPage->pgno, &rc);
+    }
+
+    /* Set the right-child pointer of pParent to point to the new page. */
+    put4byte(&pParent->aData[pParent->hdrOffset+8], pgnoNew);
+
+    /* Release the reference to the new page. */
+    releasePage(pNew);
+  }
+
+  return rc;
+}
+#endif /* SQLITE_OMIT_QUICKBALANCE */
+
+#if 0
+/*
+** This function does not contribute anything to the operation of SQLite.
+** it is sometimes activated temporarily while debugging code responsible
+** for setting pointer-map entries
