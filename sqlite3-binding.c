@@ -75487,4 +75487,190 @@ static int balance_nonroot(
 
 #if 0
   if( ISAUTOVACUUM && rc==SQLITE_OK && apNew[0]->isInit ){
- 
+    /* The ptrmapCheckPages() contains assert() statements that verify that
+    ** all pointer map pages are set correctly. This is helpful while
+    ** debugging. This is usually disabled because a corrupt database may
+    ** cause an assert() statement to fail.  */
+    ptrmapCheckPages(apNew, nNew);
+    ptrmapCheckPages(&pParent, 1);
+  }
+#endif
+
+  /*
+  ** Cleanup before returning.
+  */
+balance_cleanup:
+  sqlite3StackFree(0, b.apCell);
+  for(i=0; i<nOld; i++){
+    releasePage(apOld[i]);
+  }
+  for(i=0; i<nNew; i++){
+    releasePage(apNew[i]);
+  }
+
+  return rc;
+}
+
+
+/*
+** This function is called when the root page of a b-tree structure is
+** overfull (has one or more overflow pages).
+**
+** A new child page is allocated and the contents of the current root
+** page, including overflow cells, are copied into the child. The root
+** page is then overwritten to make it an empty page with the right-child
+** pointer pointing to the new page.
+**
+** Before returning, all pointer-map entries corresponding to pages
+** that the new child-page now contains pointers to are updated. The
+** entry corresponding to the new right-child pointer of the root
+** page is also updated.
+**
+** If successful, *ppChild is set to contain a reference to the child
+** page and SQLITE_OK is returned. In this case the caller is required
+** to call releasePage() on *ppChild exactly once. If an error occurs,
+** an error code is returned and *ppChild is set to 0.
+*/
+static int balance_deeper(MemPage *pRoot, MemPage **ppChild){
+  int rc;                        /* Return value from subprocedures */
+  MemPage *pChild = 0;           /* Pointer to a new child page */
+  Pgno pgnoChild = 0;            /* Page number of the new child page */
+  BtShared *pBt = pRoot->pBt;    /* The BTree */
+
+  assert( pRoot->nOverflow>0 );
+  assert( sqlite3_mutex_held(pBt->mutex) );
+
+  /* Make pRoot, the root page of the b-tree, writable. Allocate a new
+  ** page that will become the new right-child of pPage. Copy the contents
+  ** of the node stored on pRoot into the new child page.
+  */
+  rc = sqlite3PagerWrite(pRoot->pDbPage);
+  if( rc==SQLITE_OK ){
+    rc = allocateBtreePage(pBt,&pChild,&pgnoChild,pRoot->pgno,0);
+    copyNodeContent(pRoot, pChild, &rc);
+    if( ISAUTOVACUUM ){
+      ptrmapPut(pBt, pgnoChild, PTRMAP_BTREE, pRoot->pgno, &rc);
+    }
+  }
+  if( rc ){
+    *ppChild = 0;
+    releasePage(pChild);
+    return rc;
+  }
+  assert( sqlite3PagerIswriteable(pChild->pDbPage) );
+  assert( sqlite3PagerIswriteable(pRoot->pDbPage) );
+  assert( pChild->nCell==pRoot->nCell || CORRUPT_DB );
+
+  TRACE(("BALANCE: copy root %d into %d\n", pRoot->pgno, pChild->pgno));
+
+  /* Copy the overflow cells from pRoot to pChild */
+  memcpy(pChild->aiOvfl, pRoot->aiOvfl,
+         pRoot->nOverflow*sizeof(pRoot->aiOvfl[0]));
+  memcpy(pChild->apOvfl, pRoot->apOvfl,
+         pRoot->nOverflow*sizeof(pRoot->apOvfl[0]));
+  pChild->nOverflow = pRoot->nOverflow;
+
+  /* Zero the contents of pRoot. Then install pChild as the right-child. */
+  zeroPage(pRoot, pChild->aData[0] & ~PTF_LEAF);
+  put4byte(&pRoot->aData[pRoot->hdrOffset+8], pgnoChild);
+
+  *ppChild = pChild;
+  return SQLITE_OK;
+}
+
+/*
+** Return SQLITE_CORRUPT if any cursor other than pCur is currently valid
+** on the same B-tree as pCur.
+**
+** This can occur if a database is corrupt with two or more SQL tables
+** pointing to the same b-tree.  If an insert occurs on one SQL table
+** and causes a BEFORE TRIGGER to do a secondary insert on the other SQL
+** table linked to the same b-tree.  If the secondary insert causes a
+** rebalance, that can change content out from under the cursor on the
+** first SQL table, violating invariants on the first insert.
+*/
+static int anotherValidCursor(BtCursor *pCur){
+  BtCursor *pOther;
+  for(pOther=pCur->pBt->pCursor; pOther; pOther=pOther->pNext){
+    if( pOther!=pCur
+     && pOther->eState==CURSOR_VALID
+     && pOther->pPage==pCur->pPage
+    ){
+      return SQLITE_CORRUPT_BKPT;
+    }
+  }
+  return SQLITE_OK;
+}
+
+/*
+** The page that pCur currently points to has just been modified in
+** some way. This function figures out if this modification means the
+** tree needs to be balanced, and if so calls the appropriate balancing
+** routine. Balancing routines are:
+**
+**   balance_quick()
+**   balance_deeper()
+**   balance_nonroot()
+*/
+static int balance(BtCursor *pCur){
+  int rc = SQLITE_OK;
+  u8 aBalanceQuickSpace[13];
+  u8 *pFree = 0;
+
+  VVA_ONLY( int balance_quick_called = 0 );
+  VVA_ONLY( int balance_deeper_called = 0 );
+
+  do {
+    int iPage;
+    MemPage *pPage = pCur->pPage;
+
+    if( NEVER(pPage->nFree<0) && btreeComputeFreeSpace(pPage) ) break;
+    if( pPage->nOverflow==0 && pPage->nFree*3<=(int)pCur->pBt->usableSize*2 ){
+      /* No rebalance required as long as:
+      **   (1) There are no overflow cells
+      **   (2) The amount of free space on the page is less than 2/3rds of
+      **       the total usable space on the page. */
+      break;
+    }else if( (iPage = pCur->iPage)==0 ){
+      if( pPage->nOverflow && (rc = anotherValidCursor(pCur))==SQLITE_OK ){
+        /* The root page of the b-tree is overfull. In this case call the
+        ** balance_deeper() function to create a new child for the root-page
+        ** and copy the current contents of the root-page to it. The
+        ** next iteration of the do-loop will balance the child page.
+        */
+        assert( balance_deeper_called==0 );
+        VVA_ONLY( balance_deeper_called++ );
+        rc = balance_deeper(pPage, &pCur->apPage[1]);
+        if( rc==SQLITE_OK ){
+          pCur->iPage = 1;
+          pCur->ix = 0;
+          pCur->aiIdx[0] = 0;
+          pCur->apPage[0] = pPage;
+          pCur->pPage = pCur->apPage[1];
+          assert( pCur->pPage->nOverflow );
+        }
+      }else{
+        break;
+      }
+    }else{
+      MemPage * const pParent = pCur->apPage[iPage-1];
+      int const iIdx = pCur->aiIdx[iPage-1];
+
+      rc = sqlite3PagerWrite(pParent->pDbPage);
+      if( rc==SQLITE_OK && pParent->nFree<0 ){
+        rc = btreeComputeFreeSpace(pParent);
+      }
+      if( rc==SQLITE_OK ){
+#ifndef SQLITE_OMIT_QUICKBALANCE
+        if( pPage->intKeyLeaf
+         && pPage->nOverflow==1
+         && pPage->aiOvfl[0]==pPage->nCell
+         && pParent->pgno!=1
+         && pParent->nCell==iIdx
+        ){
+          /* Call balance_quick() to create a new sibling of pPage on which
+          ** to store the overflow cell. balance_quick() inserts a new cell
+          ** into pParent, which may cause pParent overflow. If this
+          ** happens, the next iteration of the do-loop will balance pParent
+          ** use either balance_nonroot() or balance_deeper(). Until this
+          ** happens, the overflow cell is
