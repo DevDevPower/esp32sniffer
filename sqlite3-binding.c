@@ -75307,4 +75307,184 @@ static int balance_nonroot(
           ptrmapPut(pBt, get4byte(pCell), PTRMAP_BTREE, pNew->pgno, &rc);
         }
         if( cachedCellSize(&b,i)>pNew->minLocal ){
-          ptrmapPutOvflPtr(pNew, pOld, pCell, &rc
+          ptrmapPutOvflPtr(pNew, pOld, pCell, &rc);
+        }
+        if( rc ) goto balance_cleanup;
+      }
+    }
+  }
+
+  /* Insert new divider cells into pParent. */
+  for(i=0; i<nNew-1; i++){
+    u8 *pCell;
+    u8 *pTemp;
+    int sz;
+    u8 *pSrcEnd;
+    MemPage *pNew = apNew[i];
+    j = cntNew[i];
+
+    assert( j<nMaxCells );
+    assert( b.apCell[j]!=0 );
+    pCell = b.apCell[j];
+    sz = b.szCell[j] + leafCorrection;
+    pTemp = &aOvflSpace[iOvflSpace];
+    if( !pNew->leaf ){
+      memcpy(&pNew->aData[8], pCell, 4);
+    }else if( leafData ){
+      /* If the tree is a leaf-data tree, and the siblings are leaves,
+      ** then there is no divider cell in b.apCell[]. Instead, the divider
+      ** cell consists of the integer key for the right-most cell of
+      ** the sibling-page assembled above only.
+      */
+      CellInfo info;
+      j--;
+      pNew->xParseCell(pNew, b.apCell[j], &info);
+      pCell = pTemp;
+      sz = 4 + putVarint(&pCell[4], info.nKey);
+      pTemp = 0;
+    }else{
+      pCell -= 4;
+      /* Obscure case for non-leaf-data trees: If the cell at pCell was
+      ** previously stored on a leaf node, and its reported size was 4
+      ** bytes, then it may actually be smaller than this
+      ** (see btreeParseCellPtr(), 4 bytes is the minimum size of
+      ** any cell). But it is important to pass the correct size to
+      ** insertCell(), so reparse the cell now.
+      **
+      ** This can only happen for b-trees used to evaluate "IN (SELECT ...)"
+      ** and WITHOUT ROWID tables with exactly one column which is the
+      ** primary key.
+      */
+      if( b.szCell[j]==4 ){
+        assert(leafCorrection==4);
+        sz = pParent->xCellSize(pParent, pCell);
+      }
+    }
+    iOvflSpace += sz;
+    assert( sz<=pBt->maxLocal+23 );
+    assert( iOvflSpace <= (int)pBt->pageSize );
+    for(k=0; b.ixNx[k]<=j && ALWAYS(k<NB*2); k++){}
+    pSrcEnd = b.apEnd[k];
+    if( SQLITE_WITHIN(pSrcEnd, pCell, pCell+sz) ){
+      rc = SQLITE_CORRUPT_BKPT;
+      goto balance_cleanup;
+    }
+    insertCell(pParent, nxDiv+i, pCell, sz, pTemp, pNew->pgno, &rc);
+    if( rc!=SQLITE_OK ) goto balance_cleanup;
+    assert( sqlite3PagerIswriteable(pParent->pDbPage) );
+  }
+
+  /* Now update the actual sibling pages. The order in which they are updated
+  ** is important, as this code needs to avoid disrupting any page from which
+  ** cells may still to be read. In practice, this means:
+  **
+  **  (1) If cells are moving left (from apNew[iPg] to apNew[iPg-1])
+  **      then it is not safe to update page apNew[iPg] until after
+  **      the left-hand sibling apNew[iPg-1] has been updated.
+  **
+  **  (2) If cells are moving right (from apNew[iPg] to apNew[iPg+1])
+  **      then it is not safe to update page apNew[iPg] until after
+  **      the right-hand sibling apNew[iPg+1] has been updated.
+  **
+  ** If neither of the above apply, the page is safe to update.
+  **
+  ** The iPg value in the following loop starts at nNew-1 goes down
+  ** to 0, then back up to nNew-1 again, thus making two passes over
+  ** the pages.  On the initial downward pass, only condition (1) above
+  ** needs to be tested because (2) will always be true from the previous
+  ** step.  On the upward pass, both conditions are always true, so the
+  ** upwards pass simply processes pages that were missed on the downward
+  ** pass.
+  */
+  for(i=1-nNew; i<nNew; i++){
+    int iPg = i<0 ? -i : i;
+    assert( iPg>=0 && iPg<nNew );
+    if( abDone[iPg] ) continue;         /* Skip pages already processed */
+    if( i>=0                            /* On the upwards pass, or... */
+     || cntOld[iPg-1]>=cntNew[iPg-1]    /* Condition (1) is true */
+    ){
+      int iNew;
+      int iOld;
+      int nNewCell;
+
+      /* Verify condition (1):  If cells are moving left, update iPg
+      ** only after iPg-1 has already been updated. */
+      assert( iPg==0 || cntOld[iPg-1]>=cntNew[iPg-1] || abDone[iPg-1] );
+
+      /* Verify condition (2):  If cells are moving right, update iPg
+      ** only after iPg+1 has already been updated. */
+      assert( cntNew[iPg]>=cntOld[iPg] || abDone[iPg+1] );
+
+      if( iPg==0 ){
+        iNew = iOld = 0;
+        nNewCell = cntNew[0];
+      }else{
+        iOld = iPg<nOld ? (cntOld[iPg-1] + !leafData) : b.nCell;
+        iNew = cntNew[iPg-1] + !leafData;
+        nNewCell = cntNew[iPg] - iNew;
+      }
+
+      rc = editPage(apNew[iPg], iOld, iNew, nNewCell, &b);
+      if( rc ) goto balance_cleanup;
+      abDone[iPg]++;
+      apNew[iPg]->nFree = usableSpace-szNew[iPg];
+      assert( apNew[iPg]->nOverflow==0 );
+      assert( apNew[iPg]->nCell==nNewCell );
+    }
+  }
+
+  /* All pages have been processed exactly once */
+  assert( memcmp(abDone, "\01\01\01\01\01", nNew)==0 );
+
+  assert( nOld>0 );
+  assert( nNew>0 );
+
+  if( isRoot && pParent->nCell==0 && pParent->hdrOffset<=apNew[0]->nFree ){
+    /* The root page of the b-tree now contains no cells. The only sibling
+    ** page is the right-child of the parent. Copy the contents of the
+    ** child page into the parent, decreasing the overall height of the
+    ** b-tree structure by one. This is described as the "balance-shallower"
+    ** sub-algorithm in some documentation.
+    **
+    ** If this is an auto-vacuum database, the call to copyNodeContent()
+    ** sets all pointer-map entries corresponding to database image pages
+    ** for which the pointer is stored within the content being copied.
+    **
+    ** It is critical that the child page be defragmented before being
+    ** copied into the parent, because if the parent is page 1 then it will
+    ** by smaller than the child due to the database header, and so all the
+    ** free space needs to be up front.
+    */
+    assert( nNew==1 || CORRUPT_DB );
+    rc = defragmentPage(apNew[0], -1);
+    testcase( rc!=SQLITE_OK );
+    assert( apNew[0]->nFree ==
+        (get2byteNotZero(&apNew[0]->aData[5]) - apNew[0]->cellOffset
+          - apNew[0]->nCell*2)
+      || rc!=SQLITE_OK
+    );
+    copyNodeContent(apNew[0], pParent, &rc);
+    freePage(apNew[0], &rc);
+  }else if( ISAUTOVACUUM && !leafCorrection ){
+    /* Fix the pointer map entries associated with the right-child of each
+    ** sibling page. All other pointer map entries have already been taken
+    ** care of.  */
+    for(i=0; i<nNew; i++){
+      u32 key = get4byte(&apNew[i]->aData[8]);
+      ptrmapPut(pBt, key, PTRMAP_BTREE, apNew[i]->pgno, &rc);
+    }
+  }
+
+  assert( pParent->isInit );
+  TRACE(("BALANCE: finished: old=%d new=%d cells=%d\n",
+          nOld, nNew, b.nCell));
+
+  /* Free any old pages that were not reused as new pages.
+  */
+  for(i=nNew; i<nOld; i++){
+    freePage(apOld[i], &rc);
+  }
+
+#if 0
+  if( ISAUTOVACUUM && rc==SQLITE_OK && apNew[0]->isInit ){
+ 
