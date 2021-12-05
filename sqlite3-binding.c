@@ -75132,4 +75132,179 @@ static int balance_nonroot(
     }while( r>=0 );
     szNew[i] = szRight;
     szNew[i-1] = szLeft;
-    if( cntNew[i-1] <= (i>
+    if( cntNew[i-1] <= (i>1 ? cntNew[i-2] : 0) ){
+      rc = SQLITE_CORRUPT_BKPT;
+      goto balance_cleanup;
+    }
+  }
+
+  /* Sanity check:  For a non-corrupt database file one of the follwing
+  ** must be true:
+  **    (1) We found one or more cells (cntNew[0])>0), or
+  **    (2) pPage is a virtual root page.  A virtual root page is when
+  **        the real root page is page 1 and we are the only child of
+  **        that page.
+  */
+  assert( cntNew[0]>0 || (pParent->pgno==1 && pParent->nCell==0) || CORRUPT_DB);
+  TRACE(("BALANCE: old: %d(nc=%d) %d(nc=%d) %d(nc=%d)\n",
+    apOld[0]->pgno, apOld[0]->nCell,
+    nOld>=2 ? apOld[1]->pgno : 0, nOld>=2 ? apOld[1]->nCell : 0,
+    nOld>=3 ? apOld[2]->pgno : 0, nOld>=3 ? apOld[2]->nCell : 0
+  ));
+
+  /*
+  ** Allocate k new pages.  Reuse old pages where possible.
+  */
+  pageFlags = apOld[0]->aData[0];
+  for(i=0; i<k; i++){
+    MemPage *pNew;
+    if( i<nOld ){
+      pNew = apNew[i] = apOld[i];
+      apOld[i] = 0;
+      rc = sqlite3PagerWrite(pNew->pDbPage);
+      nNew++;
+      if( sqlite3PagerPageRefcount(pNew->pDbPage)!=1+(i==(iParentIdx-nxDiv))
+       && rc==SQLITE_OK
+      ){
+        rc = SQLITE_CORRUPT_BKPT;
+      }
+      if( rc ) goto balance_cleanup;
+    }else{
+      assert( i>0 );
+      rc = allocateBtreePage(pBt, &pNew, &pgno, (bBulk ? 1 : pgno), 0);
+      if( rc ) goto balance_cleanup;
+      zeroPage(pNew, pageFlags);
+      apNew[i] = pNew;
+      nNew++;
+      cntOld[i] = b.nCell;
+
+      /* Set the pointer-map entry for the new sibling page. */
+      if( ISAUTOVACUUM ){
+        ptrmapPut(pBt, pNew->pgno, PTRMAP_BTREE, pParent->pgno, &rc);
+        if( rc!=SQLITE_OK ){
+          goto balance_cleanup;
+        }
+      }
+    }
+  }
+
+  /*
+  ** Reassign page numbers so that the new pages are in ascending order.
+  ** This helps to keep entries in the disk file in order so that a scan
+  ** of the table is closer to a linear scan through the file. That in turn
+  ** helps the operating system to deliver pages from the disk more rapidly.
+  **
+  ** An O(N*N) sort algorithm is used, but since N is never more than NB+2
+  ** (5), that is not a performance concern.
+  **
+  ** When NB==3, this one optimization makes the database about 25% faster
+  ** for large insertions and deletions.
+  */
+  for(i=0; i<nNew; i++){
+    aPgno[i] = apNew[i]->pgno;
+    assert( apNew[i]->pDbPage->flags & PGHDR_WRITEABLE );
+    assert( apNew[i]->pDbPage->flags & PGHDR_DIRTY );
+  }
+  for(i=0; i<nNew-1; i++){
+    int iB = i;
+    for(j=i+1; j<nNew; j++){
+      if( apNew[j]->pgno < apNew[iB]->pgno ) iB = j;
+    }
+
+    /* If apNew[i] has a page number that is bigger than any of the
+    ** subsequence apNew[i] entries, then swap apNew[i] with the subsequent
+    ** entry that has the smallest page number (which we know to be
+    ** entry apNew[iB]).
+    */
+    if( iB!=i ){
+      Pgno pgnoA = apNew[i]->pgno;
+      Pgno pgnoB = apNew[iB]->pgno;
+      Pgno pgnoTemp = (PENDING_BYTE/pBt->pageSize)+1;
+      u16 fgA = apNew[i]->pDbPage->flags;
+      u16 fgB = apNew[iB]->pDbPage->flags;
+      sqlite3PagerRekey(apNew[i]->pDbPage, pgnoTemp, fgB);
+      sqlite3PagerRekey(apNew[iB]->pDbPage, pgnoA, fgA);
+      sqlite3PagerRekey(apNew[i]->pDbPage, pgnoB, fgB);
+      apNew[i]->pgno = pgnoB;
+      apNew[iB]->pgno = pgnoA;
+    }
+  }
+
+  TRACE(("BALANCE: new: %d(%d nc=%d) %d(%d nc=%d) %d(%d nc=%d) "
+         "%d(%d nc=%d) %d(%d nc=%d)\n",
+    apNew[0]->pgno, szNew[0], cntNew[0],
+    nNew>=2 ? apNew[1]->pgno : 0, nNew>=2 ? szNew[1] : 0,
+    nNew>=2 ? cntNew[1] - cntNew[0] - !leafData : 0,
+    nNew>=3 ? apNew[2]->pgno : 0, nNew>=3 ? szNew[2] : 0,
+    nNew>=3 ? cntNew[2] - cntNew[1] - !leafData : 0,
+    nNew>=4 ? apNew[3]->pgno : 0, nNew>=4 ? szNew[3] : 0,
+    nNew>=4 ? cntNew[3] - cntNew[2] - !leafData : 0,
+    nNew>=5 ? apNew[4]->pgno : 0, nNew>=5 ? szNew[4] : 0,
+    nNew>=5 ? cntNew[4] - cntNew[3] - !leafData : 0
+  ));
+
+  assert( sqlite3PagerIswriteable(pParent->pDbPage) );
+  assert( nNew>=1 && nNew<=ArraySize(apNew) );
+  assert( apNew[nNew-1]!=0 );
+  put4byte(pRight, apNew[nNew-1]->pgno);
+
+  /* If the sibling pages are not leaves, ensure that the right-child pointer
+  ** of the right-most new sibling page is set to the value that was
+  ** originally in the same field of the right-most old sibling page. */
+  if( (pageFlags & PTF_LEAF)==0 && nOld!=nNew ){
+    MemPage *pOld = (nNew>nOld ? apNew : apOld)[nOld-1];
+    memcpy(&apNew[nNew-1]->aData[8], &pOld->aData[8], 4);
+  }
+
+  /* Make any required updates to pointer map entries associated with
+  ** cells stored on sibling pages following the balance operation. Pointer
+  ** map entries associated with divider cells are set by the insertCell()
+  ** routine. The associated pointer map entries are:
+  **
+  **   a) if the cell contains a reference to an overflow chain, the
+  **      entry associated with the first page in the overflow chain, and
+  **
+  **   b) if the sibling pages are not leaves, the child page associated
+  **      with the cell.
+  **
+  ** If the sibling pages are not leaves, then the pointer map entry
+  ** associated with the right-child of each sibling may also need to be
+  ** updated. This happens below, after the sibling pages have been
+  ** populated, not here.
+  */
+  if( ISAUTOVACUUM ){
+    MemPage *pOld;
+    MemPage *pNew = pOld = apNew[0];
+    int cntOldNext = pNew->nCell + pNew->nOverflow;
+    int iNew = 0;
+    int iOld = 0;
+
+    for(i=0; i<b.nCell; i++){
+      u8 *pCell = b.apCell[i];
+      while( i==cntOldNext ){
+        iOld++;
+        assert( iOld<nNew || iOld<nOld );
+        assert( iOld>=0 && iOld<NB );
+        pOld = iOld<nNew ? apNew[iOld] : apOld[iOld];
+        cntOldNext += pOld->nCell + pOld->nOverflow + !leafData;
+      }
+      if( i==cntNew[iNew] ){
+        pNew = apNew[++iNew];
+        if( !leafData ) continue;
+      }
+
+      /* Cell pCell is destined for new sibling page pNew. Originally, it
+      ** was either part of sibling page iOld (possibly an overflow cell),
+      ** or else the divider cell to the left of sibling page iOld. So,
+      ** if sibling page iOld had the same page number as pNew, and if
+      ** pCell really was a part of sibling page iOld (not a divider or
+      ** overflow cell), we can skip updating the pointer map entries.  */
+      if( iOld>=nNew
+       || pNew->pgno!=aPgno[iOld]
+       || !SQLITE_WITHIN(pCell,pOld->aData,pOld->aDataEnd)
+      ){
+        if( !leafCorrection ){
+          ptrmapPut(pBt, get4byte(pCell), PTRMAP_BTREE, pNew->pgno, &rc);
+        }
+        if( cachedCellSize(&b,i)>pNew->minLocal ){
+          ptrmapPutOvflPtr(pNew, pOld, pCell, &rc
