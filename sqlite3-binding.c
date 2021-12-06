@@ -75993,4 +75993,186 @@ SQLITE_PRIVATE int sqlite3BtreeInsert(
         r.nField = pX->nMem;
         r.default_rc = 0;
         r.eqSeen = 0;
-        rc = sqlite3BtreeIndexMov
+        rc = sqlite3BtreeIndexMoveto(pCur, &r, &loc);
+      }else{
+        rc = btreeMoveto(pCur, pX->pKey, pX->nKey,
+                    (flags & BTREE_APPEND)!=0, &loc);
+      }
+      if( rc ) return rc;
+    }
+
+    /* If the cursor is currently pointing to an entry to be overwritten
+    ** and the new content is the same as as the old, then use the
+    ** overwrite optimization.
+    */
+    if( loc==0 ){
+      getCellInfo(pCur);
+      if( pCur->info.nKey==pX->nKey ){
+        BtreePayload x2;
+        x2.pData = pX->pKey;
+        x2.nData = pX->nKey;
+        x2.nZero = 0;
+        return btreeOverwriteCell(pCur, &x2);
+      }
+    }
+  }
+  assert( pCur->eState==CURSOR_VALID
+       || (pCur->eState==CURSOR_INVALID && loc) );
+
+  pPage = pCur->pPage;
+  assert( pPage->intKey || pX->nKey>=0 || (flags & BTREE_PREFORMAT) );
+  assert( pPage->leaf || !pPage->intKey );
+  if( pPage->nFree<0 ){
+    if( NEVER(pCur->eState>CURSOR_INVALID) ){
+     /* ^^^^^--- due to the moveToRoot() call above */
+      rc = SQLITE_CORRUPT_BKPT;
+    }else{
+      rc = btreeComputeFreeSpace(pPage);
+    }
+    if( rc ) return rc;
+  }
+
+  TRACE(("INSERT: table=%d nkey=%lld ndata=%d page=%d %s\n",
+          pCur->pgnoRoot, pX->nKey, pX->nData, pPage->pgno,
+          loc==0 ? "overwrite" : "new entry"));
+  assert( pPage->isInit || CORRUPT_DB );
+  newCell = pBt->pTmpSpace;
+  assert( newCell!=0 );
+  if( flags & BTREE_PREFORMAT ){
+    rc = SQLITE_OK;
+    szNew = pBt->nPreformatSize;
+    if( szNew<4 ) szNew = 4;
+    if( ISAUTOVACUUM && szNew>pPage->maxLocal ){
+      CellInfo info;
+      pPage->xParseCell(pPage, newCell, &info);
+      if( info.nPayload!=info.nLocal ){
+        Pgno ovfl = get4byte(&newCell[szNew-4]);
+        ptrmapPut(pBt, ovfl, PTRMAP_OVERFLOW1, pPage->pgno, &rc);
+      }
+    }
+  }else{
+    rc = fillInCell(pPage, newCell, pX, &szNew);
+  }
+  if( rc ) goto end_insert;
+  assert( szNew==pPage->xCellSize(pPage, newCell) );
+  assert( szNew <= MX_CELL_SIZE(pBt) );
+  idx = pCur->ix;
+  if( loc==0 ){
+    CellInfo info;
+    assert( idx>=0 );
+    if( idx>=pPage->nCell ){
+      return SQLITE_CORRUPT_BKPT;
+    }
+    rc = sqlite3PagerWrite(pPage->pDbPage);
+    if( rc ){
+      goto end_insert;
+    }
+    oldCell = findCell(pPage, idx);
+    if( !pPage->leaf ){
+      memcpy(newCell, oldCell, 4);
+    }
+    BTREE_CLEAR_CELL(rc, pPage, oldCell, info);
+    testcase( pCur->curFlags & BTCF_ValidOvfl );
+    invalidateOverflowCache(pCur);
+    if( info.nSize==szNew && info.nLocal==info.nPayload
+     && (!ISAUTOVACUUM || szNew<pPage->minLocal)
+    ){
+      /* Overwrite the old cell with the new if they are the same size.
+      ** We could also try to do this if the old cell is smaller, then add
+      ** the leftover space to the free list.  But experiments show that
+      ** doing that is no faster then skipping this optimization and just
+      ** calling dropCell() and insertCell().
+      **
+      ** This optimization cannot be used on an autovacuum database if the
+      ** new entry uses overflow pages, as the insertCell() call below is
+      ** necessary to add the PTRMAP_OVERFLOW1 pointer-map entry.  */
+      assert( rc==SQLITE_OK ); /* clearCell never fails when nLocal==nPayload */
+      if( oldCell < pPage->aData+pPage->hdrOffset+10 ){
+        return SQLITE_CORRUPT_BKPT;
+      }
+      if( oldCell+szNew > pPage->aDataEnd ){
+        return SQLITE_CORRUPT_BKPT;
+      }
+      memcpy(oldCell, newCell, szNew);
+      return SQLITE_OK;
+    }
+    dropCell(pPage, idx, info.nSize, &rc);
+    if( rc ) goto end_insert;
+  }else if( loc<0 && pPage->nCell>0 ){
+    assert( pPage->leaf );
+    idx = ++pCur->ix;
+    pCur->curFlags &= ~BTCF_ValidNKey;
+  }else{
+    assert( pPage->leaf );
+  }
+  insertCell(pPage, idx, newCell, szNew, 0, 0, &rc);
+  assert( pPage->nOverflow==0 || rc==SQLITE_OK );
+  assert( rc!=SQLITE_OK || pPage->nCell>0 || pPage->nOverflow>0 );
+
+  /* If no error has occurred and pPage has an overflow cell, call balance()
+  ** to redistribute the cells within the tree. Since balance() may move
+  ** the cursor, zero the BtCursor.info.nSize and BTCF_ValidNKey
+  ** variables.
+  **
+  ** Previous versions of SQLite called moveToRoot() to move the cursor
+  ** back to the root page as balance() used to invalidate the contents
+  ** of BtCursor.apPage[] and BtCursor.aiIdx[]. Instead of doing that,
+  ** set the cursor state to "invalid". This makes common insert operations
+  ** slightly faster.
+  **
+  ** There is a subtle but important optimization here too. When inserting
+  ** multiple records into an intkey b-tree using a single cursor (as can
+  ** happen while processing an "INSERT INTO ... SELECT" statement), it
+  ** is advantageous to leave the cursor pointing to the last entry in
+  ** the b-tree if possible. If the cursor is left pointing to the last
+  ** entry in the table, and the next row inserted has an integer key
+  ** larger than the largest existing key, it is possible to insert the
+  ** row without seeking the cursor. This can be a big performance boost.
+  */
+  pCur->info.nSize = 0;
+  if( pPage->nOverflow ){
+    assert( rc==SQLITE_OK );
+    pCur->curFlags &= ~(BTCF_ValidNKey);
+    rc = balance(pCur);
+
+    /* Must make sure nOverflow is reset to zero even if the balance()
+    ** fails. Internal data structure corruption will result otherwise.
+    ** Also, set the cursor state to invalid. This stops saveCursorPosition()
+    ** from trying to save the current position of the cursor.  */
+    pCur->pPage->nOverflow = 0;
+    pCur->eState = CURSOR_INVALID;
+    if( (flags & BTREE_SAVEPOSITION) && rc==SQLITE_OK ){
+      btreeReleaseAllCursorPages(pCur);
+      if( pCur->pKeyInfo ){
+        assert( pCur->pKey==0 );
+        pCur->pKey = sqlite3Malloc( pX->nKey );
+        if( pCur->pKey==0 ){
+          rc = SQLITE_NOMEM;
+        }else{
+          memcpy(pCur->pKey, pX->pKey, pX->nKey);
+        }
+      }
+      pCur->eState = CURSOR_REQUIRESEEK;
+      pCur->nKey = pX->nKey;
+    }
+  }
+  assert( pCur->iPage<0 || pCur->pPage->nOverflow==0 );
+
+end_insert:
+  return rc;
+}
+
+/*
+** This function is used as part of copying the current row from cursor
+** pSrc into cursor pDest. If the cursors are open on intkey tables, then
+** parameter iKey is used as the rowid value when the record is copied
+** into pDest. Otherwise, the record is copied verbatim.
+**
+** This function does not actually write the new value to cursor pDest.
+** Instead, it creates and populates any required overflow pages and
+** writes the data for the new cell into the BtShared.pTmpSpace buffer
+** for the destination database. The size of the cell, in bytes, is left
+** in BtShared.nPreformatSize. The caller completes the insertion by
+** calling sqlite3BtreeInsert() with the BTREE_PREFORMAT flag specified.
+**
+** SQLITE_OK is returned if suc
