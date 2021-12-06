@@ -75673,4 +75673,173 @@ static int balance(BtCursor *pCur){
           ** into pParent, which may cause pParent overflow. If this
           ** happens, the next iteration of the do-loop will balance pParent
           ** use either balance_nonroot() or balance_deeper(). Until this
-          ** happens, the overflow cell is
+          ** happens, the overflow cell is stored in the aBalanceQuickSpace[]
+          ** buffer.
+          **
+          ** The purpose of the following assert() is to check that only a
+          ** single call to balance_quick() is made for each call to this
+          ** function. If this were not verified, a subtle bug involving reuse
+          ** of the aBalanceQuickSpace[] might sneak in.
+          */
+          assert( balance_quick_called==0 );
+          VVA_ONLY( balance_quick_called++ );
+          rc = balance_quick(pParent, pPage, aBalanceQuickSpace);
+        }else
+#endif
+        {
+          /* In this case, call balance_nonroot() to redistribute cells
+          ** between pPage and up to 2 of its sibling pages. This involves
+          ** modifying the contents of pParent, which may cause pParent to
+          ** become overfull or underfull. The next iteration of the do-loop
+          ** will balance the parent page to correct this.
+          **
+          ** If the parent page becomes overfull, the overflow cell or cells
+          ** are stored in the pSpace buffer allocated immediately below.
+          ** A subsequent iteration of the do-loop will deal with this by
+          ** calling balance_nonroot() (balance_deeper() may be called first,
+          ** but it doesn't deal with overflow cells - just moves them to a
+          ** different page). Once this subsequent call to balance_nonroot()
+          ** has completed, it is safe to release the pSpace buffer used by
+          ** the previous call, as the overflow cell data will have been
+          ** copied either into the body of a database page or into the new
+          ** pSpace buffer passed to the latter call to balance_nonroot().
+          */
+          u8 *pSpace = sqlite3PageMalloc(pCur->pBt->pageSize);
+          rc = balance_nonroot(pParent, iIdx, pSpace, iPage==1,
+                               pCur->hints&BTREE_BULKLOAD);
+          if( pFree ){
+            /* If pFree is not NULL, it points to the pSpace buffer used
+            ** by a previous call to balance_nonroot(). Its contents are
+            ** now stored either on real database pages or within the
+            ** new pSpace buffer, so it may be safely freed here. */
+            sqlite3PageFree(pFree);
+          }
+
+          /* The pSpace buffer will be freed after the next call to
+          ** balance_nonroot(), or just before this function returns, whichever
+          ** comes first. */
+          pFree = pSpace;
+        }
+      }
+
+      pPage->nOverflow = 0;
+
+      /* The next iteration of the do-loop balances the parent page. */
+      releasePage(pPage);
+      pCur->iPage--;
+      assert( pCur->iPage>=0 );
+      pCur->pPage = pCur->apPage[pCur->iPage];
+    }
+  }while( rc==SQLITE_OK );
+
+  if( pFree ){
+    sqlite3PageFree(pFree);
+  }
+  return rc;
+}
+
+/* Overwrite content from pX into pDest.  Only do the write if the
+** content is different from what is already there.
+*/
+static int btreeOverwriteContent(
+  MemPage *pPage,           /* MemPage on which writing will occur */
+  u8 *pDest,                /* Pointer to the place to start writing */
+  const BtreePayload *pX,   /* Source of data to write */
+  int iOffset,              /* Offset of first byte to write */
+  int iAmt                  /* Number of bytes to be written */
+){
+  int nData = pX->nData - iOffset;
+  if( nData<=0 ){
+    /* Overwritting with zeros */
+    int i;
+    for(i=0; i<iAmt && pDest[i]==0; i++){}
+    if( i<iAmt ){
+      int rc = sqlite3PagerWrite(pPage->pDbPage);
+      if( rc ) return rc;
+      memset(pDest + i, 0, iAmt - i);
+    }
+  }else{
+    if( nData<iAmt ){
+      /* Mixed read data and zeros at the end.  Make a recursive call
+      ** to write the zeros then fall through to write the real data */
+      int rc = btreeOverwriteContent(pPage, pDest+nData, pX, iOffset+nData,
+                                 iAmt-nData);
+      if( rc ) return rc;
+      iAmt = nData;
+    }
+    if( memcmp(pDest, ((u8*)pX->pData) + iOffset, iAmt)!=0 ){
+      int rc = sqlite3PagerWrite(pPage->pDbPage);
+      if( rc ) return rc;
+      /* In a corrupt database, it is possible for the source and destination
+      ** buffers to overlap.  This is harmless since the database is already
+      ** corrupt but it does cause valgrind and ASAN warnings.  So use
+      ** memmove(). */
+      memmove(pDest, ((u8*)pX->pData) + iOffset, iAmt);
+    }
+  }
+  return SQLITE_OK;
+}
+
+/*
+** Overwrite the cell that cursor pCur is pointing to with fresh content
+** contained in pX.
+*/
+static int btreeOverwriteCell(BtCursor *pCur, const BtreePayload *pX){
+  int iOffset;                        /* Next byte of pX->pData to write */
+  int nTotal = pX->nData + pX->nZero; /* Total bytes of to write */
+  int rc;                             /* Return code */
+  MemPage *pPage = pCur->pPage;       /* Page being written */
+  BtShared *pBt;                      /* Btree */
+  Pgno ovflPgno;                      /* Next overflow page to write */
+  u32 ovflPageSize;                   /* Size to write on overflow page */
+
+  if( pCur->info.pPayload + pCur->info.nLocal > pPage->aDataEnd
+   || pCur->info.pPayload < pPage->aData + pPage->cellOffset
+  ){
+    return SQLITE_CORRUPT_BKPT;
+  }
+  /* Overwrite the local portion first */
+  rc = btreeOverwriteContent(pPage, pCur->info.pPayload, pX,
+                             0, pCur->info.nLocal);
+  if( rc ) return rc;
+  if( pCur->info.nLocal==nTotal ) return SQLITE_OK;
+
+  /* Now overwrite the overflow pages */
+  iOffset = pCur->info.nLocal;
+  assert( nTotal>=0 );
+  assert( iOffset>=0 );
+  ovflPgno = get4byte(pCur->info.pPayload + iOffset);
+  pBt = pPage->pBt;
+  ovflPageSize = pBt->usableSize - 4;
+  do{
+    rc = btreeGetPage(pBt, ovflPgno, &pPage, 0);
+    if( rc ) return rc;
+    if( sqlite3PagerPageRefcount(pPage->pDbPage)!=1 || pPage->isInit ){
+      rc = SQLITE_CORRUPT_BKPT;
+    }else{
+      if( iOffset+ovflPageSize<(u32)nTotal ){
+        ovflPgno = get4byte(pPage->aData);
+      }else{
+        ovflPageSize = nTotal - iOffset;
+      }
+      rc = btreeOverwriteContent(pPage, pPage->aData+4, pX,
+                                 iOffset, ovflPageSize);
+    }
+    sqlite3PagerUnref(pPage->pDbPage);
+    if( rc ) return rc;
+    iOffset += ovflPageSize;
+  }while( iOffset<nTotal );
+  return SQLITE_OK;
+}
+
+
+/*
+** Insert a new record into the BTree.  The content of the new record
+** is described by the pX object.  The pCur cursor is used only to
+** define what table the record should be inserted into, and is left
+** pointing at a random location.
+**
+** For a table btree (used for rowid tables), only the pX.nKey value of
+** the key is used. The pX.pKey value must be NULL.  The pX.nKey is the
+** rowid or INTEGER PRIMARY KEY of the row.  The pX.nData,pData,nZero fields
+** hol
