@@ -75842,4 +75842,155 @@ static int btreeOverwriteCell(BtCursor *pCur, const BtreePayload *pX){
 ** For a table btree (used for rowid tables), only the pX.nKey value of
 ** the key is used. The pX.pKey value must be NULL.  The pX.nKey is the
 ** rowid or INTEGER PRIMARY KEY of the row.  The pX.nData,pData,nZero fields
-** hol
+** hold the content of the row.
+**
+** For an index btree (used for indexes and WITHOUT ROWID tables), the
+** key is an arbitrary byte sequence stored in pX.pKey,nKey.  The
+** pX.pData,nData,nZero fields must be zero.
+**
+** If the seekResult parameter is non-zero, then a successful call to
+** sqlite3BtreeIndexMoveto() to seek cursor pCur to (pKey,nKey) has already
+** been performed.  In other words, if seekResult!=0 then the cursor
+** is currently pointing to a cell that will be adjacent to the cell
+** to be inserted.  If seekResult<0 then pCur points to a cell that is
+** smaller then (pKey,nKey).  If seekResult>0 then pCur points to a cell
+** that is larger than (pKey,nKey).
+**
+** If seekResult==0, that means pCur is pointing at some unknown location.
+** In that case, this routine must seek the cursor to the correct insertion
+** point for (pKey,nKey) before doing the insertion.  For index btrees,
+** if pX->nMem is non-zero, then pX->aMem contains pointers to the unpacked
+** key values and pX->aMem can be used instead of pX->pKey to avoid having
+** to decode the key.
+*/
+SQLITE_PRIVATE int sqlite3BtreeInsert(
+  BtCursor *pCur,                /* Insert data into the table of this cursor */
+  const BtreePayload *pX,        /* Content of the row to be inserted */
+  int flags,                     /* True if this is likely an append */
+  int seekResult                 /* Result of prior IndexMoveto() call */
+){
+  int rc;
+  int loc = seekResult;          /* -1: before desired location  +1: after */
+  int szNew = 0;
+  int idx;
+  MemPage *pPage;
+  Btree *p = pCur->pBtree;
+  BtShared *pBt = p->pBt;
+  unsigned char *oldCell;
+  unsigned char *newCell = 0;
+
+  assert( (flags & (BTREE_SAVEPOSITION|BTREE_APPEND|BTREE_PREFORMAT))==flags );
+  assert( (flags & BTREE_PREFORMAT)==0 || seekResult || pCur->pKeyInfo==0 );
+
+  /* Save the positions of any other cursors open on this table.
+  **
+  ** In some cases, the call to btreeMoveto() below is a no-op. For
+  ** example, when inserting data into a table with auto-generated integer
+  ** keys, the VDBE layer invokes sqlite3BtreeLast() to figure out the
+  ** integer key to use. It then calls this function to actually insert the
+  ** data into the intkey B-Tree. In this case btreeMoveto() recognizes
+  ** that the cursor is already where it needs to be and returns without
+  ** doing any work. To avoid thwarting these optimizations, it is important
+  ** not to clear the cursor here.
+  */
+  if( pCur->curFlags & BTCF_Multiple ){
+    rc = saveAllCursors(pBt, pCur->pgnoRoot, pCur);
+    if( rc ) return rc;
+    if( loc && pCur->iPage<0 ){
+      /* This can only happen if the schema is corrupt such that there is more
+      ** than one table or index with the same root page as used by the cursor.
+      ** Which can only happen if the SQLITE_NoSchemaError flag was set when
+      ** the schema was loaded. This cannot be asserted though, as a user might
+      ** set the flag, load the schema, and then unset the flag.  */
+      return SQLITE_CORRUPT_BKPT;
+    }
+  }
+
+  /* Ensure that the cursor is not in the CURSOR_FAULT state and that it
+  ** points to a valid cell.
+  */
+  if( pCur->eState>=CURSOR_REQUIRESEEK ){
+    testcase( pCur->eState==CURSOR_REQUIRESEEK );
+    testcase( pCur->eState==CURSOR_FAULT );
+    rc = moveToRoot(pCur);
+    if( rc && rc!=SQLITE_EMPTY ) return rc;
+  }
+
+  assert( cursorOwnsBtShared(pCur) );
+  assert( (pCur->curFlags & BTCF_WriteFlag)!=0
+              && pBt->inTransaction==TRANS_WRITE
+              && (pBt->btsFlags & BTS_READ_ONLY)==0 );
+  assert( hasSharedCacheTableLock(p, pCur->pgnoRoot, pCur->pKeyInfo!=0, 2) );
+
+  /* Assert that the caller has been consistent. If this cursor was opened
+  ** expecting an index b-tree, then the caller should be inserting blob
+  ** keys with no associated data. If the cursor was opened expecting an
+  ** intkey table, the caller should be inserting integer keys with a
+  ** blob of associated data.  */
+  assert( (flags & BTREE_PREFORMAT) || (pX->pKey==0)==(pCur->pKeyInfo==0) );
+
+  if( pCur->pKeyInfo==0 ){
+    assert( pX->pKey==0 );
+    /* If this is an insert into a table b-tree, invalidate any incrblob
+    ** cursors open on the row being replaced */
+    if( p->hasIncrblobCur ){
+      invalidateIncrblobCursors(p, pCur->pgnoRoot, pX->nKey, 0);
+    }
+
+    /* If BTREE_SAVEPOSITION is set, the cursor must already be pointing
+    ** to a row with the same key as the new entry being inserted.
+    */
+#ifdef SQLITE_DEBUG
+    if( flags & BTREE_SAVEPOSITION ){
+      assert( pCur->curFlags & BTCF_ValidNKey );
+      assert( pX->nKey==pCur->info.nKey );
+      assert( loc==0 );
+    }
+#endif
+
+    /* On the other hand, BTREE_SAVEPOSITION==0 does not imply
+    ** that the cursor is not pointing to a row to be overwritten.
+    ** So do a complete check.
+    */
+    if( (pCur->curFlags&BTCF_ValidNKey)!=0 && pX->nKey==pCur->info.nKey ){
+      /* The cursor is pointing to the entry that is to be
+      ** overwritten */
+      assert( pX->nData>=0 && pX->nZero>=0 );
+      if( pCur->info.nSize!=0
+       && pCur->info.nPayload==(u32)pX->nData+pX->nZero
+      ){
+        /* New entry is the same size as the old.  Do an overwrite */
+        return btreeOverwriteCell(pCur, pX);
+      }
+      assert( loc==0 );
+    }else if( loc==0 ){
+      /* The cursor is *not* pointing to the cell to be overwritten, nor
+      ** to an adjacent cell.  Move the cursor so that it is pointing either
+      ** to the cell to be overwritten or an adjacent cell.
+      */
+      rc = sqlite3BtreeTableMoveto(pCur, pX->nKey,
+               (flags & BTREE_APPEND)!=0, &loc);
+      if( rc ) return rc;
+    }
+  }else{
+    /* This is an index or a WITHOUT ROWID table */
+
+    /* If BTREE_SAVEPOSITION is set, the cursor must already be pointing
+    ** to a row with the same key as the new entry being inserted.
+    */
+    assert( (flags & BTREE_SAVEPOSITION)==0 || loc==0 );
+
+    /* If the cursor is not already pointing either to the cell to be
+    ** overwritten, or if a new cell is being inserted, if the cursor is
+    ** not pointing to an immediately adjacent cell, then move the cursor
+    ** so that it does.
+    */
+    if( loc==0 && (flags & BTREE_SAVEPOSITION)==0 ){
+      if( pX->nMem ){
+        UnpackedRecord r;
+        r.pKeyInfo = pCur->pKeyInfo;
+        r.aMem = pX->aMem;
+        r.nField = pX->nMem;
+        r.default_rc = 0;
+        r.eqSeen = 0;
+        rc = sqlite3BtreeIndexMov
