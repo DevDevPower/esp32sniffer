@@ -76362,3 +76362,184 @@ SQLITE_PRIVATE int sqlite3BtreeDelete(BtCursor *pCur, u8 flags){
       bPreserve = 2;
     }
   }
+
+  /* If the page containing the entry to delete is not a leaf page, move
+  ** the cursor to the largest entry in the tree that is smaller than
+  ** the entry being deleted. This cell will replace the cell being deleted
+  ** from the internal node. The 'previous' entry is used for this instead
+  ** of the 'next' entry, as the previous entry is always a part of the
+  ** sub-tree headed by the child page of the cell being deleted. This makes
+  ** balancing the tree following the delete operation easier.  */
+  if( !pPage->leaf ){
+    rc = sqlite3BtreePrevious(pCur, 0);
+    assert( rc!=SQLITE_DONE );
+    if( rc ) return rc;
+  }
+
+  /* Save the positions of any other cursors open on this table before
+  ** making any modifications.  */
+  if( pCur->curFlags & BTCF_Multiple ){
+    rc = saveAllCursors(pBt, pCur->pgnoRoot, pCur);
+    if( rc ) return rc;
+  }
+
+  /* If this is a delete operation to remove a row from a table b-tree,
+  ** invalidate any incrblob cursors open on the row being deleted.  */
+  if( pCur->pKeyInfo==0 && p->hasIncrblobCur ){
+    invalidateIncrblobCursors(p, pCur->pgnoRoot, pCur->info.nKey, 0);
+  }
+
+  /* Make the page containing the entry to be deleted writable. Then free any
+  ** overflow pages associated with the entry and finally remove the cell
+  ** itself from within the page.  */
+  rc = sqlite3PagerWrite(pPage->pDbPage);
+  if( rc ) return rc;
+  BTREE_CLEAR_CELL(rc, pPage, pCell, info);
+  dropCell(pPage, iCellIdx, info.nSize, &rc);
+  if( rc ) return rc;
+
+  /* If the cell deleted was not located on a leaf page, then the cursor
+  ** is currently pointing to the largest entry in the sub-tree headed
+  ** by the child-page of the cell that was just deleted from an internal
+  ** node. The cell from the leaf node needs to be moved to the internal
+  ** node to replace the deleted cell.  */
+  if( !pPage->leaf ){
+    MemPage *pLeaf = pCur->pPage;
+    int nCell;
+    Pgno n;
+    unsigned char *pTmp;
+
+    if( pLeaf->nFree<0 ){
+      rc = btreeComputeFreeSpace(pLeaf);
+      if( rc ) return rc;
+    }
+    if( iCellDepth<pCur->iPage-1 ){
+      n = pCur->apPage[iCellDepth+1]->pgno;
+    }else{
+      n = pCur->pPage->pgno;
+    }
+    pCell = findCell(pLeaf, pLeaf->nCell-1);
+    if( pCell<&pLeaf->aData[4] ) return SQLITE_CORRUPT_BKPT;
+    nCell = pLeaf->xCellSize(pLeaf, pCell);
+    assert( MX_CELL_SIZE(pBt) >= nCell );
+    pTmp = pBt->pTmpSpace;
+    assert( pTmp!=0 );
+    rc = sqlite3PagerWrite(pLeaf->pDbPage);
+    if( rc==SQLITE_OK ){
+      insertCell(pPage, iCellIdx, pCell-4, nCell+4, pTmp, n, &rc);
+    }
+    dropCell(pLeaf, pLeaf->nCell-1, nCell, &rc);
+    if( rc ) return rc;
+  }
+
+  /* Balance the tree. If the entry deleted was located on a leaf page,
+  ** then the cursor still points to that page. In this case the first
+  ** call to balance() repairs the tree, and the if(...) condition is
+  ** never true.
+  **
+  ** Otherwise, if the entry deleted was on an internal node page, then
+  ** pCur is pointing to the leaf page from which a cell was removed to
+  ** replace the cell deleted from the internal node. This is slightly
+  ** tricky as the leaf node may be underfull, and the internal node may
+  ** be either under or overfull. In this case run the balancing algorithm
+  ** on the leaf node first. If the balance proceeds far enough up the
+  ** tree that we can be sure that any problem in the internal node has
+  ** been corrected, so be it. Otherwise, after balancing the leaf node,
+  ** walk the cursor up the tree to the internal node and balance it as
+  ** well.  */
+  assert( pCur->pPage->nOverflow==0 );
+  assert( pCur->pPage->nFree>=0 );
+  if( pCur->pPage->nFree*3<=(int)pCur->pBt->usableSize*2 ){
+    /* Optimization: If the free space is less than 2/3rds of the page,
+    ** then balance() will always be a no-op.  No need to invoke it. */
+    rc = SQLITE_OK;
+  }else{
+    rc = balance(pCur);
+  }
+  if( rc==SQLITE_OK && pCur->iPage>iCellDepth ){
+    releasePageNotNull(pCur->pPage);
+    pCur->iPage--;
+    while( pCur->iPage>iCellDepth ){
+      releasePage(pCur->apPage[pCur->iPage--]);
+    }
+    pCur->pPage = pCur->apPage[pCur->iPage];
+    rc = balance(pCur);
+  }
+
+  if( rc==SQLITE_OK ){
+    if( bPreserve>1 ){
+      assert( (pCur->iPage==iCellDepth || CORRUPT_DB) );
+      assert( pPage==pCur->pPage || CORRUPT_DB );
+      assert( (pPage->nCell>0 || CORRUPT_DB) && iCellIdx<=pPage->nCell );
+      pCur->eState = CURSOR_SKIPNEXT;
+      if( iCellIdx>=pPage->nCell ){
+        pCur->skipNext = -1;
+        pCur->ix = pPage->nCell-1;
+      }else{
+        pCur->skipNext = 1;
+      }
+    }else{
+      rc = moveToRoot(pCur);
+      if( bPreserve ){
+        btreeReleaseAllCursorPages(pCur);
+        pCur->eState = CURSOR_REQUIRESEEK;
+      }
+      if( rc==SQLITE_EMPTY ) rc = SQLITE_OK;
+    }
+  }
+  return rc;
+}
+
+/*
+** Create a new BTree table.  Write into *piTable the page
+** number for the root page of the new table.
+**
+** The type of type is determined by the flags parameter.  Only the
+** following values of flags are currently in use.  Other values for
+** flags might not work:
+**
+**     BTREE_INTKEY|BTREE_LEAFDATA     Used for SQL tables with rowid keys
+**     BTREE_ZERODATA                  Used for SQL indices
+*/
+static int btreeCreateTable(Btree *p, Pgno *piTable, int createTabFlags){
+  BtShared *pBt = p->pBt;
+  MemPage *pRoot;
+  Pgno pgnoRoot;
+  int rc;
+  int ptfFlags;          /* Page-type flage for the root page of new table */
+
+  assert( sqlite3BtreeHoldsMutex(p) );
+  assert( pBt->inTransaction==TRANS_WRITE );
+  assert( (pBt->btsFlags & BTS_READ_ONLY)==0 );
+
+#ifdef SQLITE_OMIT_AUTOVACUUM
+  rc = allocateBtreePage(pBt, &pRoot, &pgnoRoot, 1, 0);
+  if( rc ){
+    return rc;
+  }
+#else
+  if( pBt->autoVacuum ){
+    Pgno pgnoMove;      /* Move a page here to make room for the root-page */
+    MemPage *pPageMove; /* The page to move to. */
+
+    /* Creating a new table may probably require moving an existing database
+    ** to make room for the new tables root page. In case this page turns
+    ** out to be an overflow page, delete all overflow page-map caches
+    ** held by open cursors.
+    */
+    invalidateAllOverflowCache(pBt);
+
+    /* Read the value of meta[3] from the database to determine where the
+    ** root page of the new table should go. meta[3] is the largest root-page
+    ** created so far, so the new root-page is (meta[3]+1).
+    */
+    sqlite3BtreeGetMeta(p, BTREE_LARGEST_ROOT_PAGE, &pgnoRoot);
+    if( pgnoRoot>btreePagecount(pBt) ){
+      return SQLITE_CORRUPT_BKPT;
+    }
+    pgnoRoot++;
+
+    /* The new root-page may not be allocated on a pointer-map page, or the
+    ** PENDING_BYTE page.
+    */
+    whi
