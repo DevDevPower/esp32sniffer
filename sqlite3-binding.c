@@ -76542,4 +76542,219 @@ static int btreeCreateTable(Btree *p, Pgno *piTable, int createTabFlags){
     /* The new root-page may not be allocated on a pointer-map page, or the
     ** PENDING_BYTE page.
     */
-    whi
+    while( pgnoRoot==PTRMAP_PAGENO(pBt, pgnoRoot) ||
+        pgnoRoot==PENDING_BYTE_PAGE(pBt) ){
+      pgnoRoot++;
+    }
+    assert( pgnoRoot>=3 );
+
+    /* Allocate a page. The page that currently resides at pgnoRoot will
+    ** be moved to the allocated page (unless the allocated page happens
+    ** to reside at pgnoRoot).
+    */
+    rc = allocateBtreePage(pBt, &pPageMove, &pgnoMove, pgnoRoot, BTALLOC_EXACT);
+    if( rc!=SQLITE_OK ){
+      return rc;
+    }
+
+    if( pgnoMove!=pgnoRoot ){
+      /* pgnoRoot is the page that will be used for the root-page of
+      ** the new table (assuming an error did not occur). But we were
+      ** allocated pgnoMove. If required (i.e. if it was not allocated
+      ** by extending the file), the current page at position pgnoMove
+      ** is already journaled.
+      */
+      u8 eType = 0;
+      Pgno iPtrPage = 0;
+
+      /* Save the positions of any open cursors. This is required in
+      ** case they are holding a reference to an xFetch reference
+      ** corresponding to page pgnoRoot.  */
+      rc = saveAllCursors(pBt, 0, 0);
+      releasePage(pPageMove);
+      if( rc!=SQLITE_OK ){
+        return rc;
+      }
+
+      /* Move the page currently at pgnoRoot to pgnoMove. */
+      rc = btreeGetPage(pBt, pgnoRoot, &pRoot, 0);
+      if( rc!=SQLITE_OK ){
+        return rc;
+      }
+      rc = ptrmapGet(pBt, pgnoRoot, &eType, &iPtrPage);
+      if( eType==PTRMAP_ROOTPAGE || eType==PTRMAP_FREEPAGE ){
+        rc = SQLITE_CORRUPT_BKPT;
+      }
+      if( rc!=SQLITE_OK ){
+        releasePage(pRoot);
+        return rc;
+      }
+      assert( eType!=PTRMAP_ROOTPAGE );
+      assert( eType!=PTRMAP_FREEPAGE );
+      rc = relocatePage(pBt, pRoot, eType, iPtrPage, pgnoMove, 0);
+      releasePage(pRoot);
+
+      /* Obtain the page at pgnoRoot */
+      if( rc!=SQLITE_OK ){
+        return rc;
+      }
+      rc = btreeGetPage(pBt, pgnoRoot, &pRoot, 0);
+      if( rc!=SQLITE_OK ){
+        return rc;
+      }
+      rc = sqlite3PagerWrite(pRoot->pDbPage);
+      if( rc!=SQLITE_OK ){
+        releasePage(pRoot);
+        return rc;
+      }
+    }else{
+      pRoot = pPageMove;
+    }
+
+    /* Update the pointer-map and meta-data with the new root-page number. */
+    ptrmapPut(pBt, pgnoRoot, PTRMAP_ROOTPAGE, 0, &rc);
+    if( rc ){
+      releasePage(pRoot);
+      return rc;
+    }
+
+    /* When the new root page was allocated, page 1 was made writable in
+    ** order either to increase the database filesize, or to decrement the
+    ** freelist count.  Hence, the sqlite3BtreeUpdateMeta() call cannot fail.
+    */
+    assert( sqlite3PagerIswriteable(pBt->pPage1->pDbPage) );
+    rc = sqlite3BtreeUpdateMeta(p, 4, pgnoRoot);
+    if( NEVER(rc) ){
+      releasePage(pRoot);
+      return rc;
+    }
+
+  }else{
+    rc = allocateBtreePage(pBt, &pRoot, &pgnoRoot, 1, 0);
+    if( rc ) return rc;
+  }
+#endif
+  assert( sqlite3PagerIswriteable(pRoot->pDbPage) );
+  if( createTabFlags & BTREE_INTKEY ){
+    ptfFlags = PTF_INTKEY | PTF_LEAFDATA | PTF_LEAF;
+  }else{
+    ptfFlags = PTF_ZERODATA | PTF_LEAF;
+  }
+  zeroPage(pRoot, ptfFlags);
+  sqlite3PagerUnref(pRoot->pDbPage);
+  assert( (pBt->openFlags & BTREE_SINGLE)==0 || pgnoRoot==2 );
+  *piTable = pgnoRoot;
+  return SQLITE_OK;
+}
+SQLITE_PRIVATE int sqlite3BtreeCreateTable(Btree *p, Pgno *piTable, int flags){
+  int rc;
+  sqlite3BtreeEnter(p);
+  rc = btreeCreateTable(p, piTable, flags);
+  sqlite3BtreeLeave(p);
+  return rc;
+}
+
+/*
+** Erase the given database page and all its children.  Return
+** the page to the freelist.
+*/
+static int clearDatabasePage(
+  BtShared *pBt,           /* The BTree that contains the table */
+  Pgno pgno,               /* Page number to clear */
+  int freePageFlag,        /* Deallocate page if true */
+  i64 *pnChange            /* Add number of Cells freed to this counter */
+){
+  MemPage *pPage;
+  int rc;
+  unsigned char *pCell;
+  int i;
+  int hdr;
+  CellInfo info;
+
+  assert( sqlite3_mutex_held(pBt->mutex) );
+  if( pgno>btreePagecount(pBt) ){
+    return SQLITE_CORRUPT_BKPT;
+  }
+  rc = getAndInitPage(pBt, pgno, &pPage, 0, 0);
+  if( rc ) return rc;
+  if( (pBt->openFlags & BTREE_SINGLE)==0
+   && sqlite3PagerPageRefcount(pPage->pDbPage) != (1 + (pgno==1))
+  ){
+    rc = SQLITE_CORRUPT_BKPT;
+    goto cleardatabasepage_out;
+  }
+  hdr = pPage->hdrOffset;
+  for(i=0; i<pPage->nCell; i++){
+    pCell = findCell(pPage, i);
+    if( !pPage->leaf ){
+      rc = clearDatabasePage(pBt, get4byte(pCell), 1, pnChange);
+      if( rc ) goto cleardatabasepage_out;
+    }
+    BTREE_CLEAR_CELL(rc, pPage, pCell, info);
+    if( rc ) goto cleardatabasepage_out;
+  }
+  if( !pPage->leaf ){
+    rc = clearDatabasePage(pBt, get4byte(&pPage->aData[hdr+8]), 1, pnChange);
+    if( rc ) goto cleardatabasepage_out;
+    if( pPage->intKey ) pnChange = 0;
+  }
+  if( pnChange ){
+    testcase( !pPage->intKey );
+    *pnChange += pPage->nCell;
+  }
+  if( freePageFlag ){
+    freePage(pPage, &rc);
+  }else if( (rc = sqlite3PagerWrite(pPage->pDbPage))==0 ){
+    zeroPage(pPage, pPage->aData[hdr] | PTF_LEAF);
+  }
+
+cleardatabasepage_out:
+  releasePage(pPage);
+  return rc;
+}
+
+/*
+** Delete all information from a single table in the database.  iTable is
+** the page number of the root of the table.  After this routine returns,
+** the root page is empty, but still exists.
+**
+** This routine will fail with SQLITE_LOCKED if there are any open
+** read cursors on the table.  Open write cursors are moved to the
+** root of the table.
+**
+** If pnChange is not NULL, then the integer value pointed to by pnChange
+** is incremented by the number of entries in the table.
+*/
+SQLITE_PRIVATE int sqlite3BtreeClearTable(Btree *p, int iTable, i64 *pnChange){
+  int rc;
+  BtShared *pBt = p->pBt;
+  sqlite3BtreeEnter(p);
+  assert( p->inTrans==TRANS_WRITE );
+
+  rc = saveAllCursors(pBt, (Pgno)iTable, 0);
+
+  if( SQLITE_OK==rc ){
+    /* Invalidate all incrblob cursors open on table iTable (assuming iTable
+    ** is the root of a table b-tree - if it is not, the following call is
+    ** a no-op).  */
+    if( p->hasIncrblobCur ){
+      invalidateIncrblobCursors(p, (Pgno)iTable, 0, 1);
+    }
+    rc = clearDatabasePage(pBt, (Pgno)iTable, 0, pnChange);
+  }
+  sqlite3BtreeLeave(p);
+  return rc;
+}
+
+/*
+** Delete all information from the single table that pCur is open on.
+**
+** This routine only work for pCur on an ephemeral table.
+*/
+SQLITE_PRIVATE int sqlite3BtreeClearTableOfCursor(BtCursor *pCur){
+  return sqlite3BtreeClearTable(pCur->pBtree, pCur->pgnoRoot, 0);
+}
+
+/*
+** Erase all information in a table and add the root of the table to
+** th
