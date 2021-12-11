@@ -76175,4 +76175,190 @@ end_insert:
 ** in BtShared.nPreformatSize. The caller completes the insertion by
 ** calling sqlite3BtreeInsert() with the BTREE_PREFORMAT flag specified.
 **
-** SQLITE_OK is returned if suc
+** SQLITE_OK is returned if successful, or an SQLite error code otherwise.
+*/
+SQLITE_PRIVATE int sqlite3BtreeTransferRow(BtCursor *pDest, BtCursor *pSrc, i64 iKey){
+  int rc = SQLITE_OK;
+  BtShared *pBt = pDest->pBt;
+  u8 *aOut = pBt->pTmpSpace;    /* Pointer to next output buffer */
+  const u8 *aIn;                /* Pointer to next input buffer */
+  u32 nIn;                      /* Size of input buffer aIn[] */
+  u32 nRem;                     /* Bytes of data still to copy */
+
+  getCellInfo(pSrc);
+  if( pSrc->info.nPayload<0x80 ){
+    *(aOut++) = pSrc->info.nPayload;
+  }else{
+    aOut += sqlite3PutVarint(aOut, pSrc->info.nPayload);
+  }
+  if( pDest->pKeyInfo==0 ) aOut += putVarint(aOut, iKey);
+  nIn = pSrc->info.nLocal;
+  aIn = pSrc->info.pPayload;
+  if( aIn+nIn>pSrc->pPage->aDataEnd ){
+    return SQLITE_CORRUPT_BKPT;
+  }
+  nRem = pSrc->info.nPayload;
+  if( nIn==nRem && nIn<pDest->pPage->maxLocal ){
+    memcpy(aOut, aIn, nIn);
+    pBt->nPreformatSize = nIn + (aOut - pBt->pTmpSpace);
+  }else{
+    Pager *pSrcPager = pSrc->pBt->pPager;
+    u8 *pPgnoOut = 0;
+    Pgno ovflIn = 0;
+    DbPage *pPageIn = 0;
+    MemPage *pPageOut = 0;
+    u32 nOut;                     /* Size of output buffer aOut[] */
+
+    nOut = btreePayloadToLocal(pDest->pPage, pSrc->info.nPayload);
+    pBt->nPreformatSize = nOut + (aOut - pBt->pTmpSpace);
+    if( nOut<pSrc->info.nPayload ){
+      pPgnoOut = &aOut[nOut];
+      pBt->nPreformatSize += 4;
+    }
+
+    if( nRem>nIn ){
+      if( aIn+nIn+4>pSrc->pPage->aDataEnd ){
+        return SQLITE_CORRUPT_BKPT;
+      }
+      ovflIn = get4byte(&pSrc->info.pPayload[nIn]);
+    }
+
+    do {
+      nRem -= nOut;
+      do{
+        assert( nOut>0 );
+        if( nIn>0 ){
+          int nCopy = MIN(nOut, nIn);
+          memcpy(aOut, aIn, nCopy);
+          nOut -= nCopy;
+          nIn -= nCopy;
+          aOut += nCopy;
+          aIn += nCopy;
+        }
+        if( nOut>0 ){
+          sqlite3PagerUnref(pPageIn);
+          pPageIn = 0;
+          rc = sqlite3PagerGet(pSrcPager, ovflIn, &pPageIn, PAGER_GET_READONLY);
+          if( rc==SQLITE_OK ){
+            aIn = (const u8*)sqlite3PagerGetData(pPageIn);
+            ovflIn = get4byte(aIn);
+            aIn += 4;
+            nIn = pSrc->pBt->usableSize - 4;
+          }
+        }
+      }while( rc==SQLITE_OK && nOut>0 );
+
+      if( rc==SQLITE_OK && nRem>0 && ALWAYS(pPgnoOut) ){
+        Pgno pgnoNew;
+        MemPage *pNew = 0;
+        rc = allocateBtreePage(pBt, &pNew, &pgnoNew, 0, 0);
+        put4byte(pPgnoOut, pgnoNew);
+        if( ISAUTOVACUUM && pPageOut ){
+          ptrmapPut(pBt, pgnoNew, PTRMAP_OVERFLOW2, pPageOut->pgno, &rc);
+        }
+        releasePage(pPageOut);
+        pPageOut = pNew;
+        if( pPageOut ){
+          pPgnoOut = pPageOut->aData;
+          put4byte(pPgnoOut, 0);
+          aOut = &pPgnoOut[4];
+          nOut = MIN(pBt->usableSize - 4, nRem);
+        }
+      }
+    }while( nRem>0 && rc==SQLITE_OK );
+
+    releasePage(pPageOut);
+    sqlite3PagerUnref(pPageIn);
+  }
+
+  return rc;
+}
+
+/*
+** Delete the entry that the cursor is pointing to.
+**
+** If the BTREE_SAVEPOSITION bit of the flags parameter is zero, then
+** the cursor is left pointing at an arbitrary location after the delete.
+** But if that bit is set, then the cursor is left in a state such that
+** the next call to BtreeNext() or BtreePrev() moves it to the same row
+** as it would have been on if the call to BtreeDelete() had been omitted.
+**
+** The BTREE_AUXDELETE bit of flags indicates that is one of several deletes
+** associated with a single table entry and its indexes.  Only one of those
+** deletes is considered the "primary" delete.  The primary delete occurs
+** on a cursor that is not a BTREE_FORDELETE cursor.  All but one delete
+** operation on non-FORDELETE cursors is tagged with the AUXDELETE flag.
+** The BTREE_AUXDELETE bit is a hint that is not used by this implementation,
+** but which might be used by alternative storage engines.
+*/
+SQLITE_PRIVATE int sqlite3BtreeDelete(BtCursor *pCur, u8 flags){
+  Btree *p = pCur->pBtree;
+  BtShared *pBt = p->pBt;
+  int rc;                    /* Return code */
+  MemPage *pPage;            /* Page to delete cell from */
+  unsigned char *pCell;      /* Pointer to cell to delete */
+  int iCellIdx;              /* Index of cell to delete */
+  int iCellDepth;            /* Depth of node containing pCell */
+  CellInfo info;             /* Size of the cell being deleted */
+  u8 bPreserve;              /* Keep cursor valid.  2 for CURSOR_SKIPNEXT */
+
+  assert( cursorOwnsBtShared(pCur) );
+  assert( pBt->inTransaction==TRANS_WRITE );
+  assert( (pBt->btsFlags & BTS_READ_ONLY)==0 );
+  assert( pCur->curFlags & BTCF_WriteFlag );
+  assert( hasSharedCacheTableLock(p, pCur->pgnoRoot, pCur->pKeyInfo!=0, 2) );
+  assert( !hasReadConflicts(p, pCur->pgnoRoot) );
+  assert( (flags & ~(BTREE_SAVEPOSITION | BTREE_AUXDELETE))==0 );
+  if( pCur->eState!=CURSOR_VALID ){
+    if( pCur->eState>=CURSOR_REQUIRESEEK ){
+      rc = btreeRestoreCursorPosition(pCur);
+      assert( rc!=SQLITE_OK || CORRUPT_DB || pCur->eState==CURSOR_VALID );
+      if( rc || pCur->eState!=CURSOR_VALID ) return rc;
+    }else{
+      return SQLITE_CORRUPT_BKPT;
+    }
+  }
+  assert( pCur->eState==CURSOR_VALID );
+
+  iCellDepth = pCur->iPage;
+  iCellIdx = pCur->ix;
+  pPage = pCur->pPage;
+  if( pPage->nCell<=iCellIdx ){
+    return SQLITE_CORRUPT_BKPT;
+  }
+  pCell = findCell(pPage, iCellIdx);
+  if( pPage->nFree<0 && btreeComputeFreeSpace(pPage) ){
+    return SQLITE_CORRUPT_BKPT;
+  }
+
+  /* If the BTREE_SAVEPOSITION bit is on, then the cursor position must
+  ** be preserved following this delete operation. If the current delete
+  ** will cause a b-tree rebalance, then this is done by saving the cursor
+  ** key and leaving the cursor in CURSOR_REQUIRESEEK state before
+  ** returning.
+  **
+  ** If the current delete will not cause a rebalance, then the cursor
+  ** will be left in CURSOR_SKIPNEXT state pointing to the entry immediately
+  ** before or after the deleted entry.
+  **
+  ** The bPreserve value records which path is required:
+  **
+  **    bPreserve==0         Not necessary to save the cursor position
+  **    bPreserve==1         Use CURSOR_REQUIRESEEK to save the cursor position
+  **    bPreserve==2         Cursor won't move.  Set CURSOR_SKIPNEXT.
+  */
+  bPreserve = (flags & BTREE_SAVEPOSITION)!=0;
+  if( bPreserve ){
+    if( !pPage->leaf
+     || (pPage->nFree+pPage->xCellSize(pPage,pCell)+2) >
+                                                   (int)(pBt->usableSize*2/3)
+     || pPage->nCell==1  /* See dbfuzz001.test for a test case */
+    ){
+      /* A b-tree rebalance will be required after deleting this entry.
+      ** Save the cursor key.  */
+      rc = saveCursorKey(pCur);
+      if( rc ) return rc;
+    }else{
+      bPreserve = 2;
+    }
+  }
