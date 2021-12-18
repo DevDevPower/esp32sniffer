@@ -76965,4 +76965,223 @@ SQLITE_PRIVATE int sqlite3BtreeCount(sqlite3 *db, BtCursor *pCur, i64 *pnEntry){
   ** page in the B-Tree structure (not including overflow pages).
   */
   while( rc==SQLITE_OK && !AtomicLoad(&db->u1.isInterrupted) ){
-    int 
+    int iIdx;                          /* Index of child node in parent */
+    MemPage *pPage;                    /* Current page of the b-tree */
+
+    /* If this is a leaf page or the tree is not an int-key tree, then
+    ** this page contains countable entries. Increment the entry counter
+    ** accordingly.
+    */
+    pPage = pCur->pPage;
+    if( pPage->leaf || !pPage->intKey ){
+      nEntry += pPage->nCell;
+    }
+
+    /* pPage is a leaf node. This loop navigates the cursor so that it
+    ** points to the first interior cell that it points to the parent of
+    ** the next page in the tree that has not yet been visited. The
+    ** pCur->aiIdx[pCur->iPage] value is set to the index of the parent cell
+    ** of the page, or to the number of cells in the page if the next page
+    ** to visit is the right-child of its parent.
+    **
+    ** If all pages in the tree have been visited, return SQLITE_OK to the
+    ** caller.
+    */
+    if( pPage->leaf ){
+      do {
+        if( pCur->iPage==0 ){
+          /* All pages of the b-tree have been visited. Return successfully. */
+          *pnEntry = nEntry;
+          return moveToRoot(pCur);
+        }
+        moveToParent(pCur);
+      }while ( pCur->ix>=pCur->pPage->nCell );
+
+      pCur->ix++;
+      pPage = pCur->pPage;
+    }
+
+    /* Descend to the child node of the cell that the cursor currently
+    ** points at. This is the right-child if (iIdx==pPage->nCell).
+    */
+    iIdx = pCur->ix;
+    if( iIdx==pPage->nCell ){
+      rc = moveToChild(pCur, get4byte(&pPage->aData[pPage->hdrOffset+8]));
+    }else{
+      rc = moveToChild(pCur, get4byte(findCell(pPage, iIdx)));
+    }
+  }
+
+  /* An error has occurred. Return an error code. */
+  return rc;
+}
+
+/*
+** Return the pager associated with a BTree.  This routine is used for
+** testing and debugging only.
+*/
+SQLITE_PRIVATE Pager *sqlite3BtreePager(Btree *p){
+  return p->pBt->pPager;
+}
+
+#ifndef SQLITE_OMIT_INTEGRITY_CHECK
+/*
+** Append a message to the error message string.
+*/
+static void checkAppendMsg(
+  IntegrityCk *pCheck,
+  const char *zFormat,
+  ...
+){
+  va_list ap;
+  if( !pCheck->mxErr ) return;
+  pCheck->mxErr--;
+  pCheck->nErr++;
+  va_start(ap, zFormat);
+  if( pCheck->errMsg.nChar ){
+    sqlite3_str_append(&pCheck->errMsg, "\n", 1);
+  }
+  if( pCheck->zPfx ){
+    sqlite3_str_appendf(&pCheck->errMsg, pCheck->zPfx, pCheck->v1, pCheck->v2);
+  }
+  sqlite3_str_vappendf(&pCheck->errMsg, zFormat, ap);
+  va_end(ap);
+  if( pCheck->errMsg.accError==SQLITE_NOMEM ){
+    pCheck->bOomFault = 1;
+  }
+}
+#endif /* SQLITE_OMIT_INTEGRITY_CHECK */
+
+#ifndef SQLITE_OMIT_INTEGRITY_CHECK
+
+/*
+** Return non-zero if the bit in the IntegrityCk.aPgRef[] array that
+** corresponds to page iPg is already set.
+*/
+static int getPageReferenced(IntegrityCk *pCheck, Pgno iPg){
+  assert( iPg<=pCheck->nPage && sizeof(pCheck->aPgRef[0])==1 );
+  return (pCheck->aPgRef[iPg/8] & (1 << (iPg & 0x07)));
+}
+
+/*
+** Set the bit in the IntegrityCk.aPgRef[] array that corresponds to page iPg.
+*/
+static void setPageReferenced(IntegrityCk *pCheck, Pgno iPg){
+  assert( iPg<=pCheck->nPage && sizeof(pCheck->aPgRef[0])==1 );
+  pCheck->aPgRef[iPg/8] |= (1 << (iPg & 0x07));
+}
+
+
+/*
+** Add 1 to the reference count for page iPage.  If this is the second
+** reference to the page, add an error message to pCheck->zErrMsg.
+** Return 1 if there are 2 or more references to the page and 0 if
+** if this is the first reference to the page.
+**
+** Also check that the page number is in bounds.
+*/
+static int checkRef(IntegrityCk *pCheck, Pgno iPage){
+  if( iPage>pCheck->nPage || iPage==0 ){
+    checkAppendMsg(pCheck, "invalid page number %d", iPage);
+    return 1;
+  }
+  if( getPageReferenced(pCheck, iPage) ){
+    checkAppendMsg(pCheck, "2nd reference to page %d", iPage);
+    return 1;
+  }
+  if( AtomicLoad(&pCheck->db->u1.isInterrupted) ) return 1;
+  setPageReferenced(pCheck, iPage);
+  return 0;
+}
+
+#ifndef SQLITE_OMIT_AUTOVACUUM
+/*
+** Check that the entry in the pointer-map for page iChild maps to
+** page iParent, pointer type ptrType. If not, append an error message
+** to pCheck.
+*/
+static void checkPtrmap(
+  IntegrityCk *pCheck,   /* Integrity check context */
+  Pgno iChild,           /* Child page number */
+  u8 eType,              /* Expected pointer map type */
+  Pgno iParent           /* Expected pointer map parent page number */
+){
+  int rc;
+  u8 ePtrmapType;
+  Pgno iPtrmapParent;
+
+  rc = ptrmapGet(pCheck->pBt, iChild, &ePtrmapType, &iPtrmapParent);
+  if( rc!=SQLITE_OK ){
+    if( rc==SQLITE_NOMEM || rc==SQLITE_IOERR_NOMEM ) pCheck->bOomFault = 1;
+    checkAppendMsg(pCheck, "Failed to read ptrmap key=%d", iChild);
+    return;
+  }
+
+  if( ePtrmapType!=eType || iPtrmapParent!=iParent ){
+    checkAppendMsg(pCheck,
+      "Bad ptr map entry key=%d expected=(%d,%d) got=(%d,%d)",
+      iChild, eType, iParent, ePtrmapType, iPtrmapParent);
+  }
+}
+#endif
+
+/*
+** Check the integrity of the freelist or of an overflow page list.
+** Verify that the number of pages on the list is N.
+*/
+static void checkList(
+  IntegrityCk *pCheck,  /* Integrity checking context */
+  int isFreeList,       /* True for a freelist.  False for overflow page list */
+  Pgno iPage,           /* Page number for first page in the list */
+  u32 N                 /* Expected number of pages in the list */
+){
+  int i;
+  u32 expected = N;
+  int nErrAtStart = pCheck->nErr;
+  while( iPage!=0 && pCheck->mxErr ){
+    DbPage *pOvflPage;
+    unsigned char *pOvflData;
+    if( checkRef(pCheck, iPage) ) break;
+    N--;
+    if( sqlite3PagerGet(pCheck->pPager, (Pgno)iPage, &pOvflPage, 0) ){
+      checkAppendMsg(pCheck, "failed to get page %d", iPage);
+      break;
+    }
+    pOvflData = (unsigned char *)sqlite3PagerGetData(pOvflPage);
+    if( isFreeList ){
+      u32 n = (u32)get4byte(&pOvflData[4]);
+#ifndef SQLITE_OMIT_AUTOVACUUM
+      if( pCheck->pBt->autoVacuum ){
+        checkPtrmap(pCheck, iPage, PTRMAP_FREEPAGE, 0);
+      }
+#endif
+      if( n>pCheck->pBt->usableSize/4-2 ){
+        checkAppendMsg(pCheck,
+           "freelist leaf count too big on page %d", iPage);
+        N--;
+      }else{
+        for(i=0; i<(int)n; i++){
+          Pgno iFreePage = get4byte(&pOvflData[8+i*4]);
+#ifndef SQLITE_OMIT_AUTOVACUUM
+          if( pCheck->pBt->autoVacuum ){
+            checkPtrmap(pCheck, iFreePage, PTRMAP_FREEPAGE, 0);
+          }
+#endif
+          checkRef(pCheck, iFreePage);
+        }
+        N -= n;
+      }
+    }
+#ifndef SQLITE_OMIT_AUTOVACUUM
+    else{
+      /* If this database supports auto-vacuum and iPage is not the last
+      ** page in this overflow list, check that the pointer-map entry for
+      ** the following page matches iPage.
+      */
+      if( pCheck->pBt->autoVacuum && N>0 ){
+        i = get4byte(pOvflData);
+        checkPtrmap(pCheck, i, PTRMAP_OVERFLOW2, iPage);
+      }
+    }
+#endif
+  
