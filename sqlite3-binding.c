@@ -78719,4 +78719,187 @@ SQLITE_PRIVATE int sqlite3BtreeCopyFile(Btree *pTo, Btree *pFrom){
   b.iNext = 1;
 
   /* 0x7FFFFFFF is the hard limit for the number of pages in a database
-  ** file. By passing this as the number of page
+  ** file. By passing this as the number of pages to copy to
+  ** sqlite3_backup_step(), we can guarantee that the copy finishes
+  ** within a single call (unless an error occurs). The assert() statement
+  ** checks this assumption - (p->rc) should be set to either SQLITE_DONE
+  ** or an error code.  */
+  sqlite3_backup_step(&b, 0x7FFFFFFF);
+  assert( b.rc!=SQLITE_OK );
+
+  rc = sqlite3_backup_finish(&b);
+  if( rc==SQLITE_OK ){
+    pTo->pBt->btsFlags &= ~BTS_PAGESIZE_FIXED;
+  }else{
+    sqlite3PagerClearCache(sqlite3BtreePager(b.pDest));
+  }
+
+  assert( sqlite3BtreeTxnState(pTo)!=SQLITE_TXN_WRITE );
+copy_finished:
+  sqlite3BtreeLeave(pFrom);
+  sqlite3BtreeLeave(pTo);
+  return rc;
+}
+#endif /* SQLITE_OMIT_VACUUM */
+
+/************** End of backup.c **********************************************/
+/************** Begin file vdbemem.c *****************************************/
+/*
+** 2004 May 26
+**
+** The author disclaims copyright to this source code.  In place of
+** a legal notice, here is a blessing:
+**
+**    May you do good and not evil.
+**    May you find forgiveness for yourself and forgive others.
+**    May you share freely, never taking more than you give.
+**
+*************************************************************************
+**
+** This file contains code use to manipulate "Mem" structure.  A "Mem"
+** stores a single value in the VDBE.  Mem is an opaque structure visible
+** only within the VDBE.  Interface routines refer to a Mem using the
+** name sqlite_value
+*/
+/* #include "sqliteInt.h" */
+/* #include "vdbeInt.h" */
+
+/* True if X is a power of two.  0 is considered a power of two here.
+** In other words, return true if X has at most one bit set.
+*/
+#define ISPOWEROF2(X)  (((X)&((X)-1))==0)
+
+#ifdef SQLITE_DEBUG
+/*
+** Check invariants on a Mem object.
+**
+** This routine is intended for use inside of assert() statements, like
+** this:    assert( sqlite3VdbeCheckMemInvariants(pMem) );
+*/
+SQLITE_PRIVATE int sqlite3VdbeCheckMemInvariants(Mem *p){
+  /* If MEM_Dyn is set then Mem.xDel!=0.
+  ** Mem.xDel might not be initialized if MEM_Dyn is clear.
+  */
+  assert( (p->flags & MEM_Dyn)==0 || p->xDel!=0 );
+
+  /* MEM_Dyn may only be set if Mem.szMalloc==0.  In this way we
+  ** ensure that if Mem.szMalloc>0 then it is safe to do
+  ** Mem.z = Mem.zMalloc without having to check Mem.flags&MEM_Dyn.
+  ** That saves a few cycles in inner loops. */
+  assert( (p->flags & MEM_Dyn)==0 || p->szMalloc==0 );
+
+  /* Cannot have more than one of MEM_Int, MEM_Real, or MEM_IntReal */
+  assert( ISPOWEROF2(p->flags & (MEM_Int|MEM_Real|MEM_IntReal)) );
+
+  if( p->flags & MEM_Null ){
+    /* Cannot be both MEM_Null and some other type */
+    assert( (p->flags & (MEM_Int|MEM_Real|MEM_Str|MEM_Blob|MEM_Agg))==0 );
+
+    /* If MEM_Null is set, then either the value is a pure NULL (the usual
+    ** case) or it is a pointer set using sqlite3_bind_pointer() or
+    ** sqlite3_result_pointer().  If a pointer, then MEM_Term must also be
+    ** set.
+    */
+    if( (p->flags & (MEM_Term|MEM_Subtype))==(MEM_Term|MEM_Subtype) ){
+      /* This is a pointer type.  There may be a flag to indicate what to
+      ** do with the pointer. */
+      assert( ((p->flags&MEM_Dyn)!=0 ? 1 : 0) +
+              ((p->flags&MEM_Ephem)!=0 ? 1 : 0) +
+              ((p->flags&MEM_Static)!=0 ? 1 : 0) <= 1 );
+
+      /* No other bits set */
+      assert( (p->flags & ~(MEM_Null|MEM_Term|MEM_Subtype|MEM_FromBind
+                           |MEM_Dyn|MEM_Ephem|MEM_Static))==0 );
+    }else{
+      /* A pure NULL might have other flags, such as MEM_Static, MEM_Dyn,
+      ** MEM_Ephem, MEM_Cleared, or MEM_Subtype */
+    }
+  }else{
+    /* The MEM_Cleared bit is only allowed on NULLs */
+    assert( (p->flags & MEM_Cleared)==0 );
+  }
+
+  /* The szMalloc field holds the correct memory allocation size */
+  assert( p->szMalloc==0
+       || (p->flags==MEM_Undefined
+           && p->szMalloc<=sqlite3DbMallocSize(p->db,p->zMalloc))
+       || p->szMalloc==sqlite3DbMallocSize(p->db,p->zMalloc));
+
+  /* If p holds a string or blob, the Mem.z must point to exactly
+  ** one of the following:
+  **
+  **   (1) Memory in Mem.zMalloc and managed by the Mem object
+  **   (2) Memory to be freed using Mem.xDel
+  **   (3) An ephemeral string or blob
+  **   (4) A static string or blob
+  */
+  if( (p->flags & (MEM_Str|MEM_Blob)) && p->n>0 ){
+    assert(
+      ((p->szMalloc>0 && p->z==p->zMalloc)? 1 : 0) +
+      ((p->flags&MEM_Dyn)!=0 ? 1 : 0) +
+      ((p->flags&MEM_Ephem)!=0 ? 1 : 0) +
+      ((p->flags&MEM_Static)!=0 ? 1 : 0) == 1
+    );
+  }
+  return 1;
+}
+#endif
+
+/*
+** Render a Mem object which is one of MEM_Int, MEM_Real, or MEM_IntReal
+** into a buffer.
+*/
+static void vdbeMemRenderNum(int sz, char *zBuf, Mem *p){
+  StrAccum acc;
+  assert( p->flags & (MEM_Int|MEM_Real|MEM_IntReal) );
+  assert( sz>22 );
+  if( p->flags & MEM_Int ){
+#if GCC_VERSION>=7000000
+    /* Work-around for GCC bug
+    ** https://gcc.gnu.org/bugzilla/show_bug.cgi?id=96270 */
+    i64 x;
+    assert( (p->flags&MEM_Int)*2==sizeof(x) );
+    memcpy(&x, (char*)&p->u, (p->flags&MEM_Int)*2);
+    sqlite3Int64ToText(x, zBuf);
+#else
+    sqlite3Int64ToText(p->u.i, zBuf);
+#endif
+  }else{
+    sqlite3StrAccumInit(&acc, 0, zBuf, sz, 0);
+    sqlite3_str_appendf(&acc, "%!.15g",
+         (p->flags & MEM_IntReal)!=0 ? (double)p->u.i : p->u.r);
+    assert( acc.zText==zBuf && acc.mxAlloc<=0 );
+    zBuf[acc.nChar] = 0; /* Fast version of sqlite3StrAccumFinish(&acc) */
+  }
+}
+
+#ifdef SQLITE_DEBUG
+/*
+** Validity checks on pMem.  pMem holds a string.
+**
+** (1) Check that string value of pMem agrees with its integer or real value.
+** (2) Check that the string is correctly zero terminated
+**
+** A single int or real value always converts to the same strings.  But
+** many different strings can be converted into the same int or real.
+** If a table contains a numeric value and an index is based on the
+** corresponding string value, then it is important that the string be
+** derived from the numeric value, not the other way around, to ensure
+** that the index and table are consistent.  See ticket
+** https://www.sqlite.org/src/info/343634942dd54ab (2018-01-31) for
+** an example.
+**
+** This routine looks at pMem to verify that if it has both a numeric
+** representation and a string representation then the string rep has
+** been derived from the numeric and not the other way around.  It returns
+** true if everything is ok and false if there is a problem.
+**
+** This routine is for use inside of assert() statements only.
+*/
+SQLITE_PRIVATE int sqlite3VdbeMemValidStrRep(Mem *p){
+  char zBuf[100];
+  char *z;
+  int i, j, incr;
+  if( (p->flags & MEM_Str)==0 ) return 1;
+  if( p->flags & MEM_Term ){
+    /* Insure that
