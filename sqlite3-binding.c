@@ -77759,4 +77759,206 @@ SQLITE_PRIVATE int sqlite3BtreeIsInBackup(Btree *p){
 
 /*
 ** This function returns a pointer to a blob of memory associated with
-** a single shared-btree. The memory is used by 
+** a single shared-btree. The memory is used by client code for its own
+** purposes (for example, to store a high-level schema associated with
+** the shared-btree). The btree layer manages reference counting issues.
+**
+** The first time this is called on a shared-btree, nBytes bytes of memory
+** are allocated, zeroed, and returned to the caller. For each subsequent
+** call the nBytes parameter is ignored and a pointer to the same blob
+** of memory returned.
+**
+** If the nBytes parameter is 0 and the blob of memory has not yet been
+** allocated, a null pointer is returned. If the blob has already been
+** allocated, it is returned as normal.
+**
+** Just before the shared-btree is closed, the function passed as the
+** xFree argument when the memory allocation was made is invoked on the
+** blob of allocated memory. The xFree function should not call sqlite3_free()
+** on the memory, the btree layer does that.
+*/
+SQLITE_PRIVATE void *sqlite3BtreeSchema(Btree *p, int nBytes, void(*xFree)(void *)){
+  BtShared *pBt = p->pBt;
+  sqlite3BtreeEnter(p);
+  if( !pBt->pSchema && nBytes ){
+    pBt->pSchema = sqlite3DbMallocZero(0, nBytes);
+    pBt->xFreeSchema = xFree;
+  }
+  sqlite3BtreeLeave(p);
+  return pBt->pSchema;
+}
+
+/*
+** Return SQLITE_LOCKED_SHAREDCACHE if another user of the same shared
+** btree as the argument handle holds an exclusive lock on the
+** sqlite_schema table. Otherwise SQLITE_OK.
+*/
+SQLITE_PRIVATE int sqlite3BtreeSchemaLocked(Btree *p){
+  int rc;
+  assert( sqlite3_mutex_held(p->db->mutex) );
+  sqlite3BtreeEnter(p);
+  rc = querySharedCacheTableLock(p, SCHEMA_ROOT, READ_LOCK);
+  assert( rc==SQLITE_OK || rc==SQLITE_LOCKED_SHAREDCACHE );
+  sqlite3BtreeLeave(p);
+  return rc;
+}
+
+
+#ifndef SQLITE_OMIT_SHARED_CACHE
+/*
+** Obtain a lock on the table whose root page is iTab.  The
+** lock is a write lock if isWritelock is true or a read lock
+** if it is false.
+*/
+SQLITE_PRIVATE int sqlite3BtreeLockTable(Btree *p, int iTab, u8 isWriteLock){
+  int rc = SQLITE_OK;
+  assert( p->inTrans!=TRANS_NONE );
+  if( p->sharable ){
+    u8 lockType = READ_LOCK + isWriteLock;
+    assert( READ_LOCK+1==WRITE_LOCK );
+    assert( isWriteLock==0 || isWriteLock==1 );
+
+    sqlite3BtreeEnter(p);
+    rc = querySharedCacheTableLock(p, iTab, lockType);
+    if( rc==SQLITE_OK ){
+      rc = setSharedCacheTableLock(p, iTab, lockType);
+    }
+    sqlite3BtreeLeave(p);
+  }
+  return rc;
+}
+#endif
+
+#ifndef SQLITE_OMIT_INCRBLOB
+/*
+** Argument pCsr must be a cursor opened for writing on an
+** INTKEY table currently pointing at a valid table entry.
+** This function modifies the data stored as part of that entry.
+**
+** Only the data content may only be modified, it is not possible to
+** change the length of the data stored. If this function is called with
+** parameters that attempt to write past the end of the existing data,
+** no modifications are made and SQLITE_CORRUPT is returned.
+*/
+SQLITE_PRIVATE int sqlite3BtreePutData(BtCursor *pCsr, u32 offset, u32 amt, void *z){
+  int rc;
+  assert( cursorOwnsBtShared(pCsr) );
+  assert( sqlite3_mutex_held(pCsr->pBtree->db->mutex) );
+  assert( pCsr->curFlags & BTCF_Incrblob );
+
+  rc = restoreCursorPosition(pCsr);
+  if( rc!=SQLITE_OK ){
+    return rc;
+  }
+  assert( pCsr->eState!=CURSOR_REQUIRESEEK );
+  if( pCsr->eState!=CURSOR_VALID ){
+    return SQLITE_ABORT;
+  }
+
+  /* Save the positions of all other cursors open on this table. This is
+  ** required in case any of them are holding references to an xFetch
+  ** version of the b-tree page modified by the accessPayload call below.
+  **
+  ** Note that pCsr must be open on a INTKEY table and saveCursorPosition()
+  ** and hence saveAllCursors() cannot fail on a BTREE_INTKEY table, hence
+  ** saveAllCursors can only return SQLITE_OK.
+  */
+  VVA_ONLY(rc =) saveAllCursors(pCsr->pBt, pCsr->pgnoRoot, pCsr);
+  assert( rc==SQLITE_OK );
+
+  /* Check some assumptions:
+  **   (a) the cursor is open for writing,
+  **   (b) there is a read/write transaction open,
+  **   (c) the connection holds a write-lock on the table (if required),
+  **   (d) there are no conflicting read-locks, and
+  **   (e) the cursor points at a valid row of an intKey table.
+  */
+  if( (pCsr->curFlags & BTCF_WriteFlag)==0 ){
+    return SQLITE_READONLY;
+  }
+  assert( (pCsr->pBt->btsFlags & BTS_READ_ONLY)==0
+              && pCsr->pBt->inTransaction==TRANS_WRITE );
+  assert( hasSharedCacheTableLock(pCsr->pBtree, pCsr->pgnoRoot, 0, 2) );
+  assert( !hasReadConflicts(pCsr->pBtree, pCsr->pgnoRoot) );
+  assert( pCsr->pPage->intKey );
+
+  return accessPayload(pCsr, offset, amt, (unsigned char *)z, 1);
+}
+
+/*
+** Mark this cursor as an incremental blob cursor.
+*/
+SQLITE_PRIVATE void sqlite3BtreeIncrblobCursor(BtCursor *pCur){
+  pCur->curFlags |= BTCF_Incrblob;
+  pCur->pBtree->hasIncrblobCur = 1;
+}
+#endif
+
+/*
+** Set both the "read version" (single byte at byte offset 18) and
+** "write version" (single byte at byte offset 19) fields in the database
+** header to iVersion.
+*/
+SQLITE_PRIVATE int sqlite3BtreeSetVersion(Btree *pBtree, int iVersion){
+  BtShared *pBt = pBtree->pBt;
+  int rc;                         /* Return code */
+
+  assert( iVersion==1 || iVersion==2 );
+
+  /* If setting the version fields to 1, do not automatically open the
+  ** WAL connection, even if the version fields are currently set to 2.
+  */
+  pBt->btsFlags &= ~BTS_NO_WAL;
+  if( iVersion==1 ) pBt->btsFlags |= BTS_NO_WAL;
+
+  rc = sqlite3BtreeBeginTrans(pBtree, 0, 0);
+  if( rc==SQLITE_OK ){
+    u8 *aData = pBt->pPage1->aData;
+    if( aData[18]!=(u8)iVersion || aData[19]!=(u8)iVersion ){
+      rc = sqlite3BtreeBeginTrans(pBtree, 2, 0);
+      if( rc==SQLITE_OK ){
+        rc = sqlite3PagerWrite(pBt->pPage1->pDbPage);
+        if( rc==SQLITE_OK ){
+          aData[18] = (u8)iVersion;
+          aData[19] = (u8)iVersion;
+        }
+      }
+    }
+  }
+
+  pBt->btsFlags &= ~BTS_NO_WAL;
+  return rc;
+}
+
+/*
+** Return true if the cursor has a hint specified.  This routine is
+** only used from within assert() statements
+*/
+SQLITE_PRIVATE int sqlite3BtreeCursorHasHint(BtCursor *pCsr, unsigned int mask){
+  return (pCsr->hints & mask)!=0;
+}
+
+/*
+** Return true if the given Btree is read-only.
+*/
+SQLITE_PRIVATE int sqlite3BtreeIsReadonly(Btree *p){
+  return (p->pBt->btsFlags & BTS_READ_ONLY)!=0;
+}
+
+/*
+** Return the size of the header added to each page by this module.
+*/
+SQLITE_PRIVATE int sqlite3HeaderSizeBtree(void){ return ROUND8(sizeof(MemPage)); }
+
+#if !defined(SQLITE_OMIT_SHARED_CACHE)
+/*
+** Return true if the Btree passed as the only argument is sharable.
+*/
+SQLITE_PRIVATE int sqlite3BtreeSharable(Btree *p){
+  return p->sharable;
+}
+
+/*
+** Return the number of connections to the BtShared object accessed by
+** the Btree handle passed as the only argument. For private caches
+*
