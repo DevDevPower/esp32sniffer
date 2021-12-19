@@ -77961,4 +77961,187 @@ SQLITE_PRIVATE int sqlite3BtreeSharable(Btree *p){
 /*
 ** Return the number of connections to the BtShared object accessed by
 ** the Btree handle passed as the only argument. For private caches
-*
+** this is always 1. For shared caches it may be 1 or greater.
+*/
+SQLITE_PRIVATE int sqlite3BtreeConnectionCount(Btree *p){
+  testcase( p->sharable );
+  return p->pBt->nRef;
+}
+#endif
+
+/************** End of btree.c ***********************************************/
+/************** Begin file backup.c ******************************************/
+/*
+** 2009 January 28
+**
+** The author disclaims copyright to this source code.  In place of
+** a legal notice, here is a blessing:
+**
+**    May you do good and not evil.
+**    May you find forgiveness for yourself and forgive others.
+**    May you share freely, never taking more than you give.
+**
+*************************************************************************
+** This file contains the implementation of the sqlite3_backup_XXX()
+** API functions and the related features.
+*/
+/* #include "sqliteInt.h" */
+/* #include "btreeInt.h" */
+
+/*
+** Structure allocated for each backup operation.
+*/
+struct sqlite3_backup {
+  sqlite3* pDestDb;        /* Destination database handle */
+  Btree *pDest;            /* Destination b-tree file */
+  u32 iDestSchema;         /* Original schema cookie in destination */
+  int bDestLocked;         /* True once a write-transaction is open on pDest */
+
+  Pgno iNext;              /* Page number of the next source page to copy */
+  sqlite3* pSrcDb;         /* Source database handle */
+  Btree *pSrc;             /* Source b-tree file */
+
+  int rc;                  /* Backup process error code */
+
+  /* These two variables are set by every call to backup_step(). They are
+  ** read by calls to backup_remaining() and backup_pagecount().
+  */
+  Pgno nRemaining;         /* Number of pages left to copy */
+  Pgno nPagecount;         /* Total number of pages to copy */
+
+  int isAttached;          /* True once backup has been registered with pager */
+  sqlite3_backup *pNext;   /* Next backup associated with source pager */
+};
+
+/*
+** THREAD SAFETY NOTES:
+**
+**   Once it has been created using backup_init(), a single sqlite3_backup
+**   structure may be accessed via two groups of thread-safe entry points:
+**
+**     * Via the sqlite3_backup_XXX() API function backup_step() and
+**       backup_finish(). Both these functions obtain the source database
+**       handle mutex and the mutex associated with the source BtShared
+**       structure, in that order.
+**
+**     * Via the BackupUpdate() and BackupRestart() functions, which are
+**       invoked by the pager layer to report various state changes in
+**       the page cache associated with the source database. The mutex
+**       associated with the source database BtShared structure will always
+**       be held when either of these functions are invoked.
+**
+**   The other sqlite3_backup_XXX() API functions, backup_remaining() and
+**   backup_pagecount() are not thread-safe functions. If they are called
+**   while some other thread is calling backup_step() or backup_finish(),
+**   the values returned may be invalid. There is no way for a call to
+**   BackupUpdate() or BackupRestart() to interfere with backup_remaining()
+**   or backup_pagecount().
+**
+**   Depending on the SQLite configuration, the database handles and/or
+**   the Btree objects may have their own mutexes that require locking.
+**   Non-sharable Btrees (in-memory databases for example), do not have
+**   associated mutexes.
+*/
+
+/*
+** Return a pointer corresponding to database zDb (i.e. "main", "temp")
+** in connection handle pDb. If such a database cannot be found, return
+** a NULL pointer and write an error message to pErrorDb.
+**
+** If the "temp" database is requested, it may need to be opened by this
+** function. If an error occurs while doing so, return 0 and write an
+** error message to pErrorDb.
+*/
+static Btree *findBtree(sqlite3 *pErrorDb, sqlite3 *pDb, const char *zDb){
+  int i = sqlite3FindDbName(pDb, zDb);
+
+  if( i==1 ){
+    Parse sParse;
+    int rc = 0;
+    sqlite3ParseObjectInit(&sParse,pDb);
+    if( sqlite3OpenTempDatabase(&sParse) ){
+      sqlite3ErrorWithMsg(pErrorDb, sParse.rc, "%s", sParse.zErrMsg);
+      rc = SQLITE_ERROR;
+    }
+    sqlite3DbFree(pErrorDb, sParse.zErrMsg);
+    sqlite3ParseObjectReset(&sParse);
+    if( rc ){
+      return 0;
+    }
+  }
+
+  if( i<0 ){
+    sqlite3ErrorWithMsg(pErrorDb, SQLITE_ERROR, "unknown database %s", zDb);
+    return 0;
+  }
+
+  return pDb->aDb[i].pBt;
+}
+
+/*
+** Attempt to set the page size of the destination to match the page size
+** of the source.
+*/
+static int setDestPgsz(sqlite3_backup *p){
+  int rc;
+  rc = sqlite3BtreeSetPageSize(p->pDest,sqlite3BtreeGetPageSize(p->pSrc),0,0);
+  return rc;
+}
+
+/*
+** Check that there is no open read-transaction on the b-tree passed as the
+** second argument. If there is not, return SQLITE_OK. Otherwise, if there
+** is an open read-transaction, return SQLITE_ERROR and leave an error
+** message in database handle db.
+*/
+static int checkReadTransaction(sqlite3 *db, Btree *p){
+  if( sqlite3BtreeTxnState(p)!=SQLITE_TXN_NONE ){
+    sqlite3ErrorWithMsg(db, SQLITE_ERROR, "destination database is in use");
+    return SQLITE_ERROR;
+  }
+  return SQLITE_OK;
+}
+
+/*
+** Create an sqlite3_backup process to copy the contents of zSrcDb from
+** connection handle pSrcDb to zDestDb in pDestDb. If successful, return
+** a pointer to the new sqlite3_backup object.
+**
+** If an error occurs, NULL is returned and an error code and error message
+** stored in database handle pDestDb.
+*/
+SQLITE_API sqlite3_backup *sqlite3_backup_init(
+  sqlite3* pDestDb,                     /* Database to write to */
+  const char *zDestDb,                  /* Name of database within pDestDb */
+  sqlite3* pSrcDb,                      /* Database connection to read from */
+  const char *zSrcDb                    /* Name of database within pSrcDb */
+){
+  sqlite3_backup *p;                    /* Value to return */
+
+#ifdef SQLITE_ENABLE_API_ARMOR
+  if( !sqlite3SafetyCheckOk(pSrcDb)||!sqlite3SafetyCheckOk(pDestDb) ){
+    (void)SQLITE_MISUSE_BKPT;
+    return 0;
+  }
+#endif
+
+  /* Lock the source database handle. The destination database
+  ** handle is not locked in this routine, but it is locked in
+  ** sqlite3_backup_step(). The user is required to ensure that no
+  ** other thread accesses the destination handle for the duration
+  ** of the backup operation.  Any attempt to use the destination
+  ** database connection while a backup is in progress may cause
+  ** a malfunction or a deadlock.
+  */
+  sqlite3_mutex_enter(pSrcDb->mutex);
+  sqlite3_mutex_enter(pDestDb->mutex);
+
+  if( pSrcDb==pDestDb ){
+    sqlite3ErrorWithMsg(
+        pDestDb, SQLITE_ERROR, "source and destination must be distinct"
+    );
+    p = 0;
+  }else {
+    /* Allocate space for a new sqlite3_backup object...
+    ** EVIDENCE-OF: R-64852-21591 The sqlite3_backup object is created by a
+    ** call to sqlite3_backup_init(
