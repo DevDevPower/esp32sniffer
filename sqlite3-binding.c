@@ -79312,4 +79312,207 @@ SQLITE_PRIVATE void sqlite3VdbeMemRelease(Mem *p){
 /* Like sqlite3VdbeMemRelease() but faster for cases where we
 ** know in advance that the Mem is not MEM_Dyn or MEM_Agg.
 */
-SQLITE_PRIVATE void sqlite3VdbeMemReleaseMallo
+SQLITE_PRIVATE void sqlite3VdbeMemReleaseMalloc(Mem *p){
+  assert( !VdbeMemDynamic(p) );
+  if( p->szMalloc ) vdbeMemClear(p);
+}
+
+/*
+** Convert a 64-bit IEEE double into a 64-bit signed integer.
+** If the double is out of range of a 64-bit signed integer then
+** return the closest available 64-bit signed integer.
+*/
+static SQLITE_NOINLINE i64 doubleToInt64(double r){
+#ifdef SQLITE_OMIT_FLOATING_POINT
+  /* When floating-point is omitted, double and int64 are the same thing */
+  return r;
+#else
+  /*
+  ** Many compilers we encounter do not define constants for the
+  ** minimum and maximum 64-bit integers, or they define them
+  ** inconsistently.  And many do not understand the "LL" notation.
+  ** So we define our own static constants here using nothing
+  ** larger than a 32-bit integer constant.
+  */
+  static const i64 maxInt = LARGEST_INT64;
+  static const i64 minInt = SMALLEST_INT64;
+
+  if( r<=(double)minInt ){
+    return minInt;
+  }else if( r>=(double)maxInt ){
+    return maxInt;
+  }else{
+    return (i64)r;
+  }
+#endif
+}
+
+/*
+** Return some kind of integer value which is the best we can do
+** at representing the value that *pMem describes as an integer.
+** If pMem is an integer, then the value is exact.  If pMem is
+** a floating-point then the value returned is the integer part.
+** If pMem is a string or blob, then we make an attempt to convert
+** it into an integer and return that.  If pMem represents an
+** an SQL-NULL value, return 0.
+**
+** If pMem represents a string value, its encoding might be changed.
+*/
+static SQLITE_NOINLINE i64 memIntValue(const Mem *pMem){
+  i64 value = 0;
+  sqlite3Atoi64(pMem->z, &value, pMem->n, pMem->enc);
+  return value;
+}
+SQLITE_PRIVATE i64 sqlite3VdbeIntValue(const Mem *pMem){
+  int flags;
+  assert( pMem!=0 );
+  assert( pMem->db==0 || sqlite3_mutex_held(pMem->db->mutex) );
+  assert( EIGHT_BYTE_ALIGNMENT(pMem) );
+  flags = pMem->flags;
+  if( flags & (MEM_Int|MEM_IntReal) ){
+    testcase( flags & MEM_IntReal );
+    return pMem->u.i;
+  }else if( flags & MEM_Real ){
+    return doubleToInt64(pMem->u.r);
+  }else if( (flags & (MEM_Str|MEM_Blob))!=0 && pMem->z!=0 ){
+    return memIntValue(pMem);
+  }else{
+    return 0;
+  }
+}
+
+/*
+** Return the best representation of pMem that we can get into a
+** double.  If pMem is already a double or an integer, return its
+** value.  If it is a string or blob, try to convert it to a double.
+** If it is a NULL, return 0.0.
+*/
+static SQLITE_NOINLINE double memRealValue(Mem *pMem){
+  /* (double)0 In case of SQLITE_OMIT_FLOATING_POINT... */
+  double val = (double)0;
+  sqlite3AtoF(pMem->z, &val, pMem->n, pMem->enc);
+  return val;
+}
+SQLITE_PRIVATE double sqlite3VdbeRealValue(Mem *pMem){
+  assert( pMem!=0 );
+  assert( pMem->db==0 || sqlite3_mutex_held(pMem->db->mutex) );
+  assert( EIGHT_BYTE_ALIGNMENT(pMem) );
+  if( pMem->flags & MEM_Real ){
+    return pMem->u.r;
+  }else if( pMem->flags & (MEM_Int|MEM_IntReal) ){
+    testcase( pMem->flags & MEM_IntReal );
+    return (double)pMem->u.i;
+  }else if( pMem->flags & (MEM_Str|MEM_Blob) ){
+    return memRealValue(pMem);
+  }else{
+    /* (double)0 In case of SQLITE_OMIT_FLOATING_POINT... */
+    return (double)0;
+  }
+}
+
+/*
+** Return 1 if pMem represents true, and return 0 if pMem represents false.
+** Return the value ifNull if pMem is NULL.
+*/
+SQLITE_PRIVATE int sqlite3VdbeBooleanValue(Mem *pMem, int ifNull){
+  testcase( pMem->flags & MEM_IntReal );
+  if( pMem->flags & (MEM_Int|MEM_IntReal) ) return pMem->u.i!=0;
+  if( pMem->flags & MEM_Null ) return ifNull;
+  return sqlite3VdbeRealValue(pMem)!=0.0;
+}
+
+/*
+** The MEM structure is already a MEM_Real.  Try to also make it a
+** MEM_Int if we can.
+*/
+SQLITE_PRIVATE void sqlite3VdbeIntegerAffinity(Mem *pMem){
+  i64 ix;
+  assert( pMem!=0 );
+  assert( pMem->flags & MEM_Real );
+  assert( !sqlite3VdbeMemIsRowSet(pMem) );
+  assert( pMem->db==0 || sqlite3_mutex_held(pMem->db->mutex) );
+  assert( EIGHT_BYTE_ALIGNMENT(pMem) );
+
+  ix = doubleToInt64(pMem->u.r);
+
+  /* Only mark the value as an integer if
+  **
+  **    (1) the round-trip conversion real->int->real is a no-op, and
+  **    (2) The integer is neither the largest nor the smallest
+  **        possible integer (ticket #3922)
+  **
+  ** The second and third terms in the following conditional enforces
+  ** the second condition under the assumption that addition overflow causes
+  ** values to wrap around.
+  */
+  if( pMem->u.r==ix && ix>SMALLEST_INT64 && ix<LARGEST_INT64 ){
+    pMem->u.i = ix;
+    MemSetTypeFlag(pMem, MEM_Int);
+  }
+}
+
+/*
+** Convert pMem to type integer.  Invalidate any prior representations.
+*/
+SQLITE_PRIVATE int sqlite3VdbeMemIntegerify(Mem *pMem){
+  assert( pMem!=0 );
+  assert( pMem->db==0 || sqlite3_mutex_held(pMem->db->mutex) );
+  assert( !sqlite3VdbeMemIsRowSet(pMem) );
+  assert( EIGHT_BYTE_ALIGNMENT(pMem) );
+
+  pMem->u.i = sqlite3VdbeIntValue(pMem);
+  MemSetTypeFlag(pMem, MEM_Int);
+  return SQLITE_OK;
+}
+
+/*
+** Convert pMem so that it is of type MEM_Real.
+** Invalidate any prior representations.
+*/
+SQLITE_PRIVATE int sqlite3VdbeMemRealify(Mem *pMem){
+  assert( pMem!=0 );
+  assert( pMem->db==0 || sqlite3_mutex_held(pMem->db->mutex) );
+  assert( EIGHT_BYTE_ALIGNMENT(pMem) );
+
+  pMem->u.r = sqlite3VdbeRealValue(pMem);
+  MemSetTypeFlag(pMem, MEM_Real);
+  return SQLITE_OK;
+}
+
+/* Compare a floating point value to an integer.  Return true if the two
+** values are the same within the precision of the floating point value.
+**
+** This function assumes that i was obtained by assignment from r1.
+**
+** For some versions of GCC on 32-bit machines, if you do the more obvious
+** comparison of "r1==(double)i" you sometimes get an answer of false even
+** though the r1 and (double)i values are bit-for-bit the same.
+*/
+SQLITE_PRIVATE int sqlite3RealSameAsInt(double r1, sqlite3_int64 i){
+  double r2 = (double)i;
+  return r1==0.0
+      || (memcmp(&r1, &r2, sizeof(r1))==0
+          && i >= -2251799813685248LL && i < 2251799813685248LL);
+}
+
+/*
+** Convert pMem so that it has type MEM_Real or MEM_Int.
+** Invalidate any prior representations.
+**
+** Every effort is made to force the conversion, even if the input
+** is a string that does not look completely like a number.  Convert
+** as much of the string as we can and ignore the rest.
+*/
+SQLITE_PRIVATE int sqlite3VdbeMemNumerify(Mem *pMem){
+  assert( pMem!=0 );
+  testcase( pMem->flags & MEM_Int );
+  testcase( pMem->flags & MEM_Real );
+  testcase( pMem->flags & MEM_IntReal );
+  testcase( pMem->flags & MEM_Null );
+  if( (pMem->flags & (MEM_Int|MEM_Real|MEM_IntReal|MEM_Null))==0 ){
+    int rc;
+    sqlite3_int64 ix;
+    assert( (pMem->flags & (MEM_Blob|MEM_Str))!=0 );
+    assert( pMem->db==0 || sqlite3_mutex_held(pMem->db->mutex) );
+    rc = sqlite3AtoF(pMem->z, &pMem->u.r, pMem->n, pMem->enc);
+    if( ((rc==
