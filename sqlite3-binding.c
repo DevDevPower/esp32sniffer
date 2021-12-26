@@ -81182,4 +81182,218 @@ SQLITE_PRIVATE void sqlite3VdbeExplainPop(Parse *pParse){
   sqlite3ExplainBreakpoint("POP", 0);
   pParse->addrExplain = sqlite3VdbeExplainParent(pParse);
 }
-#endif /* SQLITE_OMI
+#endif /* SQLITE_OMIT_EXPLAIN */
+
+/*
+** Add an OP_ParseSchema opcode.  This routine is broken out from
+** sqlite3VdbeAddOp4() since it needs to also needs to mark all btrees
+** as having been used.
+**
+** The zWhere string must have been obtained from sqlite3_malloc().
+** This routine will take ownership of the allocated memory.
+*/
+SQLITE_PRIVATE void sqlite3VdbeAddParseSchemaOp(Vdbe *p, int iDb, char *zWhere, u16 p5){
+  int j;
+  sqlite3VdbeAddOp4(p, OP_ParseSchema, iDb, 0, 0, zWhere, P4_DYNAMIC);
+  sqlite3VdbeChangeP5(p, p5);
+  for(j=0; j<p->db->nDb; j++) sqlite3VdbeUsesBtree(p, j);
+  sqlite3MayAbort(p->pParse);
+}
+
+/*
+** Add an opcode that includes the p4 value as an integer.
+*/
+SQLITE_PRIVATE int sqlite3VdbeAddOp4Int(
+  Vdbe *p,            /* Add the opcode to this VM */
+  int op,             /* The new opcode */
+  int p1,             /* The P1 operand */
+  int p2,             /* The P2 operand */
+  int p3,             /* The P3 operand */
+  int p4              /* The P4 operand as an integer */
+){
+  int addr = sqlite3VdbeAddOp3(p, op, p1, p2, p3);
+  if( p->db->mallocFailed==0 ){
+    VdbeOp *pOp = &p->aOp[addr];
+    pOp->p4type = P4_INT32;
+    pOp->p4.i = p4;
+  }
+  return addr;
+}
+
+/* Insert the end of a co-routine
+*/
+SQLITE_PRIVATE void sqlite3VdbeEndCoroutine(Vdbe *v, int regYield){
+  sqlite3VdbeAddOp1(v, OP_EndCoroutine, regYield);
+
+  /* Clear the temporary register cache, thereby ensuring that each
+  ** co-routine has its own independent set of registers, because co-routines
+  ** might expect their registers to be preserved across an OP_Yield, and
+  ** that could cause problems if two or more co-routines are using the same
+  ** temporary register.
+  */
+  v->pParse->nTempReg = 0;
+  v->pParse->nRangeReg = 0;
+}
+
+/*
+** Create a new symbolic label for an instruction that has yet to be
+** coded.  The symbolic label is really just a negative number.  The
+** label can be used as the P2 value of an operation.  Later, when
+** the label is resolved to a specific address, the VDBE will scan
+** through its operation list and change all values of P2 which match
+** the label into the resolved address.
+**
+** The VDBE knows that a P2 value is a label because labels are
+** always negative and P2 values are suppose to be non-negative.
+** Hence, a negative P2 value is a label that has yet to be resolved.
+** (Later:) This is only true for opcodes that have the OPFLG_JUMP
+** property.
+**
+** Variable usage notes:
+**
+**     Parse.aLabel[x]     Stores the address that the x-th label resolves
+**                         into.  For testing (SQLITE_DEBUG), unresolved
+**                         labels stores -1, but that is not required.
+**     Parse.nLabelAlloc   Number of slots allocated to Parse.aLabel[]
+**     Parse.nLabel        The *negative* of the number of labels that have
+**                         been issued.  The negative is stored because
+**                         that gives a performance improvement over storing
+**                         the equivalent positive value.
+*/
+SQLITE_PRIVATE int sqlite3VdbeMakeLabel(Parse *pParse){
+  return --pParse->nLabel;
+}
+
+/*
+** Resolve label "x" to be the address of the next instruction to
+** be inserted.  The parameter "x" must have been obtained from
+** a prior call to sqlite3VdbeMakeLabel().
+*/
+static SQLITE_NOINLINE void resizeResolveLabel(Parse *p, Vdbe *v, int j){
+  int nNewSize = 10 - p->nLabel;
+  p->aLabel = sqlite3DbReallocOrFree(p->db, p->aLabel,
+                     nNewSize*sizeof(p->aLabel[0]));
+  if( p->aLabel==0 ){
+    p->nLabelAlloc = 0;
+  }else{
+#ifdef SQLITE_DEBUG
+    int i;
+    for(i=p->nLabelAlloc; i<nNewSize; i++) p->aLabel[i] = -1;
+#endif
+    p->nLabelAlloc = nNewSize;
+    p->aLabel[j] = v->nOp;
+  }
+}
+SQLITE_PRIVATE void sqlite3VdbeResolveLabel(Vdbe *v, int x){
+  Parse *p = v->pParse;
+  int j = ADDR(x);
+  assert( v->eVdbeState==VDBE_INIT_STATE );
+  assert( j<-p->nLabel );
+  assert( j>=0 );
+#ifdef SQLITE_DEBUG
+  if( p->db->flags & SQLITE_VdbeAddopTrace ){
+    printf("RESOLVE LABEL %d to %d\n", x, v->nOp);
+  }
+#endif
+  if( p->nLabelAlloc + p->nLabel < 0 ){
+    resizeResolveLabel(p,v,j);
+  }else{
+    assert( p->aLabel[j]==(-1) ); /* Labels may only be resolved once */
+    p->aLabel[j] = v->nOp;
+  }
+}
+
+/*
+** Mark the VDBE as one that can only be run one time.
+*/
+SQLITE_PRIVATE void sqlite3VdbeRunOnlyOnce(Vdbe *p){
+  sqlite3VdbeAddOp2(p, OP_Expire, 1, 1);
+}
+
+/*
+** Mark the VDBE as one that can be run multiple times.
+*/
+SQLITE_PRIVATE void sqlite3VdbeReusable(Vdbe *p){
+  int i;
+  for(i=1; ALWAYS(i<p->nOp); i++){
+    if( ALWAYS(p->aOp[i].opcode==OP_Expire) ){
+      p->aOp[1].opcode = OP_Noop;
+      break;
+    }
+  }
+}
+
+#ifdef SQLITE_DEBUG /* sqlite3AssertMayAbort() logic */
+
+/*
+** The following type and function are used to iterate through all opcodes
+** in a Vdbe main program and each of the sub-programs (triggers) it may
+** invoke directly or indirectly. It should be used as follows:
+**
+**   Op *pOp;
+**   VdbeOpIter sIter;
+**
+**   memset(&sIter, 0, sizeof(sIter));
+**   sIter.v = v;                            // v is of type Vdbe*
+**   while( (pOp = opIterNext(&sIter)) ){
+**     // Do something with pOp
+**   }
+**   sqlite3DbFree(v->db, sIter.apSub);
+**
+*/
+typedef struct VdbeOpIter VdbeOpIter;
+struct VdbeOpIter {
+  Vdbe *v;                   /* Vdbe to iterate through the opcodes of */
+  SubProgram **apSub;        /* Array of subprograms */
+  int nSub;                  /* Number of entries in apSub */
+  int iAddr;                 /* Address of next instruction to return */
+  int iSub;                  /* 0 = main program, 1 = first sub-program etc. */
+};
+static Op *opIterNext(VdbeOpIter *p){
+  Vdbe *v = p->v;
+  Op *pRet = 0;
+  Op *aOp;
+  int nOp;
+
+  if( p->iSub<=p->nSub ){
+
+    if( p->iSub==0 ){
+      aOp = v->aOp;
+      nOp = v->nOp;
+    }else{
+      aOp = p->apSub[p->iSub-1]->aOp;
+      nOp = p->apSub[p->iSub-1]->nOp;
+    }
+    assert( p->iAddr<nOp );
+
+    pRet = &aOp[p->iAddr];
+    p->iAddr++;
+    if( p->iAddr==nOp ){
+      p->iSub++;
+      p->iAddr = 0;
+    }
+
+    if( pRet->p4type==P4_SUBPROGRAM ){
+      int nByte = (p->nSub+1)*sizeof(SubProgram*);
+      int j;
+      for(j=0; j<p->nSub; j++){
+        if( p->apSub[j]==pRet->p4.pProgram ) break;
+      }
+      if( j==p->nSub ){
+        p->apSub = sqlite3DbReallocOrFree(v->db, p->apSub, nByte);
+        if( !p->apSub ){
+          pRet = 0;
+        }else{
+          p->apSub[p->nSub++] = pRet->p4.pProgram;
+        }
+      }
+    }
+  }
+
+  return pRet;
+}
+
+/*
+** Check if the program stored in the VM associated with pParse may
+** throw an ABORT exception (causing the statement, but not entire transaction
+** to be rolled back). This condition is true if the main program 
