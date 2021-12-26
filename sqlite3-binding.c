@@ -80963,4 +80963,223 @@ SQLITE_PRIVATE int sqlite3VdbeAddOp3(Vdbe *p, int op, int p1, int p2, int p3){
   p->nOp++;
   pOp = &p->aOp[i];
   assert( pOp!=0 );
-  pOp->opcode =
+  pOp->opcode = (u8)op;
+  pOp->p5 = 0;
+  pOp->p1 = p1;
+  pOp->p2 = p2;
+  pOp->p3 = p3;
+  pOp->p4.p = 0;
+  pOp->p4type = P4_NOTUSED;
+#ifdef SQLITE_ENABLE_EXPLAIN_COMMENTS
+  pOp->zComment = 0;
+#endif
+#ifdef SQLITE_DEBUG
+  if( p->db->flags & SQLITE_VdbeAddopTrace ){
+    sqlite3VdbePrintOp(0, i, &p->aOp[i]);
+    test_addop_breakpoint(i, &p->aOp[i]);
+  }
+#endif
+#ifdef VDBE_PROFILE
+  pOp->cycles = 0;
+  pOp->cnt = 0;
+#endif
+#ifdef SQLITE_VDBE_COVERAGE
+  pOp->iSrcLine = 0;
+#endif
+  return i;
+}
+SQLITE_PRIVATE int sqlite3VdbeAddOp0(Vdbe *p, int op){
+  return sqlite3VdbeAddOp3(p, op, 0, 0, 0);
+}
+SQLITE_PRIVATE int sqlite3VdbeAddOp1(Vdbe *p, int op, int p1){
+  return sqlite3VdbeAddOp3(p, op, p1, 0, 0);
+}
+SQLITE_PRIVATE int sqlite3VdbeAddOp2(Vdbe *p, int op, int p1, int p2){
+  return sqlite3VdbeAddOp3(p, op, p1, p2, 0);
+}
+
+/* Generate code for an unconditional jump to instruction iDest
+*/
+SQLITE_PRIVATE int sqlite3VdbeGoto(Vdbe *p, int iDest){
+  return sqlite3VdbeAddOp3(p, OP_Goto, 0, iDest, 0);
+}
+
+/* Generate code to cause the string zStr to be loaded into
+** register iDest
+*/
+SQLITE_PRIVATE int sqlite3VdbeLoadString(Vdbe *p, int iDest, const char *zStr){
+  return sqlite3VdbeAddOp4(p, OP_String8, 0, iDest, 0, zStr, 0);
+}
+
+/*
+** Generate code that initializes multiple registers to string or integer
+** constants.  The registers begin with iDest and increase consecutively.
+** One register is initialized for each characgter in zTypes[].  For each
+** "s" character in zTypes[], the register is a string if the argument is
+** not NULL, or OP_Null if the value is a null pointer.  For each "i" character
+** in zTypes[], the register is initialized to an integer.
+**
+** If the input string does not end with "X" then an OP_ResultRow instruction
+** is generated for the values inserted.
+*/
+SQLITE_PRIVATE void sqlite3VdbeMultiLoad(Vdbe *p, int iDest, const char *zTypes, ...){
+  va_list ap;
+  int i;
+  char c;
+  va_start(ap, zTypes);
+  for(i=0; (c = zTypes[i])!=0; i++){
+    if( c=='s' ){
+      const char *z = va_arg(ap, const char*);
+      sqlite3VdbeAddOp4(p, z==0 ? OP_Null : OP_String8, 0, iDest+i, 0, z, 0);
+    }else if( c=='i' ){
+      sqlite3VdbeAddOp2(p, OP_Integer, va_arg(ap, int), iDest+i);
+    }else{
+      goto skip_op_resultrow;
+    }
+  }
+  sqlite3VdbeAddOp2(p, OP_ResultRow, iDest, i);
+skip_op_resultrow:
+  va_end(ap);
+}
+
+/*
+** Add an opcode that includes the p4 value as a pointer.
+*/
+SQLITE_PRIVATE int sqlite3VdbeAddOp4(
+  Vdbe *p,            /* Add the opcode to this VM */
+  int op,             /* The new opcode */
+  int p1,             /* The P1 operand */
+  int p2,             /* The P2 operand */
+  int p3,             /* The P3 operand */
+  const char *zP4,    /* The P4 operand */
+  int p4type          /* P4 operand type */
+){
+  int addr = sqlite3VdbeAddOp3(p, op, p1, p2, p3);
+  sqlite3VdbeChangeP4(p, addr, zP4, p4type);
+  return addr;
+}
+
+/*
+** Add an OP_Function or OP_PureFunc opcode.
+**
+** The eCallCtx argument is information (typically taken from Expr.op2)
+** that describes the calling context of the function.  0 means a general
+** function call.  NC_IsCheck means called by a check constraint,
+** NC_IdxExpr means called as part of an index expression.  NC_PartIdx
+** means in the WHERE clause of a partial index.  NC_GenCol means called
+** while computing a generated column value.  0 is the usual case.
+*/
+SQLITE_PRIVATE int sqlite3VdbeAddFunctionCall(
+  Parse *pParse,        /* Parsing context */
+  int p1,               /* Constant argument mask */
+  int p2,               /* First argument register */
+  int p3,               /* Register into which results are written */
+  int nArg,             /* Number of argument */
+  const FuncDef *pFunc, /* The function to be invoked */
+  int eCallCtx          /* Calling context */
+){
+  Vdbe *v = pParse->pVdbe;
+  int nByte;
+  int addr;
+  sqlite3_context *pCtx;
+  assert( v );
+  nByte = sizeof(*pCtx) + (nArg-1)*sizeof(sqlite3_value*);
+  pCtx = sqlite3DbMallocRawNN(pParse->db, nByte);
+  if( pCtx==0 ){
+    assert( pParse->db->mallocFailed );
+    freeEphemeralFunction(pParse->db, (FuncDef*)pFunc);
+    return 0;
+  }
+  pCtx->pOut = 0;
+  pCtx->pFunc = (FuncDef*)pFunc;
+  pCtx->pVdbe = 0;
+  pCtx->isError = 0;
+  pCtx->argc = nArg;
+  pCtx->iOp = sqlite3VdbeCurrentAddr(v);
+  addr = sqlite3VdbeAddOp4(v, eCallCtx ? OP_PureFunc : OP_Function,
+                           p1, p2, p3, (char*)pCtx, P4_FUNCCTX);
+  sqlite3VdbeChangeP5(v, eCallCtx & NC_SelfRef);
+  sqlite3MayAbort(pParse);
+  return addr;
+}
+
+/*
+** Add an opcode that includes the p4 value with a P4_INT64 or
+** P4_REAL type.
+*/
+SQLITE_PRIVATE int sqlite3VdbeAddOp4Dup8(
+  Vdbe *p,            /* Add the opcode to this VM */
+  int op,             /* The new opcode */
+  int p1,             /* The P1 operand */
+  int p2,             /* The P2 operand */
+  int p3,             /* The P3 operand */
+  const u8 *zP4,      /* The P4 operand */
+  int p4type          /* P4 operand type */
+){
+  char *p4copy = sqlite3DbMallocRawNN(sqlite3VdbeDb(p), 8);
+  if( p4copy ) memcpy(p4copy, zP4, 8);
+  return sqlite3VdbeAddOp4(p, op, p1, p2, p3, p4copy, p4type);
+}
+
+#ifndef SQLITE_OMIT_EXPLAIN
+/*
+** Return the address of the current EXPLAIN QUERY PLAN baseline.
+** 0 means "none".
+*/
+SQLITE_PRIVATE int sqlite3VdbeExplainParent(Parse *pParse){
+  VdbeOp *pOp;
+  if( pParse->addrExplain==0 ) return 0;
+  pOp = sqlite3VdbeGetOp(pParse->pVdbe, pParse->addrExplain);
+  return pOp->p2;
+}
+
+/*
+** Set a debugger breakpoint on the following routine in order to
+** monitor the EXPLAIN QUERY PLAN code generation.
+*/
+#if defined(SQLITE_DEBUG)
+SQLITE_PRIVATE void sqlite3ExplainBreakpoint(const char *z1, const char *z2){
+  (void)z1;
+  (void)z2;
+}
+#endif
+
+/*
+** Add a new OP_Explain opcode.
+**
+** If the bPush flag is true, then make this opcode the parent for
+** subsequent Explains until sqlite3VdbeExplainPop() is called.
+*/
+SQLITE_PRIVATE void sqlite3VdbeExplain(Parse *pParse, u8 bPush, const char *zFmt, ...){
+#ifndef SQLITE_DEBUG
+  /* Always include the OP_Explain opcodes if SQLITE_DEBUG is defined.
+  ** But omit them (for performance) during production builds */
+  if( pParse->explain==2 )
+#endif
+  {
+    char *zMsg;
+    Vdbe *v;
+    va_list ap;
+    int iThis;
+    va_start(ap, zFmt);
+    zMsg = sqlite3VMPrintf(pParse->db, zFmt, ap);
+    va_end(ap);
+    v = pParse->pVdbe;
+    iThis = v->nOp;
+    sqlite3VdbeAddOp4(v, OP_Explain, iThis, pParse->addrExplain, 0,
+                      zMsg, P4_DYNAMIC);
+    sqlite3ExplainBreakpoint(bPush?"PUSH":"", sqlite3VdbeGetOp(v,-1)->p4.z);
+    if( bPush){
+      pParse->addrExplain = iThis;
+    }
+  }
+}
+
+/*
+** Pop the EXPLAIN QUERY PLAN stack one level.
+*/
+SQLITE_PRIVATE void sqlite3VdbeExplainPop(Parse *pParse){
+  sqlite3ExplainBreakpoint("POP", 0);
+  pParse->addrExplain = sqlite3VdbeExplainParent(pParse);
+}
+#endif /* SQLITE_OMI
