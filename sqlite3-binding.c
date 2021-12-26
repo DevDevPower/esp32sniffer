@@ -80343,4 +80343,198 @@ static int valueFromExpr(
     }else{
       zVal = sqlite3MPrintf(db, "%s%s", zNeg, pExpr->u.zToken);
       if( zVal==0 ) goto no_mem;
-      sqlite3ValueSetStr(pVal, -1, zVal, SQLITE_UTF8, SQLI
+      sqlite3ValueSetStr(pVal, -1, zVal, SQLITE_UTF8, SQLITE_DYNAMIC);
+    }
+    if( (op==TK_INTEGER || op==TK_FLOAT ) && affinity==SQLITE_AFF_BLOB ){
+      sqlite3ValueApplyAffinity(pVal, SQLITE_AFF_NUMERIC, SQLITE_UTF8);
+    }else{
+      sqlite3ValueApplyAffinity(pVal, affinity, SQLITE_UTF8);
+    }
+    assert( (pVal->flags & MEM_IntReal)==0 );
+    if( pVal->flags & (MEM_Int|MEM_IntReal|MEM_Real) ){
+      testcase( pVal->flags & MEM_Int );
+      testcase( pVal->flags & MEM_Real );
+      pVal->flags &= ~MEM_Str;
+    }
+    if( enc!=SQLITE_UTF8 ){
+      rc = sqlite3VdbeChangeEncoding(pVal, enc);
+    }
+  }else if( op==TK_UMINUS ) {
+    /* This branch happens for multiple negative signs.  Ex: -(-5) */
+    if( SQLITE_OK==valueFromExpr(db,pExpr->pLeft,enc,affinity,&pVal,pCtx)
+     && pVal!=0
+    ){
+      sqlite3VdbeMemNumerify(pVal);
+      if( pVal->flags & MEM_Real ){
+        pVal->u.r = -pVal->u.r;
+      }else if( pVal->u.i==SMALLEST_INT64 ){
+#ifndef SQLITE_OMIT_FLOATING_POINT
+        pVal->u.r = -(double)SMALLEST_INT64;
+#else
+        pVal->u.r = LARGEST_INT64;
+#endif
+        MemSetTypeFlag(pVal, MEM_Real);
+      }else{
+        pVal->u.i = -pVal->u.i;
+      }
+      sqlite3ValueApplyAffinity(pVal, affinity, enc);
+    }
+  }else if( op==TK_NULL ){
+    pVal = valueNew(db, pCtx);
+    if( pVal==0 ) goto no_mem;
+    sqlite3VdbeMemSetNull(pVal);
+  }
+#ifndef SQLITE_OMIT_BLOB_LITERAL
+  else if( op==TK_BLOB ){
+    int nVal;
+    assert( !ExprHasProperty(pExpr, EP_IntValue) );
+    assert( pExpr->u.zToken[0]=='x' || pExpr->u.zToken[0]=='X' );
+    assert( pExpr->u.zToken[1]=='\'' );
+    pVal = valueNew(db, pCtx);
+    if( !pVal ) goto no_mem;
+    zVal = &pExpr->u.zToken[2];
+    nVal = sqlite3Strlen30(zVal)-1;
+    assert( zVal[nVal]=='\'' );
+    sqlite3VdbeMemSetStr(pVal, sqlite3HexToBlob(db, zVal, nVal), nVal/2,
+                         0, SQLITE_DYNAMIC);
+  }
+#endif
+#ifdef SQLITE_ENABLE_STAT4
+  else if( op==TK_FUNCTION && pCtx!=0 ){
+    rc = valueFromFunction(db, pExpr, enc, affinity, &pVal, pCtx);
+  }
+#endif
+  else if( op==TK_TRUEFALSE ){
+    assert( !ExprHasProperty(pExpr, EP_IntValue) );
+    pVal = valueNew(db, pCtx);
+    if( pVal ){
+      pVal->flags = MEM_Int;
+      pVal->u.i = pExpr->u.zToken[4]==0;
+    }
+  }
+
+  *ppVal = pVal;
+  return rc;
+
+no_mem:
+#ifdef SQLITE_ENABLE_STAT4
+  if( pCtx==0 || NEVER(pCtx->pParse->nErr==0) )
+#endif
+    sqlite3OomFault(db);
+  sqlite3DbFree(db, zVal);
+  assert( *ppVal==0 );
+#ifdef SQLITE_ENABLE_STAT4
+  if( pCtx==0 ) sqlite3ValueFree(pVal);
+#else
+  assert( pCtx==0 ); sqlite3ValueFree(pVal);
+#endif
+  return SQLITE_NOMEM_BKPT;
+}
+
+/*
+** Create a new sqlite3_value object, containing the value of pExpr.
+**
+** This only works for very simple expressions that consist of one constant
+** token (i.e. "5", "5.1", "'a string'"). If the expression can
+** be converted directly into a value, then the value is allocated and
+** a pointer written to *ppVal. The caller is responsible for deallocating
+** the value by passing it to sqlite3ValueFree() later on. If the expression
+** cannot be converted to a value, then *ppVal is set to NULL.
+*/
+SQLITE_PRIVATE int sqlite3ValueFromExpr(
+  sqlite3 *db,              /* The database connection */
+  const Expr *pExpr,        /* The expression to evaluate */
+  u8 enc,                   /* Encoding to use */
+  u8 affinity,              /* Affinity to use */
+  sqlite3_value **ppVal     /* Write the new value here */
+){
+  return pExpr ? valueFromExpr(db, pExpr, enc, affinity, ppVal, 0) : 0;
+}
+
+#ifdef SQLITE_ENABLE_STAT4
+/*
+** Attempt to extract a value from pExpr and use it to construct *ppVal.
+**
+** If pAlloc is not NULL, then an UnpackedRecord object is created for
+** pAlloc if one does not exist and the new value is added to the
+** UnpackedRecord object.
+**
+** A value is extracted in the following cases:
+**
+**  * (pExpr==0). In this case the value is assumed to be an SQL NULL,
+**
+**  * The expression is a bound variable, and this is a reprepare, or
+**
+**  * The expression is a literal value.
+**
+** On success, *ppVal is made to point to the extracted value.  The caller
+** is responsible for ensuring that the value is eventually freed.
+*/
+static int stat4ValueFromExpr(
+  Parse *pParse,                  /* Parse context */
+  Expr *pExpr,                    /* The expression to extract a value from */
+  u8 affinity,                    /* Affinity to use */
+  struct ValueNewStat4Ctx *pAlloc,/* How to allocate space.  Or NULL */
+  sqlite3_value **ppVal           /* OUT: New value object (or NULL) */
+){
+  int rc = SQLITE_OK;
+  sqlite3_value *pVal = 0;
+  sqlite3 *db = pParse->db;
+
+  /* Skip over any TK_COLLATE nodes */
+  pExpr = sqlite3ExprSkipCollate(pExpr);
+
+  assert( pExpr==0 || pExpr->op!=TK_REGISTER || pExpr->op2!=TK_VARIABLE );
+  if( !pExpr ){
+    pVal = valueNew(db, pAlloc);
+    if( pVal ){
+      sqlite3VdbeMemSetNull((Mem*)pVal);
+    }
+  }else if( pExpr->op==TK_VARIABLE && (db->flags & SQLITE_EnableQPSG)==0 ){
+    Vdbe *v;
+    int iBindVar = pExpr->iColumn;
+    sqlite3VdbeSetVarmask(pParse->pVdbe, iBindVar);
+    if( (v = pParse->pReprepare)!=0 ){
+      pVal = valueNew(db, pAlloc);
+      if( pVal ){
+        rc = sqlite3VdbeMemCopy((Mem*)pVal, &v->aVar[iBindVar-1]);
+        sqlite3ValueApplyAffinity(pVal, affinity, ENC(db));
+        pVal->db = pParse->db;
+      }
+    }
+  }else{
+    rc = valueFromExpr(db, pExpr, ENC(db), affinity, &pVal, pAlloc);
+  }
+
+  assert( pVal==0 || pVal->db==db );
+  *ppVal = pVal;
+  return rc;
+}
+
+/*
+** This function is used to allocate and populate UnpackedRecord
+** structures intended to be compared against sample index keys stored
+** in the sqlite_stat4 table.
+**
+** A single call to this function populates zero or more fields of the
+** record starting with field iVal (fields are numbered from left to
+** right starting with 0). A single field is populated if:
+**
+**  * (pExpr==0). In this case the value is assumed to be an SQL NULL,
+**
+**  * The expression is a bound variable, and this is a reprepare, or
+**
+**  * The sqlite3ValueFromExpr() function is able to extract a value
+**    from the expression (i.e. the expression is a literal value).
+**
+** Or, if pExpr is a TK_VECTOR, one field is populated for each of the
+** vector components that match either of the two latter criteria listed
+** above.
+**
+** Before any value is appended to the record, the affinity of the
+** corresponding column within index pIdx is applied to it. Before
+** this function returns, output parameter *pnExtract is set to the
+** number of values appended to the record.
+**
+** When this function is called, *ppRec must either point to an object
+** allocated by an earlier call to this fun
