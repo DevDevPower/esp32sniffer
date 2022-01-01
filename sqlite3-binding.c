@@ -82030,4 +82030,215 @@ SQLITE_PRIVATE int sqlite3VdbeDeletePriorOpcode(Vdbe *p, u8 op){
 */
 SQLITE_PRIVATE void sqlite3VdbeReleaseRegisters(
   Parse *pParse,       /* Parsing context */
-  int iFirst,          /* Index of
+  int iFirst,          /* Index of first register to be released */
+  int N,               /* Number of registers to release */
+  u32 mask,            /* Mask of registers to NOT release */
+  int bUndefine        /* If true, mark registers as undefined */
+){
+  if( N==0 || OptimizationDisabled(pParse->db, SQLITE_ReleaseReg) ) return;
+  assert( pParse->pVdbe );
+  assert( iFirst>=1 );
+  assert( iFirst+N-1<=pParse->nMem );
+  if( N<=31 && mask!=0 ){
+    while( N>0 && (mask&1)!=0 ){
+      mask >>= 1;
+      iFirst++;
+      N--;
+    }
+    while( N>0 && N<=32 && (mask & MASKBIT32(N-1))!=0 ){
+      mask &= ~MASKBIT32(N-1);
+      N--;
+    }
+  }
+  if( N>0 ){
+    sqlite3VdbeAddOp3(pParse->pVdbe, OP_ReleaseReg, iFirst, N, *(int*)&mask);
+    if( bUndefine ) sqlite3VdbeChangeP5(pParse->pVdbe, 1);
+  }
+}
+#endif /* SQLITE_DEBUG */
+
+
+/*
+** Change the value of the P4 operand for a specific instruction.
+** This routine is useful when a large program is loaded from a
+** static array using sqlite3VdbeAddOpList but we want to make a
+** few minor changes to the program.
+**
+** If n>=0 then the P4 operand is dynamic, meaning that a copy of
+** the string is made into memory obtained from sqlite3_malloc().
+** A value of n==0 means copy bytes of zP4 up to and including the
+** first null byte.  If n>0 then copy n+1 bytes of zP4.
+**
+** Other values of n (P4_STATIC, P4_COLLSEQ etc.) indicate that zP4 points
+** to a string or structure that is guaranteed to exist for the lifetime of
+** the Vdbe. In these cases we can just copy the pointer.
+**
+** If addr<0 then change P4 on the most recently inserted instruction.
+*/
+static void SQLITE_NOINLINE vdbeChangeP4Full(
+  Vdbe *p,
+  Op *pOp,
+  const char *zP4,
+  int n
+){
+  if( pOp->p4type ){
+    freeP4(p->db, pOp->p4type, pOp->p4.p);
+    pOp->p4type = 0;
+    pOp->p4.p = 0;
+  }
+  if( n<0 ){
+    sqlite3VdbeChangeP4(p, (int)(pOp - p->aOp), zP4, n);
+  }else{
+    if( n==0 ) n = sqlite3Strlen30(zP4);
+    pOp->p4.z = sqlite3DbStrNDup(p->db, zP4, n);
+    pOp->p4type = P4_DYNAMIC;
+  }
+}
+SQLITE_PRIVATE void sqlite3VdbeChangeP4(Vdbe *p, int addr, const char *zP4, int n){
+  Op *pOp;
+  sqlite3 *db;
+  assert( p!=0 );
+  db = p->db;
+  assert( p->eVdbeState==VDBE_INIT_STATE );
+  assert( p->aOp!=0 || db->mallocFailed );
+  if( db->mallocFailed ){
+    if( n!=P4_VTAB ) freeP4(db, n, (void*)*(char**)&zP4);
+    return;
+  }
+  assert( p->nOp>0 );
+  assert( addr<p->nOp );
+  if( addr<0 ){
+    addr = p->nOp - 1;
+  }
+  pOp = &p->aOp[addr];
+  if( n>=0 || pOp->p4type ){
+    vdbeChangeP4Full(p, pOp, zP4, n);
+    return;
+  }
+  if( n==P4_INT32 ){
+    /* Note: this cast is safe, because the origin data point was an int
+    ** that was cast to a (const char *). */
+    pOp->p4.i = SQLITE_PTR_TO_INT(zP4);
+    pOp->p4type = P4_INT32;
+  }else if( zP4!=0 ){
+    assert( n<0 );
+    pOp->p4.p = (void*)zP4;
+    pOp->p4type = (signed char)n;
+    if( n==P4_VTAB ) sqlite3VtabLock((VTable*)zP4);
+  }
+}
+
+/*
+** Change the P4 operand of the most recently coded instruction
+** to the value defined by the arguments.  This is a high-speed
+** version of sqlite3VdbeChangeP4().
+**
+** The P4 operand must not have been previously defined.  And the new
+** P4 must not be P4_INT32.  Use sqlite3VdbeChangeP4() in either of
+** those cases.
+*/
+SQLITE_PRIVATE void sqlite3VdbeAppendP4(Vdbe *p, void *pP4, int n){
+  VdbeOp *pOp;
+  assert( n!=P4_INT32 && n!=P4_VTAB );
+  assert( n<=0 );
+  if( p->db->mallocFailed ){
+    freeP4(p->db, n, pP4);
+  }else{
+    assert( pP4!=0 );
+    assert( p->nOp>0 );
+    pOp = &p->aOp[p->nOp-1];
+    assert( pOp->p4type==P4_NOTUSED );
+    pOp->p4type = n;
+    pOp->p4.p = pP4;
+  }
+}
+
+/*
+** Set the P4 on the most recently added opcode to the KeyInfo for the
+** index given.
+*/
+SQLITE_PRIVATE void sqlite3VdbeSetP4KeyInfo(Parse *pParse, Index *pIdx){
+  Vdbe *v = pParse->pVdbe;
+  KeyInfo *pKeyInfo;
+  assert( v!=0 );
+  assert( pIdx!=0 );
+  pKeyInfo = sqlite3KeyInfoOfIndex(pParse, pIdx);
+  if( pKeyInfo ) sqlite3VdbeAppendP4(v, pKeyInfo, P4_KEYINFO);
+}
+
+#ifdef SQLITE_ENABLE_EXPLAIN_COMMENTS
+/*
+** Change the comment on the most recently coded instruction.  Or
+** insert a No-op and add the comment to that new instruction.  This
+** makes the code easier to read during debugging.  None of this happens
+** in a production build.
+*/
+static void vdbeVComment(Vdbe *p, const char *zFormat, va_list ap){
+  assert( p->nOp>0 || p->aOp==0 );
+  assert( p->aOp==0 || p->aOp[p->nOp-1].zComment==0 || p->pParse->nErr>0 );
+  if( p->nOp ){
+    assert( p->aOp );
+    sqlite3DbFree(p->db, p->aOp[p->nOp-1].zComment);
+    p->aOp[p->nOp-1].zComment = sqlite3VMPrintf(p->db, zFormat, ap);
+  }
+}
+SQLITE_PRIVATE void sqlite3VdbeComment(Vdbe *p, const char *zFormat, ...){
+  va_list ap;
+  if( p ){
+    va_start(ap, zFormat);
+    vdbeVComment(p, zFormat, ap);
+    va_end(ap);
+  }
+}
+SQLITE_PRIVATE void sqlite3VdbeNoopComment(Vdbe *p, const char *zFormat, ...){
+  va_list ap;
+  if( p ){
+    sqlite3VdbeAddOp0(p, OP_Noop);
+    va_start(ap, zFormat);
+    vdbeVComment(p, zFormat, ap);
+    va_end(ap);
+  }
+}
+#endif  /* NDEBUG */
+
+#ifdef SQLITE_VDBE_COVERAGE
+/*
+** Set the value if the iSrcLine field for the previously coded instruction.
+*/
+SQLITE_PRIVATE void sqlite3VdbeSetLineNumber(Vdbe *v, int iLine){
+  sqlite3VdbeGetOp(v,-1)->iSrcLine = iLine;
+}
+#endif /* SQLITE_VDBE_COVERAGE */
+
+/*
+** Return the opcode for a given address.  If the address is -1, then
+** return the most recently inserted opcode.
+**
+** If a memory allocation error has occurred prior to the calling of this
+** routine, then a pointer to a dummy VdbeOp will be returned.  That opcode
+** is readable but not writable, though it is cast to a writable value.
+** The return of a dummy opcode allows the call to continue functioning
+** after an OOM fault without having to check to see if the return from
+** this routine is a valid pointer.  But because the dummy.opcode is 0,
+** dummy will never be written to.  This is verified by code inspection and
+** by running with Valgrind.
+*/
+SQLITE_PRIVATE VdbeOp *sqlite3VdbeGetOp(Vdbe *p, int addr){
+  /* C89 specifies that the constant "dummy" will be initialized to all
+  ** zeros, which is correct.  MSVC generates a warning, nevertheless. */
+  static VdbeOp dummy;  /* Ignore the MSVC warning about no initializer */
+  assert( p->eVdbeState==VDBE_INIT_STATE );
+  if( addr<0 ){
+    addr = p->nOp - 1;
+  }
+  assert( (addr>=0 && addr<p->nOp) || p->db->mallocFailed );
+  if( p->db->mallocFailed ){
+    return (VdbeOp*)&dummy;
+  }else{
+    return &p->aOp[addr];
+  }
+}
+
+#if defined(SQLITE_ENABLE_EXPLAIN_COMMENTS)
+/*
+** Return an integer value for one of the param
