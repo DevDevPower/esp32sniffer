@@ -82241,4 +82241,209 @@ SQLITE_PRIVATE VdbeOp *sqlite3VdbeGetOp(Vdbe *p, int addr){
 
 #if defined(SQLITE_ENABLE_EXPLAIN_COMMENTS)
 /*
-** Return an integer value for one of the param
+** Return an integer value for one of the parameters to the opcode pOp
+** determined by character c.
+*/
+static int translateP(char c, const Op *pOp){
+  if( c=='1' ) return pOp->p1;
+  if( c=='2' ) return pOp->p2;
+  if( c=='3' ) return pOp->p3;
+  if( c=='4' ) return pOp->p4.i;
+  return pOp->p5;
+}
+
+/*
+** Compute a string for the "comment" field of a VDBE opcode listing.
+**
+** The Synopsis: field in comments in the vdbe.c source file gets converted
+** to an extra string that is appended to the sqlite3OpcodeName().  In the
+** absence of other comments, this synopsis becomes the comment on the opcode.
+** Some translation occurs:
+**
+**       "PX"      ->  "r[X]"
+**       "PX@PY"   ->  "r[X..X+Y-1]"  or "r[x]" if y is 0 or 1
+**       "PX@PY+1" ->  "r[X..X+Y]"    or "r[x]" if y is 0
+**       "PY..PY"  ->  "r[X..Y]"      or "r[x]" if y<=x
+*/
+SQLITE_PRIVATE char *sqlite3VdbeDisplayComment(
+  sqlite3 *db,       /* Optional - Oom error reporting only */
+  const Op *pOp,     /* The opcode to be commented */
+  const char *zP4    /* Previously obtained value for P4 */
+){
+  const char *zOpName;
+  const char *zSynopsis;
+  int nOpName;
+  int ii;
+  char zAlt[50];
+  StrAccum x;
+
+  sqlite3StrAccumInit(&x, 0, 0, 0, SQLITE_MAX_LENGTH);
+  zOpName = sqlite3OpcodeName(pOp->opcode);
+  nOpName = sqlite3Strlen30(zOpName);
+  if( zOpName[nOpName+1] ){
+    int seenCom = 0;
+    char c;
+    zSynopsis = zOpName + nOpName + 1;
+    if( strncmp(zSynopsis,"IF ",3)==0 ){
+      sqlite3_snprintf(sizeof(zAlt), zAlt, "if %s goto P2", zSynopsis+3);
+      zSynopsis = zAlt;
+    }
+    for(ii=0; (c = zSynopsis[ii])!=0; ii++){
+      if( c=='P' ){
+        c = zSynopsis[++ii];
+        if( c=='4' ){
+          sqlite3_str_appendall(&x, zP4);
+        }else if( c=='X' ){
+          if( pOp->zComment && pOp->zComment[0] ){
+            sqlite3_str_appendall(&x, pOp->zComment);
+            seenCom = 1;
+            break;
+          }
+        }else{
+          int v1 = translateP(c, pOp);
+          int v2;
+          if( strncmp(zSynopsis+ii+1, "@P", 2)==0 ){
+            ii += 3;
+            v2 = translateP(zSynopsis[ii], pOp);
+            if( strncmp(zSynopsis+ii+1,"+1",2)==0 ){
+              ii += 2;
+              v2++;
+            }
+            if( v2<2 ){
+              sqlite3_str_appendf(&x, "%d", v1);
+            }else{
+              sqlite3_str_appendf(&x, "%d..%d", v1, v1+v2-1);
+            }
+          }else if( strncmp(zSynopsis+ii+1, "@NP", 3)==0 ){
+            sqlite3_context *pCtx = pOp->p4.pCtx;
+            if( pOp->p4type!=P4_FUNCCTX || pCtx->argc==1 ){
+              sqlite3_str_appendf(&x, "%d", v1);
+            }else if( pCtx->argc>1 ){
+              sqlite3_str_appendf(&x, "%d..%d", v1, v1+pCtx->argc-1);
+            }else if( x.accError==0 ){
+              assert( x.nChar>2 );
+              x.nChar -= 2;
+              ii++;
+            }
+            ii += 3;
+          }else{
+            sqlite3_str_appendf(&x, "%d", v1);
+            if( strncmp(zSynopsis+ii+1, "..P3", 4)==0 && pOp->p3==0 ){
+              ii += 4;
+            }
+          }
+        }
+      }else{
+        sqlite3_str_appendchar(&x, 1, c);
+      }
+    }
+    if( !seenCom && pOp->zComment ){
+      sqlite3_str_appendf(&x, "; %s", pOp->zComment);
+    }
+  }else if( pOp->zComment ){
+    sqlite3_str_appendall(&x, pOp->zComment);
+  }
+  if( (x.accError & SQLITE_NOMEM)!=0 && db!=0 ){
+    sqlite3OomFault(db);
+  }
+  return sqlite3StrAccumFinish(&x);
+}
+#endif /* SQLITE_ENABLE_EXPLAIN_COMMENTS */
+
+#if VDBE_DISPLAY_P4 && defined(SQLITE_ENABLE_CURSOR_HINTS)
+/*
+** Translate the P4.pExpr value for an OP_CursorHint opcode into text
+** that can be displayed in the P4 column of EXPLAIN output.
+*/
+static void displayP4Expr(StrAccum *p, Expr *pExpr){
+  const char *zOp = 0;
+  switch( pExpr->op ){
+    case TK_STRING:
+      assert( !ExprHasProperty(pExpr, EP_IntValue) );
+      sqlite3_str_appendf(p, "%Q", pExpr->u.zToken);
+      break;
+    case TK_INTEGER:
+      sqlite3_str_appendf(p, "%d", pExpr->u.iValue);
+      break;
+    case TK_NULL:
+      sqlite3_str_appendf(p, "NULL");
+      break;
+    case TK_REGISTER: {
+      sqlite3_str_appendf(p, "r[%d]", pExpr->iTable);
+      break;
+    }
+    case TK_COLUMN: {
+      if( pExpr->iColumn<0 ){
+        sqlite3_str_appendf(p, "rowid");
+      }else{
+        sqlite3_str_appendf(p, "c%d", (int)pExpr->iColumn);
+      }
+      break;
+    }
+    case TK_LT:      zOp = "LT";      break;
+    case TK_LE:      zOp = "LE";      break;
+    case TK_GT:      zOp = "GT";      break;
+    case TK_GE:      zOp = "GE";      break;
+    case TK_NE:      zOp = "NE";      break;
+    case TK_EQ:      zOp = "EQ";      break;
+    case TK_IS:      zOp = "IS";      break;
+    case TK_ISNOT:   zOp = "ISNOT";   break;
+    case TK_AND:     zOp = "AND";     break;
+    case TK_OR:      zOp = "OR";      break;
+    case TK_PLUS:    zOp = "ADD";     break;
+    case TK_STAR:    zOp = "MUL";     break;
+    case TK_MINUS:   zOp = "SUB";     break;
+    case TK_REM:     zOp = "REM";     break;
+    case TK_BITAND:  zOp = "BITAND";  break;
+    case TK_BITOR:   zOp = "BITOR";   break;
+    case TK_SLASH:   zOp = "DIV";     break;
+    case TK_LSHIFT:  zOp = "LSHIFT";  break;
+    case TK_RSHIFT:  zOp = "RSHIFT";  break;
+    case TK_CONCAT:  zOp = "CONCAT";  break;
+    case TK_UMINUS:  zOp = "MINUS";   break;
+    case TK_UPLUS:   zOp = "PLUS";    break;
+    case TK_BITNOT:  zOp = "BITNOT";  break;
+    case TK_NOT:     zOp = "NOT";     break;
+    case TK_ISNULL:  zOp = "ISNULL";  break;
+    case TK_NOTNULL: zOp = "NOTNULL"; break;
+
+    default:
+      sqlite3_str_appendf(p, "%s", "expr");
+      break;
+  }
+
+  if( zOp ){
+    sqlite3_str_appendf(p, "%s(", zOp);
+    displayP4Expr(p, pExpr->pLeft);
+    if( pExpr->pRight ){
+      sqlite3_str_append(p, ",", 1);
+      displayP4Expr(p, pExpr->pRight);
+    }
+    sqlite3_str_append(p, ")", 1);
+  }
+}
+#endif /* VDBE_DISPLAY_P4 && defined(SQLITE_ENABLE_CURSOR_HINTS) */
+
+
+#if VDBE_DISPLAY_P4
+/*
+** Compute a string that describes the P4 parameter for an opcode.
+** Use zTemp for any required temporary buffer space.
+*/
+SQLITE_PRIVATE char *sqlite3VdbeDisplayP4(sqlite3 *db, Op *pOp){
+  char *zP4 = 0;
+  StrAccum x;
+
+  sqlite3StrAccumInit(&x, 0, 0, 0, SQLITE_MAX_LENGTH);
+  switch( pOp->p4type ){
+    case P4_KEYINFO: {
+      int j;
+      KeyInfo *pKeyInfo = pOp->p4.pKeyInfo;
+      assert( pKeyInfo->aSortFlags!=0 );
+      sqlite3_str_appendf(&x, "k(%d", pKeyInfo->nKeyField);
+      for(j=0; j<pKeyInfo->nKeyField; j++){
+        CollSeq *pColl = pKeyInfo->aColl[j];
+        const char *zColl = pColl ? pColl->zName : "";
+        if( strcmp(zColl, "BINARY")==0 ) zColl = "B";
+        sqlite3_str_appendf(&x, ",%s%s%s",
+               (pKeyInfo-
