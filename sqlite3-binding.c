@@ -81592,4 +81592,199 @@ static void resolveP2Values(Vdbe *p, int *pMaxFuncArgs){
     pOp--;
   }
   if( aLabel ){
-    sqlite3
+    sqlite3DbFreeNN(p->db, pParse->aLabel);
+    pParse->aLabel = 0;
+  }
+  pParse->nLabel = 0;
+  *pMaxFuncArgs = nMaxArgs;
+  assert( p->bIsReader!=0 || DbMaskAllZero(p->btreeMask) );
+}
+
+#ifdef SQLITE_DEBUG
+/*
+** Check to see if a subroutine contains a jump to a location outside of
+** the subroutine.  If a jump outside the subroutine is detected, add code
+** that will cause the program to halt with an error message.
+**
+** The subroutine consists of opcodes between iFirst and iLast.  Jumps to
+** locations within the subroutine are acceptable.  iRetReg is a register
+** that contains the return address.  Jumps to outside the range of iFirst
+** through iLast are also acceptable as long as the jump destination is
+** an OP_Return to iReturnAddr.
+**
+** A jump to an unresolved label means that the jump destination will be
+** beyond the current address.  That is normally a jump to an early
+** termination and is consider acceptable.
+**
+** This routine only runs during debug builds.  The purpose is (of course)
+** to detect invalid escapes out of a subroutine.  The OP_Halt opcode
+** is generated rather than an assert() or other error, so that ".eqp full"
+** will still work to show the original bytecode, to aid in debugging.
+*/
+SQLITE_PRIVATE void sqlite3VdbeNoJumpsOutsideSubrtn(
+  Vdbe *v,          /* The byte-code program under construction */
+  int iFirst,       /* First opcode of the subroutine */
+  int iLast,        /* Last opcode of the subroutine */
+  int iRetReg       /* Subroutine return address register */
+){
+  VdbeOp *pOp;
+  Parse *pParse;
+  int i;
+  sqlite3_str *pErr = 0;
+  assert( v!=0 );
+  pParse = v->pParse;
+  assert( pParse!=0 );
+  if( pParse->nErr ) return;
+  assert( iLast>=iFirst );
+  assert( iLast<v->nOp );
+  pOp = &v->aOp[iFirst];
+  for(i=iFirst; i<=iLast; i++, pOp++){
+    if( (sqlite3OpcodeProperty[pOp->opcode] & OPFLG_JUMP)!=0 ){
+      int iDest = pOp->p2;   /* Jump destination */
+      if( iDest==0 ) continue;
+      if( pOp->opcode==OP_Gosub ) continue;
+      if( iDest<0 ){
+        int j = ADDR(iDest);
+        assert( j>=0 );
+        if( j>=-pParse->nLabel || pParse->aLabel[j]<0 ){
+          continue;
+        }
+        iDest = pParse->aLabel[j];
+      }
+      if( iDest<iFirst || iDest>iLast ){
+        int j = iDest;
+        for(; j<v->nOp; j++){
+          VdbeOp *pX = &v->aOp[j];
+          if( pX->opcode==OP_Return ){
+            if( pX->p1==iRetReg ) break;
+            continue;
+          }
+          if( pX->opcode==OP_Noop ) continue;
+          if( pX->opcode==OP_Explain ) continue;
+          if( pErr==0 ){
+            pErr = sqlite3_str_new(0);
+          }else{
+            sqlite3_str_appendchar(pErr, 1, '\n');
+          }
+          sqlite3_str_appendf(pErr,
+              "Opcode at %d jumps to %d which is outside the "
+              "subroutine at %d..%d",
+              i, iDest, iFirst, iLast);
+          break;
+        }
+      }
+    }
+  }
+  if( pErr ){
+    char *zErr = sqlite3_str_finish(pErr);
+    sqlite3VdbeAddOp4(v, OP_Halt, SQLITE_INTERNAL, OE_Abort, 0, zErr, 0);
+    sqlite3_free(zErr);
+    sqlite3MayAbort(pParse);
+  }
+}
+#endif /* SQLITE_DEBUG */
+
+/*
+** Return the address of the next instruction to be inserted.
+*/
+SQLITE_PRIVATE int sqlite3VdbeCurrentAddr(Vdbe *p){
+  assert( p->eVdbeState==VDBE_INIT_STATE );
+  return p->nOp;
+}
+
+/*
+** Verify that at least N opcode slots are available in p without
+** having to malloc for more space (except when compiled using
+** SQLITE_TEST_REALLOC_STRESS).  This interface is used during testing
+** to verify that certain calls to sqlite3VdbeAddOpList() can never
+** fail due to a OOM fault and hence that the return value from
+** sqlite3VdbeAddOpList() will always be non-NULL.
+*/
+#if defined(SQLITE_DEBUG) && !defined(SQLITE_TEST_REALLOC_STRESS)
+SQLITE_PRIVATE void sqlite3VdbeVerifyNoMallocRequired(Vdbe *p, int N){
+  assert( p->nOp + N <= p->nOpAlloc );
+}
+#endif
+
+/*
+** Verify that the VM passed as the only argument does not contain
+** an OP_ResultRow opcode. Fail an assert() if it does. This is used
+** by code in pragma.c to ensure that the implementation of certain
+** pragmas comports with the flags specified in the mkpragmatab.tcl
+** script.
+*/
+#if defined(SQLITE_DEBUG) && !defined(SQLITE_TEST_REALLOC_STRESS)
+SQLITE_PRIVATE void sqlite3VdbeVerifyNoResultRow(Vdbe *p){
+  int i;
+  for(i=0; i<p->nOp; i++){
+    assert( p->aOp[i].opcode!=OP_ResultRow );
+  }
+}
+#endif
+
+/*
+** Generate code (a single OP_Abortable opcode) that will
+** verify that the VDBE program can safely call Abort in the current
+** context.
+*/
+#if defined(SQLITE_DEBUG)
+SQLITE_PRIVATE void sqlite3VdbeVerifyAbortable(Vdbe *p, int onError){
+  if( onError==OE_Abort ) sqlite3VdbeAddOp0(p, OP_Abortable);
+}
+#endif
+
+/*
+** This function returns a pointer to the array of opcodes associated with
+** the Vdbe passed as the first argument. It is the callers responsibility
+** to arrange for the returned array to be eventually freed using the
+** vdbeFreeOpArray() function.
+**
+** Before returning, *pnOp is set to the number of entries in the returned
+** array. Also, *pnMaxArg is set to the larger of its current value and
+** the number of entries in the Vdbe.apArg[] array required to execute the
+** returned program.
+*/
+SQLITE_PRIVATE VdbeOp *sqlite3VdbeTakeOpArray(Vdbe *p, int *pnOp, int *pnMaxArg){
+  VdbeOp *aOp = p->aOp;
+  assert( aOp && !p->db->mallocFailed );
+
+  /* Check that sqlite3VdbeUsesBtree() was not called on this VM */
+  assert( DbMaskAllZero(p->btreeMask) );
+
+  resolveP2Values(p, pnMaxArg);
+  *pnOp = p->nOp;
+  p->aOp = 0;
+  return aOp;
+}
+
+/*
+** Add a whole list of operations to the operation stack.  Return a
+** pointer to the first operation inserted.
+**
+** Non-zero P2 arguments to jump instructions are automatically adjusted
+** so that the jump target is relative to the first operation inserted.
+*/
+SQLITE_PRIVATE VdbeOp *sqlite3VdbeAddOpList(
+  Vdbe *p,                     /* Add opcodes to the prepared statement */
+  int nOp,                     /* Number of opcodes to add */
+  VdbeOpList const *aOp,       /* The opcodes to be added */
+  int iLineno                  /* Source-file line number of first opcode */
+){
+  int i;
+  VdbeOp *pOut, *pFirst;
+  assert( nOp>0 );
+  assert( p->eVdbeState==VDBE_INIT_STATE );
+  if( p->nOp + nOp > p->nOpAlloc && growOpArray(p, nOp) ){
+    return 0;
+  }
+  pFirst = pOut = &p->aOp[p->nOp];
+  for(i=0; i<nOp; i++, aOp++, pOut++){
+    pOut->opcode = aOp->opcode;
+    pOut->p1 = aOp->p1;
+    pOut->p2 = aOp->p2;
+    assert( aOp->p2>=0 );
+    if( (sqlite3OpcodeProperty[aOp->opcode] & OPFLG_JUMP)!=0 && aOp->p2>0 ){
+      pOut->p2 += p->nOp;
+    }
+    pOut->p3 = aOp->p3;
+    pOut->p4type = P4_
