@@ -82866,4 +82866,212 @@ SQLITE_PRIVATE int sqlite3VdbeNextOpcode(
       Op *pOp = aOp + i;
       if( pOp->opcode==OP_OpenRead ) break;
       if( pOp->opcode==OP_OpenWrite && (pOp->p5 & OPFLAG_P2ISREG)==0 ) break;
-      if( pOp->opcode==OP
+      if( pOp->opcode==OP_ReopenIdx ) break;
+    }else
+#endif
+    {
+      assert( eMode==1 );
+      if( aOp[i].opcode==OP_Explain ) break;
+      if( aOp[i].opcode==OP_Init && iPc>1 ) break;
+    }
+  }
+  *piPc = iPc;
+  *piAddr = i;
+  *paOp = aOp;
+  return rc;
+}
+#endif /* SQLITE_ENABLE_BYTECODE_VTAB || !SQLITE_OMIT_EXPLAIN */
+
+
+/*
+** Delete a VdbeFrame object and its contents. VdbeFrame objects are
+** allocated by the OP_Program opcode in sqlite3VdbeExec().
+*/
+SQLITE_PRIVATE void sqlite3VdbeFrameDelete(VdbeFrame *p){
+  int i;
+  Mem *aMem = VdbeFrameMem(p);
+  VdbeCursor **apCsr = (VdbeCursor **)&aMem[p->nChildMem];
+  assert( sqlite3VdbeFrameIsValid(p) );
+  for(i=0; i<p->nChildCsr; i++){
+    if( apCsr[i] ) sqlite3VdbeFreeCursorNN(p->v, apCsr[i]);
+  }
+  releaseMemArray(aMem, p->nChildMem);
+  sqlite3VdbeDeleteAuxData(p->v->db, &p->pAuxData, -1, 0);
+  sqlite3DbFree(p->v->db, p);
+}
+
+#ifndef SQLITE_OMIT_EXPLAIN
+/*
+** Give a listing of the program in the virtual machine.
+**
+** The interface is the same as sqlite3VdbeExec().  But instead of
+** running the code, it invokes the callback once for each instruction.
+** This feature is used to implement "EXPLAIN".
+**
+** When p->explain==1, each instruction is listed.  When
+** p->explain==2, only OP_Explain instructions are listed and these
+** are shown in a different format.  p->explain==2 is used to implement
+** EXPLAIN QUERY PLAN.
+** 2018-04-24:  In p->explain==2 mode, the OP_Init opcodes of triggers
+** are also shown, so that the boundaries between the main program and
+** each trigger are clear.
+**
+** When p->explain==1, first the main program is listed, then each of
+** the trigger subprograms are listed one by one.
+*/
+SQLITE_PRIVATE int sqlite3VdbeList(
+  Vdbe *p                   /* The VDBE */
+){
+  Mem *pSub = 0;                       /* Memory cell hold array of subprogs */
+  sqlite3 *db = p->db;                 /* The database connection */
+  int i;                               /* Loop counter */
+  int rc = SQLITE_OK;                  /* Return code */
+  Mem *pMem = &p->aMem[1];             /* First Mem of result set */
+  int bListSubprogs = (p->explain==1 || (db->flags & SQLITE_TriggerEQP)!=0);
+  Op *aOp;                             /* Array of opcodes */
+  Op *pOp;                             /* Current opcode */
+
+  assert( p->explain );
+  assert( p->eVdbeState==VDBE_RUN_STATE );
+  assert( p->rc==SQLITE_OK || p->rc==SQLITE_BUSY || p->rc==SQLITE_NOMEM );
+
+  /* Even though this opcode does not use dynamic strings for
+  ** the result, result columns may become dynamic if the user calls
+  ** sqlite3_column_text16(), causing a translation to UTF-16 encoding.
+  */
+  releaseMemArray(pMem, 8);
+  p->pResultSet = 0;
+
+  if( p->rc==SQLITE_NOMEM ){
+    /* This happens if a malloc() inside a call to sqlite3_column_text() or
+    ** sqlite3_column_text16() failed.  */
+    sqlite3OomFault(db);
+    return SQLITE_ERROR;
+  }
+
+  if( bListSubprogs ){
+    /* The first 8 memory cells are used for the result set.  So we will
+    ** commandeer the 9th cell to use as storage for an array of pointers
+    ** to trigger subprograms.  The VDBE is guaranteed to have at least 9
+    ** cells.  */
+    assert( p->nMem>9 );
+    pSub = &p->aMem[9];
+  }else{
+    pSub = 0;
+  }
+
+  /* Figure out which opcode is next to display */
+  rc = sqlite3VdbeNextOpcode(p, pSub, p->explain==2, &p->pc, &i, &aOp);
+
+  if( rc==SQLITE_OK ){
+    pOp = aOp + i;
+    if( AtomicLoad(&db->u1.isInterrupted) ){
+      p->rc = SQLITE_INTERRUPT;
+      rc = SQLITE_ERROR;
+      sqlite3VdbeError(p, sqlite3ErrStr(p->rc));
+    }else{
+      char *zP4 = sqlite3VdbeDisplayP4(db, pOp);
+      if( p->explain==2 ){
+        sqlite3VdbeMemSetInt64(pMem, pOp->p1);
+        sqlite3VdbeMemSetInt64(pMem+1, pOp->p2);
+        sqlite3VdbeMemSetInt64(pMem+2, pOp->p3);
+        sqlite3VdbeMemSetStr(pMem+3, zP4, -1, SQLITE_UTF8, sqlite3_free);
+        p->nResColumn = 4;
+      }else{
+        sqlite3VdbeMemSetInt64(pMem+0, i);
+        sqlite3VdbeMemSetStr(pMem+1, (char*)sqlite3OpcodeName(pOp->opcode),
+                             -1, SQLITE_UTF8, SQLITE_STATIC);
+        sqlite3VdbeMemSetInt64(pMem+2, pOp->p1);
+        sqlite3VdbeMemSetInt64(pMem+3, pOp->p2);
+        sqlite3VdbeMemSetInt64(pMem+4, pOp->p3);
+        /* pMem+5 for p4 is done last */
+        sqlite3VdbeMemSetInt64(pMem+6, pOp->p5);
+#ifdef SQLITE_ENABLE_EXPLAIN_COMMENTS
+        {
+          char *zCom = sqlite3VdbeDisplayComment(db, pOp, zP4);
+          sqlite3VdbeMemSetStr(pMem+7, zCom, -1, SQLITE_UTF8, sqlite3_free);
+        }
+#else
+        sqlite3VdbeMemSetNull(pMem+7);
+#endif
+        sqlite3VdbeMemSetStr(pMem+5, zP4, -1, SQLITE_UTF8, sqlite3_free);
+        p->nResColumn = 8;
+      }
+      p->pResultSet = pMem;
+      if( db->mallocFailed ){
+        p->rc = SQLITE_NOMEM;
+        rc = SQLITE_ERROR;
+      }else{
+        p->rc = SQLITE_OK;
+        rc = SQLITE_ROW;
+      }
+    }
+  }
+  return rc;
+}
+#endif /* SQLITE_OMIT_EXPLAIN */
+
+#ifdef SQLITE_DEBUG
+/*
+** Print the SQL that was used to generate a VDBE program.
+*/
+SQLITE_PRIVATE void sqlite3VdbePrintSql(Vdbe *p){
+  const char *z = 0;
+  if( p->zSql ){
+    z = p->zSql;
+  }else if( p->nOp>=1 ){
+    const VdbeOp *pOp = &p->aOp[0];
+    if( pOp->opcode==OP_Init && pOp->p4.z!=0 ){
+      z = pOp->p4.z;
+      while( sqlite3Isspace(*z) ) z++;
+    }
+  }
+  if( z ) printf("SQL: [%s]\n", z);
+}
+#endif
+
+#if !defined(SQLITE_OMIT_TRACE) && defined(SQLITE_ENABLE_IOTRACE)
+/*
+** Print an IOTRACE message showing SQL content.
+*/
+SQLITE_PRIVATE void sqlite3VdbeIOTraceSql(Vdbe *p){
+  int nOp = p->nOp;
+  VdbeOp *pOp;
+  if( sqlite3IoTrace==0 ) return;
+  if( nOp<1 ) return;
+  pOp = &p->aOp[0];
+  if( pOp->opcode==OP_Init && pOp->p4.z!=0 ){
+    int i, j;
+    char z[1000];
+    sqlite3_snprintf(sizeof(z), z, "%s", pOp->p4.z);
+    for(i=0; sqlite3Isspace(z[i]); i++){}
+    for(j=0; z[i]; i++){
+      if( sqlite3Isspace(z[i]) ){
+        if( z[i-1]!=' ' ){
+          z[j++] = ' ';
+        }
+      }else{
+        z[j++] = z[i];
+      }
+    }
+    z[j] = 0;
+    sqlite3IoTrace("SQL %s\n", z);
+  }
+}
+#endif /* !SQLITE_OMIT_TRACE && SQLITE_ENABLE_IOTRACE */
+
+/* An instance of this object describes bulk memory available for use
+** by subcomponents of a prepared statement.  Space is allocated out
+** of a ReusableSpace object by the allocSpace() routine below.
+*/
+struct ReusableSpace {
+  u8 *pSpace;            /* Available memory */
+  sqlite3_int64 nFree;   /* Bytes of available memory */
+  sqlite3_int64 nNeeded; /* Total bytes that could not be allocated */
+};
+
+/* Try to allocate nByte bytes of 8-byte aligned bulk memory for pBuf
+** from the ReusableSpace object.  Return a pointer to the allocated
+** memory on success.  If insufficient memory is available in the
+** ReusableSpace object, increase the ReusableSpace.nNeeded
+** value by the amount needed and 
