@@ -82446,4 +82446,229 @@ SQLITE_PRIVATE char *sqlite3VdbeDisplayP4(sqlite3 *db, Op *pOp){
         const char *zColl = pColl ? pColl->zName : "";
         if( strcmp(zColl, "BINARY")==0 ) zColl = "B";
         sqlite3_str_appendf(&x, ",%s%s%s",
-               (pKeyInfo-
+               (pKeyInfo->aSortFlags[j] & KEYINFO_ORDER_DESC) ? "-" : "",
+               (pKeyInfo->aSortFlags[j] & KEYINFO_ORDER_BIGNULL)? "N." : "",
+               zColl);
+      }
+      sqlite3_str_append(&x, ")", 1);
+      break;
+    }
+#ifdef SQLITE_ENABLE_CURSOR_HINTS
+    case P4_EXPR: {
+      displayP4Expr(&x, pOp->p4.pExpr);
+      break;
+    }
+#endif
+    case P4_COLLSEQ: {
+      static const char *const encnames[] = {"?", "8", "16LE", "16BE"};
+      CollSeq *pColl = pOp->p4.pColl;
+      assert( pColl->enc<4 );
+      sqlite3_str_appendf(&x, "%.18s-%s", pColl->zName,
+                          encnames[pColl->enc]);
+      break;
+    }
+    case P4_FUNCDEF: {
+      FuncDef *pDef = pOp->p4.pFunc;
+      sqlite3_str_appendf(&x, "%s(%d)", pDef->zName, pDef->nArg);
+      break;
+    }
+    case P4_FUNCCTX: {
+      FuncDef *pDef = pOp->p4.pCtx->pFunc;
+      sqlite3_str_appendf(&x, "%s(%d)", pDef->zName, pDef->nArg);
+      break;
+    }
+    case P4_INT64: {
+      sqlite3_str_appendf(&x, "%lld", *pOp->p4.pI64);
+      break;
+    }
+    case P4_INT32: {
+      sqlite3_str_appendf(&x, "%d", pOp->p4.i);
+      break;
+    }
+    case P4_REAL: {
+      sqlite3_str_appendf(&x, "%.16g", *pOp->p4.pReal);
+      break;
+    }
+    case P4_MEM: {
+      Mem *pMem = pOp->p4.pMem;
+      if( pMem->flags & MEM_Str ){
+        zP4 = pMem->z;
+      }else if( pMem->flags & (MEM_Int|MEM_IntReal) ){
+        sqlite3_str_appendf(&x, "%lld", pMem->u.i);
+      }else if( pMem->flags & MEM_Real ){
+        sqlite3_str_appendf(&x, "%.16g", pMem->u.r);
+      }else if( pMem->flags & MEM_Null ){
+        zP4 = "NULL";
+      }else{
+        assert( pMem->flags & MEM_Blob );
+        zP4 = "(blob)";
+      }
+      break;
+    }
+#ifndef SQLITE_OMIT_VIRTUALTABLE
+    case P4_VTAB: {
+      sqlite3_vtab *pVtab = pOp->p4.pVtab->pVtab;
+      sqlite3_str_appendf(&x, "vtab:%p", pVtab);
+      break;
+    }
+#endif
+    case P4_INTARRAY: {
+      u32 i;
+      u32 *ai = pOp->p4.ai;
+      u32 n = ai[0];   /* The first element of an INTARRAY is always the
+                       ** count of the number of elements to follow */
+      for(i=1; i<=n; i++){
+        sqlite3_str_appendf(&x, "%c%u", (i==1 ? '[' : ','), ai[i]);
+      }
+      sqlite3_str_append(&x, "]", 1);
+      break;
+    }
+    case P4_SUBPROGRAM: {
+      zP4 = "program";
+      break;
+    }
+    case P4_TABLE: {
+      zP4 = pOp->p4.pTab->zName;
+      break;
+    }
+    default: {
+      zP4 = pOp->p4.z;
+    }
+  }
+  if( zP4 ) sqlite3_str_appendall(&x, zP4);
+  if( (x.accError & SQLITE_NOMEM)!=0 ){
+    sqlite3OomFault(db);
+  }
+  return sqlite3StrAccumFinish(&x);
+}
+#endif /* VDBE_DISPLAY_P4 */
+
+/*
+** Declare to the Vdbe that the BTree object at db->aDb[i] is used.
+**
+** The prepared statements need to know in advance the complete set of
+** attached databases that will be use.  A mask of these databases
+** is maintained in p->btreeMask.  The p->lockMask value is the subset of
+** p->btreeMask of databases that will require a lock.
+*/
+SQLITE_PRIVATE void sqlite3VdbeUsesBtree(Vdbe *p, int i){
+  assert( i>=0 && i<p->db->nDb && i<(int)sizeof(yDbMask)*8 );
+  assert( i<(int)sizeof(p->btreeMask)*8 );
+  DbMaskSet(p->btreeMask, i);
+  if( i!=1 && sqlite3BtreeSharable(p->db->aDb[i].pBt) ){
+    DbMaskSet(p->lockMask, i);
+  }
+}
+
+#if !defined(SQLITE_OMIT_SHARED_CACHE)
+/*
+** If SQLite is compiled to support shared-cache mode and to be threadsafe,
+** this routine obtains the mutex associated with each BtShared structure
+** that may be accessed by the VM passed as an argument. In doing so it also
+** sets the BtShared.db member of each of the BtShared structures, ensuring
+** that the correct busy-handler callback is invoked if required.
+**
+** If SQLite is not threadsafe but does support shared-cache mode, then
+** sqlite3BtreeEnter() is invoked to set the BtShared.db variables
+** of all of BtShared structures accessible via the database handle
+** associated with the VM.
+**
+** If SQLite is not threadsafe and does not support shared-cache mode, this
+** function is a no-op.
+**
+** The p->btreeMask field is a bitmask of all btrees that the prepared
+** statement p will ever use.  Let N be the number of bits in p->btreeMask
+** corresponding to btrees that use shared cache.  Then the runtime of
+** this routine is N*N.  But as N is rarely more than 1, this should not
+** be a problem.
+*/
+SQLITE_PRIVATE void sqlite3VdbeEnter(Vdbe *p){
+  int i;
+  sqlite3 *db;
+  Db *aDb;
+  int nDb;
+  if( DbMaskAllZero(p->lockMask) ) return;  /* The common case */
+  db = p->db;
+  aDb = db->aDb;
+  nDb = db->nDb;
+  for(i=0; i<nDb; i++){
+    if( i!=1 && DbMaskTest(p->lockMask,i) && ALWAYS(aDb[i].pBt!=0) ){
+      sqlite3BtreeEnter(aDb[i].pBt);
+    }
+  }
+}
+#endif
+
+#if !defined(SQLITE_OMIT_SHARED_CACHE) && SQLITE_THREADSAFE>0
+/*
+** Unlock all of the btrees previously locked by a call to sqlite3VdbeEnter().
+*/
+static SQLITE_NOINLINE void vdbeLeave(Vdbe *p){
+  int i;
+  sqlite3 *db;
+  Db *aDb;
+  int nDb;
+  db = p->db;
+  aDb = db->aDb;
+  nDb = db->nDb;
+  for(i=0; i<nDb; i++){
+    if( i!=1 && DbMaskTest(p->lockMask,i) && ALWAYS(aDb[i].pBt!=0) ){
+      sqlite3BtreeLeave(aDb[i].pBt);
+    }
+  }
+}
+SQLITE_PRIVATE void sqlite3VdbeLeave(Vdbe *p){
+  if( DbMaskAllZero(p->lockMask) ) return;  /* The common case */
+  vdbeLeave(p);
+}
+#endif
+
+#if defined(VDBE_PROFILE) || defined(SQLITE_DEBUG)
+/*
+** Print a single opcode.  This routine is used for debugging only.
+*/
+SQLITE_PRIVATE void sqlite3VdbePrintOp(FILE *pOut, int pc, VdbeOp *pOp){
+  char *zP4;
+  char *zCom;
+  sqlite3 dummyDb;
+  static const char *zFormat1 = "%4d %-13s %4d %4d %4d %-13s %.2X %s\n";
+  if( pOut==0 ) pOut = stdout;
+  sqlite3BeginBenignMalloc();
+  dummyDb.mallocFailed = 1;
+  zP4 = sqlite3VdbeDisplayP4(&dummyDb, pOp);
+#ifdef SQLITE_ENABLE_EXPLAIN_COMMENTS
+  zCom = sqlite3VdbeDisplayComment(0, pOp, zP4);
+#else
+  zCom = 0;
+#endif
+  /* NB:  The sqlite3OpcodeName() function is implemented by code created
+  ** by the mkopcodeh.awk and mkopcodec.awk scripts which extract the
+  ** information from the vdbe.c source text */
+  fprintf(pOut, zFormat1, pc,
+      sqlite3OpcodeName(pOp->opcode), pOp->p1, pOp->p2, pOp->p3,
+      zP4 ? zP4 : "", pOp->p5,
+      zCom ? zCom : ""
+  );
+  fflush(pOut);
+  sqlite3_free(zP4);
+  sqlite3_free(zCom);
+  sqlite3EndBenignMalloc();
+}
+#endif
+
+/*
+** Initialize an array of N Mem element.
+**
+** This is a high-runner, so only those fields that really do need to
+** be initialized are set.  The Mem structure is organized so that
+** the fields that get initialized are nearby and hopefully on the same
+** cache line.
+**
+**    Mem.flags = flags
+**    Mem.db = db
+**    Mem.szMalloc = 0
+**
+** All other fields of Mem can safely remain uninitialized for now.  They
+** will be initialized before use.
+*/
+static void initMemArray(Mem
