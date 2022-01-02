@@ -82671,4 +82671,199 @@ SQLITE_PRIVATE void sqlite3VdbePrintOp(FILE *pOut, int pc, VdbeOp *pOp){
 ** All other fields of Mem can safely remain uninitialized for now.  They
 ** will be initialized before use.
 */
-static void initMemArray(Mem
+static void initMemArray(Mem *p, int N, sqlite3 *db, u16 flags){
+  if( N>0 ){
+    do{
+      p->flags = flags;
+      p->db = db;
+      p->szMalloc = 0;
+#ifdef SQLITE_DEBUG
+      p->pScopyFrom = 0;
+#endif
+      p++;
+    }while( (--N)>0 );
+  }
+}
+
+/*
+** Release auxiliary memory held in an array of N Mem elements.
+**
+** After this routine returns, all Mem elements in the array will still
+** be valid.  Those Mem elements that were not holding auxiliary resources
+** will be unchanged.  Mem elements which had something freed will be
+** set to MEM_Undefined.
+*/
+static void releaseMemArray(Mem *p, int N){
+  if( p && N ){
+    Mem *pEnd = &p[N];
+    sqlite3 *db = p->db;
+    if( db->pnBytesFreed ){
+      do{
+        if( p->szMalloc ) sqlite3DbFree(db, p->zMalloc);
+      }while( (++p)<pEnd );
+      return;
+    }
+    do{
+      assert( (&p[1])==pEnd || p[0].db==p[1].db );
+      assert( sqlite3VdbeCheckMemInvariants(p) );
+
+      /* This block is really an inlined version of sqlite3VdbeMemRelease()
+      ** that takes advantage of the fact that the memory cell value is
+      ** being set to NULL after releasing any dynamic resources.
+      **
+      ** The justification for duplicating code is that according to
+      ** callgrind, this causes a certain test case to hit the CPU 4.7
+      ** percent less (x86 linux, gcc version 4.1.2, -O6) than if
+      ** sqlite3MemRelease() were called from here. With -O2, this jumps
+      ** to 6.6 percent. The test case is inserting 1000 rows into a table
+      ** with no indexes using a single prepared INSERT statement, bind()
+      ** and reset(). Inserts are grouped into a transaction.
+      */
+      testcase( p->flags & MEM_Agg );
+      testcase( p->flags & MEM_Dyn );
+      if( p->flags&(MEM_Agg|MEM_Dyn) ){
+        testcase( (p->flags & MEM_Dyn)!=0 && p->xDel==sqlite3VdbeFrameMemDel );
+        sqlite3VdbeMemRelease(p);
+        p->flags = MEM_Undefined;
+      }else if( p->szMalloc ){
+        sqlite3DbFreeNN(db, p->zMalloc);
+        p->szMalloc = 0;
+        p->flags = MEM_Undefined;
+      }
+#ifdef SQLITE_DEBUG
+      else{
+        p->flags = MEM_Undefined;
+      }
+#endif
+    }while( (++p)<pEnd );
+  }
+}
+
+#ifdef SQLITE_DEBUG
+/*
+** Verify that pFrame is a valid VdbeFrame pointer.  Return true if it is
+** and false if something is wrong.
+**
+** This routine is intended for use inside of assert() statements only.
+*/
+SQLITE_PRIVATE int sqlite3VdbeFrameIsValid(VdbeFrame *pFrame){
+  if( pFrame->iFrameMagic!=SQLITE_FRAME_MAGIC ) return 0;
+  return 1;
+}
+#endif
+
+
+/*
+** This is a destructor on a Mem object (which is really an sqlite3_value)
+** that deletes the Frame object that is attached to it as a blob.
+**
+** This routine does not delete the Frame right away.  It merely adds the
+** frame to a list of frames to be deleted when the Vdbe halts.
+*/
+SQLITE_PRIVATE void sqlite3VdbeFrameMemDel(void *pArg){
+  VdbeFrame *pFrame = (VdbeFrame*)pArg;
+  assert( sqlite3VdbeFrameIsValid(pFrame) );
+  pFrame->pParent = pFrame->v->pDelFrame;
+  pFrame->v->pDelFrame = pFrame;
+}
+
+#if defined(SQLITE_ENABLE_BYTECODE_VTAB) || !defined(SQLITE_OMIT_EXPLAIN)
+/*
+** Locate the next opcode to be displayed in EXPLAIN or EXPLAIN
+** QUERY PLAN output.
+**
+** Return SQLITE_ROW on success.  Return SQLITE_DONE if there are no
+** more opcodes to be displayed.
+*/
+SQLITE_PRIVATE int sqlite3VdbeNextOpcode(
+  Vdbe *p,         /* The statement being explained */
+  Mem *pSub,       /* Storage for keeping track of subprogram nesting */
+  int eMode,       /* 0: normal.  1: EQP.  2:  TablesUsed */
+  int *piPc,       /* IN/OUT: Current rowid.  Overwritten with next rowid */
+  int *piAddr,     /* OUT: Write index into (*paOp)[] here */
+  Op **paOp        /* OUT: Write the opcode array here */
+){
+  int nRow;                            /* Stop when row count reaches this */
+  int nSub = 0;                        /* Number of sub-vdbes seen so far */
+  SubProgram **apSub = 0;              /* Array of sub-vdbes */
+  int i;                               /* Next instruction address */
+  int rc = SQLITE_OK;                  /* Result code */
+  Op *aOp = 0;                         /* Opcode array */
+  int iPc;                             /* Rowid.  Copy of value in *piPc */
+
+  /* When the number of output rows reaches nRow, that means the
+  ** listing has finished and sqlite3_step() should return SQLITE_DONE.
+  ** nRow is the sum of the number of rows in the main program, plus
+  ** the sum of the number of rows in all trigger subprograms encountered
+  ** so far.  The nRow value will increase as new trigger subprograms are
+  ** encountered, but p->pc will eventually catch up to nRow.
+  */
+  nRow = p->nOp;
+  if( pSub!=0 ){
+    if( pSub->flags&MEM_Blob ){
+      /* pSub is initiallly NULL.  It is initialized to a BLOB by
+      ** the P4_SUBPROGRAM processing logic below */
+      nSub = pSub->n/sizeof(Vdbe*);
+      apSub = (SubProgram **)pSub->z;
+    }
+    for(i=0; i<nSub; i++){
+      nRow += apSub[i]->nOp;
+    }
+  }
+  iPc = *piPc;
+  while(1){  /* Loop exits via break */
+    i = iPc++;
+    if( i>=nRow ){
+      p->rc = SQLITE_OK;
+      rc = SQLITE_DONE;
+      break;
+    }
+    if( i<p->nOp ){
+      /* The rowid is small enough that we are still in the
+      ** main program. */
+      aOp = p->aOp;
+    }else{
+      /* We are currently listing subprograms.  Figure out which one and
+      ** pick up the appropriate opcode. */
+      int j;
+      i -= p->nOp;
+      assert( apSub!=0 );
+      assert( nSub>0 );
+      for(j=0; i>=apSub[j]->nOp; j++){
+        i -= apSub[j]->nOp;
+        assert( i<apSub[j]->nOp || j+1<nSub );
+      }
+      aOp = apSub[j]->aOp;
+    }
+
+    /* When an OP_Program opcode is encounter (the only opcode that has
+    ** a P4_SUBPROGRAM argument), expand the size of the array of subprograms
+    ** kept in p->aMem[9].z to hold the new program - assuming this subprogram
+    ** has not already been seen.
+    */
+    if( pSub!=0 && aOp[i].p4type==P4_SUBPROGRAM ){
+      int nByte = (nSub+1)*sizeof(SubProgram*);
+      int j;
+      for(j=0; j<nSub; j++){
+        if( apSub[j]==aOp[i].p4.pProgram ) break;
+      }
+      if( j==nSub ){
+        p->rc = sqlite3VdbeMemGrow(pSub, nByte, nSub!=0);
+        if( p->rc!=SQLITE_OK ){
+          rc = SQLITE_ERROR;
+          break;
+        }
+        apSub = (SubProgram **)pSub->z;
+        apSub[nSub++] = aOp[i].p4.pProgram;
+        MemSetTypeFlag(pSub, MEM_Blob);
+        pSub->n = nSub*sizeof(SubProgram*);
+        nRow += aOp[i].p4.pProgram->nOp;
+      }
+    }
+    if( eMode==0 ) break;
+#ifdef SQLITE_ENABLE_BYTECODE_VTAB
+    if( eMode==2 ){
+      Op *pOp = aOp + i;
+      if( pOp->opcode==OP_OpenRead ) break;
+      if( pOp->opcode==OP_OpenWrite && (pOp->p5 & OPFLAG_P2ISREG)==0 ) break;
+      if( pOp->opcode==OP
