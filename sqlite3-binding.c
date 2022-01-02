@@ -83273,4 +83273,209 @@ SQLITE_PRIVATE void sqlite3VdbeMakeReady(
     p->nVar = (ynVar)nVar;
     initMemArray(p->aVar, nVar, db, MEM_Null);
     p->nMem = nMem;
-    i
+    initMemArray(p->aMem, nMem, db, MEM_Undefined);
+    memset(p->apCsr, 0, nCursor*sizeof(VdbeCursor*));
+#ifdef SQLITE_ENABLE_STMT_SCANSTATUS
+    memset(p->anExec, 0, p->nOp*sizeof(i64));
+#endif
+  }
+  sqlite3VdbeRewind(p);
+}
+
+/*
+** Close a VDBE cursor and release all the resources that cursor
+** happens to hold.
+*/
+SQLITE_PRIVATE void sqlite3VdbeFreeCursor(Vdbe *p, VdbeCursor *pCx){
+  if( pCx ) sqlite3VdbeFreeCursorNN(p,pCx);
+}
+SQLITE_PRIVATE void sqlite3VdbeFreeCursorNN(Vdbe *p, VdbeCursor *pCx){
+  switch( pCx->eCurType ){
+    case CURTYPE_SORTER: {
+      sqlite3VdbeSorterClose(p->db, pCx);
+      break;
+    }
+    case CURTYPE_BTREE: {
+      assert( pCx->uc.pCursor!=0 );
+      sqlite3BtreeCloseCursor(pCx->uc.pCursor);
+      break;
+    }
+#ifndef SQLITE_OMIT_VIRTUALTABLE
+    case CURTYPE_VTAB: {
+      sqlite3_vtab_cursor *pVCur = pCx->uc.pVCur;
+      const sqlite3_module *pModule = pVCur->pVtab->pModule;
+      assert( pVCur->pVtab->nRef>0 );
+      pVCur->pVtab->nRef--;
+      pModule->xClose(pVCur);
+      break;
+    }
+#endif
+  }
+}
+
+/*
+** Close all cursors in the current frame.
+*/
+static void closeCursorsInFrame(Vdbe *p){
+  int i;
+  for(i=0; i<p->nCursor; i++){
+    VdbeCursor *pC = p->apCsr[i];
+    if( pC ){
+      sqlite3VdbeFreeCursorNN(p, pC);
+      p->apCsr[i] = 0;
+    }
+  }
+}
+
+/*
+** Copy the values stored in the VdbeFrame structure to its Vdbe. This
+** is used, for example, when a trigger sub-program is halted to restore
+** control to the main program.
+*/
+SQLITE_PRIVATE int sqlite3VdbeFrameRestore(VdbeFrame *pFrame){
+  Vdbe *v = pFrame->v;
+  closeCursorsInFrame(v);
+#ifdef SQLITE_ENABLE_STMT_SCANSTATUS
+  v->anExec = pFrame->anExec;
+#endif
+  v->aOp = pFrame->aOp;
+  v->nOp = pFrame->nOp;
+  v->aMem = pFrame->aMem;
+  v->nMem = pFrame->nMem;
+  v->apCsr = pFrame->apCsr;
+  v->nCursor = pFrame->nCursor;
+  v->db->lastRowid = pFrame->lastRowid;
+  v->nChange = pFrame->nChange;
+  v->db->nChange = pFrame->nDbChange;
+  sqlite3VdbeDeleteAuxData(v->db, &v->pAuxData, -1, 0);
+  v->pAuxData = pFrame->pAuxData;
+  pFrame->pAuxData = 0;
+  return pFrame->pc;
+}
+
+/*
+** Close all cursors.
+**
+** Also release any dynamic memory held by the VM in the Vdbe.aMem memory
+** cell array. This is necessary as the memory cell array may contain
+** pointers to VdbeFrame objects, which may in turn contain pointers to
+** open cursors.
+*/
+static void closeAllCursors(Vdbe *p){
+  if( p->pFrame ){
+    VdbeFrame *pFrame;
+    for(pFrame=p->pFrame; pFrame->pParent; pFrame=pFrame->pParent);
+    sqlite3VdbeFrameRestore(pFrame);
+    p->pFrame = 0;
+    p->nFrame = 0;
+  }
+  assert( p->nFrame==0 );
+  closeCursorsInFrame(p);
+  releaseMemArray(p->aMem, p->nMem);
+  while( p->pDelFrame ){
+    VdbeFrame *pDel = p->pDelFrame;
+    p->pDelFrame = pDel->pParent;
+    sqlite3VdbeFrameDelete(pDel);
+  }
+
+  /* Delete any auxdata allocations made by the VM */
+  if( p->pAuxData ) sqlite3VdbeDeleteAuxData(p->db, &p->pAuxData, -1, 0);
+  assert( p->pAuxData==0 );
+}
+
+/*
+** Set the number of result columns that will be returned by this SQL
+** statement. This is now set at compile time, rather than during
+** execution of the vdbe program so that sqlite3_column_count() can
+** be called on an SQL statement before sqlite3_step().
+*/
+SQLITE_PRIVATE void sqlite3VdbeSetNumCols(Vdbe *p, int nResColumn){
+  int n;
+  sqlite3 *db = p->db;
+
+  if( p->nResColumn ){
+    releaseMemArray(p->aColName, p->nResColumn*COLNAME_N);
+    sqlite3DbFree(db, p->aColName);
+  }
+  n = nResColumn*COLNAME_N;
+  p->nResColumn = (u16)nResColumn;
+  p->aColName = (Mem*)sqlite3DbMallocRawNN(db, sizeof(Mem)*n );
+  if( p->aColName==0 ) return;
+  initMemArray(p->aColName, n, db, MEM_Null);
+}
+
+/*
+** Set the name of the idx'th column to be returned by the SQL statement.
+** zName must be a pointer to a nul terminated string.
+**
+** This call must be made after a call to sqlite3VdbeSetNumCols().
+**
+** The final parameter, xDel, must be one of SQLITE_DYNAMIC, SQLITE_STATIC
+** or SQLITE_TRANSIENT. If it is SQLITE_DYNAMIC, then the buffer pointed
+** to by zName will be freed by sqlite3DbFree() when the vdbe is destroyed.
+*/
+SQLITE_PRIVATE int sqlite3VdbeSetColName(
+  Vdbe *p,                         /* Vdbe being configured */
+  int idx,                         /* Index of column zName applies to */
+  int var,                         /* One of the COLNAME_* constants */
+  const char *zName,               /* Pointer to buffer containing name */
+  void (*xDel)(void*)              /* Memory management strategy for zName */
+){
+  int rc;
+  Mem *pColName;
+  assert( idx<p->nResColumn );
+  assert( var<COLNAME_N );
+  if( p->db->mallocFailed ){
+    assert( !zName || xDel!=SQLITE_DYNAMIC );
+    return SQLITE_NOMEM_BKPT;
+  }
+  assert( p->aColName!=0 );
+  pColName = &(p->aColName[idx+var*p->nResColumn]);
+  rc = sqlite3VdbeMemSetStr(pColName, zName, -1, SQLITE_UTF8, xDel);
+  assert( rc!=0 || !zName || (pColName->flags&MEM_Term)!=0 );
+  return rc;
+}
+
+/*
+** A read or write transaction may or may not be active on database handle
+** db. If a transaction is active, commit it. If there is a
+** write-transaction spanning more than one database file, this routine
+** takes care of the super-journal trickery.
+*/
+static int vdbeCommit(sqlite3 *db, Vdbe *p){
+  int i;
+  int nTrans = 0;  /* Number of databases with an active write-transaction
+                   ** that are candidates for a two-phase commit using a
+                   ** super-journal */
+  int rc = SQLITE_OK;
+  int needXcommit = 0;
+
+#ifdef SQLITE_OMIT_VIRTUALTABLE
+  /* With this option, sqlite3VtabSync() is defined to be simply
+  ** SQLITE_OK so p is not used.
+  */
+  UNUSED_PARAMETER(p);
+#endif
+
+  /* Before doing anything else, call the xSync() callback for any
+  ** virtual module tables written in this transaction. This has to
+  ** be done before determining whether a super-journal file is
+  ** required, as an xSync() callback may add an attached database
+  ** to the transaction.
+  */
+  rc = sqlite3VtabSync(db, p);
+
+  /* This loop determines (a) if the commit hook should be invoked and
+  ** (b) how many database files have open write transactions, not
+  ** including the temp database. (b) is important because if more than
+  ** one database file has an open write transaction, a super-journal
+  ** file is required for an atomic commit.
+  */
+  for(i=0; rc==SQLITE_OK && i<db->nDb; i++){
+    Btree *pBt = db->aDb[i].pBt;
+    if( sqlite3BtreeTxnState(pBt)==SQLITE_TXN_WRITE ){
+      /* Whether or not a database might need a super-journal depends upon
+      ** its journal mode (among other things).  This matrix determines which
+      ** journal modes use a super-journal and which do not */
+      static const u8 aMJNeeded[] = {
+      
