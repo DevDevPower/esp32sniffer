@@ -83074,4 +83074,203 @@ struct ReusableSpace {
 ** from the ReusableSpace object.  Return a pointer to the allocated
 ** memory on success.  If insufficient memory is available in the
 ** ReusableSpace object, increase the ReusableSpace.nNeeded
-** value by the amount needed and 
+** value by the amount needed and return NULL.
+**
+** If pBuf is not initially NULL, that means that the memory has already
+** been allocated by a prior call to this routine, so just return a copy
+** of pBuf and leave ReusableSpace unchanged.
+**
+** This allocator is employed to repurpose unused slots at the end of the
+** opcode array of prepared state for other memory needs of the prepared
+** statement.
+*/
+static void *allocSpace(
+  struct ReusableSpace *p,  /* Bulk memory available for allocation */
+  void *pBuf,               /* Pointer to a prior allocation */
+  sqlite3_int64 nByte       /* Bytes of memory needed. */
+){
+  assert( EIGHT_BYTE_ALIGNMENT(p->pSpace) );
+  if( pBuf==0 ){
+    nByte = ROUND8P(nByte);
+    if( nByte <= p->nFree ){
+      p->nFree -= nByte;
+      pBuf = &p->pSpace[p->nFree];
+    }else{
+      p->nNeeded += nByte;
+    }
+  }
+  assert( EIGHT_BYTE_ALIGNMENT(pBuf) );
+  return pBuf;
+}
+
+/*
+** Rewind the VDBE back to the beginning in preparation for
+** running it.
+*/
+SQLITE_PRIVATE void sqlite3VdbeRewind(Vdbe *p){
+#if defined(SQLITE_DEBUG) || defined(VDBE_PROFILE)
+  int i;
+#endif
+  assert( p!=0 );
+  assert( p->eVdbeState==VDBE_INIT_STATE
+       || p->eVdbeState==VDBE_READY_STATE
+       || p->eVdbeState==VDBE_HALT_STATE );
+
+  /* There should be at least one opcode.
+  */
+  assert( p->nOp>0 );
+
+  p->eVdbeState = VDBE_READY_STATE;
+
+#ifdef SQLITE_DEBUG
+  for(i=0; i<p->nMem; i++){
+    assert( p->aMem[i].db==p->db );
+  }
+#endif
+  p->pc = -1;
+  p->rc = SQLITE_OK;
+  p->errorAction = OE_Abort;
+  p->nChange = 0;
+  p->cacheCtr = 1;
+  p->minWriteFileFormat = 255;
+  p->iStatement = 0;
+  p->nFkConstraint = 0;
+#ifdef VDBE_PROFILE
+  for(i=0; i<p->nOp; i++){
+    p->aOp[i].cnt = 0;
+    p->aOp[i].cycles = 0;
+  }
+#endif
+}
+
+/*
+** Prepare a virtual machine for execution for the first time after
+** creating the virtual machine.  This involves things such
+** as allocating registers and initializing the program counter.
+** After the VDBE has be prepped, it can be executed by one or more
+** calls to sqlite3VdbeExec().
+**
+** This function may be called exactly once on each virtual machine.
+** After this routine is called the VM has been "packaged" and is ready
+** to run.  After this routine is called, further calls to
+** sqlite3VdbeAddOp() functions are prohibited.  This routine disconnects
+** the Vdbe from the Parse object that helped generate it so that the
+** the Vdbe becomes an independent entity and the Parse object can be
+** destroyed.
+**
+** Use the sqlite3VdbeRewind() procedure to restore a virtual machine back
+** to its initial state after it has been run.
+*/
+SQLITE_PRIVATE void sqlite3VdbeMakeReady(
+  Vdbe *p,                       /* The VDBE */
+  Parse *pParse                  /* Parsing context */
+){
+  sqlite3 *db;                   /* The database connection */
+  int nVar;                      /* Number of parameters */
+  int nMem;                      /* Number of VM memory registers */
+  int nCursor;                   /* Number of cursors required */
+  int nArg;                      /* Number of arguments in subprograms */
+  int n;                         /* Loop counter */
+  struct ReusableSpace x;        /* Reusable bulk memory */
+
+  assert( p!=0 );
+  assert( p->nOp>0 );
+  assert( pParse!=0 );
+  assert( p->eVdbeState==VDBE_INIT_STATE );
+  assert( pParse==p->pParse );
+  p->pVList = pParse->pVList;
+  pParse->pVList =  0;
+  db = p->db;
+  assert( db->mallocFailed==0 );
+  nVar = pParse->nVar;
+  nMem = pParse->nMem;
+  nCursor = pParse->nTab;
+  nArg = pParse->nMaxArg;
+
+  /* Each cursor uses a memory cell.  The first cursor (cursor 0) can
+  ** use aMem[0] which is not otherwise used by the VDBE program.  Allocate
+  ** space at the end of aMem[] for cursors 1 and greater.
+  ** See also: allocateCursor().
+  */
+  nMem += nCursor;
+  if( nCursor==0 && nMem>0 ) nMem++;  /* Space for aMem[0] even if not used */
+
+  /* Figure out how much reusable memory is available at the end of the
+  ** opcode array.  This extra memory will be reallocated for other elements
+  ** of the prepared statement.
+  */
+  n = ROUND8P(sizeof(Op)*p->nOp);             /* Bytes of opcode memory used */
+  x.pSpace = &((u8*)p->aOp)[n];               /* Unused opcode memory */
+  assert( EIGHT_BYTE_ALIGNMENT(x.pSpace) );
+  x.nFree = ROUNDDOWN8(pParse->szOpAlloc - n);  /* Bytes of unused memory */
+  assert( x.nFree>=0 );
+  assert( EIGHT_BYTE_ALIGNMENT(&x.pSpace[x.nFree]) );
+
+  resolveP2Values(p, &nArg);
+  p->usesStmtJournal = (u8)(pParse->isMultiWrite && pParse->mayAbort);
+  if( pParse->explain ){
+    static const char * const azColName[] = {
+       "addr", "opcode", "p1", "p2", "p3", "p4", "p5", "comment",
+       "id", "parent", "notused", "detail"
+    };
+    int iFirst, mx, i;
+    if( nMem<10 ) nMem = 10;
+    p->explain = pParse->explain;
+    if( pParse->explain==2 ){
+      sqlite3VdbeSetNumCols(p, 4);
+      iFirst = 8;
+      mx = 12;
+    }else{
+      sqlite3VdbeSetNumCols(p, 8);
+      iFirst = 0;
+      mx = 8;
+    }
+    for(i=iFirst; i<mx; i++){
+      sqlite3VdbeSetColName(p, i-iFirst, COLNAME_NAME,
+                            azColName[i], SQLITE_STATIC);
+    }
+  }
+  p->expired = 0;
+
+  /* Memory for registers, parameters, cursor, etc, is allocated in one or two
+  ** passes.  On the first pass, we try to reuse unused memory at the
+  ** end of the opcode array.  If we are unable to satisfy all memory
+  ** requirements by reusing the opcode array tail, then the second
+  ** pass will fill in the remainder using a fresh memory allocation.
+  **
+  ** This two-pass approach that reuses as much memory as possible from
+  ** the leftover memory at the end of the opcode array.  This can significantly
+  ** reduce the amount of memory held by a prepared statement.
+  */
+  x.nNeeded = 0;
+  p->aMem = allocSpace(&x, 0, nMem*sizeof(Mem));
+  p->aVar = allocSpace(&x, 0, nVar*sizeof(Mem));
+  p->apArg = allocSpace(&x, 0, nArg*sizeof(Mem*));
+  p->apCsr = allocSpace(&x, 0, nCursor*sizeof(VdbeCursor*));
+#ifdef SQLITE_ENABLE_STMT_SCANSTATUS
+  p->anExec = allocSpace(&x, 0, p->nOp*sizeof(i64));
+#endif
+  if( x.nNeeded ){
+    x.pSpace = p->pFree = sqlite3DbMallocRawNN(db, x.nNeeded);
+    x.nFree = x.nNeeded;
+    if( !db->mallocFailed ){
+      p->aMem = allocSpace(&x, p->aMem, nMem*sizeof(Mem));
+      p->aVar = allocSpace(&x, p->aVar, nVar*sizeof(Mem));
+      p->apArg = allocSpace(&x, p->apArg, nArg*sizeof(Mem*));
+      p->apCsr = allocSpace(&x, p->apCsr, nCursor*sizeof(VdbeCursor*));
+#ifdef SQLITE_ENABLE_STMT_SCANSTATUS
+      p->anExec = allocSpace(&x, p->anExec, p->nOp*sizeof(i64));
+#endif
+    }
+  }
+
+  if( db->mallocFailed ){
+    p->nVar = 0;
+    p->nCursor = 0;
+    p->nMem = 0;
+  }else{
+    p->nCursor = nCursor;
+    p->nVar = (ynVar)nVar;
+    initMemArray(p->aVar, nVar, db, MEM_Null);
+    p->nMem = nMem;
+    i
