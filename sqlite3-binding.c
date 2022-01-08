@@ -83674,4 +83674,216 @@ static int vdbeCommit(sqlite3 *db, Vdbe *p){
     /* All files and directories have already been synced, so the following
     ** calls to sqlite3BtreeCommitPhaseTwo() are only closing files and
     ** deleting or truncating journals. If something goes wrong while
-    ** this
+    ** this is happening we don't really care. The integrity of the
+    ** transaction is already guaranteed, but some stray 'cold' journals
+    ** may be lying around. Returning an error code won't help matters.
+    */
+    disable_simulated_io_errors();
+    sqlite3BeginBenignMalloc();
+    for(i=0; i<db->nDb; i++){
+      Btree *pBt = db->aDb[i].pBt;
+      if( pBt ){
+        sqlite3BtreeCommitPhaseTwo(pBt, 1);
+      }
+    }
+    sqlite3EndBenignMalloc();
+    enable_simulated_io_errors();
+
+    sqlite3VtabCommit(db);
+  }
+#endif
+
+  return rc;
+}
+
+/*
+** This routine checks that the sqlite3.nVdbeActive count variable
+** matches the number of vdbe's in the list sqlite3.pVdbe that are
+** currently active. An assertion fails if the two counts do not match.
+** This is an internal self-check only - it is not an essential processing
+** step.
+**
+** This is a no-op if NDEBUG is defined.
+*/
+#ifndef NDEBUG
+static void checkActiveVdbeCnt(sqlite3 *db){
+  Vdbe *p;
+  int cnt = 0;
+  int nWrite = 0;
+  int nRead = 0;
+  p = db->pVdbe;
+  while( p ){
+    if( sqlite3_stmt_busy((sqlite3_stmt*)p) ){
+      cnt++;
+      if( p->readOnly==0 ) nWrite++;
+      if( p->bIsReader ) nRead++;
+    }
+    p = p->pNext;
+  }
+  assert( cnt==db->nVdbeActive );
+  assert( nWrite==db->nVdbeWrite );
+  assert( nRead==db->nVdbeRead );
+}
+#else
+#define checkActiveVdbeCnt(x)
+#endif
+
+/*
+** If the Vdbe passed as the first argument opened a statement-transaction,
+** close it now. Argument eOp must be either SAVEPOINT_ROLLBACK or
+** SAVEPOINT_RELEASE. If it is SAVEPOINT_ROLLBACK, then the statement
+** transaction is rolled back. If eOp is SAVEPOINT_RELEASE, then the
+** statement transaction is committed.
+**
+** If an IO error occurs, an SQLITE_IOERR_XXX error code is returned.
+** Otherwise SQLITE_OK.
+*/
+static SQLITE_NOINLINE int vdbeCloseStatement(Vdbe *p, int eOp){
+  sqlite3 *const db = p->db;
+  int rc = SQLITE_OK;
+  int i;
+  const int iSavepoint = p->iStatement-1;
+
+  assert( eOp==SAVEPOINT_ROLLBACK || eOp==SAVEPOINT_RELEASE);
+  assert( db->nStatement>0 );
+  assert( p->iStatement==(db->nStatement+db->nSavepoint) );
+
+  for(i=0; i<db->nDb; i++){
+    int rc2 = SQLITE_OK;
+    Btree *pBt = db->aDb[i].pBt;
+    if( pBt ){
+      if( eOp==SAVEPOINT_ROLLBACK ){
+        rc2 = sqlite3BtreeSavepoint(pBt, SAVEPOINT_ROLLBACK, iSavepoint);
+      }
+      if( rc2==SQLITE_OK ){
+        rc2 = sqlite3BtreeSavepoint(pBt, SAVEPOINT_RELEASE, iSavepoint);
+      }
+      if( rc==SQLITE_OK ){
+        rc = rc2;
+      }
+    }
+  }
+  db->nStatement--;
+  p->iStatement = 0;
+
+  if( rc==SQLITE_OK ){
+    if( eOp==SAVEPOINT_ROLLBACK ){
+      rc = sqlite3VtabSavepoint(db, SAVEPOINT_ROLLBACK, iSavepoint);
+    }
+    if( rc==SQLITE_OK ){
+      rc = sqlite3VtabSavepoint(db, SAVEPOINT_RELEASE, iSavepoint);
+    }
+  }
+
+  /* If the statement transaction is being rolled back, also restore the
+  ** database handles deferred constraint counter to the value it had when
+  ** the statement transaction was opened.  */
+  if( eOp==SAVEPOINT_ROLLBACK ){
+    db->nDeferredCons = p->nStmtDefCons;
+    db->nDeferredImmCons = p->nStmtDefImmCons;
+  }
+  return rc;
+}
+SQLITE_PRIVATE int sqlite3VdbeCloseStatement(Vdbe *p, int eOp){
+  if( p->db->nStatement && p->iStatement ){
+    return vdbeCloseStatement(p, eOp);
+  }
+  return SQLITE_OK;
+}
+
+
+/*
+** This function is called when a transaction opened by the database
+** handle associated with the VM passed as an argument is about to be
+** committed. If there are outstanding deferred foreign key constraint
+** violations, return SQLITE_ERROR. Otherwise, SQLITE_OK.
+**
+** If there are outstanding FK violations and this function returns
+** SQLITE_ERROR, set the result of the VM to SQLITE_CONSTRAINT_FOREIGNKEY
+** and write an error message to it. Then return SQLITE_ERROR.
+*/
+#ifndef SQLITE_OMIT_FOREIGN_KEY
+SQLITE_PRIVATE int sqlite3VdbeCheckFk(Vdbe *p, int deferred){
+  sqlite3 *db = p->db;
+  if( (deferred && (db->nDeferredCons+db->nDeferredImmCons)>0)
+   || (!deferred && p->nFkConstraint>0)
+  ){
+    p->rc = SQLITE_CONSTRAINT_FOREIGNKEY;
+    p->errorAction = OE_Abort;
+    sqlite3VdbeError(p, "FOREIGN KEY constraint failed");
+    if( (p->prepFlags & SQLITE_PREPARE_SAVESQL)==0 ) return SQLITE_ERROR;
+    return SQLITE_CONSTRAINT_FOREIGNKEY;
+  }
+  return SQLITE_OK;
+}
+#endif
+
+/*
+** This routine is called the when a VDBE tries to halt.  If the VDBE
+** has made changes and is in autocommit mode, then commit those
+** changes.  If a rollback is needed, then do the rollback.
+**
+** This routine is the only way to move the sqlite3eOpenState of a VM from
+** SQLITE_STATE_RUN to SQLITE_STATE_HALT.  It is harmless to
+** call this on a VM that is in the SQLITE_STATE_HALT state.
+**
+** Return an error code.  If the commit could not complete because of
+** lock contention, return SQLITE_BUSY.  If SQLITE_BUSY is returned, it
+** means the close did not happen and needs to be repeated.
+*/
+SQLITE_PRIVATE int sqlite3VdbeHalt(Vdbe *p){
+  int rc;                         /* Used to store transient return codes */
+  sqlite3 *db = p->db;
+
+  /* This function contains the logic that determines if a statement or
+  ** transaction will be committed or rolled back as a result of the
+  ** execution of this virtual machine.
+  **
+  ** If any of the following errors occur:
+  **
+  **     SQLITE_NOMEM
+  **     SQLITE_IOERR
+  **     SQLITE_FULL
+  **     SQLITE_INTERRUPT
+  **
+  ** Then the internal cache might have been left in an inconsistent
+  ** state.  We need to rollback the statement transaction, if there is
+  ** one, or the complete transaction if there is no statement transaction.
+  */
+
+  assert( p->eVdbeState==VDBE_RUN_STATE );
+  if( db->mallocFailed ){
+    p->rc = SQLITE_NOMEM_BKPT;
+  }
+  closeAllCursors(p);
+  checkActiveVdbeCnt(db);
+
+  /* No commit or rollback needed if the program never started or if the
+  ** SQL statement does not read or write a database file.  */
+  if( p->bIsReader ){
+    int mrc;   /* Primary error code from p->rc */
+    int eStatementOp = 0;
+    int isSpecialError;            /* Set to true if a 'special' error */
+
+    /* Lock all btrees used by the statement */
+    sqlite3VdbeEnter(p);
+
+    /* Check for one of the special errors */
+    if( p->rc ){
+      mrc = p->rc & 0xff;
+      isSpecialError = mrc==SQLITE_NOMEM
+                    || mrc==SQLITE_IOERR
+                    || mrc==SQLITE_INTERRUPT
+                    || mrc==SQLITE_FULL;
+    }else{
+      mrc = isSpecialError = 0;
+    }
+    if( isSpecialError ){
+      /* If the query was read-only and the error code is SQLITE_INTERRUPT,
+      ** no rollback is necessary. Otherwise, at least a savepoint
+      ** transaction must be rolled back to restore the database to a
+      ** consistent state.
+      **
+      ** Even if the statement is read-only, it is important to perform
+      ** a statement or transaction rollback operation. If the error
+      
