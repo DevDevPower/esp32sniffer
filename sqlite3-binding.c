@@ -85715,4 +85715,211 @@ SQLITE_PRIVATE int sqlite3VdbeIdxRowid(sqlite3 *db, BtCursor *pCur, i64 *rowid){
 
   /* Jump here if database corruption is detected after m has been
   ** allocated.  Free the m object and return SQLITE_CORRUPT. */
-idx_r
+idx_rowid_corruption:
+  testcase( m.szMalloc!=0 );
+  sqlite3VdbeMemReleaseMalloc(&m);
+  return SQLITE_CORRUPT_BKPT;
+}
+
+/*
+** Compare the key of the index entry that cursor pC is pointing to against
+** the key string in pUnpacked.  Write into *pRes a number
+** that is negative, zero, or positive if pC is less than, equal to,
+** or greater than pUnpacked.  Return SQLITE_OK on success.
+**
+** pUnpacked is either created without a rowid or is truncated so that it
+** omits the rowid at the end.  The rowid at the end of the index entry
+** is ignored as well.  Hence, this routine only compares the prefixes
+** of the keys prior to the final rowid, not the entire key.
+*/
+SQLITE_PRIVATE int sqlite3VdbeIdxKeyCompare(
+  sqlite3 *db,                     /* Database connection */
+  VdbeCursor *pC,                  /* The cursor to compare against */
+  UnpackedRecord *pUnpacked,       /* Unpacked version of key */
+  int *res                         /* Write the comparison result here */
+){
+  i64 nCellKey = 0;
+  int rc;
+  BtCursor *pCur;
+  Mem m;
+
+  assert( pC->eCurType==CURTYPE_BTREE );
+  pCur = pC->uc.pCursor;
+  assert( sqlite3BtreeCursorIsValid(pCur) );
+  nCellKey = sqlite3BtreePayloadSize(pCur);
+  /* nCellKey will always be between 0 and 0xffffffff because of the way
+  ** that btreeParseCellPtr() and sqlite3GetVarint32() are implemented */
+  if( nCellKey<=0 || nCellKey>0x7fffffff ){
+    *res = 0;
+    return SQLITE_CORRUPT_BKPT;
+  }
+  sqlite3VdbeMemInit(&m, db, 0);
+  rc = sqlite3VdbeMemFromBtreeZeroOffset(pCur, (u32)nCellKey, &m);
+  if( rc ){
+    return rc;
+  }
+  *res = sqlite3VdbeRecordCompareWithSkip(m.n, m.z, pUnpacked, 0);
+  sqlite3VdbeMemReleaseMalloc(&m);
+  return SQLITE_OK;
+}
+
+/*
+** This routine sets the value to be returned by subsequent calls to
+** sqlite3_changes() on the database handle 'db'.
+*/
+SQLITE_PRIVATE void sqlite3VdbeSetChanges(sqlite3 *db, i64 nChange){
+  assert( sqlite3_mutex_held(db->mutex) );
+  db->nChange = nChange;
+  db->nTotalChange += nChange;
+}
+
+/*
+** Set a flag in the vdbe to update the change counter when it is finalised
+** or reset.
+*/
+SQLITE_PRIVATE void sqlite3VdbeCountChanges(Vdbe *v){
+  v->changeCntOn = 1;
+}
+
+/*
+** Mark every prepared statement associated with a database connection
+** as expired.
+**
+** An expired statement means that recompilation of the statement is
+** recommend.  Statements expire when things happen that make their
+** programs obsolete.  Removing user-defined functions or collating
+** sequences, or changing an authorization function are the types of
+** things that make prepared statements obsolete.
+**
+** If iCode is 1, then expiration is advisory.  The statement should
+** be reprepared before being restarted, but if it is already running
+** it is allowed to run to completion.
+**
+** Internally, this function just sets the Vdbe.expired flag on all
+** prepared statements.  The flag is set to 1 for an immediate expiration
+** and set to 2 for an advisory expiration.
+*/
+SQLITE_PRIVATE void sqlite3ExpirePreparedStatements(sqlite3 *db, int iCode){
+  Vdbe *p;
+  for(p = db->pVdbe; p; p=p->pNext){
+    p->expired = iCode+1;
+  }
+}
+
+/*
+** Return the database associated with the Vdbe.
+*/
+SQLITE_PRIVATE sqlite3 *sqlite3VdbeDb(Vdbe *v){
+  return v->db;
+}
+
+/*
+** Return the SQLITE_PREPARE flags for a Vdbe.
+*/
+SQLITE_PRIVATE u8 sqlite3VdbePrepareFlags(Vdbe *v){
+  return v->prepFlags;
+}
+
+/*
+** Return a pointer to an sqlite3_value structure containing the value bound
+** parameter iVar of VM v. Except, if the value is an SQL NULL, return
+** 0 instead. Unless it is NULL, apply affinity aff (one of the SQLITE_AFF_*
+** constants) to the value before returning it.
+**
+** The returned value must be freed by the caller using sqlite3ValueFree().
+*/
+SQLITE_PRIVATE sqlite3_value *sqlite3VdbeGetBoundValue(Vdbe *v, int iVar, u8 aff){
+  assert( iVar>0 );
+  if( v ){
+    Mem *pMem = &v->aVar[iVar-1];
+    assert( (v->db->flags & SQLITE_EnableQPSG)==0 );
+    if( 0==(pMem->flags & MEM_Null) ){
+      sqlite3_value *pRet = sqlite3ValueNew(v->db);
+      if( pRet ){
+        sqlite3VdbeMemCopy((Mem *)pRet, pMem);
+        sqlite3ValueApplyAffinity(pRet, aff, SQLITE_UTF8);
+      }
+      return pRet;
+    }
+  }
+  return 0;
+}
+
+/*
+** Configure SQL variable iVar so that binding a new value to it signals
+** to sqlite3_reoptimize() that re-preparing the statement may result
+** in a better query plan.
+*/
+SQLITE_PRIVATE void sqlite3VdbeSetVarmask(Vdbe *v, int iVar){
+  assert( iVar>0 );
+  assert( (v->db->flags & SQLITE_EnableQPSG)==0 );
+  if( iVar>=32 ){
+    v->expmask |= 0x80000000;
+  }else{
+    v->expmask |= ((u32)1 << (iVar-1));
+  }
+}
+
+/*
+** Cause a function to throw an error if it was call from OP_PureFunc
+** rather than OP_Function.
+**
+** OP_PureFunc means that the function must be deterministic, and should
+** throw an error if it is given inputs that would make it non-deterministic.
+** This routine is invoked by date/time functions that use non-deterministic
+** features such as 'now'.
+*/
+SQLITE_PRIVATE int sqlite3NotPureFunc(sqlite3_context *pCtx){
+  const VdbeOp *pOp;
+#ifdef SQLITE_ENABLE_STAT4
+  if( pCtx->pVdbe==0 ) return 1;
+#endif
+  pOp = pCtx->pVdbe->aOp + pCtx->iOp;
+  if( pOp->opcode==OP_PureFunc ){
+    const char *zContext;
+    char *zMsg;
+    if( pOp->p5 & NC_IsCheck ){
+      zContext = "a CHECK constraint";
+    }else if( pOp->p5 & NC_GenCol ){
+      zContext = "a generated column";
+    }else{
+      zContext = "an index";
+    }
+    zMsg = sqlite3_mprintf("non-deterministic use of %s() in %s",
+                           pCtx->pFunc->zName, zContext);
+    sqlite3_result_error(pCtx, zMsg, -1);
+    sqlite3_free(zMsg);
+    return 0;
+  }
+  return 1;
+}
+
+#ifndef SQLITE_OMIT_VIRTUALTABLE
+/*
+** Transfer error message text from an sqlite3_vtab.zErrMsg (text stored
+** in memory obtained from sqlite3_malloc) into a Vdbe.zErrMsg (text stored
+** in memory obtained from sqlite3DbMalloc).
+*/
+SQLITE_PRIVATE void sqlite3VtabImportErrmsg(Vdbe *p, sqlite3_vtab *pVtab){
+  if( pVtab->zErrMsg ){
+    sqlite3 *db = p->db;
+    sqlite3DbFree(db, p->zErrMsg);
+    p->zErrMsg = sqlite3DbStrDup(db, pVtab->zErrMsg);
+    sqlite3_free(pVtab->zErrMsg);
+    pVtab->zErrMsg = 0;
+  }
+}
+#endif /* SQLITE_OMIT_VIRTUALTABLE */
+
+#ifdef SQLITE_ENABLE_PREUPDATE_HOOK
+
+/*
+** If the second argument is not NULL, release any allocations associated
+** with the memory cells in the p->aMem[] array. Also free the UnpackedRecord
+** structure itself, using sqlite3DbFree().
+**
+** This function is used to free UnpackedRecord structures allocated by
+** the vdbeUnpackRecord() function found in vdbeapi.c.
+*/
+static void vdbeFreeUnpacked(sqlite3 *db, int nField, UnpackedRecord *p){
+  if( p ){
