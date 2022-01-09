@@ -84329,4 +84329,199 @@ SQLITE_PRIVATE int SQLITE_NOINLINE sqlite3VdbeFinishMoveto(VdbeCursor *p){
   sqlite3_search_count++;
 #endif
   p->deferredMoveto = 0;
-  p->cach
+  p->cacheStatus = CACHE_STALE;
+  return SQLITE_OK;
+}
+
+/*
+** Something has moved cursor "p" out of place.  Maybe the row it was
+** pointed to was deleted out from under it.  Or maybe the btree was
+** rebalanced.  Whatever the cause, try to restore "p" to the place it
+** is supposed to be pointing.  If the row was deleted out from under the
+** cursor, set the cursor to point to a NULL row.
+*/
+SQLITE_PRIVATE int SQLITE_NOINLINE sqlite3VdbeHandleMovedCursor(VdbeCursor *p){
+  int isDifferentRow, rc;
+  assert( p->eCurType==CURTYPE_BTREE );
+  assert( p->uc.pCursor!=0 );
+  assert( sqlite3BtreeCursorHasMoved(p->uc.pCursor) );
+  rc = sqlite3BtreeCursorRestore(p->uc.pCursor, &isDifferentRow);
+  p->cacheStatus = CACHE_STALE;
+  if( isDifferentRow ) p->nullRow = 1;
+  return rc;
+}
+
+/*
+** Check to ensure that the cursor is valid.  Restore the cursor
+** if need be.  Return any I/O error from the restore operation.
+*/
+SQLITE_PRIVATE int sqlite3VdbeCursorRestore(VdbeCursor *p){
+  assert( p->eCurType==CURTYPE_BTREE || IsNullCursor(p) );
+  if( sqlite3BtreeCursorHasMoved(p->uc.pCursor) ){
+    return sqlite3VdbeHandleMovedCursor(p);
+  }
+  return SQLITE_OK;
+}
+
+/*
+** The following functions:
+**
+** sqlite3VdbeSerialType()
+** sqlite3VdbeSerialTypeLen()
+** sqlite3VdbeSerialLen()
+** sqlite3VdbeSerialPut()  <--- in-lined into OP_MakeRecord as of 2022-04-02
+** sqlite3VdbeSerialGet()
+**
+** encapsulate the code that serializes values for storage in SQLite
+** data and index records. Each serialized value consists of a
+** 'serial-type' and a blob of data. The serial type is an 8-byte unsigned
+** integer, stored as a varint.
+**
+** In an SQLite index record, the serial type is stored directly before
+** the blob of data that it corresponds to. In a table record, all serial
+** types are stored at the start of the record, and the blobs of data at
+** the end. Hence these functions allow the caller to handle the
+** serial-type and data blob separately.
+**
+** The following table describes the various storage classes for data:
+**
+**   serial type        bytes of data      type
+**   --------------     ---------------    ---------------
+**      0                     0            NULL
+**      1                     1            signed integer
+**      2                     2            signed integer
+**      3                     3            signed integer
+**      4                     4            signed integer
+**      5                     6            signed integer
+**      6                     8            signed integer
+**      7                     8            IEEE float
+**      8                     0            Integer constant 0
+**      9                     0            Integer constant 1
+**     10,11                               reserved for expansion
+**    N>=12 and even       (N-12)/2        BLOB
+**    N>=13 and odd        (N-13)/2        text
+**
+** The 8 and 9 types were added in 3.3.0, file format 4.  Prior versions
+** of SQLite will not understand those serial types.
+*/
+
+#if 0 /* Inlined into the OP_MakeRecord opcode */
+/*
+** Return the serial-type for the value stored in pMem.
+**
+** This routine might convert a large MEM_IntReal value into MEM_Real.
+**
+** 2019-07-11:  The primary user of this subroutine was the OP_MakeRecord
+** opcode in the byte-code engine.  But by moving this routine in-line, we
+** can omit some redundant tests and make that opcode a lot faster.  So
+** this routine is now only used by the STAT3 logic and STAT3 support has
+** ended.  The code is kept here for historical reference only.
+*/
+SQLITE_PRIVATE u32 sqlite3VdbeSerialType(Mem *pMem, int file_format, u32 *pLen){
+  int flags = pMem->flags;
+  u32 n;
+
+  assert( pLen!=0 );
+  if( flags&MEM_Null ){
+    *pLen = 0;
+    return 0;
+  }
+  if( flags&(MEM_Int|MEM_IntReal) ){
+    /* Figure out whether to use 1, 2, 4, 6 or 8 bytes. */
+#   define MAX_6BYTE ((((i64)0x00008000)<<32)-1)
+    i64 i = pMem->u.i;
+    u64 u;
+    testcase( flags & MEM_Int );
+    testcase( flags & MEM_IntReal );
+    if( i<0 ){
+      u = ~i;
+    }else{
+      u = i;
+    }
+    if( u<=127 ){
+      if( (i&1)==i && file_format>=4 ){
+        *pLen = 0;
+        return 8+(u32)u;
+      }else{
+        *pLen = 1;
+        return 1;
+      }
+    }
+    if( u<=32767 ){ *pLen = 2; return 2; }
+    if( u<=8388607 ){ *pLen = 3; return 3; }
+    if( u<=2147483647 ){ *pLen = 4; return 4; }
+    if( u<=MAX_6BYTE ){ *pLen = 6; return 5; }
+    *pLen = 8;
+    if( flags&MEM_IntReal ){
+      /* If the value is IntReal and is going to take up 8 bytes to store
+      ** as an integer, then we might as well make it an 8-byte floating
+      ** point value */
+      pMem->u.r = (double)pMem->u.i;
+      pMem->flags &= ~MEM_IntReal;
+      pMem->flags |= MEM_Real;
+      return 7;
+    }
+    return 6;
+  }
+  if( flags&MEM_Real ){
+    *pLen = 8;
+    return 7;
+  }
+  assert( pMem->db->mallocFailed || flags&(MEM_Str|MEM_Blob) );
+  assert( pMem->n>=0 );
+  n = (u32)pMem->n;
+  if( flags & MEM_Zero ){
+    n += pMem->u.nZero;
+  }
+  *pLen = n;
+  return ((n*2) + 12 + ((flags&MEM_Str)!=0));
+}
+#endif /* inlined into OP_MakeRecord */
+
+/*
+** The sizes for serial types less than 128
+*/
+SQLITE_PRIVATE const u8 sqlite3SmallTypeSizes[128] = {
+        /*  0   1   2   3   4   5   6   7   8   9 */
+/*   0 */   0,  1,  2,  3,  4,  6,  8,  8,  0,  0,
+/*  10 */   0,  0,  0,  0,  1,  1,  2,  2,  3,  3,
+/*  20 */   4,  4,  5,  5,  6,  6,  7,  7,  8,  8,
+/*  30 */   9,  9, 10, 10, 11, 11, 12, 12, 13, 13,
+/*  40 */  14, 14, 15, 15, 16, 16, 17, 17, 18, 18,
+/*  50 */  19, 19, 20, 20, 21, 21, 22, 22, 23, 23,
+/*  60 */  24, 24, 25, 25, 26, 26, 27, 27, 28, 28,
+/*  70 */  29, 29, 30, 30, 31, 31, 32, 32, 33, 33,
+/*  80 */  34, 34, 35, 35, 36, 36, 37, 37, 38, 38,
+/*  90 */  39, 39, 40, 40, 41, 41, 42, 42, 43, 43,
+/* 100 */  44, 44, 45, 45, 46, 46, 47, 47, 48, 48,
+/* 110 */  49, 49, 50, 50, 51, 51, 52, 52, 53, 53,
+/* 120 */  54, 54, 55, 55, 56, 56, 57, 57
+};
+
+/*
+** Return the length of the data corresponding to the supplied serial-type.
+*/
+SQLITE_PRIVATE u32 sqlite3VdbeSerialTypeLen(u32 serial_type){
+  if( serial_type>=128 ){
+    return (serial_type-12)/2;
+  }else{
+    assert( serial_type<12
+            || sqlite3SmallTypeSizes[serial_type]==(serial_type - 12)/2 );
+    return sqlite3SmallTypeSizes[serial_type];
+  }
+}
+SQLITE_PRIVATE u8 sqlite3VdbeOneByteSerialTypeLen(u8 serial_type){
+  assert( serial_type<128 );
+  return sqlite3SmallTypeSizes[serial_type];
+}
+
+/*
+** If we are on an architecture with mixed-endian floating
+** points (ex: ARM7) then swap the lower 4 bytes with the
+** upper 4 bytes.  Return the result.
+**
+** For most architectures, this is a no-op.
+**
+** (later):  It is reported to me that the mixed-endian problem
+** on ARM7 is an issue with GCC, not with the ARM7 chip.  It seems
+** that early version
