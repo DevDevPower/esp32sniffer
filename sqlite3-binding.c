@@ -84092,3 +84092,241 @@ static void vdbeInvokeSqllog(Vdbe *v){
 ** Clean up a VDBE after execution but do not delete the VDBE just yet.
 ** Write any error messages into *pzErrMsg.  Return the result code.
 **
+** After this routine is run, the VDBE should be ready to be executed
+** again.
+**
+** To look at it another way, this routine resets the state of the
+** virtual machine from VDBE_RUN_STATE or VDBE_HALT_STATE back to
+** VDBE_READY_STATE.
+*/
+SQLITE_PRIVATE int sqlite3VdbeReset(Vdbe *p){
+#if defined(SQLITE_DEBUG) || defined(VDBE_PROFILE)
+  int i;
+#endif
+
+  sqlite3 *db;
+  db = p->db;
+
+  /* If the VM did not run to completion or if it encountered an
+  ** error, then it might not have been halted properly.  So halt
+  ** it now.
+  */
+  if( p->eVdbeState==VDBE_RUN_STATE ) sqlite3VdbeHalt(p);
+
+  /* If the VDBE has been run even partially, then transfer the error code
+  ** and error message from the VDBE into the main database structure.  But
+  ** if the VDBE has just been set to run but has not actually executed any
+  ** instructions yet, leave the main database error information unchanged.
+  */
+  if( p->pc>=0 ){
+    vdbeInvokeSqllog(p);
+    if( db->pErr || p->zErrMsg ){
+      sqlite3VdbeTransferError(p);
+    }else{
+      db->errCode = p->rc;
+    }
+  }
+
+  /* Reset register contents and reclaim error message memory.
+  */
+#ifdef SQLITE_DEBUG
+  /* Execute assert() statements to ensure that the Vdbe.apCsr[] and
+  ** Vdbe.aMem[] arrays have already been cleaned up.  */
+  if( p->apCsr ) for(i=0; i<p->nCursor; i++) assert( p->apCsr[i]==0 );
+  if( p->aMem ){
+    for(i=0; i<p->nMem; i++) assert( p->aMem[i].flags==MEM_Undefined );
+  }
+#endif
+  if( p->zErrMsg ){
+    sqlite3DbFree(db, p->zErrMsg);
+    p->zErrMsg = 0;
+  }
+  p->pResultSet = 0;
+#ifdef SQLITE_DEBUG
+  p->nWrite = 0;
+#endif
+
+  /* Save profiling information from this VDBE run.
+  */
+#ifdef VDBE_PROFILE
+  {
+    FILE *out = fopen("vdbe_profile.out", "a");
+    if( out ){
+      fprintf(out, "---- ");
+      for(i=0; i<p->nOp; i++){
+        fprintf(out, "%02x", p->aOp[i].opcode);
+      }
+      fprintf(out, "\n");
+      if( p->zSql ){
+        char c, pc = 0;
+        fprintf(out, "-- ");
+        for(i=0; (c = p->zSql[i])!=0; i++){
+          if( pc=='\n' ) fprintf(out, "-- ");
+          putc(c, out);
+          pc = c;
+        }
+        if( pc!='\n' ) fprintf(out, "\n");
+      }
+      for(i=0; i<p->nOp; i++){
+        char zHdr[100];
+        sqlite3_snprintf(sizeof(zHdr), zHdr, "%6u %12llu %8llu ",
+           p->aOp[i].cnt,
+           p->aOp[i].cycles,
+           p->aOp[i].cnt>0 ? p->aOp[i].cycles/p->aOp[i].cnt : 0
+        );
+        fprintf(out, "%s", zHdr);
+        sqlite3VdbePrintOp(out, i, &p->aOp[i]);
+      }
+      fclose(out);
+    }
+  }
+#endif
+  return p->rc & db->errMask;
+}
+
+/*
+** Clean up and delete a VDBE after execution.  Return an integer which is
+** the result code.  Write any error message text into *pzErrMsg.
+*/
+SQLITE_PRIVATE int sqlite3VdbeFinalize(Vdbe *p){
+  int rc = SQLITE_OK;
+  assert( VDBE_RUN_STATE>VDBE_READY_STATE );
+  assert( VDBE_HALT_STATE>VDBE_READY_STATE );
+  assert( VDBE_INIT_STATE<VDBE_READY_STATE );
+  if( p->eVdbeState>=VDBE_READY_STATE ){
+    rc = sqlite3VdbeReset(p);
+    assert( (rc & p->db->errMask)==rc );
+  }
+  sqlite3VdbeDelete(p);
+  return rc;
+}
+
+/*
+** If parameter iOp is less than zero, then invoke the destructor for
+** all auxiliary data pointers currently cached by the VM passed as
+** the first argument.
+**
+** Or, if iOp is greater than or equal to zero, then the destructor is
+** only invoked for those auxiliary data pointers created by the user
+** function invoked by the OP_Function opcode at instruction iOp of
+** VM pVdbe, and only then if:
+**
+**    * the associated function parameter is the 32nd or later (counting
+**      from left to right), or
+**
+**    * the corresponding bit in argument mask is clear (where the first
+**      function parameter corresponds to bit 0 etc.).
+*/
+SQLITE_PRIVATE void sqlite3VdbeDeleteAuxData(sqlite3 *db, AuxData **pp, int iOp, int mask){
+  while( *pp ){
+    AuxData *pAux = *pp;
+    if( (iOp<0)
+     || (pAux->iAuxOp==iOp
+          && pAux->iAuxArg>=0
+          && (pAux->iAuxArg>31 || !(mask & MASKBIT32(pAux->iAuxArg))))
+    ){
+      testcase( pAux->iAuxArg==31 );
+      if( pAux->xDeleteAux ){
+        pAux->xDeleteAux(pAux->pAux);
+      }
+      *pp = pAux->pNextAux;
+      sqlite3DbFree(db, pAux);
+    }else{
+      pp= &pAux->pNextAux;
+    }
+  }
+}
+
+/*
+** Free all memory associated with the Vdbe passed as the second argument,
+** except for object itself, which is preserved.
+**
+** The difference between this function and sqlite3VdbeDelete() is that
+** VdbeDelete() also unlinks the Vdbe from the list of VMs associated with
+** the database connection and frees the object itself.
+*/
+static void sqlite3VdbeClearObject(sqlite3 *db, Vdbe *p){
+  SubProgram *pSub, *pNext;
+  assert( p->db==0 || p->db==db );
+  if( p->aColName ){
+    releaseMemArray(p->aColName, p->nResColumn*COLNAME_N);
+    sqlite3DbFreeNN(db, p->aColName);
+  }
+  for(pSub=p->pProgram; pSub; pSub=pNext){
+    pNext = pSub->pNext;
+    vdbeFreeOpArray(db, pSub->aOp, pSub->nOp);
+    sqlite3DbFree(db, pSub);
+  }
+  if( p->eVdbeState!=VDBE_INIT_STATE ){
+    releaseMemArray(p->aVar, p->nVar);
+    if( p->pVList ) sqlite3DbFreeNN(db, p->pVList);
+    if( p->pFree ) sqlite3DbFreeNN(db, p->pFree);
+  }
+  vdbeFreeOpArray(db, p->aOp, p->nOp);
+  sqlite3DbFree(db, p->zSql);
+#ifdef SQLITE_ENABLE_NORMALIZE
+  sqlite3DbFree(db, p->zNormSql);
+  {
+    DblquoteStr *pThis, *pNext;
+    for(pThis=p->pDblStr; pThis; pThis=pNext){
+      pNext = pThis->pNextStr;
+      sqlite3DbFree(db, pThis);
+    }
+  }
+#endif
+#ifdef SQLITE_ENABLE_STMT_SCANSTATUS
+  {
+    int i;
+    for(i=0; i<p->nScan; i++){
+      sqlite3DbFree(db, p->aScan[i].zName);
+    }
+    sqlite3DbFree(db, p->aScan);
+  }
+#endif
+}
+
+/*
+** Delete an entire VDBE.
+*/
+SQLITE_PRIVATE void sqlite3VdbeDelete(Vdbe *p){
+  sqlite3 *db;
+
+  assert( p!=0 );
+  db = p->db;
+  assert( sqlite3_mutex_held(db->mutex) );
+  sqlite3VdbeClearObject(db, p);
+  if( db->pnBytesFreed==0 ){
+    if( p->pPrev ){
+      p->pPrev->pNext = p->pNext;
+    }else{
+      assert( db->pVdbe==p );
+      db->pVdbe = p->pNext;
+    }
+    if( p->pNext ){
+      p->pNext->pPrev = p->pPrev;
+    }
+  }
+  sqlite3DbFreeNN(db, p);
+}
+
+/*
+** The cursor "p" has a pending seek operation that has not yet been
+** carried out.  Seek the cursor now.  If an error occurs, return
+** the appropriate error code.
+*/
+SQLITE_PRIVATE int SQLITE_NOINLINE sqlite3VdbeFinishMoveto(VdbeCursor *p){
+  int res, rc;
+#ifdef SQLITE_TEST
+  extern int sqlite3_search_count;
+#endif
+  assert( p->deferredMoveto );
+  assert( p->isTable );
+  assert( p->eCurType==CURTYPE_BTREE );
+  rc = sqlite3BtreeTableMoveto(p->uc.pCursor, p->movetoTarget, 0, &res);
+  if( rc ) return rc;
+  if( res!=0 ) return SQLITE_CORRUPT_BKPT;
+#ifdef SQLITE_TEST
+  sqlite3_search_count++;
+#endif
+  p->deferredMoveto = 0;
+  p->cach
