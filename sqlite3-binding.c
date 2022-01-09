@@ -84702,4 +84702,187 @@ SQLITE_PRIVATE void sqlite3VdbeSerialGet(
       ** length.
       ** EVIDENCE-OF: R-28401-00140 Value is a string in the text encoding and
       ** (N-13)/2 bytes in length. */
-      static const u16 aFlag[] = { MEM_Blob|MEM_Ephem, MEM_Str|
+      static const u16 aFlag[] = { MEM_Blob|MEM_Ephem, MEM_Str|MEM_Ephem };
+      pMem->z = (char *)buf;
+      pMem->n = (serial_type-12)/2;
+      pMem->flags = aFlag[serial_type&1];
+      return;
+    }
+  }
+  return;
+}
+/*
+** This routine is used to allocate sufficient space for an UnpackedRecord
+** structure large enough to be used with sqlite3VdbeRecordUnpack() if
+** the first argument is a pointer to KeyInfo structure pKeyInfo.
+**
+** The space is either allocated using sqlite3DbMallocRaw() or from within
+** the unaligned buffer passed via the second and third arguments (presumably
+** stack space). If the former, then *ppFree is set to a pointer that should
+** be eventually freed by the caller using sqlite3DbFree(). Or, if the
+** allocation comes from the pSpace/szSpace buffer, *ppFree is set to NULL
+** before returning.
+**
+** If an OOM error occurs, NULL is returned.
+*/
+SQLITE_PRIVATE UnpackedRecord *sqlite3VdbeAllocUnpackedRecord(
+  KeyInfo *pKeyInfo               /* Description of the record */
+){
+  UnpackedRecord *p;              /* Unpacked record to return */
+  int nByte;                      /* Number of bytes required for *p */
+  nByte = ROUND8P(sizeof(UnpackedRecord)) + sizeof(Mem)*(pKeyInfo->nKeyField+1);
+  p = (UnpackedRecord *)sqlite3DbMallocRaw(pKeyInfo->db, nByte);
+  if( !p ) return 0;
+  p->aMem = (Mem*)&((char*)p)[ROUND8P(sizeof(UnpackedRecord))];
+  assert( pKeyInfo->aSortFlags!=0 );
+  p->pKeyInfo = pKeyInfo;
+  p->nField = pKeyInfo->nKeyField + 1;
+  return p;
+}
+
+/*
+** Given the nKey-byte encoding of a record in pKey[], populate the
+** UnpackedRecord structure indicated by the fourth argument with the
+** contents of the decoded record.
+*/
+SQLITE_PRIVATE void sqlite3VdbeRecordUnpack(
+  KeyInfo *pKeyInfo,     /* Information about the record format */
+  int nKey,              /* Size of the binary record */
+  const void *pKey,      /* The binary record */
+  UnpackedRecord *p      /* Populate this structure before returning. */
+){
+  const unsigned char *aKey = (const unsigned char *)pKey;
+  u32 d;
+  u32 idx;                        /* Offset in aKey[] to read from */
+  u16 u;                          /* Unsigned loop counter */
+  u32 szHdr;
+  Mem *pMem = p->aMem;
+
+  p->default_rc = 0;
+  assert( EIGHT_BYTE_ALIGNMENT(pMem) );
+  idx = getVarint32(aKey, szHdr);
+  d = szHdr;
+  u = 0;
+  while( idx<szHdr && d<=(u32)nKey ){
+    u32 serial_type;
+
+    idx += getVarint32(&aKey[idx], serial_type);
+    pMem->enc = pKeyInfo->enc;
+    pMem->db = pKeyInfo->db;
+    /* pMem->flags = 0; // sqlite3VdbeSerialGet() will set this for us */
+    pMem->szMalloc = 0;
+    pMem->z = 0;
+    sqlite3VdbeSerialGet(&aKey[d], serial_type, pMem);
+    d += sqlite3VdbeSerialTypeLen(serial_type);
+    pMem++;
+    if( (++u)>=p->nField ) break;
+  }
+  if( d>(u32)nKey && u ){
+    assert( CORRUPT_DB );
+    /* In a corrupt record entry, the last pMem might have been set up using
+    ** uninitialized memory. Overwrite its value with NULL, to prevent
+    ** warnings from MSAN. */
+    sqlite3VdbeMemSetNull(pMem-1);
+  }
+  assert( u<=pKeyInfo->nKeyField + 1 );
+  p->nField = u;
+}
+
+#ifdef SQLITE_DEBUG
+/*
+** This function compares two index or table record keys in the same way
+** as the sqlite3VdbeRecordCompare() routine. Unlike VdbeRecordCompare(),
+** this function deserializes and compares values using the
+** sqlite3VdbeSerialGet() and sqlite3MemCompare() functions. It is used
+** in assert() statements to ensure that the optimized code in
+** sqlite3VdbeRecordCompare() returns results with these two primitives.
+**
+** Return true if the result of comparison is equivalent to desiredResult.
+** Return false if there is a disagreement.
+*/
+static int vdbeRecordCompareDebug(
+  int nKey1, const void *pKey1, /* Left key */
+  const UnpackedRecord *pPKey2, /* Right key */
+  int desiredResult             /* Correct answer */
+){
+  u32 d1;            /* Offset into aKey[] of next data element */
+  u32 idx1;          /* Offset into aKey[] of next header element */
+  u32 szHdr1;        /* Number of bytes in header */
+  int i = 0;
+  int rc = 0;
+  const unsigned char *aKey1 = (const unsigned char *)pKey1;
+  KeyInfo *pKeyInfo;
+  Mem mem1;
+
+  pKeyInfo = pPKey2->pKeyInfo;
+  if( pKeyInfo->db==0 ) return 1;
+  mem1.enc = pKeyInfo->enc;
+  mem1.db = pKeyInfo->db;
+  /* mem1.flags = 0;  // Will be initialized by sqlite3VdbeSerialGet() */
+  VVA_ONLY( mem1.szMalloc = 0; ) /* Only needed by assert() statements */
+
+  /* Compilers may complain that mem1.u.i is potentially uninitialized.
+  ** We could initialize it, as shown here, to silence those complaints.
+  ** But in fact, mem1.u.i will never actually be used uninitialized, and doing
+  ** the unnecessary initialization has a measurable negative performance
+  ** impact, since this routine is a very high runner.  And so, we choose
+  ** to ignore the compiler warnings and leave this variable uninitialized.
+  */
+  /*  mem1.u.i = 0;  // not needed, here to silence compiler warning */
+
+  idx1 = getVarint32(aKey1, szHdr1);
+  if( szHdr1>98307 ) return SQLITE_CORRUPT;
+  d1 = szHdr1;
+  assert( pKeyInfo->nAllField>=pPKey2->nField || CORRUPT_DB );
+  assert( pKeyInfo->aSortFlags!=0 );
+  assert( pKeyInfo->nKeyField>0 );
+  assert( idx1<=szHdr1 || CORRUPT_DB );
+  do{
+    u32 serial_type1;
+
+    /* Read the serial types for the next element in each key. */
+    idx1 += getVarint32( aKey1+idx1, serial_type1 );
+
+    /* Verify that there is enough key space remaining to avoid
+    ** a buffer overread.  The "d1+serial_type1+2" subexpression will
+    ** always be greater than or equal to the amount of required key space.
+    ** Use that approximation to avoid the more expensive call to
+    ** sqlite3VdbeSerialTypeLen() in the common case.
+    */
+    if( d1+(u64)serial_type1+2>(u64)nKey1
+     && d1+(u64)sqlite3VdbeSerialTypeLen(serial_type1)>(u64)nKey1
+    ){
+      break;
+    }
+
+    /* Extract the values to be compared.
+    */
+    sqlite3VdbeSerialGet(&aKey1[d1], serial_type1, &mem1);
+    d1 += sqlite3VdbeSerialTypeLen(serial_type1);
+
+    /* Do the comparison
+    */
+    rc = sqlite3MemCompare(&mem1, &pPKey2->aMem[i],
+                           pKeyInfo->nAllField>i ? pKeyInfo->aColl[i] : 0);
+    if( rc!=0 ){
+      assert( mem1.szMalloc==0 );  /* See comment below */
+      if( (pKeyInfo->aSortFlags[i] & KEYINFO_ORDER_BIGNULL)
+       && ((mem1.flags & MEM_Null) || (pPKey2->aMem[i].flags & MEM_Null))
+      ){
+        rc = -rc;
+      }
+      if( pKeyInfo->aSortFlags[i] & KEYINFO_ORDER_DESC ){
+        rc = -rc;  /* Invert the result for DESC sort order. */
+      }
+      goto debugCompareEnd;
+    }
+    i++;
+  }while( idx1<szHdr1 && i<pPKey2->nField );
+
+  /* No memory allocation is ever used on mem1.  Prove this using
+  ** the following assert().  If the assert() fails, it indicates a
+  ** memory leak and a need to call sqlite3VdbeMemRelease(&mem1).
+  */
+  assert( mem1.szMalloc==0 );
+
+  /* rc
