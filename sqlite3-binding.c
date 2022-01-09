@@ -84524,4 +84524,182 @@ SQLITE_PRIVATE u8 sqlite3VdbeOneByteSerialTypeLen(u8 serial_type){
 **
 ** (later):  It is reported to me that the mixed-endian problem
 ** on ARM7 is an issue with GCC, not with the ARM7 chip.  It seems
-** that early version
+** that early versions of GCC stored the two words of a 64-bit
+** float in the wrong order.  And that error has been propagated
+** ever since.  The blame is not necessarily with GCC, though.
+** GCC might have just copying the problem from a prior compiler.
+** I am also told that newer versions of GCC that follow a different
+** ABI get the byte order right.
+**
+** Developers using SQLite on an ARM7 should compile and run their
+** application using -DSQLITE_DEBUG=1 at least once.  With DEBUG
+** enabled, some asserts below will ensure that the byte order of
+** floating point values is correct.
+**
+** (2007-08-30)  Frank van Vugt has studied this problem closely
+** and has send his findings to the SQLite developers.  Frank
+** writes that some Linux kernels offer floating point hardware
+** emulation that uses only 32-bit mantissas instead of a full
+** 48-bits as required by the IEEE standard.  (This is the
+** CONFIG_FPE_FASTFPE option.)  On such systems, floating point
+** byte swapping becomes very complicated.  To avoid problems,
+** the necessary byte swapping is carried out using a 64-bit integer
+** rather than a 64-bit float.  Frank assures us that the code here
+** works for him.  We, the developers, have no way to independently
+** verify this, but Frank seems to know what he is talking about
+** so we trust him.
+*/
+#ifdef SQLITE_MIXED_ENDIAN_64BIT_FLOAT
+SQLITE_PRIVATE u64 sqlite3FloatSwap(u64 in){
+  union {
+    u64 r;
+    u32 i[2];
+  } u;
+  u32 t;
+
+  u.r = in;
+  t = u.i[0];
+  u.i[0] = u.i[1];
+  u.i[1] = t;
+  return u.r;
+}
+#endif /* SQLITE_MIXED_ENDIAN_64BIT_FLOAT */
+
+
+/* Input "x" is a sequence of unsigned characters that represent a
+** big-endian integer.  Return the equivalent native integer
+*/
+#define ONE_BYTE_INT(x)    ((i8)(x)[0])
+#define TWO_BYTE_INT(x)    (256*(i8)((x)[0])|(x)[1])
+#define THREE_BYTE_INT(x)  (65536*(i8)((x)[0])|((x)[1]<<8)|(x)[2])
+#define FOUR_BYTE_UINT(x)  (((u32)(x)[0]<<24)|((x)[1]<<16)|((x)[2]<<8)|(x)[3])
+#define FOUR_BYTE_INT(x) (16777216*(i8)((x)[0])|((x)[1]<<16)|((x)[2]<<8)|(x)[3])
+
+/*
+** Deserialize the data blob pointed to by buf as serial type serial_type
+** and store the result in pMem.
+**
+** This function is implemented as two separate routines for performance.
+** The few cases that require local variables are broken out into a separate
+** routine so that in most cases the overhead of moving the stack pointer
+** is avoided.
+*/
+static void serialGet(
+  const unsigned char *buf,     /* Buffer to deserialize from */
+  u32 serial_type,              /* Serial type to deserialize */
+  Mem *pMem                     /* Memory cell to write value into */
+){
+  u64 x = FOUR_BYTE_UINT(buf);
+  u32 y = FOUR_BYTE_UINT(buf+4);
+  x = (x<<32) + y;
+  if( serial_type==6 ){
+    /* EVIDENCE-OF: R-29851-52272 Value is a big-endian 64-bit
+    ** twos-complement integer. */
+    pMem->u.i = *(i64*)&x;
+    pMem->flags = MEM_Int;
+    testcase( pMem->u.i<0 );
+  }else{
+    /* EVIDENCE-OF: R-57343-49114 Value is a big-endian IEEE 754-2008 64-bit
+    ** floating point number. */
+#if !defined(NDEBUG) && !defined(SQLITE_OMIT_FLOATING_POINT)
+    /* Verify that integers and floating point values use the same
+    ** byte order.  Or, that if SQLITE_MIXED_ENDIAN_64BIT_FLOAT is
+    ** defined that 64-bit floating point values really are mixed
+    ** endian.
+    */
+    static const u64 t1 = ((u64)0x3ff00000)<<32;
+    static const double r1 = 1.0;
+    u64 t2 = t1;
+    swapMixedEndianFloat(t2);
+    assert( sizeof(r1)==sizeof(t2) && memcmp(&r1, &t2, sizeof(r1))==0 );
+#endif
+    assert( sizeof(x)==8 && sizeof(pMem->u.r)==8 );
+    swapMixedEndianFloat(x);
+    memcpy(&pMem->u.r, &x, sizeof(x));
+    pMem->flags = IsNaN(x) ? MEM_Null : MEM_Real;
+  }
+}
+SQLITE_PRIVATE void sqlite3VdbeSerialGet(
+  const unsigned char *buf,     /* Buffer to deserialize from */
+  u32 serial_type,              /* Serial type to deserialize */
+  Mem *pMem                     /* Memory cell to write value into */
+){
+  switch( serial_type ){
+    case 10: { /* Internal use only: NULL with virtual table
+               ** UPDATE no-change flag set */
+      pMem->flags = MEM_Null|MEM_Zero;
+      pMem->n = 0;
+      pMem->u.nZero = 0;
+      return;
+    }
+    case 11:   /* Reserved for future use */
+    case 0: {  /* Null */
+      /* EVIDENCE-OF: R-24078-09375 Value is a NULL. */
+      pMem->flags = MEM_Null;
+      return;
+    }
+    case 1: {
+      /* EVIDENCE-OF: R-44885-25196 Value is an 8-bit twos-complement
+      ** integer. */
+      pMem->u.i = ONE_BYTE_INT(buf);
+      pMem->flags = MEM_Int;
+      testcase( pMem->u.i<0 );
+      return;
+    }
+    case 2: { /* 2-byte signed integer */
+      /* EVIDENCE-OF: R-49794-35026 Value is a big-endian 16-bit
+      ** twos-complement integer. */
+      pMem->u.i = TWO_BYTE_INT(buf);
+      pMem->flags = MEM_Int;
+      testcase( pMem->u.i<0 );
+      return;
+    }
+    case 3: { /* 3-byte signed integer */
+      /* EVIDENCE-OF: R-37839-54301 Value is a big-endian 24-bit
+      ** twos-complement integer. */
+      pMem->u.i = THREE_BYTE_INT(buf);
+      pMem->flags = MEM_Int;
+      testcase( pMem->u.i<0 );
+      return;
+    }
+    case 4: { /* 4-byte signed integer */
+      /* EVIDENCE-OF: R-01849-26079 Value is a big-endian 32-bit
+      ** twos-complement integer. */
+      pMem->u.i = FOUR_BYTE_INT(buf);
+#ifdef __HP_cc
+      /* Work around a sign-extension bug in the HP compiler for HP/UX */
+      if( buf[0]&0x80 ) pMem->u.i |= 0xffffffff80000000LL;
+#endif
+      pMem->flags = MEM_Int;
+      testcase( pMem->u.i<0 );
+      return;
+    }
+    case 5: { /* 6-byte signed integer */
+      /* EVIDENCE-OF: R-50385-09674 Value is a big-endian 48-bit
+      ** twos-complement integer. */
+      pMem->u.i = FOUR_BYTE_UINT(buf+2) + (((i64)1)<<32)*TWO_BYTE_INT(buf);
+      pMem->flags = MEM_Int;
+      testcase( pMem->u.i<0 );
+      return;
+    }
+    case 6:   /* 8-byte signed integer */
+    case 7: { /* IEEE floating point */
+      /* These use local variables, so do them in a separate routine
+      ** to avoid having to move the frame pointer in the common case */
+      serialGet(buf,serial_type,pMem);
+      return;
+    }
+    case 8:    /* Integer 0 */
+    case 9: {  /* Integer 1 */
+      /* EVIDENCE-OF: R-12976-22893 Value is the integer 0. */
+      /* EVIDENCE-OF: R-18143-12121 Value is the integer 1. */
+      pMem->u.i = serial_type-8;
+      pMem->flags = MEM_Int;
+      return;
+    }
+    default: {
+      /* EVIDENCE-OF: R-14606-31564 Value is a BLOB that is (N-12)/2 bytes in
+      ** length.
+      ** EVIDENCE-OF: R-28401-00140 Value is a string in the text encoding and
+      ** (N-13)/2 bytes in length. */
+      static const u16 aFlag[] = { MEM_Blob|MEM_Ephem, MEM_Str|
