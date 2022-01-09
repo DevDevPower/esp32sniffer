@@ -84885,4 +84885,211 @@ static int vdbeRecordCompareDebug(
   */
   assert( mem1.szMalloc==0 );
 
-  /* rc
+  /* rc==0 here means that one of the keys ran out of fields and
+  ** all the fields up to that point were equal. Return the default_rc
+  ** value.  */
+  rc = pPKey2->default_rc;
+
+debugCompareEnd:
+  if( desiredResult==0 && rc==0 ) return 1;
+  if( desiredResult<0 && rc<0 ) return 1;
+  if( desiredResult>0 && rc>0 ) return 1;
+  if( CORRUPT_DB ) return 1;
+  if( pKeyInfo->db->mallocFailed ) return 1;
+  return 0;
+}
+#endif
+
+#ifdef SQLITE_DEBUG
+/*
+** Count the number of fields (a.k.a. columns) in the record given by
+** pKey,nKey.  The verify that this count is less than or equal to the
+** limit given by pKeyInfo->nAllField.
+**
+** If this constraint is not satisfied, it means that the high-speed
+** vdbeRecordCompareInt() and vdbeRecordCompareString() routines will
+** not work correctly.  If this assert() ever fires, it probably means
+** that the KeyInfo.nKeyField or KeyInfo.nAllField values were computed
+** incorrectly.
+*/
+static void vdbeAssertFieldCountWithinLimits(
+  int nKey, const void *pKey,   /* The record to verify */
+  const KeyInfo *pKeyInfo       /* Compare size with this KeyInfo */
+){
+  int nField = 0;
+  u32 szHdr;
+  u32 idx;
+  u32 notUsed;
+  const unsigned char *aKey = (const unsigned char*)pKey;
+
+  if( CORRUPT_DB ) return;
+  idx = getVarint32(aKey, szHdr);
+  assert( nKey>=0 );
+  assert( szHdr<=(u32)nKey );
+  while( idx<szHdr ){
+    idx += getVarint32(aKey+idx, notUsed);
+    nField++;
+  }
+  assert( nField <= pKeyInfo->nAllField );
+}
+#else
+# define vdbeAssertFieldCountWithinLimits(A,B,C)
+#endif
+
+/*
+** Both *pMem1 and *pMem2 contain string values. Compare the two values
+** using the collation sequence pColl. As usual, return a negative , zero
+** or positive value if *pMem1 is less than, equal to or greater than
+** *pMem2, respectively. Similar in spirit to "rc = (*pMem1) - (*pMem2);".
+*/
+static int vdbeCompareMemString(
+  const Mem *pMem1,
+  const Mem *pMem2,
+  const CollSeq *pColl,
+  u8 *prcErr                      /* If an OOM occurs, set to SQLITE_NOMEM */
+){
+  if( pMem1->enc==pColl->enc ){
+    /* The strings are already in the correct encoding.  Call the
+     ** comparison function directly */
+    return pColl->xCmp(pColl->pUser,pMem1->n,pMem1->z,pMem2->n,pMem2->z);
+  }else{
+    int rc;
+    const void *v1, *v2;
+    Mem c1;
+    Mem c2;
+    sqlite3VdbeMemInit(&c1, pMem1->db, MEM_Null);
+    sqlite3VdbeMemInit(&c2, pMem1->db, MEM_Null);
+    sqlite3VdbeMemShallowCopy(&c1, pMem1, MEM_Ephem);
+    sqlite3VdbeMemShallowCopy(&c2, pMem2, MEM_Ephem);
+    v1 = sqlite3ValueText((sqlite3_value*)&c1, pColl->enc);
+    v2 = sqlite3ValueText((sqlite3_value*)&c2, pColl->enc);
+    if( (v1==0 || v2==0) ){
+      if( prcErr ) *prcErr = SQLITE_NOMEM_BKPT;
+      rc = 0;
+    }else{
+      rc = pColl->xCmp(pColl->pUser, c1.n, v1, c2.n, v2);
+    }
+    sqlite3VdbeMemReleaseMalloc(&c1);
+    sqlite3VdbeMemReleaseMalloc(&c2);
+    return rc;
+  }
+}
+
+/*
+** The input pBlob is guaranteed to be a Blob that is not marked
+** with MEM_Zero.  Return true if it could be a zero-blob.
+*/
+static int isAllZero(const char *z, int n){
+  int i;
+  for(i=0; i<n; i++){
+    if( z[i] ) return 0;
+  }
+  return 1;
+}
+
+/*
+** Compare two blobs.  Return negative, zero, or positive if the first
+** is less than, equal to, or greater than the second, respectively.
+** If one blob is a prefix of the other, then the shorter is the lessor.
+*/
+SQLITE_PRIVATE SQLITE_NOINLINE int sqlite3BlobCompare(const Mem *pB1, const Mem *pB2){
+  int c;
+  int n1 = pB1->n;
+  int n2 = pB2->n;
+
+  /* It is possible to have a Blob value that has some non-zero content
+  ** followed by zero content.  But that only comes up for Blobs formed
+  ** by the OP_MakeRecord opcode, and such Blobs never get passed into
+  ** sqlite3MemCompare(). */
+  assert( (pB1->flags & MEM_Zero)==0 || n1==0 );
+  assert( (pB2->flags & MEM_Zero)==0 || n2==0 );
+
+  if( (pB1->flags|pB2->flags) & MEM_Zero ){
+    if( pB1->flags & pB2->flags & MEM_Zero ){
+      return pB1->u.nZero - pB2->u.nZero;
+    }else if( pB1->flags & MEM_Zero ){
+      if( !isAllZero(pB2->z, pB2->n) ) return -1;
+      return pB1->u.nZero - n2;
+    }else{
+      if( !isAllZero(pB1->z, pB1->n) ) return +1;
+      return n1 - pB2->u.nZero;
+    }
+  }
+  c = memcmp(pB1->z, pB2->z, n1>n2 ? n2 : n1);
+  if( c ) return c;
+  return n1 - n2;
+}
+
+/*
+** Do a comparison between a 64-bit signed integer and a 64-bit floating-point
+** number.  Return negative, zero, or positive if the first (i64) is less than,
+** equal to, or greater than the second (double).
+*/
+SQLITE_PRIVATE int sqlite3IntFloatCompare(i64 i, double r){
+  if( sizeof(LONGDOUBLE_TYPE)>8 ){
+    LONGDOUBLE_TYPE x = (LONGDOUBLE_TYPE)i;
+    testcase( x<r );
+    testcase( x>r );
+    testcase( x==r );
+    if( x<r ) return -1;
+    if( x>r ) return +1;  /*NO_TEST*/ /* work around bugs in gcov */
+    return 0;             /*NO_TEST*/ /* work around bugs in gcov */
+  }else{
+    i64 y;
+    double s;
+    if( r<-9223372036854775808.0 ) return +1;
+    if( r>=9223372036854775808.0 ) return -1;
+    y = (i64)r;
+    if( i<y ) return -1;
+    if( i>y ) return +1;
+    s = (double)i;
+    if( s<r ) return -1;
+    if( s>r ) return +1;
+    return 0;
+  }
+}
+
+/*
+** Compare the values contained by the two memory cells, returning
+** negative, zero or positive if pMem1 is less than, equal to, or greater
+** than pMem2. Sorting order is NULL's first, followed by numbers (integers
+** and reals) sorted numerically, followed by text ordered by the collating
+** sequence pColl and finally blob's ordered by memcmp().
+**
+** Two NULL values are considered equal by this function.
+*/
+SQLITE_PRIVATE int sqlite3MemCompare(const Mem *pMem1, const Mem *pMem2, const CollSeq *pColl){
+  int f1, f2;
+  int combined_flags;
+
+  f1 = pMem1->flags;
+  f2 = pMem2->flags;
+  combined_flags = f1|f2;
+  assert( !sqlite3VdbeMemIsRowSet(pMem1) && !sqlite3VdbeMemIsRowSet(pMem2) );
+
+  /* If one value is NULL, it is less than the other. If both values
+  ** are NULL, return 0.
+  */
+  if( combined_flags&MEM_Null ){
+    return (f2&MEM_Null) - (f1&MEM_Null);
+  }
+
+  /* At least one of the two values is a number
+  */
+  if( combined_flags&(MEM_Int|MEM_Real|MEM_IntReal) ){
+    testcase( combined_flags & MEM_Int );
+    testcase( combined_flags & MEM_Real );
+    testcase( combined_flags & MEM_IntReal );
+    if( (f1 & f2 & (MEM_Int|MEM_IntReal))!=0 ){
+      testcase( f1 & f2 & MEM_Int );
+      testcase( f1 & f2 & MEM_IntReal );
+      if( pMem1->u.i < pMem2->u.i ) return -1;
+      if( pMem1->u.i > pMem2->u.i ) return +1;
+      return 0;
+    }
+    if( (f1 & f2 & MEM_Real)!=0 ){
+      if( pMem1->u.r < pMem2->u.r ) return -1;
+      if( pMem1->u.r > pMem2->u.r ) return +1;
+      return 0;
+    }
+  
