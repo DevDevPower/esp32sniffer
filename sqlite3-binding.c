@@ -86317,4 +86317,221 @@ SQLITE_API int sqlite3_value_type(sqlite3_value* pVal){
     }else if( pVal->flags & MEM_Int ){
       eType = SQLITE_INTEGER;
     }else if( pVal->flags & MEM_Str ){
- 
+      eType = SQLITE_TEXT;
+    }
+    assert( eType == aType[pVal->flags&MEM_AffMask] );
+  }
+#endif
+  return aType[pVal->flags&MEM_AffMask];
+}
+
+/* Return true if a parameter to xUpdate represents an unchanged column */
+SQLITE_API int sqlite3_value_nochange(sqlite3_value *pVal){
+  return (pVal->flags&(MEM_Null|MEM_Zero))==(MEM_Null|MEM_Zero);
+}
+
+/* Return true if a parameter value originated from an sqlite3_bind() */
+SQLITE_API int sqlite3_value_frombind(sqlite3_value *pVal){
+  return (pVal->flags&MEM_FromBind)!=0;
+}
+
+/* Make a copy of an sqlite3_value object
+*/
+SQLITE_API sqlite3_value *sqlite3_value_dup(const sqlite3_value *pOrig){
+  sqlite3_value *pNew;
+  if( pOrig==0 ) return 0;
+  pNew = sqlite3_malloc( sizeof(*pNew) );
+  if( pNew==0 ) return 0;
+  memset(pNew, 0, sizeof(*pNew));
+  memcpy(pNew, pOrig, MEMCELLSIZE);
+  pNew->flags &= ~MEM_Dyn;
+  pNew->db = 0;
+  if( pNew->flags&(MEM_Str|MEM_Blob) ){
+    pNew->flags &= ~(MEM_Static|MEM_Dyn);
+    pNew->flags |= MEM_Ephem;
+    if( sqlite3VdbeMemMakeWriteable(pNew)!=SQLITE_OK ){
+      sqlite3ValueFree(pNew);
+      pNew = 0;
+    }
+  }else if( pNew->flags & MEM_Null ){
+    /* Do not duplicate pointer values */
+    pNew->flags &= ~(MEM_Term|MEM_Subtype);
+  }
+  return pNew;
+}
+
+/* Destroy an sqlite3_value object previously obtained from
+** sqlite3_value_dup().
+*/
+SQLITE_API void sqlite3_value_free(sqlite3_value *pOld){
+  sqlite3ValueFree(pOld);
+}
+
+
+/**************************** sqlite3_result_  *******************************
+** The following routines are used by user-defined functions to specify
+** the function result.
+**
+** The setStrOrError() function calls sqlite3VdbeMemSetStr() to store the
+** result as a string or blob.  Appropriate errors are set if the string/blob
+** is too big or if an OOM occurs.
+**
+** The invokeValueDestructor(P,X) routine invokes destructor function X()
+** on value P is not going to be used and need to be destroyed.
+*/
+static void setResultStrOrError(
+  sqlite3_context *pCtx,  /* Function context */
+  const char *z,          /* String pointer */
+  int n,                  /* Bytes in string, or negative */
+  u8 enc,                 /* Encoding of z.  0 for BLOBs */
+  void (*xDel)(void*)     /* Destructor function */
+){
+  Mem *pOut = pCtx->pOut;
+  int rc = sqlite3VdbeMemSetStr(pOut, z, n, enc, xDel);
+  if( rc ){
+    if( rc==SQLITE_TOOBIG ){
+      sqlite3_result_error_toobig(pCtx);
+    }else{
+      /* The only errors possible from sqlite3VdbeMemSetStr are
+      ** SQLITE_TOOBIG and SQLITE_NOMEM */
+      assert( rc==SQLITE_NOMEM );
+      sqlite3_result_error_nomem(pCtx);
+    }
+    return;
+  }
+  sqlite3VdbeChangeEncoding(pOut, pCtx->enc);
+  if( sqlite3VdbeMemTooBig(pOut) ){
+    sqlite3_result_error_toobig(pCtx);
+  }
+}
+static int invokeValueDestructor(
+  const void *p,             /* Value to destroy */
+  void (*xDel)(void*),       /* The destructor */
+  sqlite3_context *pCtx      /* Set a SQLITE_TOOBIG error if no NULL */
+){
+  assert( xDel!=SQLITE_DYNAMIC );
+  if( xDel==0 ){
+    /* noop */
+  }else if( xDel==SQLITE_TRANSIENT ){
+    /* noop */
+  }else{
+    xDel((void*)p);
+  }
+  sqlite3_result_error_toobig(pCtx);
+  return SQLITE_TOOBIG;
+}
+SQLITE_API void sqlite3_result_blob(
+  sqlite3_context *pCtx,
+  const void *z,
+  int n,
+  void (*xDel)(void *)
+){
+  assert( n>=0 );
+  assert( sqlite3_mutex_held(pCtx->pOut->db->mutex) );
+  setResultStrOrError(pCtx, z, n, 0, xDel);
+}
+SQLITE_API void sqlite3_result_blob64(
+  sqlite3_context *pCtx,
+  const void *z,
+  sqlite3_uint64 n,
+  void (*xDel)(void *)
+){
+  assert( sqlite3_mutex_held(pCtx->pOut->db->mutex) );
+  assert( xDel!=SQLITE_DYNAMIC );
+  if( n>0x7fffffff ){
+    (void)invokeValueDestructor(z, xDel, pCtx);
+  }else{
+    setResultStrOrError(pCtx, z, (int)n, 0, xDel);
+  }
+}
+SQLITE_API void sqlite3_result_double(sqlite3_context *pCtx, double rVal){
+  assert( sqlite3_mutex_held(pCtx->pOut->db->mutex) );
+  sqlite3VdbeMemSetDouble(pCtx->pOut, rVal);
+}
+SQLITE_API void sqlite3_result_error(sqlite3_context *pCtx, const char *z, int n){
+  assert( sqlite3_mutex_held(pCtx->pOut->db->mutex) );
+  pCtx->isError = SQLITE_ERROR;
+  sqlite3VdbeMemSetStr(pCtx->pOut, z, n, SQLITE_UTF8, SQLITE_TRANSIENT);
+}
+#ifndef SQLITE_OMIT_UTF16
+SQLITE_API void sqlite3_result_error16(sqlite3_context *pCtx, const void *z, int n){
+  assert( sqlite3_mutex_held(pCtx->pOut->db->mutex) );
+  pCtx->isError = SQLITE_ERROR;
+  sqlite3VdbeMemSetStr(pCtx->pOut, z, n, SQLITE_UTF16NATIVE, SQLITE_TRANSIENT);
+}
+#endif
+SQLITE_API void sqlite3_result_int(sqlite3_context *pCtx, int iVal){
+  assert( sqlite3_mutex_held(pCtx->pOut->db->mutex) );
+  sqlite3VdbeMemSetInt64(pCtx->pOut, (i64)iVal);
+}
+SQLITE_API void sqlite3_result_int64(sqlite3_context *pCtx, i64 iVal){
+  assert( sqlite3_mutex_held(pCtx->pOut->db->mutex) );
+  sqlite3VdbeMemSetInt64(pCtx->pOut, iVal);
+}
+SQLITE_API void sqlite3_result_null(sqlite3_context *pCtx){
+  assert( sqlite3_mutex_held(pCtx->pOut->db->mutex) );
+  sqlite3VdbeMemSetNull(pCtx->pOut);
+}
+SQLITE_API void sqlite3_result_pointer(
+  sqlite3_context *pCtx,
+  void *pPtr,
+  const char *zPType,
+  void (*xDestructor)(void*)
+){
+  Mem *pOut = pCtx->pOut;
+  assert( sqlite3_mutex_held(pOut->db->mutex) );
+  sqlite3VdbeMemRelease(pOut);
+  pOut->flags = MEM_Null;
+  sqlite3VdbeMemSetPointer(pOut, pPtr, zPType, xDestructor);
+}
+SQLITE_API void sqlite3_result_subtype(sqlite3_context *pCtx, unsigned int eSubtype){
+  Mem *pOut = pCtx->pOut;
+  assert( sqlite3_mutex_held(pOut->db->mutex) );
+  pOut->eSubtype = eSubtype & 0xff;
+  pOut->flags |= MEM_Subtype;
+}
+SQLITE_API void sqlite3_result_text(
+  sqlite3_context *pCtx,
+  const char *z,
+  int n,
+  void (*xDel)(void *)
+){
+  assert( sqlite3_mutex_held(pCtx->pOut->db->mutex) );
+  setResultStrOrError(pCtx, z, n, SQLITE_UTF8, xDel);
+}
+SQLITE_API void sqlite3_result_text64(
+  sqlite3_context *pCtx,
+  const char *z,
+  sqlite3_uint64 n,
+  void (*xDel)(void *),
+  unsigned char enc
+){
+  assert( sqlite3_mutex_held(pCtx->pOut->db->mutex) );
+  assert( xDel!=SQLITE_DYNAMIC );
+  if( enc==SQLITE_UTF16 ) enc = SQLITE_UTF16NATIVE;
+  if( n>0x7fffffff ){
+    (void)invokeValueDestructor(z, xDel, pCtx);
+  }else{
+    setResultStrOrError(pCtx, z, (int)n, enc, xDel);
+  }
+}
+#ifndef SQLITE_OMIT_UTF16
+SQLITE_API void sqlite3_result_text16(
+  sqlite3_context *pCtx,
+  const void *z,
+  int n,
+  void (*xDel)(void *)
+){
+  assert( sqlite3_mutex_held(pCtx->pOut->db->mutex) );
+  setResultStrOrError(pCtx, z, n, SQLITE_UTF16NATIVE, xDel);
+}
+SQLITE_API void sqlite3_result_text16be(
+  sqlite3_context *pCtx,
+  const void *z,
+  int n,
+  void (*xDel)(void *)
+){
+  assert( sqlite3_mutex_held(pCtx->pOut->db->mutex) );
+  setResultStrOrError(pCtx, z, n, SQLITE_UTF16BE, xDel);
+}
+SQLITE_API v
