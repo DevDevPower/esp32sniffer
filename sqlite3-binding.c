@@ -85923,3 +85923,210 @@ SQLITE_PRIVATE void sqlite3VtabImportErrmsg(Vdbe *p, sqlite3_vtab *pVtab){
 */
 static void vdbeFreeUnpacked(sqlite3 *db, int nField, UnpackedRecord *p){
   if( p ){
+    int i;
+    for(i=0; i<nField; i++){
+      Mem *pMem = &p->aMem[i];
+      if( pMem->zMalloc ) sqlite3VdbeMemReleaseMalloc(pMem);
+    }
+    sqlite3DbFreeNN(db, p);
+  }
+}
+#endif /* SQLITE_ENABLE_PREUPDATE_HOOK */
+
+#ifdef SQLITE_ENABLE_PREUPDATE_HOOK
+/*
+** Invoke the pre-update hook. If this is an UPDATE or DELETE pre-update call,
+** then cursor passed as the second argument should point to the row about
+** to be update or deleted. If the application calls sqlite3_preupdate_old(),
+** the required value will be read from the row the cursor points to.
+*/
+SQLITE_PRIVATE void sqlite3VdbePreUpdateHook(
+  Vdbe *v,                        /* Vdbe pre-update hook is invoked by */
+  VdbeCursor *pCsr,               /* Cursor to grab old.* values from */
+  int op,                         /* SQLITE_INSERT, UPDATE or DELETE */
+  const char *zDb,                /* Database name */
+  Table *pTab,                    /* Modified table */
+  i64 iKey1,                      /* Initial key value */
+  int iReg,                       /* Register for new.* record */
+  int iBlobWrite
+){
+  sqlite3 *db = v->db;
+  i64 iKey2;
+  PreUpdate preupdate;
+  const char *zTbl = pTab->zName;
+  static const u8 fakeSortOrder = 0;
+
+  assert( db->pPreUpdate==0 );
+  memset(&preupdate, 0, sizeof(PreUpdate));
+  if( HasRowid(pTab)==0 ){
+    iKey1 = iKey2 = 0;
+    preupdate.pPk = sqlite3PrimaryKeyIndex(pTab);
+  }else{
+    if( op==SQLITE_UPDATE ){
+      iKey2 = v->aMem[iReg].u.i;
+    }else{
+      iKey2 = iKey1;
+    }
+  }
+
+  assert( pCsr!=0 );
+  assert( pCsr->eCurType==CURTYPE_BTREE );
+  assert( pCsr->nField==pTab->nCol
+       || (pCsr->nField==pTab->nCol+1 && op==SQLITE_DELETE && iReg==-1)
+  );
+
+  preupdate.v = v;
+  preupdate.pCsr = pCsr;
+  preupdate.op = op;
+  preupdate.iNewReg = iReg;
+  preupdate.keyinfo.db = db;
+  preupdate.keyinfo.enc = ENC(db);
+  preupdate.keyinfo.nKeyField = pTab->nCol;
+  preupdate.keyinfo.aSortFlags = (u8*)&fakeSortOrder;
+  preupdate.iKey1 = iKey1;
+  preupdate.iKey2 = iKey2;
+  preupdate.pTab = pTab;
+  preupdate.iBlobWrite = iBlobWrite;
+
+  db->pPreUpdate = &preupdate;
+  db->xPreUpdateCallback(db->pPreUpdateArg, db, op, zDb, zTbl, iKey1, iKey2);
+  db->pPreUpdate = 0;
+  sqlite3DbFree(db, preupdate.aRecord);
+  vdbeFreeUnpacked(db, preupdate.keyinfo.nKeyField+1, preupdate.pUnpacked);
+  vdbeFreeUnpacked(db, preupdate.keyinfo.nKeyField+1, preupdate.pNewUnpacked);
+  if( preupdate.aNew ){
+    int i;
+    for(i=0; i<pCsr->nField; i++){
+      sqlite3VdbeMemRelease(&preupdate.aNew[i]);
+    }
+    sqlite3DbFreeNN(db, preupdate.aNew);
+  }
+}
+#endif /* SQLITE_ENABLE_PREUPDATE_HOOK */
+
+/************** End of vdbeaux.c *********************************************/
+/************** Begin file vdbeapi.c *****************************************/
+/*
+** 2004 May 26
+**
+** The author disclaims copyright to this source code.  In place of
+** a legal notice, here is a blessing:
+**
+**    May you do good and not evil.
+**    May you find forgiveness for yourself and forgive others.
+**    May you share freely, never taking more than you give.
+**
+*************************************************************************
+**
+** This file contains code use to implement APIs that are part of the
+** VDBE.
+*/
+/* #include "sqliteInt.h" */
+/* #include "vdbeInt.h" */
+
+#ifndef SQLITE_OMIT_DEPRECATED
+/*
+** Return TRUE (non-zero) of the statement supplied as an argument needs
+** to be recompiled.  A statement needs to be recompiled whenever the
+** execution environment changes in a way that would alter the program
+** that sqlite3_prepare() generates.  For example, if new functions or
+** collating sequences are registered or if an authorizer function is
+** added or changed.
+*/
+SQLITE_API int sqlite3_expired(sqlite3_stmt *pStmt){
+  Vdbe *p = (Vdbe*)pStmt;
+  return p==0 || p->expired;
+}
+#endif
+
+/*
+** Check on a Vdbe to make sure it has not been finalized.  Log
+** an error and return true if it has been finalized (or is otherwise
+** invalid).  Return false if it is ok.
+*/
+static int vdbeSafety(Vdbe *p){
+  if( p->db==0 ){
+    sqlite3_log(SQLITE_MISUSE, "API called with finalized prepared statement");
+    return 1;
+  }else{
+    return 0;
+  }
+}
+static int vdbeSafetyNotNull(Vdbe *p){
+  if( p==0 ){
+    sqlite3_log(SQLITE_MISUSE, "API called with NULL prepared statement");
+    return 1;
+  }else{
+    return vdbeSafety(p);
+  }
+}
+
+#ifndef SQLITE_OMIT_TRACE
+/*
+** Invoke the profile callback.  This routine is only called if we already
+** know that the profile callback is defined and needs to be invoked.
+*/
+static SQLITE_NOINLINE void invokeProfileCallback(sqlite3 *db, Vdbe *p){
+  sqlite3_int64 iNow;
+  sqlite3_int64 iElapse;
+  assert( p->startTime>0 );
+  assert( (db->mTrace & (SQLITE_TRACE_PROFILE|SQLITE_TRACE_XPROFILE))!=0 );
+  assert( db->init.busy==0 );
+  assert( p->zSql!=0 );
+  sqlite3OsCurrentTimeInt64(db->pVfs, &iNow);
+  iElapse = (iNow - p->startTime)*1000000;
+#ifndef SQLITE_OMIT_DEPRECATED
+  if( db->xProfile ){
+    db->xProfile(db->pProfileArg, p->zSql, iElapse);
+  }
+#endif
+  if( db->mTrace & SQLITE_TRACE_PROFILE ){
+    db->trace.xV2(SQLITE_TRACE_PROFILE, db->pTraceArg, p, (void*)&iElapse);
+  }
+  p->startTime = 0;
+}
+/*
+** The checkProfileCallback(DB,P) macro checks to see if a profile callback
+** is needed, and it invokes the callback if it is needed.
+*/
+# define checkProfileCallback(DB,P) \
+   if( ((P)->startTime)>0 ){ invokeProfileCallback(DB,P); }
+#else
+# define checkProfileCallback(DB,P)  /*no-op*/
+#endif
+
+/*
+** The following routine destroys a virtual machine that is created by
+** the sqlite3_compile() routine. The integer returned is an SQLITE_
+** success/failure code that describes the result of executing the virtual
+** machine.
+**
+** This routine sets the error code and string returned by
+** sqlite3_errcode(), sqlite3_errmsg() and sqlite3_errmsg16().
+*/
+SQLITE_API int sqlite3_finalize(sqlite3_stmt *pStmt){
+  int rc;
+  if( pStmt==0 ){
+    /* IMPLEMENTATION-OF: R-57228-12904 Invoking sqlite3_finalize() on a NULL
+    ** pointer is a harmless no-op. */
+    rc = SQLITE_OK;
+  }else{
+    Vdbe *v = (Vdbe*)pStmt;
+    sqlite3 *db = v->db;
+    if( vdbeSafety(v) ) return SQLITE_MISUSE_BKPT;
+    sqlite3_mutex_enter(db->mutex);
+    checkProfileCallback(db, v);
+    rc = sqlite3VdbeFinalize(v);
+    rc = sqlite3ApiExit(db, rc);
+    sqlite3LeaveMutexAndCloseZombie(db);
+  }
+  return rc;
+}
+
+/*
+** Terminate the current execution of an SQL statement and reset it
+** back to its starting state so that it can be reused. A success code from
+** the prior execution is returned.
+**
+** This routine sets the error code and string returned by
+** sqlite3_errcode()
