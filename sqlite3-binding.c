@@ -87571,4 +87571,237 @@ SQLITE_API int sqlite3_bind_null(sqlite3_stmt *pStmt, int i){
   }
   return rc;
 }
-SQLITE_API int sqlite3_bi
+SQLITE_API int sqlite3_bind_pointer(
+  sqlite3_stmt *pStmt,
+  int i,
+  void *pPtr,
+  const char *zPTtype,
+  void (*xDestructor)(void*)
+){
+  int rc;
+  Vdbe *p = (Vdbe*)pStmt;
+  rc = vdbeUnbind(p, i);
+  if( rc==SQLITE_OK ){
+    sqlite3VdbeMemSetPointer(&p->aVar[i-1], pPtr, zPTtype, xDestructor);
+    sqlite3_mutex_leave(p->db->mutex);
+  }else if( xDestructor ){
+    xDestructor(pPtr);
+  }
+  return rc;
+}
+SQLITE_API int sqlite3_bind_text(
+  sqlite3_stmt *pStmt,
+  int i,
+  const char *zData,
+  int nData,
+  void (*xDel)(void*)
+){
+  return bindText(pStmt, i, zData, nData, xDel, SQLITE_UTF8);
+}
+SQLITE_API int sqlite3_bind_text64(
+  sqlite3_stmt *pStmt,
+  int i,
+  const char *zData,
+  sqlite3_uint64 nData,
+  void (*xDel)(void*),
+  unsigned char enc
+){
+  assert( xDel!=SQLITE_DYNAMIC );
+  if( enc==SQLITE_UTF16 ) enc = SQLITE_UTF16NATIVE;
+  return bindText(pStmt, i, zData, nData, xDel, enc);
+}
+#ifndef SQLITE_OMIT_UTF16
+SQLITE_API int sqlite3_bind_text16(
+  sqlite3_stmt *pStmt,
+  int i,
+  const void *zData,
+  int nData,
+  void (*xDel)(void*)
+){
+  return bindText(pStmt, i, zData, nData, xDel, SQLITE_UTF16NATIVE);
+}
+#endif /* SQLITE_OMIT_UTF16 */
+SQLITE_API int sqlite3_bind_value(sqlite3_stmt *pStmt, int i, const sqlite3_value *pValue){
+  int rc;
+  switch( sqlite3_value_type((sqlite3_value*)pValue) ){
+    case SQLITE_INTEGER: {
+      rc = sqlite3_bind_int64(pStmt, i, pValue->u.i);
+      break;
+    }
+    case SQLITE_FLOAT: {
+      assert( pValue->flags & (MEM_Real|MEM_IntReal) );
+      rc = sqlite3_bind_double(pStmt, i,
+          (pValue->flags & MEM_Real) ? pValue->u.r : (double)pValue->u.i
+      );
+      break;
+    }
+    case SQLITE_BLOB: {
+      if( pValue->flags & MEM_Zero ){
+        rc = sqlite3_bind_zeroblob(pStmt, i, pValue->u.nZero);
+      }else{
+        rc = sqlite3_bind_blob(pStmt, i, pValue->z, pValue->n,SQLITE_TRANSIENT);
+      }
+      break;
+    }
+    case SQLITE_TEXT: {
+      rc = bindText(pStmt,i,  pValue->z, pValue->n, SQLITE_TRANSIENT,
+                              pValue->enc);
+      break;
+    }
+    default: {
+      rc = sqlite3_bind_null(pStmt, i);
+      break;
+    }
+  }
+  return rc;
+}
+SQLITE_API int sqlite3_bind_zeroblob(sqlite3_stmt *pStmt, int i, int n){
+  int rc;
+  Vdbe *p = (Vdbe *)pStmt;
+  rc = vdbeUnbind(p, i);
+  if( rc==SQLITE_OK ){
+#ifndef SQLITE_OMIT_INCRBLOB
+    sqlite3VdbeMemSetZeroBlob(&p->aVar[i-1], n);
+#else
+    rc = sqlite3VdbeMemSetZeroBlob(&p->aVar[i-1], n);
+#endif
+    sqlite3_mutex_leave(p->db->mutex);
+  }
+  return rc;
+}
+SQLITE_API int sqlite3_bind_zeroblob64(sqlite3_stmt *pStmt, int i, sqlite3_uint64 n){
+  int rc;
+  Vdbe *p = (Vdbe *)pStmt;
+  sqlite3_mutex_enter(p->db->mutex);
+  if( n>(u64)p->db->aLimit[SQLITE_LIMIT_LENGTH] ){
+    rc = SQLITE_TOOBIG;
+  }else{
+    assert( (n & 0x7FFFFFFF)==n );
+    rc = sqlite3_bind_zeroblob(pStmt, i, n);
+  }
+  rc = sqlite3ApiExit(p->db, rc);
+  sqlite3_mutex_leave(p->db->mutex);
+  return rc;
+}
+
+/*
+** Return the number of wildcards that can be potentially bound to.
+** This routine is added to support DBD::SQLite.
+*/
+SQLITE_API int sqlite3_bind_parameter_count(sqlite3_stmt *pStmt){
+  Vdbe *p = (Vdbe*)pStmt;
+  return p ? p->nVar : 0;
+}
+
+/*
+** Return the name of a wildcard parameter.  Return NULL if the index
+** is out of range or if the wildcard is unnamed.
+**
+** The result is always UTF-8.
+*/
+SQLITE_API const char *sqlite3_bind_parameter_name(sqlite3_stmt *pStmt, int i){
+  Vdbe *p = (Vdbe*)pStmt;
+  if( p==0 ) return 0;
+  return sqlite3VListNumToName(p->pVList, i);
+}
+
+/*
+** Given a wildcard parameter name, return the index of the variable
+** with that name.  If there is no variable with the given name,
+** return 0.
+*/
+SQLITE_PRIVATE int sqlite3VdbeParameterIndex(Vdbe *p, const char *zName, int nName){
+  if( p==0 || zName==0 ) return 0;
+  return sqlite3VListNameToNum(p->pVList, zName, nName);
+}
+SQLITE_API int sqlite3_bind_parameter_index(sqlite3_stmt *pStmt, const char *zName){
+  return sqlite3VdbeParameterIndex((Vdbe*)pStmt, zName, sqlite3Strlen30(zName));
+}
+
+/*
+** Transfer all bindings from the first statement over to the second.
+*/
+SQLITE_PRIVATE int sqlite3TransferBindings(sqlite3_stmt *pFromStmt, sqlite3_stmt *pToStmt){
+  Vdbe *pFrom = (Vdbe*)pFromStmt;
+  Vdbe *pTo = (Vdbe*)pToStmt;
+  int i;
+  assert( pTo->db==pFrom->db );
+  assert( pTo->nVar==pFrom->nVar );
+  sqlite3_mutex_enter(pTo->db->mutex);
+  for(i=0; i<pFrom->nVar; i++){
+    sqlite3VdbeMemMove(&pTo->aVar[i], &pFrom->aVar[i]);
+  }
+  sqlite3_mutex_leave(pTo->db->mutex);
+  return SQLITE_OK;
+}
+
+#ifndef SQLITE_OMIT_DEPRECATED
+/*
+** Deprecated external interface.  Internal/core SQLite code
+** should call sqlite3TransferBindings.
+**
+** It is misuse to call this routine with statements from different
+** database connections.  But as this is a deprecated interface, we
+** will not bother to check for that condition.
+**
+** If the two statements contain a different number of bindings, then
+** an SQLITE_ERROR is returned.  Nothing else can go wrong, so otherwise
+** SQLITE_OK is returned.
+*/
+SQLITE_API int sqlite3_transfer_bindings(sqlite3_stmt *pFromStmt, sqlite3_stmt *pToStmt){
+  Vdbe *pFrom = (Vdbe*)pFromStmt;
+  Vdbe *pTo = (Vdbe*)pToStmt;
+  if( pFrom->nVar!=pTo->nVar ){
+    return SQLITE_ERROR;
+  }
+  assert( (pTo->prepFlags & SQLITE_PREPARE_SAVESQL)!=0 || pTo->expmask==0 );
+  if( pTo->expmask ){
+    pTo->expired = 1;
+  }
+  assert( (pFrom->prepFlags & SQLITE_PREPARE_SAVESQL)!=0 || pFrom->expmask==0 );
+  if( pFrom->expmask ){
+    pFrom->expired = 1;
+  }
+  return sqlite3TransferBindings(pFromStmt, pToStmt);
+}
+#endif
+
+/*
+** Return the sqlite3* database handle to which the prepared statement given
+** in the argument belongs.  This is the same database handle that was
+** the first argument to the sqlite3_prepare() that was used to create
+** the statement in the first place.
+*/
+SQLITE_API sqlite3 *sqlite3_db_handle(sqlite3_stmt *pStmt){
+  return pStmt ? ((Vdbe*)pStmt)->db : 0;
+}
+
+/*
+** Return true if the prepared statement is guaranteed to not modify the
+** database.
+*/
+SQLITE_API int sqlite3_stmt_readonly(sqlite3_stmt *pStmt){
+  return pStmt ? ((Vdbe*)pStmt)->readOnly : 1;
+}
+
+/*
+** Return 1 if the statement is an EXPLAIN and return 2 if the
+** statement is an EXPLAIN QUERY PLAN
+*/
+SQLITE_API int sqlite3_stmt_isexplain(sqlite3_stmt *pStmt){
+  return pStmt ? ((Vdbe*)pStmt)->explain : 0;
+}
+
+/*
+** Return true if the prepared statement is in need of being reset.
+*/
+SQLITE_API int sqlite3_stmt_busy(sqlite3_stmt *pStmt){
+  Vdbe *v = (Vdbe*)pStmt;
+  return v!=0 && v->eVdbeState==VDBE_RUN_STATE;
+}
+
+/*
+** Return a pointer to the next prepared statement after pStmt associated
+** with database connection pDb.  If pStmt is NULL, return the first
+** prepared statement for the database connection.  Return NULL if there
+** are no mor
