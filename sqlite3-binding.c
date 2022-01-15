@@ -88245,4 +88245,186 @@ static int findNextHostParameter(const char *zSql, int *pnToken){
 ** the value as a literal in place of the host parameter name.
 */
 SQLITE_PRIVATE char *sqlite3VdbeExpandSql(
-  Vdbe *p,                 /* 
+  Vdbe *p,                 /* The prepared statement being evaluated */
+  const char *zRawSql      /* Raw text of the SQL statement */
+){
+  sqlite3 *db;             /* The database connection */
+  int idx = 0;             /* Index of a host parameter */
+  int nextIndex = 1;       /* Index of next ? host parameter */
+  int n;                   /* Length of a token prefix */
+  int nToken;              /* Length of the parameter token */
+  int i;                   /* Loop counter */
+  Mem *pVar;               /* Value of a host parameter */
+  StrAccum out;            /* Accumulate the output here */
+#ifndef SQLITE_OMIT_UTF16
+  Mem utf8;                /* Used to convert UTF16 into UTF8 for display */
+#endif
+
+  db = p->db;
+  sqlite3StrAccumInit(&out, 0, 0, 0, db->aLimit[SQLITE_LIMIT_LENGTH]);
+  if( db->nVdbeExec>1 ){
+    while( *zRawSql ){
+      const char *zStart = zRawSql;
+      while( *(zRawSql++)!='\n' && *zRawSql );
+      sqlite3_str_append(&out, "-- ", 3);
+      assert( (zRawSql - zStart) > 0 );
+      sqlite3_str_append(&out, zStart, (int)(zRawSql-zStart));
+    }
+  }else if( p->nVar==0 ){
+    sqlite3_str_append(&out, zRawSql, sqlite3Strlen30(zRawSql));
+  }else{
+    while( zRawSql[0] ){
+      n = findNextHostParameter(zRawSql, &nToken);
+      assert( n>0 );
+      sqlite3_str_append(&out, zRawSql, n);
+      zRawSql += n;
+      assert( zRawSql[0] || nToken==0 );
+      if( nToken==0 ) break;
+      if( zRawSql[0]=='?' ){
+        if( nToken>1 ){
+          assert( sqlite3Isdigit(zRawSql[1]) );
+          sqlite3GetInt32(&zRawSql[1], &idx);
+        }else{
+          idx = nextIndex;
+        }
+      }else{
+        assert( zRawSql[0]==':' || zRawSql[0]=='$' ||
+                zRawSql[0]=='@' || zRawSql[0]=='#' );
+        testcase( zRawSql[0]==':' );
+        testcase( zRawSql[0]=='$' );
+        testcase( zRawSql[0]=='@' );
+        testcase( zRawSql[0]=='#' );
+        idx = sqlite3VdbeParameterIndex(p, zRawSql, nToken);
+        assert( idx>0 );
+      }
+      zRawSql += nToken;
+      nextIndex = MAX(idx + 1, nextIndex);
+      assert( idx>0 && idx<=p->nVar );
+      pVar = &p->aVar[idx-1];
+      if( pVar->flags & MEM_Null ){
+        sqlite3_str_append(&out, "NULL", 4);
+      }else if( pVar->flags & (MEM_Int|MEM_IntReal) ){
+        sqlite3_str_appendf(&out, "%lld", pVar->u.i);
+      }else if( pVar->flags & MEM_Real ){
+        sqlite3_str_appendf(&out, "%!.15g", pVar->u.r);
+      }else if( pVar->flags & MEM_Str ){
+        int nOut;  /* Number of bytes of the string text to include in output */
+#ifndef SQLITE_OMIT_UTF16
+        u8 enc = ENC(db);
+        if( enc!=SQLITE_UTF8 ){
+          memset(&utf8, 0, sizeof(utf8));
+          utf8.db = db;
+          sqlite3VdbeMemSetStr(&utf8, pVar->z, pVar->n, enc, SQLITE_STATIC);
+          if( SQLITE_NOMEM==sqlite3VdbeChangeEncoding(&utf8, SQLITE_UTF8) ){
+            out.accError = SQLITE_NOMEM;
+            out.nAlloc = 0;
+          }
+          pVar = &utf8;
+        }
+#endif
+        nOut = pVar->n;
+#ifdef SQLITE_TRACE_SIZE_LIMIT
+        if( nOut>SQLITE_TRACE_SIZE_LIMIT ){
+          nOut = SQLITE_TRACE_SIZE_LIMIT;
+          while( nOut<pVar->n && (pVar->z[nOut]&0xc0)==0x80 ){ nOut++; }
+        }
+#endif
+        sqlite3_str_appendf(&out, "'%.*q'", nOut, pVar->z);
+#ifdef SQLITE_TRACE_SIZE_LIMIT
+        if( nOut<pVar->n ){
+          sqlite3_str_appendf(&out, "/*+%d bytes*/", pVar->n-nOut);
+        }
+#endif
+#ifndef SQLITE_OMIT_UTF16
+        if( enc!=SQLITE_UTF8 ) sqlite3VdbeMemRelease(&utf8);
+#endif
+      }else if( pVar->flags & MEM_Zero ){
+        sqlite3_str_appendf(&out, "zeroblob(%d)", pVar->u.nZero);
+      }else{
+        int nOut;  /* Number of bytes of the blob to include in output */
+        assert( pVar->flags & MEM_Blob );
+        sqlite3_str_append(&out, "x'", 2);
+        nOut = pVar->n;
+#ifdef SQLITE_TRACE_SIZE_LIMIT
+        if( nOut>SQLITE_TRACE_SIZE_LIMIT ) nOut = SQLITE_TRACE_SIZE_LIMIT;
+#endif
+        for(i=0; i<nOut; i++){
+          sqlite3_str_appendf(&out, "%02x", pVar->z[i]&0xff);
+        }
+        sqlite3_str_append(&out, "'", 1);
+#ifdef SQLITE_TRACE_SIZE_LIMIT
+        if( nOut<pVar->n ){
+          sqlite3_str_appendf(&out, "/*+%d bytes*/", pVar->n-nOut);
+        }
+#endif
+      }
+    }
+  }
+  if( out.accError ) sqlite3_str_reset(&out);
+  return sqlite3StrAccumFinish(&out);
+}
+
+#endif /* #ifndef SQLITE_OMIT_TRACE */
+
+/************** End of vdbetrace.c *******************************************/
+/************** Begin file vdbe.c ********************************************/
+/*
+** 2001 September 15
+**
+** The author disclaims copyright to this source code.  In place of
+** a legal notice, here is a blessing:
+**
+**    May you do good and not evil.
+**    May you find forgiveness for yourself and forgive others.
+**    May you share freely, never taking more than you give.
+**
+*************************************************************************
+** The code in this file implements the function that runs the
+** bytecode of a prepared statement.
+**
+** Various scripts scan this source file in order to generate HTML
+** documentation, headers files, or other derived files.  The formatting
+** of the code in this file is, therefore, important.  See other comments
+** in this file for details.  If in doubt, do not deviate from existing
+** commenting and indentation practices when changing or adding code.
+*/
+/* #include "sqliteInt.h" */
+/* #include "vdbeInt.h" */
+
+/*
+** Invoke this macro on memory cells just prior to changing the
+** value of the cell.  This macro verifies that shallow copies are
+** not misused.  A shallow copy of a string or blob just copies a
+** pointer to the string or blob, not the content.  If the original
+** is changed while the copy is still in use, the string or blob might
+** be changed out from under the copy.  This macro verifies that nothing
+** like that ever happens.
+*/
+#ifdef SQLITE_DEBUG
+# define memAboutToChange(P,M) sqlite3VdbeMemAboutToChange(P,M)
+#else
+# define memAboutToChange(P,M)
+#endif
+
+/*
+** The following global variable is incremented every time a cursor
+** moves, either by the OP_SeekXX, OP_Next, or OP_Prev opcodes.  The test
+** procedures use this information to make sure that indices are
+** working correctly.  This variable has no function other than to
+** help verify the correct operation of the library.
+*/
+#ifdef SQLITE_TEST
+SQLITE_API int sqlite3_search_count = 0;
+#endif
+
+/*
+** When this global variable is positive, it gets decremented once before
+** each instruction in the VDBE.  When it reaches zero, the u1.isInterrupted
+** field of the sqlite3 structure is set in order to simulate an interrupt.
+**
+** This facility is used for testing purposes only.  It does not function
+** in an ordinary build.
+*/
+#ifdef SQLITE_TEST
+SQLITE_API int sqlite3_interrupt_count = 0;
+#e
