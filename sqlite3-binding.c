@@ -87158,4 +87158,212 @@ static const Mem *columnNullValue(void){
 }
 
 /*
-** Check
+** Check to see if column iCol of the given statement is valid.  If
+** it is, return a pointer to the Mem for the value of that column.
+** If iCol is not valid, return a pointer to a Mem which has a value
+** of NULL.
+*/
+static Mem *columnMem(sqlite3_stmt *pStmt, int i){
+  Vdbe *pVm;
+  Mem *pOut;
+
+  pVm = (Vdbe *)pStmt;
+  if( pVm==0 ) return (Mem*)columnNullValue();
+  assert( pVm->db );
+  sqlite3_mutex_enter(pVm->db->mutex);
+  if( pVm->pResultSet!=0 && i<pVm->nResColumn && i>=0 ){
+    pOut = &pVm->pResultSet[i];
+  }else{
+    sqlite3Error(pVm->db, SQLITE_RANGE);
+    pOut = (Mem*)columnNullValue();
+  }
+  return pOut;
+}
+
+/*
+** This function is called after invoking an sqlite3_value_XXX function on a
+** column value (i.e. a value returned by evaluating an SQL expression in the
+** select list of a SELECT statement) that may cause a malloc() failure. If
+** malloc() has failed, the threads mallocFailed flag is cleared and the result
+** code of statement pStmt set to SQLITE_NOMEM.
+**
+** Specifically, this is called from within:
+**
+**     sqlite3_column_int()
+**     sqlite3_column_int64()
+**     sqlite3_column_text()
+**     sqlite3_column_text16()
+**     sqlite3_column_real()
+**     sqlite3_column_bytes()
+**     sqlite3_column_bytes16()
+**     sqiite3_column_blob()
+*/
+static void columnMallocFailure(sqlite3_stmt *pStmt)
+{
+  /* If malloc() failed during an encoding conversion within an
+  ** sqlite3_column_XXX API, then set the return code of the statement to
+  ** SQLITE_NOMEM. The next call to _step() (if any) will return SQLITE_ERROR
+  ** and _finalize() will return NOMEM.
+  */
+  Vdbe *p = (Vdbe *)pStmt;
+  if( p ){
+    assert( p->db!=0 );
+    assert( sqlite3_mutex_held(p->db->mutex) );
+    p->rc = sqlite3ApiExit(p->db, p->rc);
+    sqlite3_mutex_leave(p->db->mutex);
+  }
+}
+
+/**************************** sqlite3_column_  *******************************
+** The following routines are used to access elements of the current row
+** in the result set.
+*/
+SQLITE_API const void *sqlite3_column_blob(sqlite3_stmt *pStmt, int i){
+  const void *val;
+  val = sqlite3_value_blob( columnMem(pStmt,i) );
+  /* Even though there is no encoding conversion, value_blob() might
+  ** need to call malloc() to expand the result of a zeroblob()
+  ** expression.
+  */
+  columnMallocFailure(pStmt);
+  return val;
+}
+SQLITE_API int sqlite3_column_bytes(sqlite3_stmt *pStmt, int i){
+  int val = sqlite3_value_bytes( columnMem(pStmt,i) );
+  columnMallocFailure(pStmt);
+  return val;
+}
+SQLITE_API int sqlite3_column_bytes16(sqlite3_stmt *pStmt, int i){
+  int val = sqlite3_value_bytes16( columnMem(pStmt,i) );
+  columnMallocFailure(pStmt);
+  return val;
+}
+SQLITE_API double sqlite3_column_double(sqlite3_stmt *pStmt, int i){
+  double val = sqlite3_value_double( columnMem(pStmt,i) );
+  columnMallocFailure(pStmt);
+  return val;
+}
+SQLITE_API int sqlite3_column_int(sqlite3_stmt *pStmt, int i){
+  int val = sqlite3_value_int( columnMem(pStmt,i) );
+  columnMallocFailure(pStmt);
+  return val;
+}
+SQLITE_API sqlite_int64 sqlite3_column_int64(sqlite3_stmt *pStmt, int i){
+  sqlite_int64 val = sqlite3_value_int64( columnMem(pStmt,i) );
+  columnMallocFailure(pStmt);
+  return val;
+}
+SQLITE_API const unsigned char *sqlite3_column_text(sqlite3_stmt *pStmt, int i){
+  const unsigned char *val = sqlite3_value_text( columnMem(pStmt,i) );
+  columnMallocFailure(pStmt);
+  return val;
+}
+SQLITE_API sqlite3_value *sqlite3_column_value(sqlite3_stmt *pStmt, int i){
+  Mem *pOut = columnMem(pStmt, i);
+  if( pOut->flags&MEM_Static ){
+    pOut->flags &= ~MEM_Static;
+    pOut->flags |= MEM_Ephem;
+  }
+  columnMallocFailure(pStmt);
+  return (sqlite3_value *)pOut;
+}
+#ifndef SQLITE_OMIT_UTF16
+SQLITE_API const void *sqlite3_column_text16(sqlite3_stmt *pStmt, int i){
+  const void *val = sqlite3_value_text16( columnMem(pStmt,i) );
+  columnMallocFailure(pStmt);
+  return val;
+}
+#endif /* SQLITE_OMIT_UTF16 */
+SQLITE_API int sqlite3_column_type(sqlite3_stmt *pStmt, int i){
+  int iType = sqlite3_value_type( columnMem(pStmt,i) );
+  columnMallocFailure(pStmt);
+  return iType;
+}
+
+/*
+** Convert the N-th element of pStmt->pColName[] into a string using
+** xFunc() then return that string.  If N is out of range, return 0.
+**
+** There are up to 5 names for each column.  useType determines which
+** name is returned.  Here are the names:
+**
+**    0      The column name as it should be displayed for output
+**    1      The datatype name for the column
+**    2      The name of the database that the column derives from
+**    3      The name of the table that the column derives from
+**    4      The name of the table column that the result column derives from
+**
+** If the result is not a simple column reference (if it is an expression
+** or a constant) then useTypes 2, 3, and 4 return NULL.
+*/
+static const void *columnName(
+  sqlite3_stmt *pStmt,     /* The statement */
+  int N,                   /* Which column to get the name for */
+  int useUtf16,            /* True to return the name as UTF16 */
+  int useType              /* What type of name */
+){
+  const void *ret;
+  Vdbe *p;
+  int n;
+  sqlite3 *db;
+#ifdef SQLITE_ENABLE_API_ARMOR
+  if( pStmt==0 ){
+    (void)SQLITE_MISUSE_BKPT;
+    return 0;
+  }
+#endif
+  ret = 0;
+  p = (Vdbe *)pStmt;
+  db = p->db;
+  assert( db!=0 );
+  n = sqlite3_column_count(pStmt);
+  if( N<n && N>=0 ){
+    N += useType*n;
+    sqlite3_mutex_enter(db->mutex);
+    assert( db->mallocFailed==0 );
+#ifndef SQLITE_OMIT_UTF16
+    if( useUtf16 ){
+      ret = sqlite3_value_text16((sqlite3_value*)&p->aColName[N]);
+    }else
+#endif
+    {
+      ret = sqlite3_value_text((sqlite3_value*)&p->aColName[N]);
+    }
+    /* A malloc may have failed inside of the _text() call. If this
+    ** is the case, clear the mallocFailed flag and return NULL.
+    */
+    if( db->mallocFailed ){
+      sqlite3OomClear(db);
+      ret = 0;
+    }
+    sqlite3_mutex_leave(db->mutex);
+  }
+  return ret;
+}
+
+/*
+** Return the name of the Nth column of the result set returned by SQL
+** statement pStmt.
+*/
+SQLITE_API const char *sqlite3_column_name(sqlite3_stmt *pStmt, int N){
+  return columnName(pStmt, N, 0, COLNAME_NAME);
+}
+#ifndef SQLITE_OMIT_UTF16
+SQLITE_API const void *sqlite3_column_name16(sqlite3_stmt *pStmt, int N){
+  return columnName(pStmt, N, 1, COLNAME_NAME);
+}
+#endif
+
+/*
+** Constraint:  If you have ENABLE_COLUMN_METADATA then you must
+** not define OMIT_DECLTYPE.
+*/
+#if defined(SQLITE_OMIT_DECLTYPE) && defined(SQLITE_ENABLE_COLUMN_METADATA)
+# error "Must not define both SQLITE_OMIT_DECLTYPE \
+         and SQLITE_ENABLE_COLUMN_METADATA"
+#endif
+
+#ifndef SQLITE_OMIT_DECLTYPE
+/*
+** Return the column declaration type (if applicable) of the 'i'th column
+** of the result set 
