@@ -88592,4 +88592,178 @@ static void test_trace_breakpoint(int pc, Op *pOp, Vdbe *v){
 ** does not control the string, it might be deleted without the register
 ** knowing it.
 **
-** This routine converts an ephemeral s
+** This routine converts an ephemeral string into a dynamically allocated
+** string that the register itself controls.  In other words, it
+** converts an MEM_Ephem string into a string with P.z==P.zMalloc.
+*/
+#define Deephemeralize(P) \
+   if( ((P)->flags&MEM_Ephem)!=0 \
+       && sqlite3VdbeMemMakeWriteable(P) ){ goto no_mem;}
+
+/* Return true if the cursor was opened using the OP_OpenSorter opcode. */
+#define isSorter(x) ((x)->eCurType==CURTYPE_SORTER)
+
+/*
+** Allocate VdbeCursor number iCur.  Return a pointer to it.  Return NULL
+** if we run out of memory.
+*/
+static VdbeCursor *allocateCursor(
+  Vdbe *p,              /* The virtual machine */
+  int iCur,             /* Index of the new VdbeCursor */
+  int nField,           /* Number of fields in the table or index */
+  u8 eCurType           /* Type of the new cursor */
+){
+  /* Find the memory cell that will be used to store the blob of memory
+  ** required for this VdbeCursor structure. It is convenient to use a
+  ** vdbe memory cell to manage the memory allocation required for a
+  ** VdbeCursor structure for the following reasons:
+  **
+  **   * Sometimes cursor numbers are used for a couple of different
+  **     purposes in a vdbe program. The different uses might require
+  **     different sized allocations. Memory cells provide growable
+  **     allocations.
+  **
+  **   * When using ENABLE_MEMORY_MANAGEMENT, memory cell buffers can
+  **     be freed lazily via the sqlite3_release_memory() API. This
+  **     minimizes the number of malloc calls made by the system.
+  **
+  ** The memory cell for cursor 0 is aMem[0]. The rest are allocated from
+  ** the top of the register space.  Cursor 1 is at Mem[p->nMem-1].
+  ** Cursor 2 is at Mem[p->nMem-2]. And so forth.
+  */
+  Mem *pMem = iCur>0 ? &p->aMem[p->nMem-iCur] : p->aMem;
+
+  int nByte;
+  VdbeCursor *pCx = 0;
+  nByte =
+      ROUND8P(sizeof(VdbeCursor)) + 2*sizeof(u32)*nField +
+      (eCurType==CURTYPE_BTREE?sqlite3BtreeCursorSize():0);
+
+  assert( iCur>=0 && iCur<p->nCursor );
+  if( p->apCsr[iCur] ){ /*OPTIMIZATION-IF-FALSE*/
+    sqlite3VdbeFreeCursorNN(p, p->apCsr[iCur]);
+    p->apCsr[iCur] = 0;
+  }
+
+  /* There used to be a call to sqlite3VdbeMemClearAndResize() to make sure
+  ** the pMem used to hold space for the cursor has enough storage available
+  ** in pMem->zMalloc.  But for the special case of the aMem[] entries used
+  ** to hold cursors, it is faster to in-line the logic. */
+  assert( pMem->flags==MEM_Undefined );
+  assert( (pMem->flags & MEM_Dyn)==0 );
+  assert( pMem->szMalloc==0 || pMem->z==pMem->zMalloc );
+  if( pMem->szMalloc<nByte ){
+    if( pMem->szMalloc>0 ){
+      sqlite3DbFreeNN(pMem->db, pMem->zMalloc);
+    }
+    pMem->z = pMem->zMalloc = sqlite3DbMallocRaw(pMem->db, nByte);
+    if( pMem->zMalloc==0 ){
+      pMem->szMalloc = 0;
+      return 0;
+    }
+    pMem->szMalloc = nByte;
+  }
+
+  p->apCsr[iCur] = pCx = (VdbeCursor*)pMem->zMalloc;
+  memset(pCx, 0, offsetof(VdbeCursor,pAltCursor));
+  pCx->eCurType = eCurType;
+  pCx->nField = nField;
+  pCx->aOffset = &pCx->aType[nField];
+  if( eCurType==CURTYPE_BTREE ){
+    pCx->uc.pCursor = (BtCursor*)
+        &pMem->z[ROUND8P(sizeof(VdbeCursor))+2*sizeof(u32)*nField];
+    sqlite3BtreeCursorZero(pCx->uc.pCursor);
+  }
+  return pCx;
+}
+
+/*
+** The string in pRec is known to look like an integer and to have a
+** floating point value of rValue.  Return true and set *piValue to the
+** integer value if the string is in range to be an integer.  Otherwise,
+** return false.
+*/
+static int alsoAnInt(Mem *pRec, double rValue, i64 *piValue){
+  i64 iValue = (double)rValue;
+  if( sqlite3RealSameAsInt(rValue,iValue) ){
+    *piValue = iValue;
+    return 1;
+  }
+  return 0==sqlite3Atoi64(pRec->z, piValue, pRec->n, pRec->enc);
+}
+
+/*
+** Try to convert a value into a numeric representation if we can
+** do so without loss of information.  In other words, if the string
+** looks like a number, convert it into a number.  If it does not
+** look like a number, leave it alone.
+**
+** If the bTryForInt flag is true, then extra effort is made to give
+** an integer representation.  Strings that look like floating point
+** values but which have no fractional component (example: '48.00')
+** will have a MEM_Int representation when bTryForInt is true.
+**
+** If bTryForInt is false, then if the input string contains a decimal
+** point or exponential notation, the result is only MEM_Real, even
+** if there is an exact integer representation of the quantity.
+*/
+static void applyNumericAffinity(Mem *pRec, int bTryForInt){
+  double rValue;
+  u8 enc = pRec->enc;
+  int rc;
+  assert( (pRec->flags & (MEM_Str|MEM_Int|MEM_Real|MEM_IntReal))==MEM_Str );
+  rc = sqlite3AtoF(pRec->z, &rValue, pRec->n, enc);
+  if( rc<=0 ) return;
+  if( rc==1 && alsoAnInt(pRec, rValue, &pRec->u.i) ){
+    pRec->flags |= MEM_Int;
+  }else{
+    pRec->u.r = rValue;
+    pRec->flags |= MEM_Real;
+    if( bTryForInt ) sqlite3VdbeIntegerAffinity(pRec);
+  }
+  /* TEXT->NUMERIC is many->one.  Hence, it is important to invalidate the
+  ** string representation after computing a numeric equivalent, because the
+  ** string representation might not be the canonical representation for the
+  ** numeric value.  Ticket [343634942dd54ab57b7024] 2018-01-31. */
+  pRec->flags &= ~MEM_Str;
+}
+
+/*
+** Processing is determine by the affinity parameter:
+**
+** SQLITE_AFF_INTEGER:
+** SQLITE_AFF_REAL:
+** SQLITE_AFF_NUMERIC:
+**    Try to convert pRec to an integer representation or a
+**    floating-point representation if an integer representation
+**    is not possible.  Note that the integer representation is
+**    always preferred, even if the affinity is REAL, because
+**    an integer representation is more space efficient on disk.
+**
+** SQLITE_AFF_TEXT:
+**    Convert pRec to a text representation.
+**
+** SQLITE_AFF_BLOB:
+** SQLITE_AFF_NONE:
+**    No-op.  pRec is unchanged.
+*/
+static void applyAffinity(
+  Mem *pRec,          /* The value to apply affinity to */
+  char affinity,      /* The affinity to be applied */
+  u8 enc              /* Use this text encoding */
+){
+  if( affinity>=SQLITE_AFF_NUMERIC ){
+    assert( affinity==SQLITE_AFF_INTEGER || affinity==SQLITE_AFF_REAL
+             || affinity==SQLITE_AFF_NUMERIC );
+    if( (pRec->flags & MEM_Int)==0 ){ /*OPTIMIZATION-IF-FALSE*/
+      if( (pRec->flags & MEM_Real)==0 ){
+        if( pRec->flags & MEM_Str ) applyNumericAffinity(pRec,1);
+      }else{
+        sqlite3VdbeIntegerAffinity(pRec);
+      }
+    }
+  }else if( affinity==SQLITE_AFF_TEXT ){
+    /* Only attempt the conversion to TEXT if there is an integer or real
+    ** representation (blob and NULL do not get converted) but no string
+    ** representation.  It would be harmless to repeat the conversion if
+    ** there is already a string rep, b
