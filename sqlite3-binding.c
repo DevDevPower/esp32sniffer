@@ -88034,4 +88034,215 @@ SQLITE_API int sqlite3_preupdate_blobwrite(sqlite3 *db){
 SQLITE_API int sqlite3_preupdate_new(sqlite3 *db, int iIdx, sqlite3_value **ppValue){
   PreUpdate *p = db->pPreUpdate;
   int rc = SQLITE_OK;
-  Mem *
+  Mem *pMem;
+
+  if( !p || p->op==SQLITE_DELETE ){
+    rc = SQLITE_MISUSE_BKPT;
+    goto preupdate_new_out;
+  }
+  if( p->pPk && p->op!=SQLITE_UPDATE ){
+    iIdx = sqlite3TableColumnToIndex(p->pPk, iIdx);
+  }
+  if( iIdx>=p->pCsr->nField || iIdx<0 ){
+    rc = SQLITE_RANGE;
+    goto preupdate_new_out;
+  }
+
+  if( p->op==SQLITE_INSERT ){
+    /* For an INSERT, memory cell p->iNewReg contains the serialized record
+    ** that is being inserted. Deserialize it. */
+    UnpackedRecord *pUnpack = p->pNewUnpacked;
+    if( !pUnpack ){
+      Mem *pData = &p->v->aMem[p->iNewReg];
+      rc = ExpandBlob(pData);
+      if( rc!=SQLITE_OK ) goto preupdate_new_out;
+      pUnpack = vdbeUnpackRecord(&p->keyinfo, pData->n, pData->z);
+      if( !pUnpack ){
+        rc = SQLITE_NOMEM;
+        goto preupdate_new_out;
+      }
+      p->pNewUnpacked = pUnpack;
+    }
+    pMem = &pUnpack->aMem[iIdx];
+    if( iIdx==p->pTab->iPKey ){
+      sqlite3VdbeMemSetInt64(pMem, p->iKey2);
+    }else if( iIdx>=pUnpack->nField ){
+      pMem = (sqlite3_value *)columnNullValue();
+    }
+  }else{
+    /* For an UPDATE, memory cell (p->iNewReg+1+iIdx) contains the required
+    ** value. Make a copy of the cell contents and return a pointer to it.
+    ** It is not safe to return a pointer to the memory cell itself as the
+    ** caller may modify the value text encoding.
+    */
+    assert( p->op==SQLITE_UPDATE );
+    if( !p->aNew ){
+      p->aNew = (Mem *)sqlite3DbMallocZero(db, sizeof(Mem) * p->pCsr->nField);
+      if( !p->aNew ){
+        rc = SQLITE_NOMEM;
+        goto preupdate_new_out;
+      }
+    }
+    assert( iIdx>=0 && iIdx<p->pCsr->nField );
+    pMem = &p->aNew[iIdx];
+    if( pMem->flags==0 ){
+      if( iIdx==p->pTab->iPKey ){
+        sqlite3VdbeMemSetInt64(pMem, p->iKey2);
+      }else{
+        rc = sqlite3VdbeMemCopy(pMem, &p->v->aMem[p->iNewReg+1+iIdx]);
+        if( rc!=SQLITE_OK ) goto preupdate_new_out;
+      }
+    }
+  }
+  *ppValue = pMem;
+
+ preupdate_new_out:
+  sqlite3Error(db, rc);
+  return sqlite3ApiExit(db, rc);
+}
+#endif /* SQLITE_ENABLE_PREUPDATE_HOOK */
+
+#ifdef SQLITE_ENABLE_STMT_SCANSTATUS
+/*
+** Return status data for a single loop within query pStmt.
+*/
+SQLITE_API int sqlite3_stmt_scanstatus(
+  sqlite3_stmt *pStmt,            /* Prepared statement being queried */
+  int idx,                        /* Index of loop to report on */
+  int iScanStatusOp,              /* Which metric to return */
+  void *pOut                      /* OUT: Write the answer here */
+){
+  Vdbe *p = (Vdbe*)pStmt;
+  ScanStatus *pScan;
+  if( idx<0 || idx>=p->nScan ) return 1;
+  pScan = &p->aScan[idx];
+  switch( iScanStatusOp ){
+    case SQLITE_SCANSTAT_NLOOP: {
+      *(sqlite3_int64*)pOut = p->anExec[pScan->addrLoop];
+      break;
+    }
+    case SQLITE_SCANSTAT_NVISIT: {
+      *(sqlite3_int64*)pOut = p->anExec[pScan->addrVisit];
+      break;
+    }
+    case SQLITE_SCANSTAT_EST: {
+      double r = 1.0;
+      LogEst x = pScan->nEst;
+      while( x<100 ){
+        x += 10;
+        r *= 0.5;
+      }
+      *(double*)pOut = r*sqlite3LogEstToInt(x);
+      break;
+    }
+    case SQLITE_SCANSTAT_NAME: {
+      *(const char**)pOut = pScan->zName;
+      break;
+    }
+    case SQLITE_SCANSTAT_EXPLAIN: {
+      if( pScan->addrExplain ){
+        *(const char**)pOut = p->aOp[ pScan->addrExplain ].p4.z;
+      }else{
+        *(const char**)pOut = 0;
+      }
+      break;
+    }
+    case SQLITE_SCANSTAT_SELECTID: {
+      if( pScan->addrExplain ){
+        *(int*)pOut = p->aOp[ pScan->addrExplain ].p1;
+      }else{
+        *(int*)pOut = -1;
+      }
+      break;
+    }
+    default: {
+      return 1;
+    }
+  }
+  return 0;
+}
+
+/*
+** Zero all counters associated with the sqlite3_stmt_scanstatus() data.
+*/
+SQLITE_API void sqlite3_stmt_scanstatus_reset(sqlite3_stmt *pStmt){
+  Vdbe *p = (Vdbe*)pStmt;
+  memset(p->anExec, 0, p->nOp * sizeof(i64));
+}
+#endif /* SQLITE_ENABLE_STMT_SCANSTATUS */
+
+/************** End of vdbeapi.c *********************************************/
+/************** Begin file vdbetrace.c ***************************************/
+/*
+** 2009 November 25
+**
+** The author disclaims copyright to this source code.  In place of
+** a legal notice, here is a blessing:
+**
+**    May you do good and not evil.
+**    May you find forgiveness for yourself and forgive others.
+**    May you share freely, never taking more than you give.
+**
+*************************************************************************
+**
+** This file contains code used to insert the values of host parameters
+** (aka "wildcards") into the SQL text output by sqlite3_trace().
+**
+** The Vdbe parse-tree explainer is also found here.
+*/
+/* #include "sqliteInt.h" */
+/* #include "vdbeInt.h" */
+
+#ifndef SQLITE_OMIT_TRACE
+
+/*
+** zSql is a zero-terminated string of UTF-8 SQL text.  Return the number of
+** bytes in this text up to but excluding the first character in
+** a host parameter.  If the text contains no host parameters, return
+** the total number of bytes in the text.
+*/
+static int findNextHostParameter(const char *zSql, int *pnToken){
+  int tokenType;
+  int nTotal = 0;
+  int n;
+
+  *pnToken = 0;
+  while( zSql[0] ){
+    n = sqlite3GetToken((u8*)zSql, &tokenType);
+    assert( n>0 && tokenType!=TK_ILLEGAL );
+    if( tokenType==TK_VARIABLE ){
+      *pnToken = n;
+      break;
+    }
+    nTotal += n;
+    zSql += n;
+  }
+  return nTotal;
+}
+
+/*
+** This function returns a pointer to a nul-terminated string in memory
+** obtained from sqlite3DbMalloc(). If sqlite3.nVdbeExec is 1, then the
+** string contains a copy of zRawSql but with host parameters expanded to
+** their current bindings. Or, if sqlite3.nVdbeExec is greater than 1,
+** then the returned string holds a copy of zRawSql with "-- " prepended
+** to each line of text.
+**
+** If the SQLITE_TRACE_SIZE_LIMIT macro is defined to an integer, then
+** then long strings and blobs are truncated to that many bytes.  This
+** can be used to prevent unreasonably large trace strings when dealing
+** with large (multi-megabyte) strings and blobs.
+**
+** The calling function is responsible for making sure the memory returned
+** is eventually freed.
+**
+** ALGORITHM:  Scan the input string looking for host parameters in any of
+** these forms:  ?, ?N, $A, @A, :A.  Take care to avoid text within
+** string literals, quoted identifier names, and comments.  For text forms,
+** the host parameter index is found by scanning the prepared
+** statement for the corresponding OP_Variable opcode.  Once the host
+** parameter index is known, locate the value in p->aVar[].  Then render
+** the value as a literal in place of the host parameter name.
+*/
+SQLITE_PRIVATE char *sqlite3VdbeExpandSql(
+  Vdbe *p,                 /* 
