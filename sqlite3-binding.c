@@ -86934,4 +86934,228 @@ static int valueFromValueList(
 ** Set (*ppOut) to point to this value before returning.
 */
 SQLITE_API int sqlite3_vtab_in_first(sqlite3_value *pVal, sqlite3_value **ppOut){
-  return valueFro
+  return valueFromValueList(pVal, ppOut, 0);
+}
+
+/*
+** Set the iterator value pVal to point to the next value in the set.
+** Set (*ppOut) to point to this value before returning.
+*/
+SQLITE_API int sqlite3_vtab_in_next(sqlite3_value *pVal, sqlite3_value **ppOut){
+  return valueFromValueList(pVal, ppOut, 1);
+}
+
+/*
+** Return the current time for a statement.  If the current time
+** is requested more than once within the same run of a single prepared
+** statement, the exact same time is returned for each invocation regardless
+** of the amount of time that elapses between invocations.  In other words,
+** the time returned is always the time of the first call.
+*/
+SQLITE_PRIVATE sqlite3_int64 sqlite3StmtCurrentTime(sqlite3_context *p){
+  int rc;
+#ifndef SQLITE_ENABLE_STAT4
+  sqlite3_int64 *piTime = &p->pVdbe->iCurrentTime;
+  assert( p->pVdbe!=0 );
+#else
+  sqlite3_int64 iTime = 0;
+  sqlite3_int64 *piTime = p->pVdbe!=0 ? &p->pVdbe->iCurrentTime : &iTime;
+#endif
+  if( *piTime==0 ){
+    rc = sqlite3OsCurrentTimeInt64(p->pOut->db->pVfs, piTime);
+    if( rc ) *piTime = 0;
+  }
+  return *piTime;
+}
+
+/*
+** Create a new aggregate context for p and return a pointer to
+** its pMem->z element.
+*/
+static SQLITE_NOINLINE void *createAggContext(sqlite3_context *p, int nByte){
+  Mem *pMem = p->pMem;
+  assert( (pMem->flags & MEM_Agg)==0 );
+  if( nByte<=0 ){
+    sqlite3VdbeMemSetNull(pMem);
+    pMem->z = 0;
+  }else{
+    sqlite3VdbeMemClearAndResize(pMem, nByte);
+    pMem->flags = MEM_Agg;
+    pMem->u.pDef = p->pFunc;
+    if( pMem->z ){
+      memset(pMem->z, 0, nByte);
+    }
+  }
+  return (void*)pMem->z;
+}
+
+/*
+** Allocate or return the aggregate context for a user function.  A new
+** context is allocated on the first call.  Subsequent calls return the
+** same context that was returned on prior calls.
+*/
+SQLITE_API void *sqlite3_aggregate_context(sqlite3_context *p, int nByte){
+  assert( p && p->pFunc && p->pFunc->xFinalize );
+  assert( sqlite3_mutex_held(p->pOut->db->mutex) );
+  testcase( nByte<0 );
+  if( (p->pMem->flags & MEM_Agg)==0 ){
+    return createAggContext(p, nByte);
+  }else{
+    return (void*)p->pMem->z;
+  }
+}
+
+/*
+** Return the auxiliary data pointer, if any, for the iArg'th argument to
+** the user-function defined by pCtx.
+**
+** The left-most argument is 0.
+**
+** Undocumented behavior:  If iArg is negative then access a cache of
+** auxiliary data pointers that is available to all functions within a
+** single prepared statement.  The iArg values must match.
+*/
+SQLITE_API void *sqlite3_get_auxdata(sqlite3_context *pCtx, int iArg){
+  AuxData *pAuxData;
+
+  assert( sqlite3_mutex_held(pCtx->pOut->db->mutex) );
+#if SQLITE_ENABLE_STAT4
+  if( pCtx->pVdbe==0 ) return 0;
+#else
+  assert( pCtx->pVdbe!=0 );
+#endif
+  for(pAuxData=pCtx->pVdbe->pAuxData; pAuxData; pAuxData=pAuxData->pNextAux){
+    if(  pAuxData->iAuxArg==iArg && (pAuxData->iAuxOp==pCtx->iOp || iArg<0) ){
+      return pAuxData->pAux;
+    }
+  }
+  return 0;
+}
+
+/*
+** Set the auxiliary data pointer and delete function, for the iArg'th
+** argument to the user-function defined by pCtx. Any previous value is
+** deleted by calling the delete function specified when it was set.
+**
+** The left-most argument is 0.
+**
+** Undocumented behavior:  If iArg is negative then make the data available
+** to all functions within the current prepared statement using iArg as an
+** access code.
+*/
+SQLITE_API void sqlite3_set_auxdata(
+  sqlite3_context *pCtx,
+  int iArg,
+  void *pAux,
+  void (*xDelete)(void*)
+){
+  AuxData *pAuxData;
+  Vdbe *pVdbe = pCtx->pVdbe;
+
+  assert( sqlite3_mutex_held(pCtx->pOut->db->mutex) );
+#ifdef SQLITE_ENABLE_STAT4
+  if( pVdbe==0 ) goto failed;
+#else
+  assert( pVdbe!=0 );
+#endif
+
+  for(pAuxData=pVdbe->pAuxData; pAuxData; pAuxData=pAuxData->pNextAux){
+    if( pAuxData->iAuxArg==iArg && (pAuxData->iAuxOp==pCtx->iOp || iArg<0) ){
+      break;
+    }
+  }
+  if( pAuxData==0 ){
+    pAuxData = sqlite3DbMallocZero(pVdbe->db, sizeof(AuxData));
+    if( !pAuxData ) goto failed;
+    pAuxData->iAuxOp = pCtx->iOp;
+    pAuxData->iAuxArg = iArg;
+    pAuxData->pNextAux = pVdbe->pAuxData;
+    pVdbe->pAuxData = pAuxData;
+    if( pCtx->isError==0 ) pCtx->isError = -1;
+  }else if( pAuxData->xDeleteAux ){
+    pAuxData->xDeleteAux(pAuxData->pAux);
+  }
+
+  pAuxData->pAux = pAux;
+  pAuxData->xDeleteAux = xDelete;
+  return;
+
+failed:
+  if( xDelete ){
+    xDelete(pAux);
+  }
+}
+
+#ifndef SQLITE_OMIT_DEPRECATED
+/*
+** Return the number of times the Step function of an aggregate has been
+** called.
+**
+** This function is deprecated.  Do not use it for new code.  It is
+** provide only to avoid breaking legacy code.  New aggregate function
+** implementations should keep their own counts within their aggregate
+** context.
+*/
+SQLITE_API int sqlite3_aggregate_count(sqlite3_context *p){
+  assert( p && p->pMem && p->pFunc && p->pFunc->xFinalize );
+  return p->pMem->n;
+}
+#endif
+
+/*
+** Return the number of columns in the result set for the statement pStmt.
+*/
+SQLITE_API int sqlite3_column_count(sqlite3_stmt *pStmt){
+  Vdbe *pVm = (Vdbe *)pStmt;
+  return pVm ? pVm->nResColumn : 0;
+}
+
+/*
+** Return the number of values available from the current row of the
+** currently executing statement pStmt.
+*/
+SQLITE_API int sqlite3_data_count(sqlite3_stmt *pStmt){
+  Vdbe *pVm = (Vdbe *)pStmt;
+  if( pVm==0 || pVm->pResultSet==0 ) return 0;
+  return pVm->nResColumn;
+}
+
+/*
+** Return a pointer to static memory containing an SQL NULL value.
+*/
+static const Mem *columnNullValue(void){
+  /* Even though the Mem structure contains an element
+  ** of type i64, on certain architectures (x86) with certain compiler
+  ** switches (-Os), gcc may align this Mem object on a 4-byte boundary
+  ** instead of an 8-byte one. This all works fine, except that when
+  ** running with SQLITE_DEBUG defined the SQLite code sometimes assert()s
+  ** that a Mem structure is located on an 8-byte boundary. To prevent
+  ** these assert()s from failing, when building with SQLITE_DEBUG defined
+  ** using gcc, we force nullMem to be 8-byte aligned using the magical
+  ** __attribute__((aligned(8))) macro.  */
+  static const Mem nullMem
+#if defined(SQLITE_DEBUG) && defined(__GNUC__)
+    __attribute__((aligned(8)))
+#endif
+    = {
+        /* .u          = */ {0},
+        /* .z          = */ (char*)0,
+        /* .n          = */ (int)0,
+        /* .flags      = */ (u16)MEM_Null,
+        /* .enc        = */ (u8)0,
+        /* .eSubtype   = */ (u8)0,
+        /* .db         = */ (sqlite3*)0,
+        /* .szMalloc   = */ (int)0,
+        /* .uTemp      = */ (u32)0,
+        /* .zMalloc    = */ (char*)0,
+        /* .xDel       = */ (void(*)(void*))0,
+#ifdef SQLITE_DEBUG
+        /* .pScopyFrom = */ (Mem*)0,
+        /* .mScopyFlags= */ 0,
+#endif
+      };
+  return &nullMem;
+}
+
+/*
+** Check
