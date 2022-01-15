@@ -88427,4 +88427,169 @@ SQLITE_API int sqlite3_search_count = 0;
 */
 #ifdef SQLITE_TEST
 SQLITE_API int sqlite3_interrupt_count = 0;
-#e
+#endif
+
+/*
+** The next global variable is incremented each type the OP_Sort opcode
+** is executed.  The test procedures use this information to make sure that
+** sorting is occurring or not occurring at appropriate times.   This variable
+** has no function other than to help verify the correct operation of the
+** library.
+*/
+#ifdef SQLITE_TEST
+SQLITE_API int sqlite3_sort_count = 0;
+#endif
+
+/*
+** The next global variable records the size of the largest MEM_Blob
+** or MEM_Str that has been used by a VDBE opcode.  The test procedures
+** use this information to make sure that the zero-blob functionality
+** is working correctly.   This variable has no function other than to
+** help verify the correct operation of the library.
+*/
+#ifdef SQLITE_TEST
+SQLITE_API int sqlite3_max_blobsize = 0;
+static void updateMaxBlobsize(Mem *p){
+  if( (p->flags & (MEM_Str|MEM_Blob))!=0 && p->n>sqlite3_max_blobsize ){
+    sqlite3_max_blobsize = p->n;
+  }
+}
+#endif
+
+/*
+** This macro evaluates to true if either the update hook or the preupdate
+** hook are enabled for database connect DB.
+*/
+#ifdef SQLITE_ENABLE_PREUPDATE_HOOK
+# define HAS_UPDATE_HOOK(DB) ((DB)->xPreUpdateCallback||(DB)->xUpdateCallback)
+#else
+# define HAS_UPDATE_HOOK(DB) ((DB)->xUpdateCallback)
+#endif
+
+/*
+** The next global variable is incremented each time the OP_Found opcode
+** is executed. This is used to test whether or not the foreign key
+** operation implemented using OP_FkIsZero is working. This variable
+** has no function other than to help verify the correct operation of the
+** library.
+*/
+#ifdef SQLITE_TEST
+SQLITE_API int sqlite3_found_count = 0;
+#endif
+
+/*
+** Test a register to see if it exceeds the current maximum blob size.
+** If it does, record the new maximum blob size.
+*/
+#if defined(SQLITE_TEST) && !defined(SQLITE_UNTESTABLE)
+# define UPDATE_MAX_BLOBSIZE(P)  updateMaxBlobsize(P)
+#else
+# define UPDATE_MAX_BLOBSIZE(P)
+#endif
+
+#ifdef SQLITE_DEBUG
+/* This routine provides a convenient place to set a breakpoint during
+** tracing with PRAGMA vdbe_trace=on.  The breakpoint fires right after
+** each opcode is printed.  Variables "pc" (program counter) and pOp are
+** available to add conditionals to the breakpoint.  GDB example:
+**
+**         break test_trace_breakpoint if pc=22
+**
+** Other useful labels for breakpoints include:
+**   test_addop_breakpoint(pc,pOp)
+**   sqlite3CorruptError(lineno)
+**   sqlite3MisuseError(lineno)
+**   sqlite3CantopenError(lineno)
+*/
+static void test_trace_breakpoint(int pc, Op *pOp, Vdbe *v){
+  static int n = 0;
+  n++;
+}
+#endif
+
+/*
+** Invoke the VDBE coverage callback, if that callback is defined.  This
+** feature is used for test suite validation only and does not appear an
+** production builds.
+**
+** M is the type of branch.  I is the direction taken for this instance of
+** the branch.
+**
+**   M: 2 - two-way branch (I=0: fall-thru   1: jump                )
+**      3 - two-way + NULL (I=0: fall-thru   1: jump      2: NULL   )
+**      4 - OP_Jump        (I=0: jump p1     1: jump p2   2: jump p3)
+**
+** In other words, if M is 2, then I is either 0 (for fall-through) or
+** 1 (for when the branch is taken).  If M is 3, the I is 0 for an
+** ordinary fall-through, I is 1 if the branch was taken, and I is 2
+** if the result of comparison is NULL.  For M=3, I=2 the jump may or
+** may not be taken, depending on the SQLITE_JUMPIFNULL flags in p5.
+** When M is 4, that means that an OP_Jump is being run.  I is 0, 1, or 2
+** depending on if the operands are less than, equal, or greater than.
+**
+** iSrcLine is the source code line (from the __LINE__ macro) that
+** generated the VDBE instruction combined with flag bits.  The source
+** code line number is in the lower 24 bits of iSrcLine and the upper
+** 8 bytes are flags.  The lower three bits of the flags indicate
+** values for I that should never occur.  For example, if the branch is
+** always taken, the flags should be 0x05 since the fall-through and
+** alternate branch are never taken.  If a branch is never taken then
+** flags should be 0x06 since only the fall-through approach is allowed.
+**
+** Bit 0x08 of the flags indicates an OP_Jump opcode that is only
+** interested in equal or not-equal.  In other words, I==0 and I==2
+** should be treated as equivalent
+**
+** Since only a line number is retained, not the filename, this macro
+** only works for amalgamation builds.  But that is ok, since these macros
+** should be no-ops except for special builds used to measure test coverage.
+*/
+#if !defined(SQLITE_VDBE_COVERAGE)
+# define VdbeBranchTaken(I,M)
+#else
+# define VdbeBranchTaken(I,M) vdbeTakeBranch(pOp->iSrcLine,I,M)
+  static void vdbeTakeBranch(u32 iSrcLine, u8 I, u8 M){
+    u8 mNever;
+    assert( I<=2 );  /* 0: fall through,  1: taken,  2: alternate taken */
+    assert( M<=4 );  /* 2: two-way branch, 3: three-way branch, 4: OP_Jump */
+    assert( I<M );   /* I can only be 2 if M is 3 or 4 */
+    /* Transform I from a integer [0,1,2] into a bitmask of [1,2,4] */
+    I = 1<<I;
+    /* The upper 8 bits of iSrcLine are flags.  The lower three bits of
+    ** the flags indicate directions that the branch can never go.  If
+    ** a branch really does go in one of those directions, assert right
+    ** away. */
+    mNever = iSrcLine >> 24;
+    assert( (I & mNever)==0 );
+    if( sqlite3GlobalConfig.xVdbeBranch==0 ) return;  /*NO_TEST*/
+    /* Invoke the branch coverage callback with three arguments:
+    **    iSrcLine - the line number of the VdbeCoverage() macro, with
+    **               flags removed.
+    **    I        - Mask of bits 0x07 indicating which cases are are
+    **               fulfilled by this instance of the jump.  0x01 means
+    **               fall-thru, 0x02 means taken, 0x04 means NULL.  Any
+    **               impossible cases (ex: if the comparison is never NULL)
+    **               are filled in automatically so that the coverage
+    **               measurement logic does not flag those impossible cases
+    **               as missed coverage.
+    **    M        - Type of jump.  Same as M argument above
+    */
+    I |= mNever;
+    if( M==2 ) I |= 0x04;
+    if( M==4 ){
+      I |= 0x08;
+      if( (mNever&0x08)!=0 && (I&0x05)!=0) I |= 0x05; /*NO_TEST*/
+    }
+    sqlite3GlobalConfig.xVdbeBranch(sqlite3GlobalConfig.pVdbeBranchArg,
+                                    iSrcLine&0xffffff, I, M);
+  }
+#endif
+
+/*
+** An ephemeral string value (signified by the MEM_Ephem flag) contains
+** a pointer to a dynamically allocated string where some other entity
+** is responsible for deallocating that string.  Because the register
+** does not control the string, it might be deleted without the register
+** knowing it.
+**
+** This routine converts an ephemeral s
