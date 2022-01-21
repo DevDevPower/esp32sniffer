@@ -89616,4 +89616,201 @@ case OP_Real: {            /* same as TK_FLOAT, out2 */
 /* Opcode: String8 * P2 * P4 *
 ** Synopsis: r[P2]='P4'
 **
-** P4 points to a nul te
+** P4 points to a nul terminated UTF-8 string. This opcode is transformed
+** into a String opcode before it is executed for the first time.  During
+** this transformation, the length of string P4 is computed and stored
+** as the P1 parameter.
+*/
+case OP_String8: {         /* same as TK_STRING, out2 */
+  assert( pOp->p4.z!=0 );
+  pOut = out2Prerelease(p, pOp);
+  pOp->p1 = sqlite3Strlen30(pOp->p4.z);
+
+#ifndef SQLITE_OMIT_UTF16
+  if( encoding!=SQLITE_UTF8 ){
+    rc = sqlite3VdbeMemSetStr(pOut, pOp->p4.z, -1, SQLITE_UTF8, SQLITE_STATIC);
+    assert( rc==SQLITE_OK || rc==SQLITE_TOOBIG );
+    if( rc ) goto too_big;
+    if( SQLITE_OK!=sqlite3VdbeChangeEncoding(pOut, encoding) ) goto no_mem;
+    assert( pOut->szMalloc>0 && pOut->zMalloc==pOut->z );
+    assert( VdbeMemDynamic(pOut)==0 );
+    pOut->szMalloc = 0;
+    pOut->flags |= MEM_Static;
+    if( pOp->p4type==P4_DYNAMIC ){
+      sqlite3DbFree(db, pOp->p4.z);
+    }
+    pOp->p4type = P4_DYNAMIC;
+    pOp->p4.z = pOut->z;
+    pOp->p1 = pOut->n;
+  }
+#endif
+  if( pOp->p1>db->aLimit[SQLITE_LIMIT_LENGTH] ){
+    goto too_big;
+  }
+  pOp->opcode = OP_String;
+  assert( rc==SQLITE_OK );
+  /* Fall through to the next case, OP_String */
+  /* no break */ deliberate_fall_through
+}
+
+/* Opcode: String P1 P2 P3 P4 P5
+** Synopsis: r[P2]='P4' (len=P1)
+**
+** The string value P4 of length P1 (bytes) is stored in register P2.
+**
+** If P3 is not zero and the content of register P3 is equal to P5, then
+** the datatype of the register P2 is converted to BLOB.  The content is
+** the same sequence of bytes, it is merely interpreted as a BLOB instead
+** of a string, as if it had been CAST.  In other words:
+**
+** if( P3!=0 and reg[P3]==P5 ) reg[P2] := CAST(reg[P2] as BLOB)
+*/
+case OP_String: {          /* out2 */
+  assert( pOp->p4.z!=0 );
+  pOut = out2Prerelease(p, pOp);
+  pOut->flags = MEM_Str|MEM_Static|MEM_Term;
+  pOut->z = pOp->p4.z;
+  pOut->n = pOp->p1;
+  pOut->enc = encoding;
+  UPDATE_MAX_BLOBSIZE(pOut);
+#ifndef SQLITE_LIKE_DOESNT_MATCH_BLOBS
+  if( pOp->p3>0 ){
+    assert( pOp->p3<=(p->nMem+1 - p->nCursor) );
+    pIn3 = &aMem[pOp->p3];
+    assert( pIn3->flags & MEM_Int );
+    if( pIn3->u.i==pOp->p5 ) pOut->flags = MEM_Blob|MEM_Static|MEM_Term;
+  }
+#endif
+  break;
+}
+
+/* Opcode: BeginSubrtn * P2 * * *
+** Synopsis: r[P2]=NULL
+**
+** Mark the beginning of a subroutine that can be entered in-line
+** or that can be called using OP_Gosub.  The subroutine should
+** be terminated by an OP_Return instruction that has a P1 operand that
+** is the same as the P2 operand to this opcode and that has P3 set to 1.
+** If the subroutine is entered in-line, then the OP_Return will simply
+** fall through.  But if the subroutine is entered using OP_Gosub, then
+** the OP_Return will jump back to the first instruction after the OP_Gosub.
+**
+** This routine works by loading a NULL into the P2 register.  When the
+** return address register contains a NULL, the OP_Return instruction is
+** a no-op that simply falls through to the next instruction (assuming that
+** the OP_Return opcode has a P3 value of 1).  Thus if the subroutine is
+** entered in-line, then the OP_Return will cause in-line execution to
+** continue.  But if the subroutine is entered via OP_Gosub, then the
+** OP_Return will cause a return to the address following the OP_Gosub.
+**
+** This opcode is identical to OP_Null.  It has a different name
+** only to make the byte code easier to read and verify.
+*/
+/* Opcode: Null P1 P2 P3 * *
+** Synopsis: r[P2..P3]=NULL
+**
+** Write a NULL into registers P2.  If P3 greater than P2, then also write
+** NULL into register P3 and every register in between P2 and P3.  If P3
+** is less than P2 (typically P3 is zero) then only register P2 is
+** set to NULL.
+**
+** If the P1 value is non-zero, then also set the MEM_Cleared flag so that
+** NULL values will not compare equal even if SQLITE_NULLEQ is set on
+** OP_Ne or OP_Eq.
+*/
+case OP_BeginSubrtn:
+case OP_Null: {           /* out2 */
+  int cnt;
+  u16 nullFlag;
+  pOut = out2Prerelease(p, pOp);
+  cnt = pOp->p3-pOp->p2;
+  assert( pOp->p3<=(p->nMem+1 - p->nCursor) );
+  pOut->flags = nullFlag = pOp->p1 ? (MEM_Null|MEM_Cleared) : MEM_Null;
+  pOut->n = 0;
+#ifdef SQLITE_DEBUG
+  pOut->uTemp = 0;
+#endif
+  while( cnt>0 ){
+    pOut++;
+    memAboutToChange(p, pOut);
+    sqlite3VdbeMemSetNull(pOut);
+    pOut->flags = nullFlag;
+    pOut->n = 0;
+    cnt--;
+  }
+  break;
+}
+
+/* Opcode: SoftNull P1 * * * *
+** Synopsis: r[P1]=NULL
+**
+** Set register P1 to have the value NULL as seen by the OP_MakeRecord
+** instruction, but do not free any string or blob memory associated with
+** the register, so that if the value was a string or blob that was
+** previously copied using OP_SCopy, the copies will continue to be valid.
+*/
+case OP_SoftNull: {
+  assert( pOp->p1>0 && pOp->p1<=(p->nMem+1 - p->nCursor) );
+  pOut = &aMem[pOp->p1];
+  pOut->flags = (pOut->flags&~(MEM_Undefined|MEM_AffMask))|MEM_Null;
+  break;
+}
+
+/* Opcode: Blob P1 P2 * P4 *
+** Synopsis: r[P2]=P4 (len=P1)
+**
+** P4 points to a blob of data P1 bytes long.  Store this
+** blob in register P2.  If P4 is a NULL pointer, then construct
+** a zero-filled blob that is P1 bytes long in P2.
+*/
+case OP_Blob: {                /* out2 */
+  assert( pOp->p1 <= SQLITE_MAX_LENGTH );
+  pOut = out2Prerelease(p, pOp);
+  if( pOp->p4.z==0 ){
+    sqlite3VdbeMemSetZeroBlob(pOut, pOp->p1);
+    if( sqlite3VdbeMemExpandBlob(pOut) ) goto no_mem;
+  }else{
+    sqlite3VdbeMemSetStr(pOut, pOp->p4.z, pOp->p1, 0, 0);
+  }
+  pOut->enc = encoding;
+  UPDATE_MAX_BLOBSIZE(pOut);
+  break;
+}
+
+/* Opcode: Variable P1 P2 * P4 *
+** Synopsis: r[P2]=parameter(P1,P4)
+**
+** Transfer the values of bound parameter P1 into register P2
+**
+** If the parameter is named, then its name appears in P4.
+** The P4 value is used by sqlite3_bind_parameter_name().
+*/
+case OP_Variable: {            /* out2 */
+  Mem *pVar;       /* Value being transferred */
+
+  assert( pOp->p1>0 && pOp->p1<=p->nVar );
+  assert( pOp->p4.z==0 || pOp->p4.z==sqlite3VListNumToName(p->pVList,pOp->p1) );
+  pVar = &p->aVar[pOp->p1 - 1];
+  if( sqlite3VdbeMemTooBig(pVar) ){
+    goto too_big;
+  }
+  pOut = &aMem[pOp->p2];
+  if( VdbeMemDynamic(pOut) ) sqlite3VdbeMemSetNull(pOut);
+  memcpy(pOut, pVar, MEMCELLSIZE);
+  pOut->flags &= ~(MEM_Dyn|MEM_Ephem);
+  pOut->flags |= MEM_Static|MEM_FromBind;
+  UPDATE_MAX_BLOBSIZE(pOut);
+  break;
+}
+
+/* Opcode: Move P1 P2 P3 * *
+** Synopsis: r[P2@P3]=r[P1@P3]
+**
+** Move the P3 values in register P1..P1+P3-1 over into
+** registers P2..P2+P3-1.  Registers P1..P1+P3-1 are
+** left holding a NULL.  It is an error for register ranges
+** P1..P1+P3-1 and P2..P2+P3-1 to overlap.  It is an error
+** for P3 to be less than 1.
+*/
+case OP_Move: {
+  int n;           /* Number of registers left to copy *
