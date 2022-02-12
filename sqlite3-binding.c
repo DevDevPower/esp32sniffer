@@ -91193,4 +91193,197 @@ op_column_restart:
       ** database file.
       */
       zData = pC->aRow;
-      assert( pC->nHdrParsed<=p2 );         /* Conditional skipped 
+      assert( pC->nHdrParsed<=p2 );         /* Conditional skipped */
+      testcase( aOffset[0]==0 );
+      goto op_column_read_header;
+    }
+  }else if( sqlite3BtreeCursorHasMoved(pC->uc.pCursor) ){
+    rc = sqlite3VdbeHandleMovedCursor(pC);
+    if( rc ) goto abort_due_to_error;
+    goto op_column_restart;
+  }
+
+  /* Make sure at least the first p2+1 entries of the header have been
+  ** parsed and valid information is in aOffset[] and pC->aType[].
+  */
+  if( pC->nHdrParsed<=p2 ){
+    /* If there is more header available for parsing in the record, try
+    ** to extract additional fields up through the p2+1-th field
+    */
+    if( pC->iHdrOffset<aOffset[0] ){
+      /* Make sure zData points to enough of the record to cover the header. */
+      if( pC->aRow==0 ){
+        memset(&sMem, 0, sizeof(sMem));
+        rc = sqlite3VdbeMemFromBtreeZeroOffset(pC->uc.pCursor,aOffset[0],&sMem);
+        if( rc!=SQLITE_OK ) goto abort_due_to_error;
+        zData = (u8*)sMem.z;
+      }else{
+        zData = pC->aRow;
+      }
+
+      /* Fill in pC->aType[i] and aOffset[i] values through the p2-th field. */
+    op_column_read_header:
+      i = pC->nHdrParsed;
+      offset64 = aOffset[i];
+      zHdr = zData + pC->iHdrOffset;
+      zEndHdr = zData + aOffset[0];
+      testcase( zHdr>=zEndHdr );
+      do{
+        if( (pC->aType[i] = t = zHdr[0])<0x80 ){
+          zHdr++;
+          offset64 += sqlite3VdbeOneByteSerialTypeLen(t);
+        }else{
+          zHdr += sqlite3GetVarint32(zHdr, &t);
+          pC->aType[i] = t;
+          offset64 += sqlite3VdbeSerialTypeLen(t);
+        }
+        aOffset[++i] = (u32)(offset64 & 0xffffffff);
+      }while( (u32)i<=p2 && zHdr<zEndHdr );
+
+      /* The record is corrupt if any of the following are true:
+      ** (1) the bytes of the header extend past the declared header size
+      ** (2) the entire header was used but not all data was used
+      ** (3) the end of the data extends beyond the end of the record.
+      */
+      if( (zHdr>=zEndHdr && (zHdr>zEndHdr || offset64!=pC->payloadSize))
+       || (offset64 > pC->payloadSize)
+      ){
+        if( aOffset[0]==0 ){
+          i = 0;
+          zHdr = zEndHdr;
+        }else{
+          if( pC->aRow==0 ) sqlite3VdbeMemRelease(&sMem);
+          goto op_column_corrupt;
+        }
+      }
+
+      pC->nHdrParsed = i;
+      pC->iHdrOffset = (u32)(zHdr - zData);
+      if( pC->aRow==0 ) sqlite3VdbeMemRelease(&sMem);
+    }else{
+      t = 0;
+    }
+
+    /* If after trying to extract new entries from the header, nHdrParsed is
+    ** still not up to p2, that means that the record has fewer than p2
+    ** columns.  So the result will be either the default value or a NULL.
+    */
+    if( pC->nHdrParsed<=p2 ){
+      pDest = &aMem[pOp->p3];
+      memAboutToChange(p, pDest);
+      if( pOp->p4type==P4_MEM ){
+        sqlite3VdbeMemShallowCopy(pDest, pOp->p4.pMem, MEM_Static);
+      }else{
+        sqlite3VdbeMemSetNull(pDest);
+      }
+      goto op_column_out;
+    }
+  }else{
+    t = pC->aType[p2];
+  }
+
+  /* Extract the content for the p2+1-th column.  Control can only
+  ** reach this point if aOffset[p2], aOffset[p2+1], and pC->aType[p2] are
+  ** all valid.
+  */
+  assert( p2<pC->nHdrParsed );
+  assert( rc==SQLITE_OK );
+  pDest = &aMem[pOp->p3];
+  memAboutToChange(p, pDest);
+  assert( sqlite3VdbeCheckMemInvariants(pDest) );
+  if( VdbeMemDynamic(pDest) ){
+    sqlite3VdbeMemSetNull(pDest);
+  }
+  assert( t==pC->aType[p2] );
+  if( pC->szRow>=aOffset[p2+1] ){
+    /* This is the common case where the desired content fits on the original
+    ** page - where the content is not on an overflow page */
+    zData = pC->aRow + aOffset[p2];
+    if( t<12 ){
+      sqlite3VdbeSerialGet(zData, t, pDest);
+    }else{
+      /* If the column value is a string, we need a persistent value, not
+      ** a MEM_Ephem value.  This branch is a fast short-cut that is equivalent
+      ** to calling sqlite3VdbeSerialGet() and sqlite3VdbeDeephemeralize().
+      */
+      static const u16 aFlag[] = { MEM_Blob, MEM_Str|MEM_Term };
+      pDest->n = len = (t-12)/2;
+      pDest->enc = encoding;
+      if( pDest->szMalloc < len+2 ){
+        if( len>db->aLimit[SQLITE_LIMIT_LENGTH] ) goto too_big;
+        pDest->flags = MEM_Null;
+        if( sqlite3VdbeMemGrow(pDest, len+2, 0) ) goto no_mem;
+      }else{
+        pDest->z = pDest->zMalloc;
+      }
+      memcpy(pDest->z, zData, len);
+      pDest->z[len] = 0;
+      pDest->z[len+1] = 0;
+      pDest->flags = aFlag[t&1];
+    }
+  }else{
+    pDest->enc = encoding;
+    /* This branch happens only when content is on overflow pages */
+    if( ((pOp->p5 & (OPFLAG_LENGTHARG|OPFLAG_TYPEOFARG))!=0
+          && ((t>=12 && (t&1)==0) || (pOp->p5 & OPFLAG_TYPEOFARG)!=0))
+     || (len = sqlite3VdbeSerialTypeLen(t))==0
+    ){
+      /* Content is irrelevant for
+      **    1. the typeof() function,
+      **    2. the length(X) function if X is a blob, and
+      **    3. if the content length is zero.
+      ** So we might as well use bogus content rather than reading
+      ** content from disk.
+      **
+      ** Although sqlite3VdbeSerialGet() may read at most 8 bytes from the
+      ** buffer passed to it, debugging function VdbeMemPrettyPrint() may
+      ** read more.  Use the global constant sqlite3CtypeMap[] as the array,
+      ** as that array is 256 bytes long (plenty for VdbeMemPrettyPrint())
+      ** and it begins with a bunch of zeros.
+      */
+      sqlite3VdbeSerialGet((u8*)sqlite3CtypeMap, t, pDest);
+    }else{
+      if( len>db->aLimit[SQLITE_LIMIT_LENGTH] ) goto too_big;
+      rc = sqlite3VdbeMemFromBtree(pC->uc.pCursor, aOffset[p2], len, pDest);
+      if( rc!=SQLITE_OK ) goto abort_due_to_error;
+      sqlite3VdbeSerialGet((const u8*)pDest->z, t, pDest);
+      pDest->flags &= ~MEM_Ephem;
+    }
+  }
+
+op_column_out:
+  UPDATE_MAX_BLOBSIZE(pDest);
+  REGISTER_TRACE(pOp->p3, pDest);
+  break;
+
+op_column_corrupt:
+  if( aOp[0].p3>0 ){
+    pOp = &aOp[aOp[0].p3-1];
+    break;
+  }else{
+    rc = SQLITE_CORRUPT_BKPT;
+    goto abort_due_to_error;
+  }
+}
+
+/* Opcode: TypeCheck P1 P2 P3 P4 *
+** Synopsis: typecheck(r[P1@P2])
+**
+** Apply affinities to the range of P2 registers beginning with P1.
+** Take the affinities from the Table object in P4.  If any value
+** cannot be coerced into the correct type, then raise an error.
+**
+** This opcode is similar to OP_Affinity except that this opcode
+** forces the register type to the Table column type.  This is used
+** to implement "strict affinity".
+**
+** GENERATED ALWAYS AS ... STATIC columns are only checked if P3
+** is zero.  When P3 is non-zero, no type checking occurs for
+** static generated columns.  Virtual columns are computed at query time
+** and so they are never checked.
+**
+** Preconditions:
+**
+** <ul>
+** <li> P2 should be the number of non-virtual columns in the
+**      table
