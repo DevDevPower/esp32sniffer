@@ -91031,4 +91031,166 @@ case OP_IfNullRow: {         /* jump */
 ** P2 is the column number for the argument to the sqlite_offset() function.
 ** This opcode does not use P2 itself, but the P2 value is used by the
 ** code generator.  The P1, P2, and P3 operands to this opcode are the
-** same as for OP_Col
+** same as for OP_Column.
+**
+** This opcode is only available if SQLite is compiled with the
+** -DSQLITE_ENABLE_OFFSET_SQL_FUNC option.
+*/
+case OP_Offset: {          /* out3 */
+  VdbeCursor *pC;    /* The VDBE cursor */
+  assert( pOp->p1>=0 && pOp->p1<p->nCursor );
+  pC = p->apCsr[pOp->p1];
+  pOut = &p->aMem[pOp->p3];
+  if( pC==0 || pC->eCurType!=CURTYPE_BTREE ){
+    sqlite3VdbeMemSetNull(pOut);
+  }else{
+    if( pC->deferredMoveto ){
+      rc = sqlite3VdbeFinishMoveto(pC);
+      if( rc ) goto abort_due_to_error;
+    }
+    if( sqlite3BtreeEof(pC->uc.pCursor) ){
+      sqlite3VdbeMemSetNull(pOut);
+    }else{
+      sqlite3VdbeMemSetInt64(pOut, sqlite3BtreeOffset(pC->uc.pCursor));
+    }
+  }
+  break;
+}
+#endif /* SQLITE_ENABLE_OFFSET_SQL_FUNC */
+
+/* Opcode: Column P1 P2 P3 P4 P5
+** Synopsis: r[P3]=PX cursor P1 column P2
+**
+** Interpret the data that cursor P1 points to as a structure built using
+** the MakeRecord instruction.  (See the MakeRecord opcode for additional
+** information about the format of the data.)  Extract the P2-th column
+** from this record.  If there are less that (P2+1)
+** values in the record, extract a NULL.
+**
+** The value extracted is stored in register P3.
+**
+** If the record contains fewer than P2 fields, then extract a NULL.  Or,
+** if the P4 argument is a P4_MEM use the value of the P4 argument as
+** the result.
+**
+** If the OPFLAG_LENGTHARG and OPFLAG_TYPEOFARG bits are set on P5 then
+** the result is guaranteed to only be used as the argument of a length()
+** or typeof() function, respectively.  The loading of large blobs can be
+** skipped for length() and all content loading can be skipped for typeof().
+*/
+case OP_Column: {
+  u32 p2;            /* column number to retrieve */
+  VdbeCursor *pC;    /* The VDBE cursor */
+  BtCursor *pCrsr;   /* The B-Tree cursor corresponding to pC */
+  u32 *aOffset;      /* aOffset[i] is offset to start of data for i-th column */
+  int len;           /* The length of the serialized data for the column */
+  int i;             /* Loop counter */
+  Mem *pDest;        /* Where to write the extracted value */
+  Mem sMem;          /* For storing the record being decoded */
+  const u8 *zData;   /* Part of the record being decoded */
+  const u8 *zHdr;    /* Next unparsed byte of the header */
+  const u8 *zEndHdr; /* Pointer to first byte after the header */
+  u64 offset64;      /* 64-bit offset */
+  u32 t;             /* A type code from the record header */
+  Mem *pReg;         /* PseudoTable input register */
+
+  assert( pOp->p1>=0 && pOp->p1<p->nCursor );
+  assert( pOp->p3>0 && pOp->p3<=(p->nMem+1 - p->nCursor) );
+  pC = p->apCsr[pOp->p1];
+  p2 = (u32)pOp->p2;
+
+op_column_restart:
+  assert( pC!=0 );
+  assert( p2<(u32)pC->nField
+       || (pC->eCurType==CURTYPE_PSEUDO && pC->seekResult==0) );
+  aOffset = pC->aOffset;
+  assert( aOffset==pC->aType+pC->nField );
+  assert( pC->eCurType!=CURTYPE_VTAB );
+  assert( pC->eCurType!=CURTYPE_PSEUDO || pC->nullRow );
+  assert( pC->eCurType!=CURTYPE_SORTER );
+
+  if( pC->cacheStatus!=p->cacheCtr ){                /*OPTIMIZATION-IF-FALSE*/
+    if( pC->nullRow ){
+      if( pC->eCurType==CURTYPE_PSEUDO && pC->seekResult>0 ){
+        /* For the special case of as pseudo-cursor, the seekResult field
+        ** identifies the register that holds the record */
+        pReg = &aMem[pC->seekResult];
+        assert( pReg->flags & MEM_Blob );
+        assert( memIsValid(pReg) );
+        pC->payloadSize = pC->szRow = pReg->n;
+        pC->aRow = (u8*)pReg->z;
+      }else{
+        pDest = &aMem[pOp->p3];
+        memAboutToChange(p, pDest);
+        sqlite3VdbeMemSetNull(pDest);
+        goto op_column_out;
+      }
+    }else{
+      pCrsr = pC->uc.pCursor;
+      if( pC->deferredMoveto ){
+        u32 iMap;
+        assert( !pC->isEphemeral );
+        if( pC->ub.aAltMap && (iMap = pC->ub.aAltMap[1+p2])>0  ){
+          pC = pC->pAltCursor;
+          p2 = iMap - 1;
+          goto op_column_restart;
+        }
+        rc = sqlite3VdbeFinishMoveto(pC);
+        if( rc ) goto abort_due_to_error;
+      }else if( sqlite3BtreeCursorHasMoved(pCrsr) ){
+        rc = sqlite3VdbeHandleMovedCursor(pC);
+        if( rc ) goto abort_due_to_error;
+        goto op_column_restart;
+      }
+      assert( pC->eCurType==CURTYPE_BTREE );
+      assert( pCrsr );
+      assert( sqlite3BtreeCursorIsValid(pCrsr) );
+      pC->payloadSize = sqlite3BtreePayloadSize(pCrsr);
+      pC->aRow = sqlite3BtreePayloadFetch(pCrsr, &pC->szRow);
+      assert( pC->szRow<=pC->payloadSize );
+      assert( pC->szRow<=65536 );  /* Maximum page size is 64KiB */
+    }
+    pC->cacheStatus = p->cacheCtr;
+    if( (aOffset[0] = pC->aRow[0])<0x80 ){
+      pC->iHdrOffset = 1;
+    }else{
+      pC->iHdrOffset = sqlite3GetVarint32(pC->aRow, aOffset);
+    }
+    pC->nHdrParsed = 0;
+
+    if( pC->szRow<aOffset[0] ){      /*OPTIMIZATION-IF-FALSE*/
+      /* pC->aRow does not have to hold the entire row, but it does at least
+      ** need to cover the header of the record.  If pC->aRow does not contain
+      ** the complete header, then set it to zero, forcing the header to be
+      ** dynamically allocated. */
+      pC->aRow = 0;
+      pC->szRow = 0;
+
+      /* Make sure a corrupt database has not given us an oversize header.
+      ** Do this now to avoid an oversize memory allocation.
+      **
+      ** Type entries can be between 1 and 5 bytes each.  But 4 and 5 byte
+      ** types use so much data space that there can only be 4096 and 32 of
+      ** them, respectively.  So the maximum header length results from a
+      ** 3-byte type for each of the maximum of 32768 columns plus three
+      ** extra bytes for the header length itself.  32768*3 + 3 = 98307.
+      */
+      if( aOffset[0] > 98307 || aOffset[0] > pC->payloadSize ){
+        goto op_column_corrupt;
+      }
+    }else{
+      /* This is an optimization.  By skipping over the first few tests
+      ** (ex: pC->nHdrParsed<=p2) in the next section, we achieve a
+      ** measurable performance gain.
+      **
+      ** This branch is taken even if aOffset[0]==0.  Such a record is never
+      ** generated by SQLite, and could be considered corruption, but we
+      ** accept it for historical reasons.  When aOffset[0]==0, the code this
+      ** branch jumps to reads past the end of the record, but never more
+      ** than a few bytes.  Even if the record occurs at the end of the page
+      ** content area, the "page header" comes after the page content and so
+      ** this overread is harmless.  Similar overreads can occur for a corrupt
+      ** database file.
+      */
+      zData = pC->aRow;
+      assert( pC->nHdrParsed<=p2 );         /* Conditional skipped 
