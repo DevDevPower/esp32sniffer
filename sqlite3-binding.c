@@ -91386,4 +91386,185 @@ op_column_corrupt:
 **
 ** <ul>
 ** <li> P2 should be the number of non-virtual columns in the
-**      table
+**      table of P4.
+** <li> Table P4 should be a STRICT table.
+** </ul>
+**
+** If any precondition is false, an assertion fault occurs.
+*/
+case OP_TypeCheck: {
+  Table *pTab;
+  Column *aCol;
+  int i;
+
+  assert( pOp->p4type==P4_TABLE );
+  pTab = pOp->p4.pTab;
+  assert( pTab->tabFlags & TF_Strict );
+  assert( pTab->nNVCol==pOp->p2 );
+  aCol = pTab->aCol;
+  pIn1 = &aMem[pOp->p1];
+  for(i=0; i<pTab->nCol; i++){
+    if( aCol[i].colFlags & COLFLAG_GENERATED ){
+      if( aCol[i].colFlags & COLFLAG_VIRTUAL ) continue;
+      if( pOp->p3 ){ pIn1++; continue; }
+    }
+    assert( pIn1 < &aMem[pOp->p1+pOp->p2] );
+    applyAffinity(pIn1, aCol[i].affinity, encoding);
+    if( (pIn1->flags & MEM_Null)==0 ){
+      switch( aCol[i].eCType ){
+        case COLTYPE_BLOB: {
+          if( (pIn1->flags & MEM_Blob)==0 ) goto vdbe_type_error;
+          break;
+        }
+        case COLTYPE_INTEGER:
+        case COLTYPE_INT: {
+          if( (pIn1->flags & MEM_Int)==0 ) goto vdbe_type_error;
+          break;
+        }
+        case COLTYPE_TEXT: {
+          if( (pIn1->flags & MEM_Str)==0 ) goto vdbe_type_error;
+          break;
+        }
+        case COLTYPE_REAL: {
+          testcase( (pIn1->flags & (MEM_Real|MEM_IntReal))==MEM_Real );
+          testcase( (pIn1->flags & (MEM_Real|MEM_IntReal))==MEM_IntReal );
+          if( pIn1->flags & MEM_Int ){
+            /* When applying REAL affinity, if the result is still an MEM_Int
+            ** that will fit in 6 bytes, then change the type to MEM_IntReal
+            ** so that we keep the high-resolution integer value but know that
+            ** the type really wants to be REAL. */
+            testcase( pIn1->u.i==140737488355328LL );
+            testcase( pIn1->u.i==140737488355327LL );
+            testcase( pIn1->u.i==-140737488355328LL );
+            testcase( pIn1->u.i==-140737488355329LL );
+            if( pIn1->u.i<=140737488355327LL && pIn1->u.i>=-140737488355328LL){
+              pIn1->flags |= MEM_IntReal;
+              pIn1->flags &= ~MEM_Int;
+            }else{
+              pIn1->u.r = (double)pIn1->u.i;
+              pIn1->flags |= MEM_Real;
+              pIn1->flags &= ~MEM_Int;
+            }
+          }else if( (pIn1->flags & (MEM_Real|MEM_IntReal))==0 ){
+            goto vdbe_type_error;
+          }
+          break;
+        }
+        default: {
+          /* COLTYPE_ANY.  Accept anything. */
+          break;
+        }
+      }
+    }
+    REGISTER_TRACE((int)(pIn1-aMem), pIn1);
+    pIn1++;
+  }
+  assert( pIn1 == &aMem[pOp->p1+pOp->p2] );
+  break;
+
+vdbe_type_error:
+  sqlite3VdbeError(p, "cannot store %s value in %s column %s.%s",
+     vdbeMemTypeName(pIn1), sqlite3StdType[aCol[i].eCType-1],
+     pTab->zName, aCol[i].zCnName);
+  rc = SQLITE_CONSTRAINT_DATATYPE;
+  goto abort_due_to_error;
+}
+
+/* Opcode: Affinity P1 P2 * P4 *
+** Synopsis: affinity(r[P1@P2])
+**
+** Apply affinities to a range of P2 registers starting with P1.
+**
+** P4 is a string that is P2 characters long. The N-th character of the
+** string indicates the column affinity that should be used for the N-th
+** memory cell in the range.
+*/
+case OP_Affinity: {
+  const char *zAffinity;   /* The affinity to be applied */
+
+  zAffinity = pOp->p4.z;
+  assert( zAffinity!=0 );
+  assert( pOp->p2>0 );
+  assert( zAffinity[pOp->p2]==0 );
+  pIn1 = &aMem[pOp->p1];
+  while( 1 /*exit-by-break*/ ){
+    assert( pIn1 <= &p->aMem[(p->nMem+1 - p->nCursor)] );
+    assert( zAffinity[0]==SQLITE_AFF_NONE || memIsValid(pIn1) );
+    applyAffinity(pIn1, zAffinity[0], encoding);
+    if( zAffinity[0]==SQLITE_AFF_REAL && (pIn1->flags & MEM_Int)!=0 ){
+      /* When applying REAL affinity, if the result is still an MEM_Int
+      ** that will fit in 6 bytes, then change the type to MEM_IntReal
+      ** so that we keep the high-resolution integer value but know that
+      ** the type really wants to be REAL. */
+      testcase( pIn1->u.i==140737488355328LL );
+      testcase( pIn1->u.i==140737488355327LL );
+      testcase( pIn1->u.i==-140737488355328LL );
+      testcase( pIn1->u.i==-140737488355329LL );
+      if( pIn1->u.i<=140737488355327LL && pIn1->u.i>=-140737488355328LL ){
+        pIn1->flags |= MEM_IntReal;
+        pIn1->flags &= ~MEM_Int;
+      }else{
+        pIn1->u.r = (double)pIn1->u.i;
+        pIn1->flags |= MEM_Real;
+        pIn1->flags &= ~MEM_Int;
+      }
+    }
+    REGISTER_TRACE((int)(pIn1-aMem), pIn1);
+    zAffinity++;
+    if( zAffinity[0]==0 ) break;
+    pIn1++;
+  }
+  break;
+}
+
+/* Opcode: MakeRecord P1 P2 P3 P4 *
+** Synopsis: r[P3]=mkrec(r[P1@P2])
+**
+** Convert P2 registers beginning with P1 into the [record format]
+** use as a data record in a database table or as a key
+** in an index.  The OP_Column opcode can decode the record later.
+**
+** P4 may be a string that is P2 characters long.  The N-th character of the
+** string indicates the column affinity that should be used for the N-th
+** field of the index key.
+**
+** The mapping from character to affinity is given by the SQLITE_AFF_
+** macros defined in sqliteInt.h.
+**
+** If P4 is NULL then all index fields have the affinity BLOB.
+**
+** The meaning of P5 depends on whether or not the SQLITE_ENABLE_NULL_TRIM
+** compile-time option is enabled:
+**
+**   * If SQLITE_ENABLE_NULL_TRIM is enabled, then the P5 is the index
+**     of the right-most table that can be null-trimmed.
+**
+**   * If SQLITE_ENABLE_NULL_TRIM is omitted, then P5 has the value
+**     OPFLAG_NOCHNG_MAGIC if the OP_MakeRecord opcode is allowed to
+**     accept no-change records with serial_type 10.  This value is
+**     only used inside an assert() and does not affect the end result.
+*/
+case OP_MakeRecord: {
+  Mem *pRec;             /* The new record */
+  u64 nData;             /* Number of bytes of data space */
+  int nHdr;              /* Number of bytes of header space */
+  i64 nByte;             /* Data space required for this record */
+  i64 nZero;             /* Number of zero bytes at the end of the record */
+  int nVarint;           /* Number of bytes in a varint */
+  u32 serial_type;       /* Type field */
+  Mem *pData0;           /* First field to be combined into the record */
+  Mem *pLast;            /* Last field of the record */
+  int nField;            /* Number of fields in the record */
+  char *zAffinity;       /* The affinity string for the record */
+  u32 len;               /* Length of a field */
+  u8 *zHdr;              /* Where to write next byte of the header */
+  u8 *zPayload;          /* Where to write next byte of the payload */
+
+  /* Assuming the record contains N fields, the record format looks
+  ** like this:
+  **
+  ** ------------------------------------------------------------------------
+  ** | hdr-size | type 0 | type 1 | ... | type N-1 | data0 | ... | data N-1 |
+  ** ------------------------------------------------------------------------
+  **
+  ** Data(0) is taken from register
