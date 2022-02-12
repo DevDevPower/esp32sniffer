@@ -90812,4 +90812,223 @@ case OP_Or: {             /* same as TK_OR, in1, in2, out3 */
 /* Opcode: IsTrue P1 P2 P3 P4 *
 ** Synopsis: r[P2] = coalesce(r[P1]==TRUE,P3) ^ P4
 **
-** This opcode implements the IS TRUE, IS FALSE, IS N
+** This opcode implements the IS TRUE, IS FALSE, IS NOT TRUE, and
+** IS NOT FALSE operators.
+**
+** Interpret the value in register P1 as a boolean value.  Store that
+** boolean (a 0 or 1) in register P2.  Or if the value in register P1 is
+** NULL, then the P3 is stored in register P2.  Invert the answer if P4
+** is 1.
+**
+** The logic is summarized like this:
+**
+** <ul>
+** <li> If P3==0 and P4==0  then  r[P2] := r[P1] IS TRUE
+** <li> If P3==1 and P4==1  then  r[P2] := r[P1] IS FALSE
+** <li> If P3==0 and P4==1  then  r[P2] := r[P1] IS NOT TRUE
+** <li> If P3==1 and P4==0  then  r[P2] := r[P1] IS NOT FALSE
+** </ul>
+*/
+case OP_IsTrue: {               /* in1, out2 */
+  assert( pOp->p4type==P4_INT32 );
+  assert( pOp->p4.i==0 || pOp->p4.i==1 );
+  assert( pOp->p3==0 || pOp->p3==1 );
+  sqlite3VdbeMemSetInt64(&aMem[pOp->p2],
+      sqlite3VdbeBooleanValue(&aMem[pOp->p1], pOp->p3) ^ pOp->p4.i);
+  break;
+}
+
+/* Opcode: Not P1 P2 * * *
+** Synopsis: r[P2]= !r[P1]
+**
+** Interpret the value in register P1 as a boolean value.  Store the
+** boolean complement in register P2.  If the value in register P1 is
+** NULL, then a NULL is stored in P2.
+*/
+case OP_Not: {                /* same as TK_NOT, in1, out2 */
+  pIn1 = &aMem[pOp->p1];
+  pOut = &aMem[pOp->p2];
+  if( (pIn1->flags & MEM_Null)==0 ){
+    sqlite3VdbeMemSetInt64(pOut, !sqlite3VdbeBooleanValue(pIn1,0));
+  }else{
+    sqlite3VdbeMemSetNull(pOut);
+  }
+  break;
+}
+
+/* Opcode: BitNot P1 P2 * * *
+** Synopsis: r[P2]= ~r[P1]
+**
+** Interpret the content of register P1 as an integer.  Store the
+** ones-complement of the P1 value into register P2.  If P1 holds
+** a NULL then store a NULL in P2.
+*/
+case OP_BitNot: {             /* same as TK_BITNOT, in1, out2 */
+  pIn1 = &aMem[pOp->p1];
+  pOut = &aMem[pOp->p2];
+  sqlite3VdbeMemSetNull(pOut);
+  if( (pIn1->flags & MEM_Null)==0 ){
+    pOut->flags = MEM_Int;
+    pOut->u.i = ~sqlite3VdbeIntValue(pIn1);
+  }
+  break;
+}
+
+/* Opcode: Once P1 P2 * * *
+**
+** Fall through to the next instruction the first time this opcode is
+** encountered on each invocation of the byte-code program.  Jump to P2
+** on the second and all subsequent encounters during the same invocation.
+**
+** Top-level programs determine first invocation by comparing the P1
+** operand against the P1 operand on the OP_Init opcode at the beginning
+** of the program.  If the P1 values differ, then fall through and make
+** the P1 of this opcode equal to the P1 of OP_Init.  If P1 values are
+** the same then take the jump.
+**
+** For subprograms, there is a bitmask in the VdbeFrame that determines
+** whether or not the jump should be taken.  The bitmask is necessary
+** because the self-altering code trick does not work for recursive
+** triggers.
+*/
+case OP_Once: {             /* jump */
+  u32 iAddr;                /* Address of this instruction */
+  assert( p->aOp[0].opcode==OP_Init );
+  if( p->pFrame ){
+    iAddr = (int)(pOp - p->aOp);
+    if( (p->pFrame->aOnce[iAddr/8] & (1<<(iAddr & 7)))!=0 ){
+      VdbeBranchTaken(1, 2);
+      goto jump_to_p2;
+    }
+    p->pFrame->aOnce[iAddr/8] |= 1<<(iAddr & 7);
+  }else{
+    if( p->aOp[0].p1==pOp->p1 ){
+      VdbeBranchTaken(1, 2);
+      goto jump_to_p2;
+    }
+  }
+  VdbeBranchTaken(0, 2);
+  pOp->p1 = p->aOp[0].p1;
+  break;
+}
+
+/* Opcode: If P1 P2 P3 * *
+**
+** Jump to P2 if the value in register P1 is true.  The value
+** is considered true if it is numeric and non-zero.  If the value
+** in P1 is NULL then take the jump if and only if P3 is non-zero.
+*/
+case OP_If:  {               /* jump, in1 */
+  int c;
+  c = sqlite3VdbeBooleanValue(&aMem[pOp->p1], pOp->p3);
+  VdbeBranchTaken(c!=0, 2);
+  if( c ) goto jump_to_p2;
+  break;
+}
+
+/* Opcode: IfNot P1 P2 P3 * *
+**
+** Jump to P2 if the value in register P1 is False.  The value
+** is considered false if it has a numeric value of zero.  If the value
+** in P1 is NULL then take the jump if and only if P3 is non-zero.
+*/
+case OP_IfNot: {            /* jump, in1 */
+  int c;
+  c = !sqlite3VdbeBooleanValue(&aMem[pOp->p1], !pOp->p3);
+  VdbeBranchTaken(c!=0, 2);
+  if( c ) goto jump_to_p2;
+  break;
+}
+
+/* Opcode: IsNull P1 P2 * * *
+** Synopsis: if r[P1]==NULL goto P2
+**
+** Jump to P2 if the value in register P1 is NULL.
+*/
+case OP_IsNull: {            /* same as TK_ISNULL, jump, in1 */
+  pIn1 = &aMem[pOp->p1];
+  VdbeBranchTaken( (pIn1->flags & MEM_Null)!=0, 2);
+  if( (pIn1->flags & MEM_Null)!=0 ){
+    goto jump_to_p2;
+  }
+  break;
+}
+
+/* Opcode: IsNullOrType P1 P2 P3 * *
+** Synopsis: if typeof(r[P1]) IN (P3,5) goto P2
+**
+** Jump to P2 if the value in register P1 is NULL or has a datatype P3.
+** P3 is an integer which should be one of SQLITE_INTEGER, SQLITE_FLOAT,
+** SQLITE_BLOB, SQLITE_NULL, or SQLITE_TEXT.
+*/
+case OP_IsNullOrType: {      /* jump, in1 */
+  int doTheJump;
+  pIn1 = &aMem[pOp->p1];
+  doTheJump = (pIn1->flags & MEM_Null)!=0 || sqlite3_value_type(pIn1)==pOp->p3;
+  VdbeBranchTaken( doTheJump, 2);
+  if( doTheJump ) goto jump_to_p2;
+  break;
+}
+
+/* Opcode: ZeroOrNull P1 P2 P3 * *
+** Synopsis: r[P2] = 0 OR NULL
+**
+** If all both registers P1 and P3 are NOT NULL, then store a zero in
+** register P2.  If either registers P1 or P3 are NULL then put
+** a NULL in register P2.
+*/
+case OP_ZeroOrNull: {            /* in1, in2, out2, in3 */
+  if( (aMem[pOp->p1].flags & MEM_Null)!=0
+   || (aMem[pOp->p3].flags & MEM_Null)!=0
+  ){
+    sqlite3VdbeMemSetNull(aMem + pOp->p2);
+  }else{
+    sqlite3VdbeMemSetInt64(aMem + pOp->p2, 0);
+  }
+  break;
+}
+
+/* Opcode: NotNull P1 P2 * * *
+** Synopsis: if r[P1]!=NULL goto P2
+**
+** Jump to P2 if the value in register P1 is not NULL.
+*/
+case OP_NotNull: {            /* same as TK_NOTNULL, jump, in1 */
+  pIn1 = &aMem[pOp->p1];
+  VdbeBranchTaken( (pIn1->flags & MEM_Null)==0, 2);
+  if( (pIn1->flags & MEM_Null)==0 ){
+    goto jump_to_p2;
+  }
+  break;
+}
+
+/* Opcode: IfNullRow P1 P2 P3 * *
+** Synopsis: if P1.nullRow then r[P3]=NULL, goto P2
+**
+** Check the cursor P1 to see if it is currently pointing at a NULL row.
+** If it is, then set register P3 to NULL and jump immediately to P2.
+** If P1 is not on a NULL row, then fall through without making any
+** changes.
+*/
+case OP_IfNullRow: {         /* jump */
+  assert( pOp->p1>=0 && pOp->p1<p->nCursor );
+  assert( p->apCsr[pOp->p1]!=0 );
+  if( p->apCsr[pOp->p1]->nullRow ){
+    sqlite3VdbeMemSetNull(aMem + pOp->p3);
+    goto jump_to_p2;
+  }
+  break;
+}
+
+#ifdef SQLITE_ENABLE_OFFSET_SQL_FUNC
+/* Opcode: Offset P1 P2 P3 * *
+** Synopsis: r[P3] = sqlite_offset(P1)
+**
+** Store in register r[P3] the byte offset into the database file that is the
+** start of the payload for the record at which that cursor P1 is currently
+** pointing.
+**
+** P2 is the column number for the argument to the sqlite_offset() function.
+** This opcode does not use P2 itself, but the P2 value is used by the
+** code generator.  The P1, P2, and P3 operands to this opcode are the
+** same as for OP_Col
