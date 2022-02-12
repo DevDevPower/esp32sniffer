@@ -90615,4 +90615,201 @@ case OP_Ge: {             /* same as TK_GE, jump, in1, in3 */
 
 /* Opcode: ElseEq * P2 * * *
 **
-** This opcode must follow an OP_Lt 
+** This opcode must follow an OP_Lt or OP_Gt comparison operator.  There
+** can be zero or more OP_ReleaseReg opcodes intervening, but no other
+** opcodes are allowed to occur between this instruction and the previous
+** OP_Lt or OP_Gt.
+**
+** If result of an OP_Eq comparison on the same two operands as the
+** prior OP_Lt or OP_Gt would have been true, then jump to P2.
+** If the result of an OP_Eq comparison on the two previous
+** operands would have been false or NULL, then fall through.
+*/
+case OP_ElseEq: {       /* same as TK_ESCAPE, jump */
+
+#ifdef SQLITE_DEBUG
+  /* Verify the preconditions of this opcode - that it follows an OP_Lt or
+  ** OP_Gt with zero or more intervening OP_ReleaseReg opcodes */
+  int iAddr;
+  for(iAddr = (int)(pOp - aOp) - 1; ALWAYS(iAddr>=0); iAddr--){
+    if( aOp[iAddr].opcode==OP_ReleaseReg ) continue;
+    assert( aOp[iAddr].opcode==OP_Lt || aOp[iAddr].opcode==OP_Gt );
+    break;
+  }
+#endif /* SQLITE_DEBUG */
+  VdbeBranchTaken(iCompare==0, 2);
+  if( iCompare==0 ) goto jump_to_p2;
+  break;
+}
+
+
+/* Opcode: Permutation * * * P4 *
+**
+** Set the permutation used by the OP_Compare operator in the next
+** instruction.  The permutation is stored in the P4 operand.
+**
+** The permutation is only valid for the next opcode which must be
+** an OP_Compare that has the OPFLAG_PERMUTE bit set in P5.
+**
+** The first integer in the P4 integer array is the length of the array
+** and does not become part of the permutation.
+*/
+case OP_Permutation: {
+  assert( pOp->p4type==P4_INTARRAY );
+  assert( pOp->p4.ai );
+  assert( pOp[1].opcode==OP_Compare );
+  assert( pOp[1].p5 & OPFLAG_PERMUTE );
+  break;
+}
+
+/* Opcode: Compare P1 P2 P3 P4 P5
+** Synopsis: r[P1@P3] <-> r[P2@P3]
+**
+** Compare two vectors of registers in reg(P1)..reg(P1+P3-1) (call this
+** vector "A") and in reg(P2)..reg(P2+P3-1) ("B").  Save the result of
+** the comparison for use by the next OP_Jump instruct.
+**
+** If P5 has the OPFLAG_PERMUTE bit set, then the order of comparison is
+** determined by the most recent OP_Permutation operator.  If the
+** OPFLAG_PERMUTE bit is clear, then register are compared in sequential
+** order.
+**
+** P4 is a KeyInfo structure that defines collating sequences and sort
+** orders for the comparison.  The permutation applies to registers
+** only.  The KeyInfo elements are used sequentially.
+**
+** The comparison is a sort comparison, so NULLs compare equal,
+** NULLs are less than numbers, numbers are less than strings,
+** and strings are less than blobs.
+**
+** This opcode must be immediately followed by an OP_Jump opcode.
+*/
+case OP_Compare: {
+  int n;
+  int i;
+  int p1;
+  int p2;
+  const KeyInfo *pKeyInfo;
+  u32 idx;
+  CollSeq *pColl;    /* Collating sequence to use on this term */
+  int bRev;          /* True for DESCENDING sort order */
+  u32 *aPermute;     /* The permutation */
+
+  if( (pOp->p5 & OPFLAG_PERMUTE)==0 ){
+    aPermute = 0;
+  }else{
+    assert( pOp>aOp );
+    assert( pOp[-1].opcode==OP_Permutation );
+    assert( pOp[-1].p4type==P4_INTARRAY );
+    aPermute = pOp[-1].p4.ai + 1;
+    assert( aPermute!=0 );
+  }
+  n = pOp->p3;
+  pKeyInfo = pOp->p4.pKeyInfo;
+  assert( n>0 );
+  assert( pKeyInfo!=0 );
+  p1 = pOp->p1;
+  p2 = pOp->p2;
+#ifdef SQLITE_DEBUG
+  if( aPermute ){
+    int k, mx = 0;
+    for(k=0; k<n; k++) if( aPermute[k]>(u32)mx ) mx = aPermute[k];
+    assert( p1>0 && p1+mx<=(p->nMem+1 - p->nCursor)+1 );
+    assert( p2>0 && p2+mx<=(p->nMem+1 - p->nCursor)+1 );
+  }else{
+    assert( p1>0 && p1+n<=(p->nMem+1 - p->nCursor)+1 );
+    assert( p2>0 && p2+n<=(p->nMem+1 - p->nCursor)+1 );
+  }
+#endif /* SQLITE_DEBUG */
+  for(i=0; i<n; i++){
+    idx = aPermute ? aPermute[i] : (u32)i;
+    assert( memIsValid(&aMem[p1+idx]) );
+    assert( memIsValid(&aMem[p2+idx]) );
+    REGISTER_TRACE(p1+idx, &aMem[p1+idx]);
+    REGISTER_TRACE(p2+idx, &aMem[p2+idx]);
+    assert( i<pKeyInfo->nKeyField );
+    pColl = pKeyInfo->aColl[i];
+    bRev = (pKeyInfo->aSortFlags[i] & KEYINFO_ORDER_DESC);
+    iCompare = sqlite3MemCompare(&aMem[p1+idx], &aMem[p2+idx], pColl);
+    if( iCompare ){
+      if( (pKeyInfo->aSortFlags[i] & KEYINFO_ORDER_BIGNULL)
+       && ((aMem[p1+idx].flags & MEM_Null) || (aMem[p2+idx].flags & MEM_Null))
+      ){
+        iCompare = -iCompare;
+      }
+      if( bRev ) iCompare = -iCompare;
+      break;
+    }
+  }
+  assert( pOp[1].opcode==OP_Jump );
+  break;
+}
+
+/* Opcode: Jump P1 P2 P3 * *
+**
+** Jump to the instruction at address P1, P2, or P3 depending on whether
+** in the most recent OP_Compare instruction the P1 vector was less than
+** equal to, or greater than the P2 vector, respectively.
+**
+** This opcode must immediately follow an OP_Compare opcode.
+*/
+case OP_Jump: {             /* jump */
+  assert( pOp>aOp && pOp[-1].opcode==OP_Compare );
+  if( iCompare<0 ){
+    VdbeBranchTaken(0,4); pOp = &aOp[pOp->p1 - 1];
+  }else if( iCompare==0 ){
+    VdbeBranchTaken(1,4); pOp = &aOp[pOp->p2 - 1];
+  }else{
+    VdbeBranchTaken(2,4); pOp = &aOp[pOp->p3 - 1];
+  }
+  break;
+}
+
+/* Opcode: And P1 P2 P3 * *
+** Synopsis: r[P3]=(r[P1] && r[P2])
+**
+** Take the logical AND of the values in registers P1 and P2 and
+** write the result into register P3.
+**
+** If either P1 or P2 is 0 (false) then the result is 0 even if
+** the other input is NULL.  A NULL and true or two NULLs give
+** a NULL output.
+*/
+/* Opcode: Or P1 P2 P3 * *
+** Synopsis: r[P3]=(r[P1] || r[P2])
+**
+** Take the logical OR of the values in register P1 and P2 and
+** store the answer in register P3.
+**
+** If either P1 or P2 is nonzero (true) then the result is 1 (true)
+** even if the other input is NULL.  A NULL and false or two NULLs
+** give a NULL output.
+*/
+case OP_And:              /* same as TK_AND, in1, in2, out3 */
+case OP_Or: {             /* same as TK_OR, in1, in2, out3 */
+  int v1;    /* Left operand:  0==FALSE, 1==TRUE, 2==UNKNOWN or NULL */
+  int v2;    /* Right operand: 0==FALSE, 1==TRUE, 2==UNKNOWN or NULL */
+
+  v1 = sqlite3VdbeBooleanValue(&aMem[pOp->p1], 2);
+  v2 = sqlite3VdbeBooleanValue(&aMem[pOp->p2], 2);
+  if( pOp->opcode==OP_And ){
+    static const unsigned char and_logic[] = { 0, 0, 0, 0, 1, 2, 0, 2, 2 };
+    v1 = and_logic[v1*3+v2];
+  }else{
+    static const unsigned char or_logic[] = { 0, 1, 2, 1, 1, 1, 2, 1, 2 };
+    v1 = or_logic[v1*3+v2];
+  }
+  pOut = &aMem[pOp->p3];
+  if( v1==2 ){
+    MemSetTypeFlag(pOut, MEM_Null);
+  }else{
+    pOut->u.i = v1;
+    MemSetTypeFlag(pOut, MEM_Int);
+  }
+  break;
+}
+
+/* Opcode: IsTrue P1 P2 P3 P4 *
+** Synopsis: r[P2] = coalesce(r[P1]==TRUE,P3) ^ P4
+**
+** This opcode implements the IS TRUE, IS FALSE, IS N
