@@ -93286,4 +93286,189 @@ case OP_IfNotOpen: {        /* jump */
 ** advanced in the forward direction.  The Next instruction will work,
 ** but not the Prev instruction.
 **
-** See also: NotFound
+** See also: NotFound, NoConflict, NotExists. SeekGe
+*/
+/* Opcode: NotFound P1 P2 P3 P4 *
+** Synopsis: key=r[P3@P4]
+**
+** If P4==0 then register P3 holds a blob constructed by MakeRecord.  If
+** P4>0 then register P3 is the first of P4 registers that form an unpacked
+** record.
+**
+** Cursor P1 is on an index btree.  If the record identified by P3 and P4
+** is not the prefix of any entry in P1 then a jump is made to P2.  If P1
+** does contain an entry whose prefix matches the P3/P4 record then control
+** falls through to the next instruction and P1 is left pointing at the
+** matching entry.
+**
+** This operation leaves the cursor in a state where it cannot be
+** advanced in either direction.  In other words, the Next and Prev
+** opcodes do not work after this operation.
+**
+** See also: Found, NotExists, NoConflict, IfNoHope
+*/
+/* Opcode: IfNoHope P1 P2 P3 P4 *
+** Synopsis: key=r[P3@P4]
+**
+** Register P3 is the first of P4 registers that form an unpacked
+** record.  Cursor P1 is an index btree.  P2 is a jump destination.
+** In other words, the operands to this opcode are the same as the
+** operands to OP_NotFound and OP_IdxGT.
+**
+** This opcode is an optimization attempt only.  If this opcode always
+** falls through, the correct answer is still obtained, but extra works
+** is performed.
+**
+** A value of N in the seekHit flag of cursor P1 means that there exists
+** a key P3:N that will match some record in the index.  We want to know
+** if it is possible for a record P3:P4 to match some record in the
+** index.  If it is not possible, we can skips some work.  So if seekHit
+** is less than P4, attempt to find out if a match is possible by running
+** OP_NotFound.
+**
+** This opcode is used in IN clause processing for a multi-column key.
+** If an IN clause is attached to an element of the key other than the
+** left-most element, and if there are no matches on the most recent
+** seek over the whole key, then it might be that one of the key element
+** to the left is prohibiting a match, and hence there is "no hope" of
+** any match regardless of how many IN clause elements are checked.
+** In such a case, we abandon the IN clause search early, using this
+** opcode.  The opcode name comes from the fact that the
+** jump is taken if there is "no hope" of achieving a match.
+**
+** See also: NotFound, SeekHit
+*/
+/* Opcode: NoConflict P1 P2 P3 P4 *
+** Synopsis: key=r[P3@P4]
+**
+** If P4==0 then register P3 holds a blob constructed by MakeRecord.  If
+** P4>0 then register P3 is the first of P4 registers that form an unpacked
+** record.
+**
+** Cursor P1 is on an index btree.  If the record identified by P3 and P4
+** contains any NULL value, jump immediately to P2.  If all terms of the
+** record are not-NULL then a check is done to determine if any row in the
+** P1 index btree has a matching key prefix.  If there are no matches, jump
+** immediately to P2.  If there is a match, fall through and leave the P1
+** cursor pointing to the matching row.
+**
+** This opcode is similar to OP_NotFound with the exceptions that the
+** branch is always taken if any part of the search key input is NULL.
+**
+** This operation leaves the cursor in a state where it cannot be
+** advanced in either direction.  In other words, the Next and Prev
+** opcodes do not work after this operation.
+**
+** See also: NotFound, Found, NotExists
+*/
+case OP_IfNoHope: {     /* jump, in3 */
+  VdbeCursor *pC;
+  assert( pOp->p1>=0 && pOp->p1<p->nCursor );
+  pC = p->apCsr[pOp->p1];
+  assert( pC!=0 );
+#ifdef SQLITE_DEBUG
+  if( db->flags&SQLITE_VdbeTrace ){
+    printf("seekHit is %d\n", pC->seekHit);
+  }
+#endif
+  if( pC->seekHit>=pOp->p4.i ) break;
+  /* Fall through into OP_NotFound */
+  /* no break */ deliberate_fall_through
+}
+case OP_NoConflict:     /* jump, in3 */
+case OP_NotFound:       /* jump, in3 */
+case OP_Found: {        /* jump, in3 */
+  int alreadyExists;
+  int ii;
+  VdbeCursor *pC;
+  UnpackedRecord *pIdxKey;
+  UnpackedRecord r;
+
+#ifdef SQLITE_TEST
+  if( pOp->opcode!=OP_NoConflict ) sqlite3_found_count++;
+#endif
+
+  assert( pOp->p1>=0 && pOp->p1<p->nCursor );
+  assert( pOp->p4type==P4_INT32 );
+  pC = p->apCsr[pOp->p1];
+  assert( pC!=0 );
+#ifdef SQLITE_DEBUG
+  pC->seekOp = pOp->opcode;
+#endif
+  r.aMem = &aMem[pOp->p3];
+  assert( pC->eCurType==CURTYPE_BTREE );
+  assert( pC->uc.pCursor!=0 );
+  assert( pC->isTable==0 );
+  r.nField = (u16)pOp->p4.i;
+  if( r.nField>0 ){
+    /* Key values in an array of registers */
+    r.pKeyInfo = pC->pKeyInfo;
+    r.default_rc = 0;
+#ifdef SQLITE_DEBUG
+    for(ii=0; ii<r.nField; ii++){
+      assert( memIsValid(&r.aMem[ii]) );
+      assert( (r.aMem[ii].flags & MEM_Zero)==0 || r.aMem[ii].n==0 );
+      if( ii ) REGISTER_TRACE(pOp->p3+ii, &r.aMem[ii]);
+    }
+#endif
+    rc = sqlite3BtreeIndexMoveto(pC->uc.pCursor, &r, &pC->seekResult);
+  }else{
+    /* Composite key generated by OP_MakeRecord */
+    assert( r.aMem->flags & MEM_Blob );
+    assert( pOp->opcode!=OP_NoConflict );
+    rc = ExpandBlob(r.aMem);
+    assert( rc==SQLITE_OK || rc==SQLITE_NOMEM );
+    if( rc ) goto no_mem;
+    pIdxKey = sqlite3VdbeAllocUnpackedRecord(pC->pKeyInfo);
+    if( pIdxKey==0 ) goto no_mem;
+    sqlite3VdbeRecordUnpack(pC->pKeyInfo, r.aMem->n, r.aMem->z, pIdxKey);
+    pIdxKey->default_rc = 0;
+    rc = sqlite3BtreeIndexMoveto(pC->uc.pCursor, pIdxKey, &pC->seekResult);
+    sqlite3DbFreeNN(db, pIdxKey);
+  }
+  if( rc!=SQLITE_OK ){
+    goto abort_due_to_error;
+  }
+  alreadyExists = (pC->seekResult==0);
+  pC->nullRow = 1-alreadyExists;
+  pC->deferredMoveto = 0;
+  pC->cacheStatus = CACHE_STALE;
+  if( pOp->opcode==OP_Found ){
+    VdbeBranchTaken(alreadyExists!=0,2);
+    if( alreadyExists ) goto jump_to_p2;
+  }else{
+    if( !alreadyExists ){
+      VdbeBranchTaken(1,2);
+      goto jump_to_p2;
+    }
+    if( pOp->opcode==OP_NoConflict ){
+      /* For the OP_NoConflict opcode, take the jump if any of the
+      ** input fields are NULL, since any key with a NULL will not
+      ** conflict */
+      for(ii=0; ii<r.nField; ii++){
+        if( r.aMem[ii].flags & MEM_Null ){
+          VdbeBranchTaken(1,2);
+          goto jump_to_p2;
+        }
+      }
+    }
+    VdbeBranchTaken(0,2);
+    if( pOp->opcode==OP_IfNoHope ){
+      pC->seekHit = pOp->p4.i;
+    }
+  }
+  break;
+}
+
+/* Opcode: SeekRowid P1 P2 P3 * *
+** Synopsis: intkey=r[P3]
+**
+** P1 is the index of a cursor open on an SQL table btree (with integer
+** keys).  If register P3 does not contain an integer or if P1 does not
+** contain a record with rowid P3 then jump immediately to P2.
+** Or, if P2 is 0, raise an SQLITE_CORRUPT error. If P1 does contain
+** a record with rowid P3 then
+** leave the cursor pointing at that record and fall through to the next
+** instruction.
+**
+** The OP_NotExists opcode performs the same operation, but with OP_NotExists
