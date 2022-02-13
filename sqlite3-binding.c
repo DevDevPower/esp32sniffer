@@ -92698,4 +92698,181 @@ case OP_SorterOpen: {
 
   assert( pOp->p1>=0 );
   assert( pOp->p2>=0 );
-  pCx = allocateCursor(p, pOp->p1, pOp->p2, CURTYPE_
+  pCx = allocateCursor(p, pOp->p1, pOp->p2, CURTYPE_SORTER);
+  if( pCx==0 ) goto no_mem;
+  pCx->pKeyInfo = pOp->p4.pKeyInfo;
+  assert( pCx->pKeyInfo->db==db );
+  assert( pCx->pKeyInfo->enc==ENC(db) );
+  rc = sqlite3VdbeSorterInit(db, pOp->p3, pCx);
+  if( rc ) goto abort_due_to_error;
+  break;
+}
+
+/* Opcode: SequenceTest P1 P2 * * *
+** Synopsis: if( cursor[P1].ctr++ ) pc = P2
+**
+** P1 is a sorter cursor. If the sequence counter is currently zero, jump
+** to P2. Regardless of whether or not the jump is taken, increment the
+** the sequence value.
+*/
+case OP_SequenceTest: {
+  VdbeCursor *pC;
+  assert( pOp->p1>=0 && pOp->p1<p->nCursor );
+  pC = p->apCsr[pOp->p1];
+  assert( isSorter(pC) );
+  if( (pC->seqCount++)==0 ){
+    goto jump_to_p2;
+  }
+  break;
+}
+
+/* Opcode: OpenPseudo P1 P2 P3 * *
+** Synopsis: P3 columns in r[P2]
+**
+** Open a new cursor that points to a fake table that contains a single
+** row of data.  The content of that one row is the content of memory
+** register P2.  In other words, cursor P1 becomes an alias for the
+** MEM_Blob content contained in register P2.
+**
+** A pseudo-table created by this opcode is used to hold a single
+** row output from the sorter so that the row can be decomposed into
+** individual columns using the OP_Column opcode.  The OP_Column opcode
+** is the only cursor opcode that works with a pseudo-table.
+**
+** P3 is the number of fields in the records that will be stored by
+** the pseudo-table.
+*/
+case OP_OpenPseudo: {
+  VdbeCursor *pCx;
+
+  assert( pOp->p1>=0 );
+  assert( pOp->p3>=0 );
+  pCx = allocateCursor(p, pOp->p1, pOp->p3, CURTYPE_PSEUDO);
+  if( pCx==0 ) goto no_mem;
+  pCx->nullRow = 1;
+  pCx->seekResult = pOp->p2;
+  pCx->isTable = 1;
+  /* Give this pseudo-cursor a fake BtCursor pointer so that pCx
+  ** can be safely passed to sqlite3VdbeCursorMoveto().  This avoids a test
+  ** for pCx->eCurType==CURTYPE_BTREE inside of sqlite3VdbeCursorMoveto()
+  ** which is a performance optimization */
+  pCx->uc.pCursor = sqlite3BtreeFakeValidCursor();
+  assert( pOp->p5==0 );
+  break;
+}
+
+/* Opcode: Close P1 * * * *
+**
+** Close a cursor previously opened as P1.  If P1 is not
+** currently open, this instruction is a no-op.
+*/
+case OP_Close: {
+  assert( pOp->p1>=0 && pOp->p1<p->nCursor );
+  sqlite3VdbeFreeCursor(p, p->apCsr[pOp->p1]);
+  p->apCsr[pOp->p1] = 0;
+  break;
+}
+
+#ifdef SQLITE_ENABLE_COLUMN_USED_MASK
+/* Opcode: ColumnsUsed P1 * * P4 *
+**
+** This opcode (which only exists if SQLite was compiled with
+** SQLITE_ENABLE_COLUMN_USED_MASK) identifies which columns of the
+** table or index for cursor P1 are used.  P4 is a 64-bit integer
+** (P4_INT64) in which the first 63 bits are one for each of the
+** first 63 columns of the table or index that are actually used
+** by the cursor.  The high-order bit is set if any column after
+** the 64th is used.
+*/
+case OP_ColumnsUsed: {
+  VdbeCursor *pC;
+  pC = p->apCsr[pOp->p1];
+  assert( pC->eCurType==CURTYPE_BTREE );
+  pC->maskUsed = *(u64*)pOp->p4.pI64;
+  break;
+}
+#endif
+
+/* Opcode: SeekGE P1 P2 P3 P4 *
+** Synopsis: key=r[P3@P4]
+**
+** If cursor P1 refers to an SQL table (B-Tree that uses integer keys),
+** use the value in register P3 as the key.  If cursor P1 refers
+** to an SQL index, then P3 is the first in an array of P4 registers
+** that are used as an unpacked index key.
+**
+** Reposition cursor P1 so that  it points to the smallest entry that
+** is greater than or equal to the key value. If there are no records
+** greater than or equal to the key and P2 is not zero, then jump to P2.
+**
+** If the cursor P1 was opened using the OPFLAG_SEEKEQ flag, then this
+** opcode will either land on a record that exactly matches the key, or
+** else it will cause a jump to P2.  When the cursor is OPFLAG_SEEKEQ,
+** this opcode must be followed by an IdxLE opcode with the same arguments.
+** The IdxGT opcode will be skipped if this opcode succeeds, but the
+** IdxGT opcode will be used on subsequent loop iterations.  The
+** OPFLAG_SEEKEQ flags is a hint to the btree layer to say that this
+** is an equality search.
+**
+** This opcode leaves the cursor configured to move in forward order,
+** from the beginning toward the end.  In other words, the cursor is
+** configured to use Next, not Prev.
+**
+** See also: Found, NotFound, SeekLt, SeekGt, SeekLe
+*/
+/* Opcode: SeekGT P1 P2 P3 P4 *
+** Synopsis: key=r[P3@P4]
+**
+** If cursor P1 refers to an SQL table (B-Tree that uses integer keys),
+** use the value in register P3 as a key. If cursor P1 refers
+** to an SQL index, then P3 is the first in an array of P4 registers
+** that are used as an unpacked index key.
+**
+** Reposition cursor P1 so that it points to the smallest entry that
+** is greater than the key value. If there are no records greater than
+** the key and P2 is not zero, then jump to P2.
+**
+** This opcode leaves the cursor configured to move in forward order,
+** from the beginning toward the end.  In other words, the cursor is
+** configured to use Next, not Prev.
+**
+** See also: Found, NotFound, SeekLt, SeekGe, SeekLe
+*/
+/* Opcode: SeekLT P1 P2 P3 P4 *
+** Synopsis: key=r[P3@P4]
+**
+** If cursor P1 refers to an SQL table (B-Tree that uses integer keys),
+** use the value in register P3 as a key. If cursor P1 refers
+** to an SQL index, then P3 is the first in an array of P4 registers
+** that are used as an unpacked index key.
+**
+** Reposition cursor P1 so that  it points to the largest entry that
+** is less than the key value. If there are no records less than
+** the key and P2 is not zero, then jump to P2.
+**
+** This opcode leaves the cursor configured to move in reverse order,
+** from the end toward the beginning.  In other words, the cursor is
+** configured to use Prev, not Next.
+**
+** See also: Found, NotFound, SeekGt, SeekGe, SeekLe
+*/
+/* Opcode: SeekLE P1 P2 P3 P4 *
+** Synopsis: key=r[P3@P4]
+**
+** If cursor P1 refers to an SQL table (B-Tree that uses integer keys),
+** use the value in register P3 as a key. If cursor P1 refers
+** to an SQL index, then P3 is the first in an array of P4 registers
+** that are used as an unpacked index key.
+**
+** Reposition cursor P1 so that it points to the largest entry that
+** is less than or equal to the key value. If there are no records
+** less than or equal to the key and P2 is not zero, then jump to P2.
+**
+** This opcode leaves the cursor configured to move in reverse order,
+** from the end toward the beginning.  In other words, the cursor is
+** configured to use Prev, not Next.
+**
+** If the cursor P1 was opened using the OPFLAG_SEEKEQ flag, then this
+** opcode will either land on a record that exactly matches the key, or
+** else it will cause a jump to P2.  When the cursor is OPFLAG_SEEKEQ,
+** t
