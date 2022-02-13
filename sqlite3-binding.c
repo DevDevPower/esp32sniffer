@@ -92330,4 +92330,194 @@ case OP_SetCookie: {
   if( pOp->p2==BTREE_SCHEMA_VERSION ){
     /* When the schema cookie changes, record the new cookie internally */
     *(u32*)&pDb->pSchema->schema_cookie = *(u32*)&pOp->p3 - pOp->p5;
-    db-
+    db->mDbFlags |= DBFLAG_SchemaChange;
+    sqlite3FkClearTriggerCache(db, pOp->p1);
+  }else if( pOp->p2==BTREE_FILE_FORMAT ){
+    /* Record changes in the file format */
+    pDb->pSchema->file_format = pOp->p3;
+  }
+  if( pOp->p1==1 ){
+    /* Invalidate all prepared statements whenever the TEMP database
+    ** schema is changed.  Ticket #1644 */
+    sqlite3ExpirePreparedStatements(db, 0);
+    p->expired = 0;
+  }
+  if( rc ) goto abort_due_to_error;
+  break;
+}
+
+/* Opcode: OpenRead P1 P2 P3 P4 P5
+** Synopsis: root=P2 iDb=P3
+**
+** Open a read-only cursor for the database table whose root page is
+** P2 in a database file.  The database file is determined by P3.
+** P3==0 means the main database, P3==1 means the database used for
+** temporary tables, and P3>1 means used the corresponding attached
+** database.  Give the new cursor an identifier of P1.  The P1
+** values need not be contiguous but all P1 values should be small integers.
+** It is an error for P1 to be negative.
+**
+** Allowed P5 bits:
+** <ul>
+** <li>  <b>0x02 OPFLAG_SEEKEQ</b>: This cursor will only be used for
+**       equality lookups (implemented as a pair of opcodes OP_SeekGE/OP_IdxGT
+**       of OP_SeekLE/OP_IdxLT)
+** </ul>
+**
+** The P4 value may be either an integer (P4_INT32) or a pointer to
+** a KeyInfo structure (P4_KEYINFO). If it is a pointer to a KeyInfo
+** object, then table being opened must be an [index b-tree] where the
+** KeyInfo object defines the content and collating
+** sequence of that index b-tree. Otherwise, if P4 is an integer
+** value, then the table being opened must be a [table b-tree] with a
+** number of columns no less than the value of P4.
+**
+** See also: OpenWrite, ReopenIdx
+*/
+/* Opcode: ReopenIdx P1 P2 P3 P4 P5
+** Synopsis: root=P2 iDb=P3
+**
+** The ReopenIdx opcode works like OP_OpenRead except that it first
+** checks to see if the cursor on P1 is already open on the same
+** b-tree and if it is this opcode becomes a no-op.  In other words,
+** if the cursor is already open, do not reopen it.
+**
+** The ReopenIdx opcode may only be used with P5==0 or P5==OPFLAG_SEEKEQ
+** and with P4 being a P4_KEYINFO object.  Furthermore, the P3 value must
+** be the same as every other ReopenIdx or OpenRead for the same cursor
+** number.
+**
+** Allowed P5 bits:
+** <ul>
+** <li>  <b>0x02 OPFLAG_SEEKEQ</b>: This cursor will only be used for
+**       equality lookups (implemented as a pair of opcodes OP_SeekGE/OP_IdxGT
+**       of OP_SeekLE/OP_IdxLT)
+** </ul>
+**
+** See also: OP_OpenRead, OP_OpenWrite
+*/
+/* Opcode: OpenWrite P1 P2 P3 P4 P5
+** Synopsis: root=P2 iDb=P3
+**
+** Open a read/write cursor named P1 on the table or index whose root
+** page is P2 (or whose root page is held in register P2 if the
+** OPFLAG_P2ISREG bit is set in P5 - see below).
+**
+** The P4 value may be either an integer (P4_INT32) or a pointer to
+** a KeyInfo structure (P4_KEYINFO). If it is a pointer to a KeyInfo
+** object, then table being opened must be an [index b-tree] where the
+** KeyInfo object defines the content and collating
+** sequence of that index b-tree. Otherwise, if P4 is an integer
+** value, then the table being opened must be a [table b-tree] with a
+** number of columns no less than the value of P4.
+**
+** Allowed P5 bits:
+** <ul>
+** <li>  <b>0x02 OPFLAG_SEEKEQ</b>: This cursor will only be used for
+**       equality lookups (implemented as a pair of opcodes OP_SeekGE/OP_IdxGT
+**       of OP_SeekLE/OP_IdxLT)
+** <li>  <b>0x08 OPFLAG_FORDELETE</b>: This cursor is used only to seek
+**       and subsequently delete entries in an index btree.  This is a
+**       hint to the storage engine that the storage engine is allowed to
+**       ignore.  The hint is not used by the official SQLite b*tree storage
+**       engine, but is used by COMDB2.
+** <li>  <b>0x10 OPFLAG_P2ISREG</b>: Use the content of register P2
+**       as the root page, not the value of P2 itself.
+** </ul>
+**
+** This instruction works like OpenRead except that it opens the cursor
+** in read/write mode.
+**
+** See also: OP_OpenRead, OP_ReopenIdx
+*/
+case OP_ReopenIdx: {
+  int nField;
+  KeyInfo *pKeyInfo;
+  u32 p2;
+  int iDb;
+  int wrFlag;
+  Btree *pX;
+  VdbeCursor *pCur;
+  Db *pDb;
+
+  assert( pOp->p5==0 || pOp->p5==OPFLAG_SEEKEQ );
+  assert( pOp->p4type==P4_KEYINFO );
+  pCur = p->apCsr[pOp->p1];
+  if( pCur && pCur->pgnoRoot==(u32)pOp->p2 ){
+    assert( pCur->iDb==pOp->p3 );      /* Guaranteed by the code generator */
+    assert( pCur->eCurType==CURTYPE_BTREE );
+    sqlite3BtreeClearCursor(pCur->uc.pCursor);
+    goto open_cursor_set_hints;
+  }
+  /* If the cursor is not currently open or is open on a different
+  ** index, then fall through into OP_OpenRead to force a reopen */
+case OP_OpenRead:
+case OP_OpenWrite:
+
+  assert( pOp->opcode==OP_OpenWrite || pOp->p5==0 || pOp->p5==OPFLAG_SEEKEQ );
+  assert( p->bIsReader );
+  assert( pOp->opcode==OP_OpenRead || pOp->opcode==OP_ReopenIdx
+          || p->readOnly==0 );
+
+  if( p->expired==1 ){
+    rc = SQLITE_ABORT_ROLLBACK;
+    goto abort_due_to_error;
+  }
+
+  nField = 0;
+  pKeyInfo = 0;
+  p2 = (u32)pOp->p2;
+  iDb = pOp->p3;
+  assert( iDb>=0 && iDb<db->nDb );
+  assert( DbMaskTest(p->btreeMask, iDb) );
+  pDb = &db->aDb[iDb];
+  pX = pDb->pBt;
+  assert( pX!=0 );
+  if( pOp->opcode==OP_OpenWrite ){
+    assert( OPFLAG_FORDELETE==BTREE_FORDELETE );
+    wrFlag = BTREE_WRCSR | (pOp->p5 & OPFLAG_FORDELETE);
+    assert( sqlite3SchemaMutexHeld(db, iDb, 0) );
+    if( pDb->pSchema->file_format < p->minWriteFileFormat ){
+      p->minWriteFileFormat = pDb->pSchema->file_format;
+    }
+  }else{
+    wrFlag = 0;
+  }
+  if( pOp->p5 & OPFLAG_P2ISREG ){
+    assert( p2>0 );
+    assert( p2<=(u32)(p->nMem+1 - p->nCursor) );
+    assert( pOp->opcode==OP_OpenWrite );
+    pIn2 = &aMem[p2];
+    assert( memIsValid(pIn2) );
+    assert( (pIn2->flags & MEM_Int)!=0 );
+    sqlite3VdbeMemIntegerify(pIn2);
+    p2 = (int)pIn2->u.i;
+    /* The p2 value always comes from a prior OP_CreateBtree opcode and
+    ** that opcode will always set the p2 value to 2 or more or else fail.
+    ** If there were a failure, the prepared statement would have halted
+    ** before reaching this instruction. */
+    assert( p2>=2 );
+  }
+  if( pOp->p4type==P4_KEYINFO ){
+    pKeyInfo = pOp->p4.pKeyInfo;
+    assert( pKeyInfo->enc==ENC(db) );
+    assert( pKeyInfo->db==db );
+    nField = pKeyInfo->nAllField;
+  }else if( pOp->p4type==P4_INT32 ){
+    nField = pOp->p4.i;
+  }
+  assert( pOp->p1>=0 );
+  assert( nField>=0 );
+  testcase( nField==0 );  /* Table with INTEGER PRIMARY KEY and nothing else */
+  pCur = allocateCursor(p, pOp->p1, nField, CURTYPE_BTREE);
+  if( pCur==0 ) goto no_mem;
+  pCur->iDb = iDb;
+  pCur->nullRow = 1;
+  pCur->isOrdered = 1;
+  pCur->pgnoRoot = p2;
+#ifdef SQLITE_DEBUG
+  pCur->wrFlag = wrFlag;
+#endif
+  rc = sqlite3BtreeCursor(pX, p2, wrFlag, pKeyInfo, pCur->uc.pCursor);
+  pCur->pKeyInfo = pKeyInfo;
+  /* Set the VdbeCursor.isT
