@@ -91762,4 +91762,206 @@ case OP_MakeRecord: {
 
   /* Make sure the output register has a buffer large enough to store
   ** the new record. The output register (pOp->p3) is not allowed to
-  *
+  ** be one of the input registers (because the following call to
+  ** sqlite3VdbeMemClearAndResize() could clobber the value before it is used).
+  */
+  if( nByte+nZero<=pOut->szMalloc ){
+    /* The output register is already large enough to hold the record.
+    ** No error checks or buffer enlargement is required */
+    pOut->z = pOut->zMalloc;
+  }else{
+    /* Need to make sure that the output is not too big and then enlarge
+    ** the output register to hold the full result */
+    if( nByte+nZero>db->aLimit[SQLITE_LIMIT_LENGTH] ){
+      goto too_big;
+    }
+    if( sqlite3VdbeMemClearAndResize(pOut, (int)nByte) ){
+      goto no_mem;
+    }
+  }
+  pOut->n = (int)nByte;
+  pOut->flags = MEM_Blob;
+  if( nZero ){
+    pOut->u.nZero = nZero;
+    pOut->flags |= MEM_Zero;
+  }
+  UPDATE_MAX_BLOBSIZE(pOut);
+  zHdr = (u8 *)pOut->z;
+  zPayload = zHdr + nHdr;
+
+  /* Write the record */
+  if( nHdr<0x80 ){
+    *(zHdr++) = nHdr;
+  }else{
+    zHdr += sqlite3PutVarint(zHdr,nHdr);
+  }
+  assert( pData0<=pLast );
+  pRec = pData0;
+  while( 1 /*exit-by-break*/ ){
+    serial_type = pRec->uTemp;
+    /* EVIDENCE-OF: R-06529-47362 Following the size varint are one or more
+    ** additional varints, one per column.
+    ** EVIDENCE-OF: R-64536-51728 The values for each column in the record
+    ** immediately follow the header. */
+    if( serial_type<=7 ){
+      *(zHdr++) = serial_type;
+      if( serial_type==0 ){
+        /* NULL value.  No change in zPayload */
+      }else{
+        u64 v;
+        u32 i;
+        if( serial_type==7 ){
+          assert( sizeof(v)==sizeof(pRec->u.r) );
+          memcpy(&v, &pRec->u.r, sizeof(v));
+          swapMixedEndianFloat(v);
+        }else{
+          v = pRec->u.i;
+        }
+        len = i = sqlite3SmallTypeSizes[serial_type];
+        assert( i>0 );
+        while( 1 /*exit-by-break*/ ){
+          zPayload[--i] = (u8)(v&0xFF);
+          if( i==0 ) break;
+          v >>= 8;
+        }
+        zPayload += len;
+      }
+    }else if( serial_type<0x80 ){
+      *(zHdr++) = serial_type;
+      if( serial_type>=14 && pRec->n>0 ){
+        assert( pRec->z!=0 );
+        memcpy(zPayload, pRec->z, pRec->n);
+        zPayload += pRec->n;
+      }
+    }else{
+      zHdr += sqlite3PutVarint(zHdr, serial_type);
+      if( pRec->n ){
+        assert( pRec->z!=0 );
+        memcpy(zPayload, pRec->z, pRec->n);
+        zPayload += pRec->n;
+      }
+    }
+    if( pRec==pLast ) break;
+    pRec++;
+  }
+  assert( nHdr==(int)(zHdr - (u8*)pOut->z) );
+  assert( nByte==(int)(zPayload - (u8*)pOut->z) );
+
+  assert( pOp->p3>0 && pOp->p3<=(p->nMem+1 - p->nCursor) );
+  REGISTER_TRACE(pOp->p3, pOut);
+  break;
+}
+
+/* Opcode: Count P1 P2 P3 * *
+** Synopsis: r[P2]=count()
+**
+** Store the number of entries (an integer value) in the table or index
+** opened by cursor P1 in register P2.
+**
+** If P3==0, then an exact count is obtained, which involves visiting
+** every btree page of the table.  But if P3 is non-zero, an estimate
+** is returned based on the current cursor position.
+*/
+case OP_Count: {         /* out2 */
+  i64 nEntry;
+  BtCursor *pCrsr;
+
+  assert( p->apCsr[pOp->p1]->eCurType==CURTYPE_BTREE );
+  pCrsr = p->apCsr[pOp->p1]->uc.pCursor;
+  assert( pCrsr );
+  if( pOp->p3 ){
+    nEntry = sqlite3BtreeRowCountEst(pCrsr);
+  }else{
+    nEntry = 0;  /* Not needed.  Only used to silence a warning. */
+    rc = sqlite3BtreeCount(db, pCrsr, &nEntry);
+    if( rc ) goto abort_due_to_error;
+  }
+  pOut = out2Prerelease(p, pOp);
+  pOut->u.i = nEntry;
+  goto check_for_interrupt;
+}
+
+/* Opcode: Savepoint P1 * * P4 *
+**
+** Open, release or rollback the savepoint named by parameter P4, depending
+** on the value of P1. To open a new savepoint set P1==0 (SAVEPOINT_BEGIN).
+** To release (commit) an existing savepoint set P1==1 (SAVEPOINT_RELEASE).
+** To rollback an existing savepoint set P1==2 (SAVEPOINT_ROLLBACK).
+*/
+case OP_Savepoint: {
+  int p1;                         /* Value of P1 operand */
+  char *zName;                    /* Name of savepoint */
+  int nName;
+  Savepoint *pNew;
+  Savepoint *pSavepoint;
+  Savepoint *pTmp;
+  int iSavepoint;
+  int ii;
+
+  p1 = pOp->p1;
+  zName = pOp->p4.z;
+
+  /* Assert that the p1 parameter is valid. Also that if there is no open
+  ** transaction, then there cannot be any savepoints.
+  */
+  assert( db->pSavepoint==0 || db->autoCommit==0 );
+  assert( p1==SAVEPOINT_BEGIN||p1==SAVEPOINT_RELEASE||p1==SAVEPOINT_ROLLBACK );
+  assert( db->pSavepoint || db->isTransactionSavepoint==0 );
+  assert( checkSavepointCount(db) );
+  assert( p->bIsReader );
+
+  if( p1==SAVEPOINT_BEGIN ){
+    if( db->nVdbeWrite>0 ){
+      /* A new savepoint cannot be created if there are active write
+      ** statements (i.e. open read/write incremental blob handles).
+      */
+      sqlite3VdbeError(p, "cannot open savepoint - SQL statements in progress");
+      rc = SQLITE_BUSY;
+    }else{
+      nName = sqlite3Strlen30(zName);
+
+#ifndef SQLITE_OMIT_VIRTUALTABLE
+      /* This call is Ok even if this savepoint is actually a transaction
+      ** savepoint (and therefore should not prompt xSavepoint()) callbacks.
+      ** If this is a transaction savepoint being opened, it is guaranteed
+      ** that the db->aVTrans[] array is empty.  */
+      assert( db->autoCommit==0 || db->nVTrans==0 );
+      rc = sqlite3VtabSavepoint(db, SAVEPOINT_BEGIN,
+                                db->nStatement+db->nSavepoint);
+      if( rc!=SQLITE_OK ) goto abort_due_to_error;
+#endif
+
+      /* Create a new savepoint structure. */
+      pNew = sqlite3DbMallocRawNN(db, sizeof(Savepoint)+nName+1);
+      if( pNew ){
+        pNew->zName = (char *)&pNew[1];
+        memcpy(pNew->zName, zName, nName+1);
+
+        /* If there is no open transaction, then mark this as a special
+        ** "transaction savepoint". */
+        if( db->autoCommit ){
+          db->autoCommit = 0;
+          db->isTransactionSavepoint = 1;
+        }else{
+          db->nSavepoint++;
+        }
+
+        /* Link the new savepoint into the database handle's list. */
+        pNew->pNext = db->pSavepoint;
+        db->pSavepoint = pNew;
+        pNew->nDeferredCons = db->nDeferredCons;
+        pNew->nDeferredImmCons = db->nDeferredImmCons;
+      }
+    }
+  }else{
+    assert( p1==SAVEPOINT_RELEASE || p1==SAVEPOINT_ROLLBACK );
+    iSavepoint = 0;
+
+    /* Find the named savepoint. If there is no such savepoint, then an
+    ** an error is returned to the user.  */
+    for(
+      pSavepoint = db->pSavepoint;
+      pSavepoint && sqlite3StrICmp(pSavepoint->zName, zName);
+      pSavepoint = pSavepoint->pNext
+    ){
+      iSavepoint
