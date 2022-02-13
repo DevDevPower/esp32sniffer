@@ -92520,4 +92520,182 @@ case OP_OpenWrite:
 #endif
   rc = sqlite3BtreeCursor(pX, p2, wrFlag, pKeyInfo, pCur->uc.pCursor);
   pCur->pKeyInfo = pKeyInfo;
-  /* Set the VdbeCursor.isT
+  /* Set the VdbeCursor.isTable variable. Previous versions of
+  ** SQLite used to check if the root-page flags were sane at this point
+  ** and report database corruption if they were not, but this check has
+  ** since moved into the btree layer.  */
+  pCur->isTable = pOp->p4type!=P4_KEYINFO;
+
+open_cursor_set_hints:
+  assert( OPFLAG_BULKCSR==BTREE_BULKLOAD );
+  assert( OPFLAG_SEEKEQ==BTREE_SEEK_EQ );
+  testcase( pOp->p5 & OPFLAG_BULKCSR );
+  testcase( pOp->p2 & OPFLAG_SEEKEQ );
+  sqlite3BtreeCursorHintFlags(pCur->uc.pCursor,
+                               (pOp->p5 & (OPFLAG_BULKCSR|OPFLAG_SEEKEQ)));
+  if( rc ) goto abort_due_to_error;
+  break;
+}
+
+/* Opcode: OpenDup P1 P2 * * *
+**
+** Open a new cursor P1 that points to the same ephemeral table as
+** cursor P2.  The P2 cursor must have been opened by a prior OP_OpenEphemeral
+** opcode.  Only ephemeral cursors may be duplicated.
+**
+** Duplicate ephemeral cursors are used for self-joins of materialized views.
+*/
+case OP_OpenDup: {
+  VdbeCursor *pOrig;    /* The original cursor to be duplicated */
+  VdbeCursor *pCx;      /* The new cursor */
+
+  pOrig = p->apCsr[pOp->p2];
+  assert( pOrig );
+  assert( pOrig->isEphemeral );  /* Only ephemeral cursors can be duplicated */
+
+  pCx = allocateCursor(p, pOp->p1, pOrig->nField, CURTYPE_BTREE);
+  if( pCx==0 ) goto no_mem;
+  pCx->nullRow = 1;
+  pCx->isEphemeral = 1;
+  pCx->pKeyInfo = pOrig->pKeyInfo;
+  pCx->isTable = pOrig->isTable;
+  pCx->pgnoRoot = pOrig->pgnoRoot;
+  pCx->isOrdered = pOrig->isOrdered;
+  pCx->ub.pBtx = pOrig->ub.pBtx;
+  pCx->noReuse = 1;
+  pOrig->noReuse = 1;
+  rc = sqlite3BtreeCursor(pCx->ub.pBtx, pCx->pgnoRoot, BTREE_WRCSR,
+                          pCx->pKeyInfo, pCx->uc.pCursor);
+  /* The sqlite3BtreeCursor() routine can only fail for the first cursor
+  ** opened for a database.  Since there is already an open cursor when this
+  ** opcode is run, the sqlite3BtreeCursor() cannot fail */
+  assert( rc==SQLITE_OK );
+  break;
+}
+
+
+/* Opcode: OpenEphemeral P1 P2 P3 P4 P5
+** Synopsis: nColumn=P2
+**
+** Open a new cursor P1 to a transient table.
+** The cursor is always opened read/write even if
+** the main database is read-only.  The ephemeral
+** table is deleted automatically when the cursor is closed.
+**
+** If the cursor P1 is already opened on an ephemeral table, the table
+** is cleared (all content is erased).
+**
+** P2 is the number of columns in the ephemeral table.
+** The cursor points to a BTree table if P4==0 and to a BTree index
+** if P4 is not 0.  If P4 is not NULL, it points to a KeyInfo structure
+** that defines the format of keys in the index.
+**
+** The P5 parameter can be a mask of the BTREE_* flags defined
+** in btree.h.  These flags control aspects of the operation of
+** the btree.  The BTREE_OMIT_JOURNAL and BTREE_SINGLE flags are
+** added automatically.
+**
+** If P3 is positive, then reg[P3] is modified slightly so that it
+** can be used as zero-length data for OP_Insert.  This is an optimization
+** that avoids an extra OP_Blob opcode to initialize that register.
+*/
+/* Opcode: OpenAutoindex P1 P2 * P4 *
+** Synopsis: nColumn=P2
+**
+** This opcode works the same as OP_OpenEphemeral.  It has a
+** different name to distinguish its use.  Tables created using
+** by this opcode will be used for automatically created transient
+** indices in joins.
+*/
+case OP_OpenAutoindex:
+case OP_OpenEphemeral: {
+  VdbeCursor *pCx;
+  KeyInfo *pKeyInfo;
+
+  static const int vfsFlags =
+      SQLITE_OPEN_READWRITE |
+      SQLITE_OPEN_CREATE |
+      SQLITE_OPEN_EXCLUSIVE |
+      SQLITE_OPEN_DELETEONCLOSE |
+      SQLITE_OPEN_TRANSIENT_DB;
+  assert( pOp->p1>=0 );
+  assert( pOp->p2>=0 );
+  if( pOp->p3>0 ){
+    /* Make register reg[P3] into a value that can be used as the data
+    ** form sqlite3BtreeInsert() where the length of the data is zero. */
+    assert( pOp->p2==0 ); /* Only used when number of columns is zero */
+    assert( pOp->opcode==OP_OpenEphemeral );
+    assert( aMem[pOp->p3].flags & MEM_Null );
+    aMem[pOp->p3].n = 0;
+    aMem[pOp->p3].z = "";
+  }
+  pCx = p->apCsr[pOp->p1];
+  if( pCx && !pCx->noReuse &&  ALWAYS(pOp->p2<=pCx->nField) ){
+    /* If the ephermeral table is already open and has no duplicates from
+    ** OP_OpenDup, then erase all existing content so that the table is
+    ** empty again, rather than creating a new table. */
+    assert( pCx->isEphemeral );
+    pCx->seqCount = 0;
+    pCx->cacheStatus = CACHE_STALE;
+    rc = sqlite3BtreeClearTable(pCx->ub.pBtx, pCx->pgnoRoot, 0);
+  }else{
+    pCx = allocateCursor(p, pOp->p1, pOp->p2, CURTYPE_BTREE);
+    if( pCx==0 ) goto no_mem;
+    pCx->isEphemeral = 1;
+    rc = sqlite3BtreeOpen(db->pVfs, 0, db, &pCx->ub.pBtx,
+                          BTREE_OMIT_JOURNAL | BTREE_SINGLE | pOp->p5,
+                          vfsFlags);
+    if( rc==SQLITE_OK ){
+      rc = sqlite3BtreeBeginTrans(pCx->ub.pBtx, 1, 0);
+      if( rc==SQLITE_OK ){
+        /* If a transient index is required, create it by calling
+        ** sqlite3BtreeCreateTable() with the BTREE_BLOBKEY flag before
+        ** opening it. If a transient table is required, just use the
+        ** automatically created table with root-page 1 (an BLOB_INTKEY table).
+        */
+        if( (pCx->pKeyInfo = pKeyInfo = pOp->p4.pKeyInfo)!=0 ){
+          assert( pOp->p4type==P4_KEYINFO );
+          rc = sqlite3BtreeCreateTable(pCx->ub.pBtx, &pCx->pgnoRoot,
+              BTREE_BLOBKEY | pOp->p5);
+          if( rc==SQLITE_OK ){
+            assert( pCx->pgnoRoot==SCHEMA_ROOT+1 );
+            assert( pKeyInfo->db==db );
+            assert( pKeyInfo->enc==ENC(db) );
+            rc = sqlite3BtreeCursor(pCx->ub.pBtx, pCx->pgnoRoot, BTREE_WRCSR,
+                pKeyInfo, pCx->uc.pCursor);
+          }
+          pCx->isTable = 0;
+        }else{
+          pCx->pgnoRoot = SCHEMA_ROOT;
+          rc = sqlite3BtreeCursor(pCx->ub.pBtx, SCHEMA_ROOT, BTREE_WRCSR,
+              0, pCx->uc.pCursor);
+          pCx->isTable = 1;
+        }
+      }
+      pCx->isOrdered = (pOp->p5!=BTREE_UNORDERED);
+      if( rc ){
+        sqlite3BtreeClose(pCx->ub.pBtx);
+      }
+    }
+  }
+  if( rc ) goto abort_due_to_error;
+  pCx->nullRow = 1;
+  break;
+}
+
+/* Opcode: SorterOpen P1 P2 P3 P4 *
+**
+** This opcode works like OP_OpenEphemeral except that it opens
+** a transient index that is specifically designed to sort large
+** tables using an external merge-sort algorithm.
+**
+** If argument P3 is non-zero, then it indicates that the sorter may
+** assume that a stable sort considering the first P3 fields of each
+** key is sufficient to produce the required results.
+*/
+case OP_SorterOpen: {
+  VdbeCursor *pCx;
+
+  assert( pOp->p1>=0 );
+  assert( pOp->p2>=0 );
+  pCx = allocateCursor(p, pOp->p1, pOp->p2, CURTYPE_
