@@ -92875,4 +92875,200 @@ case OP_ColumnsUsed: {
 ** If the cursor P1 was opened using the OPFLAG_SEEKEQ flag, then this
 ** opcode will either land on a record that exactly matches the key, or
 ** else it will cause a jump to P2.  When the cursor is OPFLAG_SEEKEQ,
-** t
+** this opcode must be followed by an IdxLE opcode with the same arguments.
+** The IdxGE opcode will be skipped if this opcode succeeds, but the
+** IdxGE opcode will be used on subsequent loop iterations.  The
+** OPFLAG_SEEKEQ flags is a hint to the btree layer to say that this
+** is an equality search.
+**
+** See also: Found, NotFound, SeekGt, SeekGe, SeekLt
+*/
+case OP_SeekLT:         /* jump, in3, group */
+case OP_SeekLE:         /* jump, in3, group */
+case OP_SeekGE:         /* jump, in3, group */
+case OP_SeekGT: {       /* jump, in3, group */
+  int res;           /* Comparison result */
+  int oc;            /* Opcode */
+  VdbeCursor *pC;    /* The cursor to seek */
+  UnpackedRecord r;  /* The key to seek for */
+  int nField;        /* Number of columns or fields in the key */
+  i64 iKey;          /* The rowid we are to seek to */
+  int eqOnly;        /* Only interested in == results */
+
+  assert( pOp->p1>=0 && pOp->p1<p->nCursor );
+  assert( pOp->p2!=0 );
+  pC = p->apCsr[pOp->p1];
+  assert( pC!=0 );
+  assert( pC->eCurType==CURTYPE_BTREE );
+  assert( OP_SeekLE == OP_SeekLT+1 );
+  assert( OP_SeekGE == OP_SeekLT+2 );
+  assert( OP_SeekGT == OP_SeekLT+3 );
+  assert( pC->isOrdered );
+  assert( pC->uc.pCursor!=0 );
+  oc = pOp->opcode;
+  eqOnly = 0;
+  pC->nullRow = 0;
+#ifdef SQLITE_DEBUG
+  pC->seekOp = pOp->opcode;
+#endif
+
+  pC->deferredMoveto = 0;
+  pC->cacheStatus = CACHE_STALE;
+  if( pC->isTable ){
+    u16 flags3, newType;
+    /* The OPFLAG_SEEKEQ/BTREE_SEEK_EQ flag is only set on index cursors */
+    assert( sqlite3BtreeCursorHasHint(pC->uc.pCursor, BTREE_SEEK_EQ)==0
+              || CORRUPT_DB );
+
+    /* The input value in P3 might be of any type: integer, real, string,
+    ** blob, or NULL.  But it needs to be an integer before we can do
+    ** the seek, so convert it. */
+    pIn3 = &aMem[pOp->p3];
+    flags3 = pIn3->flags;
+    if( (flags3 & (MEM_Int|MEM_Real|MEM_IntReal|MEM_Str))==MEM_Str ){
+      applyNumericAffinity(pIn3, 0);
+    }
+    iKey = sqlite3VdbeIntValue(pIn3); /* Get the integer key value */
+    newType = pIn3->flags; /* Record the type after applying numeric affinity */
+    pIn3->flags = flags3;  /* But convert the type back to its original */
+
+    /* If the P3 value could not be converted into an integer without
+    ** loss of information, then special processing is required... */
+    if( (newType & (MEM_Int|MEM_IntReal))==0 ){
+      int c;
+      if( (newType & MEM_Real)==0 ){
+        if( (newType & MEM_Null) || oc>=OP_SeekGE ){
+          VdbeBranchTaken(1,2);
+          goto jump_to_p2;
+        }else{
+          rc = sqlite3BtreeLast(pC->uc.pCursor, &res);
+          if( rc!=SQLITE_OK ) goto abort_due_to_error;
+          goto seek_not_found;
+        }
+      }
+      c = sqlite3IntFloatCompare(iKey, pIn3->u.r);
+
+      /* If the approximation iKey is larger than the actual real search
+      ** term, substitute >= for > and < for <=. e.g. if the search term
+      ** is 4.9 and the integer approximation 5:
+      **
+      **        (x >  4.9)    ->     (x >= 5)
+      **        (x <= 4.9)    ->     (x <  5)
+      */
+      if( c>0 ){
+        assert( OP_SeekGE==(OP_SeekGT-1) );
+        assert( OP_SeekLT==(OP_SeekLE-1) );
+        assert( (OP_SeekLE & 0x0001)==(OP_SeekGT & 0x0001) );
+        if( (oc & 0x0001)==(OP_SeekGT & 0x0001) ) oc--;
+      }
+
+      /* If the approximation iKey is smaller than the actual real search
+      ** term, substitute <= for < and > for >=.  */
+      else if( c<0 ){
+        assert( OP_SeekLE==(OP_SeekLT+1) );
+        assert( OP_SeekGT==(OP_SeekGE+1) );
+        assert( (OP_SeekLT & 0x0001)==(OP_SeekGE & 0x0001) );
+        if( (oc & 0x0001)==(OP_SeekLT & 0x0001) ) oc++;
+      }
+    }
+    rc = sqlite3BtreeTableMoveto(pC->uc.pCursor, (u64)iKey, 0, &res);
+    pC->movetoTarget = iKey;  /* Used by OP_Delete */
+    if( rc!=SQLITE_OK ){
+      goto abort_due_to_error;
+    }
+  }else{
+    /* For a cursor with the OPFLAG_SEEKEQ/BTREE_SEEK_EQ hint, only the
+    ** OP_SeekGE and OP_SeekLE opcodes are allowed, and these must be
+    ** immediately followed by an OP_IdxGT or OP_IdxLT opcode, respectively,
+    ** with the same key.
+    */
+    if( sqlite3BtreeCursorHasHint(pC->uc.pCursor, BTREE_SEEK_EQ) ){
+      eqOnly = 1;
+      assert( pOp->opcode==OP_SeekGE || pOp->opcode==OP_SeekLE );
+      assert( pOp[1].opcode==OP_IdxLT || pOp[1].opcode==OP_IdxGT );
+      assert( pOp->opcode==OP_SeekGE || pOp[1].opcode==OP_IdxLT );
+      assert( pOp->opcode==OP_SeekLE || pOp[1].opcode==OP_IdxGT );
+      assert( pOp[1].p1==pOp[0].p1 );
+      assert( pOp[1].p2==pOp[0].p2 );
+      assert( pOp[1].p3==pOp[0].p3 );
+      assert( pOp[1].p4.i==pOp[0].p4.i );
+    }
+
+    nField = pOp->p4.i;
+    assert( pOp->p4type==P4_INT32 );
+    assert( nField>0 );
+    r.pKeyInfo = pC->pKeyInfo;
+    r.nField = (u16)nField;
+
+    /* The next line of code computes as follows, only faster:
+    **   if( oc==OP_SeekGT || oc==OP_SeekLE ){
+    **     r.default_rc = -1;
+    **   }else{
+    **     r.default_rc = +1;
+    **   }
+    */
+    r.default_rc = ((1 & (oc - OP_SeekLT)) ? -1 : +1);
+    assert( oc!=OP_SeekGT || r.default_rc==-1 );
+    assert( oc!=OP_SeekLE || r.default_rc==-1 );
+    assert( oc!=OP_SeekGE || r.default_rc==+1 );
+    assert( oc!=OP_SeekLT || r.default_rc==+1 );
+
+    r.aMem = &aMem[pOp->p3];
+#ifdef SQLITE_DEBUG
+    { int i; for(i=0; i<r.nField; i++) assert( memIsValid(&r.aMem[i]) ); }
+#endif
+    r.eqSeen = 0;
+    rc = sqlite3BtreeIndexMoveto(pC->uc.pCursor, &r, &res);
+    if( rc!=SQLITE_OK ){
+      goto abort_due_to_error;
+    }
+    if( eqOnly && r.eqSeen==0 ){
+      assert( res!=0 );
+      goto seek_not_found;
+    }
+  }
+#ifdef SQLITE_TEST
+  sqlite3_search_count++;
+#endif
+  if( oc>=OP_SeekGE ){  assert( oc==OP_SeekGE || oc==OP_SeekGT );
+    if( res<0 || (res==0 && oc==OP_SeekGT) ){
+      res = 0;
+      rc = sqlite3BtreeNext(pC->uc.pCursor, 0);
+      if( rc!=SQLITE_OK ){
+        if( rc==SQLITE_DONE ){
+          rc = SQLITE_OK;
+          res = 1;
+        }else{
+          goto abort_due_to_error;
+        }
+      }
+    }else{
+      res = 0;
+    }
+  }else{
+    assert( oc==OP_SeekLT || oc==OP_SeekLE );
+    if( res>0 || (res==0 && oc==OP_SeekLT) ){
+      res = 0;
+      rc = sqlite3BtreePrevious(pC->uc.pCursor, 0);
+      if( rc!=SQLITE_OK ){
+        if( rc==SQLITE_DONE ){
+          rc = SQLITE_OK;
+          res = 1;
+        }else{
+          goto abort_due_to_error;
+        }
+      }
+    }else{
+      /* res might be negative because the table is empty.  Check to
+      ** see if this is the case.
+      */
+      res = sqlite3BtreeEof(pC->uc.pCursor);
+    }
+  }
+seek_not_found:
+  assert( pOp->p2>0 );
+  VdbeBranchTaken(res!=0,2);
+  if( res ){
+    goto jump_to_p2;
+  }else if( eqOnly ){
+    assert( pOp[1].opcode==OP_IdxLT 
