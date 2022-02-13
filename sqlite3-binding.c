@@ -91964,4 +91964,192 @@ case OP_Savepoint: {
       pSavepoint && sqlite3StrICmp(pSavepoint->zName, zName);
       pSavepoint = pSavepoint->pNext
     ){
-      iSavepoint
+      iSavepoint++;
+    }
+    if( !pSavepoint ){
+      sqlite3VdbeError(p, "no such savepoint: %s", zName);
+      rc = SQLITE_ERROR;
+    }else if( db->nVdbeWrite>0 && p1==SAVEPOINT_RELEASE ){
+      /* It is not possible to release (commit) a savepoint if there are
+      ** active write statements.
+      */
+      sqlite3VdbeError(p, "cannot release savepoint - "
+                          "SQL statements in progress");
+      rc = SQLITE_BUSY;
+    }else{
+
+      /* Determine whether or not this is a transaction savepoint. If so,
+      ** and this is a RELEASE command, then the current transaction
+      ** is committed.
+      */
+      int isTransaction = pSavepoint->pNext==0 && db->isTransactionSavepoint;
+      if( isTransaction && p1==SAVEPOINT_RELEASE ){
+        if( (rc = sqlite3VdbeCheckFk(p, 1))!=SQLITE_OK ){
+          goto vdbe_return;
+        }
+        db->autoCommit = 1;
+        if( sqlite3VdbeHalt(p)==SQLITE_BUSY ){
+          p->pc = (int)(pOp - aOp);
+          db->autoCommit = 0;
+          p->rc = rc = SQLITE_BUSY;
+          goto vdbe_return;
+        }
+        rc = p->rc;
+        if( rc ){
+          db->autoCommit = 0;
+        }else{
+          db->isTransactionSavepoint = 0;
+        }
+      }else{
+        int isSchemaChange;
+        iSavepoint = db->nSavepoint - iSavepoint - 1;
+        if( p1==SAVEPOINT_ROLLBACK ){
+          isSchemaChange = (db->mDbFlags & DBFLAG_SchemaChange)!=0;
+          for(ii=0; ii<db->nDb; ii++){
+            rc = sqlite3BtreeTripAllCursors(db->aDb[ii].pBt,
+                                       SQLITE_ABORT_ROLLBACK,
+                                       isSchemaChange==0);
+            if( rc!=SQLITE_OK ) goto abort_due_to_error;
+          }
+        }else{
+          assert( p1==SAVEPOINT_RELEASE );
+          isSchemaChange = 0;
+        }
+        for(ii=0; ii<db->nDb; ii++){
+          rc = sqlite3BtreeSavepoint(db->aDb[ii].pBt, p1, iSavepoint);
+          if( rc!=SQLITE_OK ){
+            goto abort_due_to_error;
+          }
+        }
+        if( isSchemaChange ){
+          sqlite3ExpirePreparedStatements(db, 0);
+          sqlite3ResetAllSchemasOfConnection(db);
+          db->mDbFlags |= DBFLAG_SchemaChange;
+        }
+      }
+      if( rc ) goto abort_due_to_error;
+
+      /* Regardless of whether this is a RELEASE or ROLLBACK, destroy all
+      ** savepoints nested inside of the savepoint being operated on. */
+      while( db->pSavepoint!=pSavepoint ){
+        pTmp = db->pSavepoint;
+        db->pSavepoint = pTmp->pNext;
+        sqlite3DbFree(db, pTmp);
+        db->nSavepoint--;
+      }
+
+      /* If it is a RELEASE, then destroy the savepoint being operated on
+      ** too. If it is a ROLLBACK TO, then set the number of deferred
+      ** constraint violations present in the database to the value stored
+      ** when the savepoint was created.  */
+      if( p1==SAVEPOINT_RELEASE ){
+        assert( pSavepoint==db->pSavepoint );
+        db->pSavepoint = pSavepoint->pNext;
+        sqlite3DbFree(db, pSavepoint);
+        if( !isTransaction ){
+          db->nSavepoint--;
+        }
+      }else{
+        assert( p1==SAVEPOINT_ROLLBACK );
+        db->nDeferredCons = pSavepoint->nDeferredCons;
+        db->nDeferredImmCons = pSavepoint->nDeferredImmCons;
+      }
+
+      if( !isTransaction || p1==SAVEPOINT_ROLLBACK ){
+        rc = sqlite3VtabSavepoint(db, p1, iSavepoint);
+        if( rc!=SQLITE_OK ) goto abort_due_to_error;
+      }
+    }
+  }
+  if( rc ) goto abort_due_to_error;
+  if( p->eVdbeState==VDBE_HALT_STATE ){
+    rc = SQLITE_DONE;
+    goto vdbe_return;
+  }
+  break;
+}
+
+/* Opcode: AutoCommit P1 P2 * * *
+**
+** Set the database auto-commit flag to P1 (1 or 0). If P2 is true, roll
+** back any currently active btree transactions. If there are any active
+** VMs (apart from this one), then a ROLLBACK fails.  A COMMIT fails if
+** there are active writing VMs or active VMs that use shared cache.
+**
+** This instruction causes the VM to halt.
+*/
+case OP_AutoCommit: {
+  int desiredAutoCommit;
+  int iRollback;
+
+  desiredAutoCommit = pOp->p1;
+  iRollback = pOp->p2;
+  assert( desiredAutoCommit==1 || desiredAutoCommit==0 );
+  assert( desiredAutoCommit==1 || iRollback==0 );
+  assert( db->nVdbeActive>0 );  /* At least this one VM is active */
+  assert( p->bIsReader );
+
+  if( desiredAutoCommit!=db->autoCommit ){
+    if( iRollback ){
+      assert( desiredAutoCommit==1 );
+      sqlite3RollbackAll(db, SQLITE_ABORT_ROLLBACK);
+      db->autoCommit = 1;
+    }else if( desiredAutoCommit && db->nVdbeWrite>0 ){
+      /* If this instruction implements a COMMIT and other VMs are writing
+      ** return an error indicating that the other VMs must complete first.
+      */
+      sqlite3VdbeError(p, "cannot commit transaction - "
+                          "SQL statements in progress");
+      rc = SQLITE_BUSY;
+      goto abort_due_to_error;
+    }else if( (rc = sqlite3VdbeCheckFk(p, 1))!=SQLITE_OK ){
+      goto vdbe_return;
+    }else{
+      db->autoCommit = (u8)desiredAutoCommit;
+    }
+    if( sqlite3VdbeHalt(p)==SQLITE_BUSY ){
+      p->pc = (int)(pOp - aOp);
+      db->autoCommit = (u8)(1-desiredAutoCommit);
+      p->rc = rc = SQLITE_BUSY;
+      goto vdbe_return;
+    }
+    sqlite3CloseSavepoints(db);
+    if( p->rc==SQLITE_OK ){
+      rc = SQLITE_DONE;
+    }else{
+      rc = SQLITE_ERROR;
+    }
+    goto vdbe_return;
+  }else{
+    sqlite3VdbeError(p,
+        (!desiredAutoCommit)?"cannot start a transaction within a transaction":(
+        (iRollback)?"cannot rollback - no transaction is active":
+                   "cannot commit - no transaction is active"));
+
+    rc = SQLITE_ERROR;
+    goto abort_due_to_error;
+  }
+  /*NOTREACHED*/ assert(0);
+}
+
+/* Opcode: Transaction P1 P2 P3 P4 P5
+**
+** Begin a transaction on database P1 if a transaction is not already
+** active.
+** If P2 is non-zero, then a write-transaction is started, or if a
+** read-transaction is already active, it is upgraded to a write-transaction.
+** If P2 is zero, then a read-transaction is started.  If P2 is 2 or more
+** then an exclusive transaction is started.
+**
+** P1 is the index of the database file on which the transaction is
+** started.  Index 0 is the main database file and index 1 is the
+** file used for temporary tables.  Indices of 2 or more are used for
+** attached databases.
+**
+** If a write-transaction is started and the Vdbe.usesStmtJournal flag is
+** true (this flag is set if the Vdbe may modify more than one row and may
+** throw an ABORT exception), a statement transaction may also be opened.
+** More specifically, a statement transaction is opened iff the database
+** connection is currently not in autocommit mode, or if there are other
+** active statements. A statement transaction allows the changes made by this
+** VDBE
