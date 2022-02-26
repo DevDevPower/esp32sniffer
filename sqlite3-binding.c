@@ -95265,4 +95265,181 @@ case OP_RowSetRead: {       /* jump, in1, out3 */
 ** next opcode.
 **
 ** The RowSet object is optimized for the case where sets of integers
-** are inserted in dis
+** are inserted in distinct phases, which each set contains no duplicates.
+** Each set is identified by a unique P4 value. The first set
+** must have P4==0, the final set must have P4==-1, and for all other sets
+** must have P4>0.
+**
+** This allows optimizations: (a) when P4==0 there is no need to test
+** the RowSet object for P3, as it is guaranteed not to contain it,
+** (b) when P4==-1 there is no need to insert the value, as it will
+** never be tested for, and (c) when a value that is part of set X is
+** inserted, there is no need to search to see if the same value was
+** previously inserted as part of set X (only if it was previously
+** inserted as part of some other set).
+*/
+case OP_RowSetTest: {                     /* jump, in1, in3 */
+  int iSet;
+  int exists;
+
+  pIn1 = &aMem[pOp->p1];
+  pIn3 = &aMem[pOp->p3];
+  iSet = pOp->p4.i;
+  assert( pIn3->flags&MEM_Int );
+
+  /* If there is anything other than a rowset object in memory cell P1,
+  ** delete it now and initialize P1 with an empty rowset
+  */
+  if( (pIn1->flags & MEM_Blob)==0 ){
+    if( sqlite3VdbeMemSetRowSet(pIn1) ) goto no_mem;
+  }
+  assert( sqlite3VdbeMemIsRowSet(pIn1) );
+  assert( pOp->p4type==P4_INT32 );
+  assert( iSet==-1 || iSet>=0 );
+  if( iSet ){
+    exists = sqlite3RowSetTest((RowSet*)pIn1->z, iSet, pIn3->u.i);
+    VdbeBranchTaken(exists!=0,2);
+    if( exists ) goto jump_to_p2;
+  }
+  if( iSet>=0 ){
+    sqlite3RowSetInsert((RowSet*)pIn1->z, pIn3->u.i);
+  }
+  break;
+}
+
+
+#ifndef SQLITE_OMIT_TRIGGER
+
+/* Opcode: Program P1 P2 P3 P4 P5
+**
+** Execute the trigger program passed as P4 (type P4_SUBPROGRAM).
+**
+** P1 contains the address of the memory cell that contains the first memory
+** cell in an array of values used as arguments to the sub-program. P2
+** contains the address to jump to if the sub-program throws an IGNORE
+** exception using the RAISE() function. Register P3 contains the address
+** of a memory cell in this (the parent) VM that is used to allocate the
+** memory required by the sub-vdbe at runtime.
+**
+** P4 is a pointer to the VM containing the trigger program.
+**
+** If P5 is non-zero, then recursive program invocation is enabled.
+*/
+case OP_Program: {        /* jump */
+  int nMem;               /* Number of memory registers for sub-program */
+  int nByte;              /* Bytes of runtime space required for sub-program */
+  Mem *pRt;               /* Register to allocate runtime space */
+  Mem *pMem;              /* Used to iterate through memory cells */
+  Mem *pEnd;              /* Last memory cell in new array */
+  VdbeFrame *pFrame;      /* New vdbe frame to execute in */
+  SubProgram *pProgram;   /* Sub-program to execute */
+  void *t;                /* Token identifying trigger */
+
+  pProgram = pOp->p4.pProgram;
+  pRt = &aMem[pOp->p3];
+  assert( pProgram->nOp>0 );
+
+  /* If the p5 flag is clear, then recursive invocation of triggers is
+  ** disabled for backwards compatibility (p5 is set if this sub-program
+  ** is really a trigger, not a foreign key action, and the flag set
+  ** and cleared by the "PRAGMA recursive_triggers" command is clear).
+  **
+  ** It is recursive invocation of triggers, at the SQL level, that is
+  ** disabled. In some cases a single trigger may generate more than one
+  ** SubProgram (if the trigger may be executed with more than one different
+  ** ON CONFLICT algorithm). SubProgram structures associated with a
+  ** single trigger all have the same value for the SubProgram.token
+  ** variable.  */
+  if( pOp->p5 ){
+    t = pProgram->token;
+    for(pFrame=p->pFrame; pFrame && pFrame->token!=t; pFrame=pFrame->pParent);
+    if( pFrame ) break;
+  }
+
+  if( p->nFrame>=db->aLimit[SQLITE_LIMIT_TRIGGER_DEPTH] ){
+    rc = SQLITE_ERROR;
+    sqlite3VdbeError(p, "too many levels of trigger recursion");
+    goto abort_due_to_error;
+  }
+
+  /* Register pRt is used to store the memory required to save the state
+  ** of the current program, and the memory required at runtime to execute
+  ** the trigger program. If this trigger has been fired before, then pRt
+  ** is already allocated. Otherwise, it must be initialized.  */
+  if( (pRt->flags&MEM_Blob)==0 ){
+    /* SubProgram.nMem is set to the number of memory cells used by the
+    ** program stored in SubProgram.aOp. As well as these, one memory
+    ** cell is required for each cursor used by the program. Set local
+    ** variable nMem (and later, VdbeFrame.nChildMem) to this value.
+    */
+    nMem = pProgram->nMem + pProgram->nCsr;
+    assert( nMem>0 );
+    if( pProgram->nCsr==0 ) nMem++;
+    nByte = ROUND8(sizeof(VdbeFrame))
+              + nMem * sizeof(Mem)
+              + pProgram->nCsr * sizeof(VdbeCursor*)
+              + (pProgram->nOp + 7)/8;
+    pFrame = sqlite3DbMallocZero(db, nByte);
+    if( !pFrame ){
+      goto no_mem;
+    }
+    sqlite3VdbeMemRelease(pRt);
+    pRt->flags = MEM_Blob|MEM_Dyn;
+    pRt->z = (char*)pFrame;
+    pRt->n = nByte;
+    pRt->xDel = sqlite3VdbeFrameMemDel;
+
+    pFrame->v = p;
+    pFrame->nChildMem = nMem;
+    pFrame->nChildCsr = pProgram->nCsr;
+    pFrame->pc = (int)(pOp - aOp);
+    pFrame->aMem = p->aMem;
+    pFrame->nMem = p->nMem;
+    pFrame->apCsr = p->apCsr;
+    pFrame->nCursor = p->nCursor;
+    pFrame->aOp = p->aOp;
+    pFrame->nOp = p->nOp;
+    pFrame->token = pProgram->token;
+#ifdef SQLITE_ENABLE_STMT_SCANSTATUS
+    pFrame->anExec = p->anExec;
+#endif
+#ifdef SQLITE_DEBUG
+    pFrame->iFrameMagic = SQLITE_FRAME_MAGIC;
+#endif
+
+    pEnd = &VdbeFrameMem(pFrame)[pFrame->nChildMem];
+    for(pMem=VdbeFrameMem(pFrame); pMem!=pEnd; pMem++){
+      pMem->flags = MEM_Undefined;
+      pMem->db = db;
+    }
+  }else{
+    pFrame = (VdbeFrame*)pRt->z;
+    assert( pRt->xDel==sqlite3VdbeFrameMemDel );
+    assert( pProgram->nMem+pProgram->nCsr==pFrame->nChildMem
+        || (pProgram->nCsr==0 && pProgram->nMem+1==pFrame->nChildMem) );
+    assert( pProgram->nCsr==pFrame->nChildCsr );
+    assert( (int)(pOp - aOp)==pFrame->pc );
+  }
+
+  p->nFrame++;
+  pFrame->pParent = p->pFrame;
+  pFrame->lastRowid = db->lastRowid;
+  pFrame->nChange = p->nChange;
+  pFrame->nDbChange = p->db->nChange;
+  assert( pFrame->pAuxData==0 );
+  pFrame->pAuxData = p->pAuxData;
+  p->pAuxData = 0;
+  p->nChange = 0;
+  p->pFrame = pFrame;
+  p->aMem = aMem = VdbeFrameMem(pFrame);
+  p->nMem = pFrame->nChildMem;
+  p->nCursor = (u16)pFrame->nChildCsr;
+  p->apCsr = (VdbeCursor **)&aMem[p->nMem];
+  pFrame->aOnce = (u8*)&p->apCsr[pProgram->nCsr];
+  memset(pFrame->aOnce, 0, (pProgram->nOp + 7)/8);
+  p->aOp = aOp = pProgram->aOp;
+  p->nOp = pProgram->nOp;
+#ifdef SQLITE_ENABLE_STMT_SCANSTATUS
+  p->anExec = 0;
+#endif
+#ifde
