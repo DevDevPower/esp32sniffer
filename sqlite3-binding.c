@@ -94644,4 +94644,207 @@ case OP_IdxDelete: {
 ** one entry for each column in the P3 table.  If array entry a(i)
 ** is non-zero, then reading column a(i)-1 from cursor P3 is
 ** equivalent to performing the deferred seek and then reading column i
-** from P1.  This inf
+** from P1.  This information is stored in P3 and used to redirect
+** reads against P3 over to P1, thus possibly avoiding the need to
+** seek and read cursor P3.
+*/
+/* Opcode: IdxRowid P1 P2 * * *
+** Synopsis: r[P2]=rowid
+**
+** Write into register P2 an integer which is the last entry in the record at
+** the end of the index key pointed to by cursor P1.  This integer should be
+** the rowid of the table entry to which this index entry points.
+**
+** See also: Rowid, MakeRecord.
+*/
+case OP_DeferredSeek:
+case OP_IdxRowid: {           /* out2 */
+  VdbeCursor *pC;             /* The P1 index cursor */
+  VdbeCursor *pTabCur;        /* The P2 table cursor (OP_DeferredSeek only) */
+  i64 rowid;                  /* Rowid that P1 current points to */
+
+  assert( pOp->p1>=0 && pOp->p1<p->nCursor );
+  pC = p->apCsr[pOp->p1];
+  assert( pC!=0 );
+  assert( pC->eCurType==CURTYPE_BTREE || IsNullCursor(pC) );
+  assert( pC->uc.pCursor!=0 );
+  assert( pC->isTable==0 || IsNullCursor(pC) );
+  assert( pC->deferredMoveto==0 );
+  assert( !pC->nullRow || pOp->opcode==OP_IdxRowid );
+
+  /* The IdxRowid and Seek opcodes are combined because of the commonality
+  ** of sqlite3VdbeCursorRestore() and sqlite3VdbeIdxRowid(). */
+  rc = sqlite3VdbeCursorRestore(pC);
+
+  /* sqlite3VbeCursorRestore() can only fail if the record has been deleted
+  ** out from under the cursor.  That will never happens for an IdxRowid
+  ** or Seek opcode */
+  if( NEVER(rc!=SQLITE_OK) ) goto abort_due_to_error;
+
+  if( !pC->nullRow ){
+    rowid = 0;  /* Not needed.  Only used to silence a warning. */
+    rc = sqlite3VdbeIdxRowid(db, pC->uc.pCursor, &rowid);
+    if( rc!=SQLITE_OK ){
+      goto abort_due_to_error;
+    }
+    if( pOp->opcode==OP_DeferredSeek ){
+      assert( pOp->p3>=0 && pOp->p3<p->nCursor );
+      pTabCur = p->apCsr[pOp->p3];
+      assert( pTabCur!=0 );
+      assert( pTabCur->eCurType==CURTYPE_BTREE );
+      assert( pTabCur->uc.pCursor!=0 );
+      assert( pTabCur->isTable );
+      pTabCur->nullRow = 0;
+      pTabCur->movetoTarget = rowid;
+      pTabCur->deferredMoveto = 1;
+      pTabCur->cacheStatus = CACHE_STALE;
+      assert( pOp->p4type==P4_INTARRAY || pOp->p4.ai==0 );
+      assert( !pTabCur->isEphemeral );
+      pTabCur->ub.aAltMap = pOp->p4.ai;
+      assert( !pC->isEphemeral );
+      pTabCur->pAltCursor = pC;
+    }else{
+      pOut = out2Prerelease(p, pOp);
+      pOut->u.i = rowid;
+    }
+  }else{
+    assert( pOp->opcode==OP_IdxRowid );
+    sqlite3VdbeMemSetNull(&aMem[pOp->p2]);
+  }
+  break;
+}
+
+/* Opcode: FinishSeek P1 * * * *
+**
+** If cursor P1 was previously moved via OP_DeferredSeek, complete that
+** seek operation now, without further delay.  If the cursor seek has
+** already occurred, this instruction is a no-op.
+*/
+case OP_FinishSeek: {
+  VdbeCursor *pC;             /* The P1 index cursor */
+
+  assert( pOp->p1>=0 && pOp->p1<p->nCursor );
+  pC = p->apCsr[pOp->p1];
+  if( pC->deferredMoveto ){
+    rc = sqlite3VdbeFinishMoveto(pC);
+    if( rc ) goto abort_due_to_error;
+  }
+  break;
+}
+
+/* Opcode: IdxGE P1 P2 P3 P4 *
+** Synopsis: key=r[P3@P4]
+**
+** The P4 register values beginning with P3 form an unpacked index
+** key that omits the PRIMARY KEY.  Compare this key value against the index
+** that P1 is currently pointing to, ignoring the PRIMARY KEY or ROWID
+** fields at the end.
+**
+** If the P1 index entry is greater than or equal to the key value
+** then jump to P2.  Otherwise fall through to the next instruction.
+*/
+/* Opcode: IdxGT P1 P2 P3 P4 *
+** Synopsis: key=r[P3@P4]
+**
+** The P4 register values beginning with P3 form an unpacked index
+** key that omits the PRIMARY KEY.  Compare this key value against the index
+** that P1 is currently pointing to, ignoring the PRIMARY KEY or ROWID
+** fields at the end.
+**
+** If the P1 index entry is greater than the key value
+** then jump to P2.  Otherwise fall through to the next instruction.
+*/
+/* Opcode: IdxLT P1 P2 P3 P4 *
+** Synopsis: key=r[P3@P4]
+**
+** The P4 register values beginning with P3 form an unpacked index
+** key that omits the PRIMARY KEY or ROWID.  Compare this key value against
+** the index that P1 is currently pointing to, ignoring the PRIMARY KEY or
+** ROWID on the P1 index.
+**
+** If the P1 index entry is less than the key value then jump to P2.
+** Otherwise fall through to the next instruction.
+*/
+/* Opcode: IdxLE P1 P2 P3 P4 *
+** Synopsis: key=r[P3@P4]
+**
+** The P4 register values beginning with P3 form an unpacked index
+** key that omits the PRIMARY KEY or ROWID.  Compare this key value against
+** the index that P1 is currently pointing to, ignoring the PRIMARY KEY or
+** ROWID on the P1 index.
+**
+** If the P1 index entry is less than or equal to the key value then jump
+** to P2. Otherwise fall through to the next instruction.
+*/
+case OP_IdxLE:          /* jump */
+case OP_IdxGT:          /* jump */
+case OP_IdxLT:          /* jump */
+case OP_IdxGE:  {       /* jump */
+  VdbeCursor *pC;
+  int res;
+  UnpackedRecord r;
+
+  assert( pOp->p1>=0 && pOp->p1<p->nCursor );
+  pC = p->apCsr[pOp->p1];
+  assert( pC!=0 );
+  assert( pC->isOrdered );
+  assert( pC->eCurType==CURTYPE_BTREE );
+  assert( pC->uc.pCursor!=0);
+  assert( pC->deferredMoveto==0 );
+  assert( pOp->p4type==P4_INT32 );
+  r.pKeyInfo = pC->pKeyInfo;
+  r.nField = (u16)pOp->p4.i;
+  if( pOp->opcode<OP_IdxLT ){
+    assert( pOp->opcode==OP_IdxLE || pOp->opcode==OP_IdxGT );
+    r.default_rc = -1;
+  }else{
+    assert( pOp->opcode==OP_IdxGE || pOp->opcode==OP_IdxLT );
+    r.default_rc = 0;
+  }
+  r.aMem = &aMem[pOp->p3];
+#ifdef SQLITE_DEBUG
+  {
+    int i;
+    for(i=0; i<r.nField; i++){
+      assert( memIsValid(&r.aMem[i]) );
+      REGISTER_TRACE(pOp->p3+i, &aMem[pOp->p3+i]);
+    }
+  }
+#endif
+
+  /* Inlined version of sqlite3VdbeIdxKeyCompare() */
+  {
+    i64 nCellKey = 0;
+    BtCursor *pCur;
+    Mem m;
+
+    assert( pC->eCurType==CURTYPE_BTREE );
+    pCur = pC->uc.pCursor;
+    assert( sqlite3BtreeCursorIsValid(pCur) );
+    nCellKey = sqlite3BtreePayloadSize(pCur);
+    /* nCellKey will always be between 0 and 0xffffffff because of the way
+    ** that btreeParseCellPtr() and sqlite3GetVarint32() are implemented */
+    if( nCellKey<=0 || nCellKey>0x7fffffff ){
+      rc = SQLITE_CORRUPT_BKPT;
+      goto abort_due_to_error;
+    }
+    sqlite3VdbeMemInit(&m, db, 0);
+    rc = sqlite3VdbeMemFromBtreeZeroOffset(pCur, (u32)nCellKey, &m);
+    if( rc ) goto abort_due_to_error;
+    res = sqlite3VdbeRecordCompareWithSkip(m.n, m.z, &r, 0);
+    sqlite3VdbeMemReleaseMalloc(&m);
+  }
+  /* End of inlined sqlite3VdbeIdxKeyCompare() */
+
+  assert( (OP_IdxLE&1)==(OP_IdxLT&1) && (OP_IdxGE&1)==(OP_IdxGT&1) );
+  if( (pOp->opcode&1)==(OP_IdxLT&1) ){
+    assert( pOp->opcode==OP_IdxLE || pOp->opcode==OP_IdxLT );
+    res = -res;
+  }else{
+    assert( pOp->opcode==OP_IdxGE || pOp->opcode==OP_IdxGT );
+    res++;
+  }
+  VdbeBranchTaken(res>0,2);
+  assert( rc==SQLITE_OK );
+  if( res>0 ) goto jump_to_p2;
+  br
