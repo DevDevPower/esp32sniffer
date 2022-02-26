@@ -95637,4 +95637,219 @@ case OP_IfNotZero: {        /* jump, in1 */
   break;
 }
 
-/* Opcode: DecrJumpZero
+/* Opcode: DecrJumpZero P1 P2 * * *
+** Synopsis: if (--r[P1])==0 goto P2
+**
+** Register P1 must hold an integer.  Decrement the value in P1
+** and jump to P2 if the new value is exactly zero.
+*/
+case OP_DecrJumpZero: {      /* jump, in1 */
+  pIn1 = &aMem[pOp->p1];
+  assert( pIn1->flags&MEM_Int );
+  if( pIn1->u.i>SMALLEST_INT64 ) pIn1->u.i--;
+  VdbeBranchTaken(pIn1->u.i==0, 2);
+  if( pIn1->u.i==0 ) goto jump_to_p2;
+  break;
+}
+
+
+/* Opcode: AggStep * P2 P3 P4 P5
+** Synopsis: accum=r[P3] step(r[P2@P5])
+**
+** Execute the xStep function for an aggregate.
+** The function has P5 arguments.  P4 is a pointer to the
+** FuncDef structure that specifies the function.  Register P3 is the
+** accumulator.
+**
+** The P5 arguments are taken from register P2 and its
+** successors.
+*/
+/* Opcode: AggInverse * P2 P3 P4 P5
+** Synopsis: accum=r[P3] inverse(r[P2@P5])
+**
+** Execute the xInverse function for an aggregate.
+** The function has P5 arguments.  P4 is a pointer to the
+** FuncDef structure that specifies the function.  Register P3 is the
+** accumulator.
+**
+** The P5 arguments are taken from register P2 and its
+** successors.
+*/
+/* Opcode: AggStep1 P1 P2 P3 P4 P5
+** Synopsis: accum=r[P3] step(r[P2@P5])
+**
+** Execute the xStep (if P1==0) or xInverse (if P1!=0) function for an
+** aggregate.  The function has P5 arguments.  P4 is a pointer to the
+** FuncDef structure that specifies the function.  Register P3 is the
+** accumulator.
+**
+** The P5 arguments are taken from register P2 and its
+** successors.
+**
+** This opcode is initially coded as OP_AggStep0.  On first evaluation,
+** the FuncDef stored in P4 is converted into an sqlite3_context and
+** the opcode is changed.  In this way, the initialization of the
+** sqlite3_context only happens once, instead of on each call to the
+** step function.
+*/
+case OP_AggInverse:
+case OP_AggStep: {
+  int n;
+  sqlite3_context *pCtx;
+
+  assert( pOp->p4type==P4_FUNCDEF );
+  n = pOp->p5;
+  assert( pOp->p3>0 && pOp->p3<=(p->nMem+1 - p->nCursor) );
+  assert( n==0 || (pOp->p2>0 && pOp->p2+n<=(p->nMem+1 - p->nCursor)+1) );
+  assert( pOp->p3<pOp->p2 || pOp->p3>=pOp->p2+n );
+  pCtx = sqlite3DbMallocRawNN(db, n*sizeof(sqlite3_value*) +
+               (sizeof(pCtx[0]) + sizeof(Mem) - sizeof(sqlite3_value*)));
+  if( pCtx==0 ) goto no_mem;
+  pCtx->pMem = 0;
+  pCtx->pOut = (Mem*)&(pCtx->argv[n]);
+  sqlite3VdbeMemInit(pCtx->pOut, db, MEM_Null);
+  pCtx->pFunc = pOp->p4.pFunc;
+  pCtx->iOp = (int)(pOp - aOp);
+  pCtx->pVdbe = p;
+  pCtx->skipFlag = 0;
+  pCtx->isError = 0;
+  pCtx->enc = encoding;
+  pCtx->argc = n;
+  pOp->p4type = P4_FUNCCTX;
+  pOp->p4.pCtx = pCtx;
+
+  /* OP_AggInverse must have P1==1 and OP_AggStep must have P1==0 */
+  assert( pOp->p1==(pOp->opcode==OP_AggInverse) );
+
+  pOp->opcode = OP_AggStep1;
+  /* Fall through into OP_AggStep */
+  /* no break */ deliberate_fall_through
+}
+case OP_AggStep1: {
+  int i;
+  sqlite3_context *pCtx;
+  Mem *pMem;
+
+  assert( pOp->p4type==P4_FUNCCTX );
+  pCtx = pOp->p4.pCtx;
+  pMem = &aMem[pOp->p3];
+
+#ifdef SQLITE_DEBUG
+  if( pOp->p1 ){
+    /* This is an OP_AggInverse call.  Verify that xStep has always
+    ** been called at least once prior to any xInverse call. */
+    assert( pMem->uTemp==0x1122e0e3 );
+  }else{
+    /* This is an OP_AggStep call.  Mark it as such. */
+    pMem->uTemp = 0x1122e0e3;
+  }
+#endif
+
+  /* If this function is inside of a trigger, the register array in aMem[]
+  ** might change from one evaluation to the next.  The next block of code
+  ** checks to see if the register array has changed, and if so it
+  ** reinitializes the relavant parts of the sqlite3_context object */
+  if( pCtx->pMem != pMem ){
+    pCtx->pMem = pMem;
+    for(i=pCtx->argc-1; i>=0; i--) pCtx->argv[i] = &aMem[pOp->p2+i];
+  }
+
+#ifdef SQLITE_DEBUG
+  for(i=0; i<pCtx->argc; i++){
+    assert( memIsValid(pCtx->argv[i]) );
+    REGISTER_TRACE(pOp->p2+i, pCtx->argv[i]);
+  }
+#endif
+
+  pMem->n++;
+  assert( pCtx->pOut->flags==MEM_Null );
+  assert( pCtx->isError==0 );
+  assert( pCtx->skipFlag==0 );
+#ifndef SQLITE_OMIT_WINDOWFUNC
+  if( pOp->p1 ){
+    (pCtx->pFunc->xInverse)(pCtx,pCtx->argc,pCtx->argv);
+  }else
+#endif
+  (pCtx->pFunc->xSFunc)(pCtx,pCtx->argc,pCtx->argv); /* IMP: R-24505-23230 */
+
+  if( pCtx->isError ){
+    if( pCtx->isError>0 ){
+      sqlite3VdbeError(p, "%s", sqlite3_value_text(pCtx->pOut));
+      rc = pCtx->isError;
+    }
+    if( pCtx->skipFlag ){
+      assert( pOp[-1].opcode==OP_CollSeq );
+      i = pOp[-1].p1;
+      if( i ) sqlite3VdbeMemSetInt64(&aMem[i], 1);
+      pCtx->skipFlag = 0;
+    }
+    sqlite3VdbeMemRelease(pCtx->pOut);
+    pCtx->pOut->flags = MEM_Null;
+    pCtx->isError = 0;
+    if( rc ) goto abort_due_to_error;
+  }
+  assert( pCtx->pOut->flags==MEM_Null );
+  assert( pCtx->skipFlag==0 );
+  break;
+}
+
+/* Opcode: AggFinal P1 P2 * P4 *
+** Synopsis: accum=r[P1] N=P2
+**
+** P1 is the memory location that is the accumulator for an aggregate
+** or window function.  Execute the finalizer function
+** for an aggregate and store the result in P1.
+**
+** P2 is the number of arguments that the step function takes and
+** P4 is a pointer to the FuncDef for this function.  The P2
+** argument is not used by this opcode.  It is only there to disambiguate
+** functions that can take varying numbers of arguments.  The
+** P4 argument is only needed for the case where
+** the step function was not previously called.
+*/
+/* Opcode: AggValue * P2 P3 P4 *
+** Synopsis: r[P3]=value N=P2
+**
+** Invoke the xValue() function and store the result in register P3.
+**
+** P2 is the number of arguments that the step function takes and
+** P4 is a pointer to the FuncDef for this function.  The P2
+** argument is not used by this opcode.  It is only there to disambiguate
+** functions that can take varying numbers of arguments.  The
+** P4 argument is only needed for the case where
+** the step function was not previously called.
+*/
+case OP_AggValue:
+case OP_AggFinal: {
+  Mem *pMem;
+  assert( pOp->p1>0 && pOp->p1<=(p->nMem+1 - p->nCursor) );
+  assert( pOp->p3==0 || pOp->opcode==OP_AggValue );
+  pMem = &aMem[pOp->p1];
+  assert( (pMem->flags & ~(MEM_Null|MEM_Agg))==0 );
+#ifndef SQLITE_OMIT_WINDOWFUNC
+  if( pOp->p3 ){
+    memAboutToChange(p, &aMem[pOp->p3]);
+    rc = sqlite3VdbeMemAggValue(pMem, &aMem[pOp->p3], pOp->p4.pFunc);
+    pMem = &aMem[pOp->p3];
+  }else
+#endif
+  {
+    rc = sqlite3VdbeMemFinalize(pMem, pOp->p4.pFunc);
+  }
+
+  if( rc ){
+    sqlite3VdbeError(p, "%s", sqlite3_value_text(pMem));
+    goto abort_due_to_error;
+  }
+  sqlite3VdbeChangeEncoding(pMem, encoding);
+  UPDATE_MAX_BLOBSIZE(pMem);
+  break;
+}
+
+#ifndef SQLITE_OMIT_WAL
+/* Opcode: Checkpoint P1 P2 P3 * *
+**
+** Checkpoint database P1. This is a no-op if P1 is not currently in
+** WAL mode. Parameter P2 is one of SQLITE_CHECKPOINT_PASSIVE, FULL,
+** RESTART, or TRUNCATE.  Write 1 or 0 into mem[P3] if the checkpoint returns
+** SQLITE_BUSY or not, re
