@@ -94444,4 +94444,204 @@ case OP_Rewind: {        /* jump */
 ** This opcode works just like OP_Next except that P1 must be a
 ** sorter object for which the OP_SorterSort opcode has been
 ** invoked.  This opcode advances the cursor to the next sorted
-** record, or jumps to P2 i
+** record, or jumps to P2 if there are no more sorted records.
+*/
+case OP_SorterNext: {  /* jump */
+  VdbeCursor *pC;
+
+  pC = p->apCsr[pOp->p1];
+  assert( isSorter(pC) );
+  rc = sqlite3VdbeSorterNext(db, pC);
+  goto next_tail;
+
+case OP_Prev:          /* jump */
+  assert( pOp->p1>=0 && pOp->p1<p->nCursor );
+  assert( pOp->p5<ArraySize(p->aCounter) );
+  pC = p->apCsr[pOp->p1];
+  assert( pC!=0 );
+  assert( pC->deferredMoveto==0 );
+  assert( pC->eCurType==CURTYPE_BTREE );
+  assert( pC->seekOp==OP_SeekLT || pC->seekOp==OP_SeekLE
+       || pC->seekOp==OP_Last   || pC->seekOp==OP_IfNoHope
+       || pC->seekOp==OP_NullRow);
+  rc = sqlite3BtreePrevious(pC->uc.pCursor, pOp->p3);
+  goto next_tail;
+
+case OP_Next:          /* jump */
+  assert( pOp->p1>=0 && pOp->p1<p->nCursor );
+  assert( pOp->p5<ArraySize(p->aCounter) );
+  pC = p->apCsr[pOp->p1];
+  assert( pC!=0 );
+  assert( pC->deferredMoveto==0 );
+  assert( pC->eCurType==CURTYPE_BTREE );
+  assert( pC->seekOp==OP_SeekGT || pC->seekOp==OP_SeekGE
+       || pC->seekOp==OP_Rewind || pC->seekOp==OP_Found
+       || pC->seekOp==OP_NullRow|| pC->seekOp==OP_SeekRowid
+       || pC->seekOp==OP_IfNoHope);
+  rc = sqlite3BtreeNext(pC->uc.pCursor, pOp->p3);
+
+next_tail:
+  pC->cacheStatus = CACHE_STALE;
+  VdbeBranchTaken(rc==SQLITE_OK,2);
+  if( rc==SQLITE_OK ){
+    pC->nullRow = 0;
+    p->aCounter[pOp->p5]++;
+#ifdef SQLITE_TEST
+    sqlite3_search_count++;
+#endif
+    goto jump_to_p2_and_check_for_interrupt;
+  }
+  if( rc!=SQLITE_DONE ) goto abort_due_to_error;
+  rc = SQLITE_OK;
+  pC->nullRow = 1;
+  goto check_for_interrupt;
+}
+
+/* Opcode: IdxInsert P1 P2 P3 P4 P5
+** Synopsis: key=r[P2]
+**
+** Register P2 holds an SQL index key made using the
+** MakeRecord instructions.  This opcode writes that key
+** into the index P1.  Data for the entry is nil.
+**
+** If P4 is not zero, then it is the number of values in the unpacked
+** key of reg(P2).  In that case, P3 is the index of the first register
+** for the unpacked key.  The availability of the unpacked key can sometimes
+** be an optimization.
+**
+** If P5 has the OPFLAG_APPEND bit set, that is a hint to the b-tree layer
+** that this insert is likely to be an append.
+**
+** If P5 has the OPFLAG_NCHANGE bit set, then the change counter is
+** incremented by this instruction.  If the OPFLAG_NCHANGE bit is clear,
+** then the change counter is unchanged.
+**
+** If the OPFLAG_USESEEKRESULT flag of P5 is set, the implementation might
+** run faster by avoiding an unnecessary seek on cursor P1.  However,
+** the OPFLAG_USESEEKRESULT flag must only be set if there have been no prior
+** seeks on the cursor or if the most recent seek used a key equivalent
+** to P2.
+**
+** This instruction only works for indices.  The equivalent instruction
+** for tables is OP_Insert.
+*/
+case OP_IdxInsert: {        /* in2 */
+  VdbeCursor *pC;
+  BtreePayload x;
+
+  assert( pOp->p1>=0 && pOp->p1<p->nCursor );
+  pC = p->apCsr[pOp->p1];
+  sqlite3VdbeIncrWriteCounter(p, pC);
+  assert( pC!=0 );
+  assert( !isSorter(pC) );
+  pIn2 = &aMem[pOp->p2];
+  assert( (pIn2->flags & MEM_Blob) || (pOp->p5 & OPFLAG_PREFORMAT) );
+  if( pOp->p5 & OPFLAG_NCHANGE ) p->nChange++;
+  assert( pC->eCurType==CURTYPE_BTREE );
+  assert( pC->isTable==0 );
+  rc = ExpandBlob(pIn2);
+  if( rc ) goto abort_due_to_error;
+  x.nKey = pIn2->n;
+  x.pKey = pIn2->z;
+  x.aMem = aMem + pOp->p3;
+  x.nMem = (u16)pOp->p4.i;
+  rc = sqlite3BtreeInsert(pC->uc.pCursor, &x,
+       (pOp->p5 & (OPFLAG_APPEND|OPFLAG_SAVEPOSITION|OPFLAG_PREFORMAT)),
+      ((pOp->p5 & OPFLAG_USESEEKRESULT) ? pC->seekResult : 0)
+      );
+  assert( pC->deferredMoveto==0 );
+  pC->cacheStatus = CACHE_STALE;
+  if( rc) goto abort_due_to_error;
+  break;
+}
+
+/* Opcode: SorterInsert P1 P2 * * *
+** Synopsis: key=r[P2]
+**
+** Register P2 holds an SQL index key made using the
+** MakeRecord instructions.  This opcode writes that key
+** into the sorter P1.  Data for the entry is nil.
+*/
+case OP_SorterInsert: {     /* in2 */
+  VdbeCursor *pC;
+
+  assert( pOp->p1>=0 && pOp->p1<p->nCursor );
+  pC = p->apCsr[pOp->p1];
+  sqlite3VdbeIncrWriteCounter(p, pC);
+  assert( pC!=0 );
+  assert( isSorter(pC) );
+  pIn2 = &aMem[pOp->p2];
+  assert( pIn2->flags & MEM_Blob );
+  assert( pC->isTable==0 );
+  rc = ExpandBlob(pIn2);
+  if( rc ) goto abort_due_to_error;
+  rc = sqlite3VdbeSorterWrite(pC, pIn2);
+  if( rc) goto abort_due_to_error;
+  break;
+}
+
+/* Opcode: IdxDelete P1 P2 P3 * P5
+** Synopsis: key=r[P2@P3]
+**
+** The content of P3 registers starting at register P2 form
+** an unpacked index key. This opcode removes that entry from the
+** index opened by cursor P1.
+**
+** If P5 is not zero, then raise an SQLITE_CORRUPT_INDEX error
+** if no matching index entry is found.  This happens when running
+** an UPDATE or DELETE statement and the index entry to be updated
+** or deleted is not found.  For some uses of IdxDelete
+** (example:  the EXCEPT operator) it does not matter that no matching
+** entry is found.  For those cases, P5 is zero.  Also, do not raise
+** this (self-correcting and non-critical) error if in writable_schema mode.
+*/
+case OP_IdxDelete: {
+  VdbeCursor *pC;
+  BtCursor *pCrsr;
+  int res;
+  UnpackedRecord r;
+
+  assert( pOp->p3>0 );
+  assert( pOp->p2>0 && pOp->p2+pOp->p3<=(p->nMem+1 - p->nCursor)+1 );
+  assert( pOp->p1>=0 && pOp->p1<p->nCursor );
+  pC = p->apCsr[pOp->p1];
+  assert( pC!=0 );
+  assert( pC->eCurType==CURTYPE_BTREE );
+  sqlite3VdbeIncrWriteCounter(p, pC);
+  pCrsr = pC->uc.pCursor;
+  assert( pCrsr!=0 );
+  r.pKeyInfo = pC->pKeyInfo;
+  r.nField = (u16)pOp->p3;
+  r.default_rc = 0;
+  r.aMem = &aMem[pOp->p2];
+  rc = sqlite3BtreeIndexMoveto(pCrsr, &r, &res);
+  if( rc ) goto abort_due_to_error;
+  if( res==0 ){
+    rc = sqlite3BtreeDelete(pCrsr, BTREE_AUXDELETE);
+    if( rc ) goto abort_due_to_error;
+  }else if( pOp->p5 && !sqlite3WritableSchema(db) ){
+    rc = sqlite3ReportError(SQLITE_CORRUPT_INDEX, __LINE__, "index corruption");
+    goto abort_due_to_error;
+  }
+  assert( pC->deferredMoveto==0 );
+  pC->cacheStatus = CACHE_STALE;
+  pC->seekResult = 0;
+  break;
+}
+
+/* Opcode: DeferredSeek P1 * P3 P4 *
+** Synopsis: Move P3 to P1.rowid if needed
+**
+** P1 is an open index cursor and P3 is a cursor on the corresponding
+** table.  This opcode does a deferred seek of the P3 table cursor
+** to the row that corresponds to the current row of P1.
+**
+** This is a deferred seek.  Nothing actually happens until
+** the cursor is used to read a record.  That way, if no reads
+** occur, no unnecessary I/O happens.
+**
+** P4 may be an array of integers (type P4_INTARRAY) containing
+** one entry for each column in the P3 table.  If array entry a(i)
+** is non-zero, then reading column a(i)-1 from cursor P3 is
+** equivalent to performing the deferred seek and then reading column i
+** from P1.  This inf
