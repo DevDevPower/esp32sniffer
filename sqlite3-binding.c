@@ -95057,4 +95057,212 @@ case OP_ParseSchema: {
     zSchema = LEGACY_SCHEMA_TABLE;
     initData.db = db;
     initData.iDb = iDb;
-    initData.pzErrMsg = &p->
+    initData.pzErrMsg = &p->zErrMsg;
+    initData.mInitFlags = 0;
+    initData.mxPage = sqlite3BtreeLastPage(db->aDb[iDb].pBt);
+    zSql = sqlite3MPrintf(db,
+       "SELECT*FROM\"%w\".%s WHERE %s ORDER BY rowid",
+       db->aDb[iDb].zDbSName, zSchema, pOp->p4.z);
+    if( zSql==0 ){
+      rc = SQLITE_NOMEM_BKPT;
+    }else{
+      assert( db->init.busy==0 );
+      db->init.busy = 1;
+      initData.rc = SQLITE_OK;
+      initData.nInitRow = 0;
+      assert( !db->mallocFailed );
+      rc = sqlite3_exec(db, zSql, sqlite3InitCallback, &initData, 0);
+      if( rc==SQLITE_OK ) rc = initData.rc;
+      if( rc==SQLITE_OK && initData.nInitRow==0 ){
+        /* The OP_ParseSchema opcode with a non-NULL P4 argument should parse
+        ** at least one SQL statement. Any less than that indicates that
+        ** the sqlite_schema table is corrupt. */
+        rc = SQLITE_CORRUPT_BKPT;
+      }
+      sqlite3DbFreeNN(db, zSql);
+      db->init.busy = 0;
+    }
+  }
+  if( rc ){
+    sqlite3ResetAllSchemasOfConnection(db);
+    if( rc==SQLITE_NOMEM ){
+      goto no_mem;
+    }
+    goto abort_due_to_error;
+  }
+  break;
+}
+
+#if !defined(SQLITE_OMIT_ANALYZE)
+/* Opcode: LoadAnalysis P1 * * * *
+**
+** Read the sqlite_stat1 table for database P1 and load the content
+** of that table into the internal index hash table.  This will cause
+** the analysis to be used when preparing all subsequent queries.
+*/
+case OP_LoadAnalysis: {
+  assert( pOp->p1>=0 && pOp->p1<db->nDb );
+  rc = sqlite3AnalysisLoad(db, pOp->p1);
+  if( rc ) goto abort_due_to_error;
+  break;
+}
+#endif /* !defined(SQLITE_OMIT_ANALYZE) */
+
+/* Opcode: DropTable P1 * * P4 *
+**
+** Remove the internal (in-memory) data structures that describe
+** the table named P4 in database P1.  This is called after a table
+** is dropped from disk (using the Destroy opcode) in order to keep
+** the internal representation of the
+** schema consistent with what is on disk.
+*/
+case OP_DropTable: {
+  sqlite3VdbeIncrWriteCounter(p, 0);
+  sqlite3UnlinkAndDeleteTable(db, pOp->p1, pOp->p4.z);
+  break;
+}
+
+/* Opcode: DropIndex P1 * * P4 *
+**
+** Remove the internal (in-memory) data structures that describe
+** the index named P4 in database P1.  This is called after an index
+** is dropped from disk (using the Destroy opcode)
+** in order to keep the internal representation of the
+** schema consistent with what is on disk.
+*/
+case OP_DropIndex: {
+  sqlite3VdbeIncrWriteCounter(p, 0);
+  sqlite3UnlinkAndDeleteIndex(db, pOp->p1, pOp->p4.z);
+  break;
+}
+
+/* Opcode: DropTrigger P1 * * P4 *
+**
+** Remove the internal (in-memory) data structures that describe
+** the trigger named P4 in database P1.  This is called after a trigger
+** is dropped from disk (using the Destroy opcode) in order to keep
+** the internal representation of the
+** schema consistent with what is on disk.
+*/
+case OP_DropTrigger: {
+  sqlite3VdbeIncrWriteCounter(p, 0);
+  sqlite3UnlinkAndDeleteTrigger(db, pOp->p1, pOp->p4.z);
+  break;
+}
+
+
+#ifndef SQLITE_OMIT_INTEGRITY_CHECK
+/* Opcode: IntegrityCk P1 P2 P3 P4 P5
+**
+** Do an analysis of the currently open database.  Store in
+** register P1 the text of an error message describing any problems.
+** If no problems are found, store a NULL in register P1.
+**
+** The register P3 contains one less than the maximum number of allowed errors.
+** At most reg(P3) errors will be reported.
+** In other words, the analysis stops as soon as reg(P1) errors are
+** seen.  Reg(P1) is updated with the number of errors remaining.
+**
+** The root page numbers of all tables in the database are integers
+** stored in P4_INTARRAY argument.
+**
+** If P5 is not zero, the check is done on the auxiliary database
+** file, not the main database file.
+**
+** This opcode is used to implement the integrity_check pragma.
+*/
+case OP_IntegrityCk: {
+  int nRoot;      /* Number of tables to check.  (Number of root pages.) */
+  Pgno *aRoot;    /* Array of rootpage numbers for tables to be checked */
+  int nErr;       /* Number of errors reported */
+  char *z;        /* Text of the error report */
+  Mem *pnErr;     /* Register keeping track of errors remaining */
+
+  assert( p->bIsReader );
+  nRoot = pOp->p2;
+  aRoot = pOp->p4.ai;
+  assert( nRoot>0 );
+  assert( aRoot[0]==(Pgno)nRoot );
+  assert( pOp->p3>0 && pOp->p3<=(p->nMem+1 - p->nCursor) );
+  pnErr = &aMem[pOp->p3];
+  assert( (pnErr->flags & MEM_Int)!=0 );
+  assert( (pnErr->flags & (MEM_Str|MEM_Blob))==0 );
+  pIn1 = &aMem[pOp->p1];
+  assert( pOp->p5<db->nDb );
+  assert( DbMaskTest(p->btreeMask, pOp->p5) );
+  z = sqlite3BtreeIntegrityCheck(db, db->aDb[pOp->p5].pBt, &aRoot[1], nRoot,
+                                 (int)pnErr->u.i+1, &nErr);
+  sqlite3VdbeMemSetNull(pIn1);
+  if( nErr==0 ){
+    assert( z==0 );
+  }else if( z==0 ){
+    goto no_mem;
+  }else{
+    pnErr->u.i -= nErr-1;
+    sqlite3VdbeMemSetStr(pIn1, z, -1, SQLITE_UTF8, sqlite3_free);
+  }
+  UPDATE_MAX_BLOBSIZE(pIn1);
+  sqlite3VdbeChangeEncoding(pIn1, encoding);
+  goto check_for_interrupt;
+}
+#endif /* SQLITE_OMIT_INTEGRITY_CHECK */
+
+/* Opcode: RowSetAdd P1 P2 * * *
+** Synopsis: rowset(P1)=r[P2]
+**
+** Insert the integer value held by register P2 into a RowSet object
+** held in register P1.
+**
+** An assertion fails if P2 is not an integer.
+*/
+case OP_RowSetAdd: {       /* in1, in2 */
+  pIn1 = &aMem[pOp->p1];
+  pIn2 = &aMem[pOp->p2];
+  assert( (pIn2->flags & MEM_Int)!=0 );
+  if( (pIn1->flags & MEM_Blob)==0 ){
+    if( sqlite3VdbeMemSetRowSet(pIn1) ) goto no_mem;
+  }
+  assert( sqlite3VdbeMemIsRowSet(pIn1) );
+  sqlite3RowSetInsert((RowSet*)pIn1->z, pIn2->u.i);
+  break;
+}
+
+/* Opcode: RowSetRead P1 P2 P3 * *
+** Synopsis: r[P3]=rowset(P1)
+**
+** Extract the smallest value from the RowSet object in P1
+** and put that value into register P3.
+** Or, if RowSet object P1 is initially empty, leave P3
+** unchanged and jump to instruction P2.
+*/
+case OP_RowSetRead: {       /* jump, in1, out3 */
+  i64 val;
+
+  pIn1 = &aMem[pOp->p1];
+  assert( (pIn1->flags & MEM_Blob)==0 || sqlite3VdbeMemIsRowSet(pIn1) );
+  if( (pIn1->flags & MEM_Blob)==0
+   || sqlite3RowSetNext((RowSet*)pIn1->z, &val)==0
+  ){
+    /* The boolean index is empty */
+    sqlite3VdbeMemSetNull(pIn1);
+    VdbeBranchTaken(1,2);
+    goto jump_to_p2_and_check_for_interrupt;
+  }else{
+    /* A value was pulled from the index */
+    VdbeBranchTaken(0,2);
+    sqlite3VdbeMemSetInt64(&aMem[pOp->p3], val);
+  }
+  goto check_for_interrupt;
+}
+
+/* Opcode: RowSetTest P1 P2 P3 P4
+** Synopsis: if r[P3] in rowset(P1) goto P2
+**
+** Register P3 is assumed to hold a 64-bit integer value. If register P1
+** contains a RowSet object and that RowSet object contains
+** the value held in P3, jump to register P2. Otherwise, insert the
+** integer in P3 into the RowSet and continue on to the
+** next opcode.
+**
+** The RowSet object is optimized for the case where sets of integers
+** are inserted in dis
