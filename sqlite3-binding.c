@@ -96476,4 +96476,190 @@ case OP_VRename: {
 **
 ** The xUpdate method will do a DELETE or an INSERT or both.
 ** The argv[0] element (which corresponds to memory cell P3)
-** is th
+** is the rowid of a row to delete.  If argv[0] is NULL then no
+** deletion occurs.  The argv[1] element is the rowid of the new
+** row.  This can be NULL to have the virtual table select the new
+** rowid for itself.  The subsequent elements in the array are
+** the values of columns in the new row.
+**
+** If P2==1 then no insert is performed.  argv[0] is the rowid of
+** a row to delete.
+**
+** P1 is a boolean flag. If it is set to true and the xUpdate call
+** is successful, then the value returned by sqlite3_last_insert_rowid()
+** is set to the value of the rowid for the row just inserted.
+**
+** P5 is the error actions (OE_Replace, OE_Fail, OE_Ignore, etc) to
+** apply in the case of a constraint failure on an insert or update.
+*/
+case OP_VUpdate: {
+  sqlite3_vtab *pVtab;
+  const sqlite3_module *pModule;
+  int nArg;
+  int i;
+  sqlite_int64 rowid = 0;
+  Mem **apArg;
+  Mem *pX;
+
+  assert( pOp->p2==1        || pOp->p5==OE_Fail   || pOp->p5==OE_Rollback
+       || pOp->p5==OE_Abort || pOp->p5==OE_Ignore || pOp->p5==OE_Replace
+  );
+  assert( p->readOnly==0 );
+  if( db->mallocFailed ) goto no_mem;
+  sqlite3VdbeIncrWriteCounter(p, 0);
+  pVtab = pOp->p4.pVtab->pVtab;
+  if( pVtab==0 || NEVER(pVtab->pModule==0) ){
+    rc = SQLITE_LOCKED;
+    goto abort_due_to_error;
+  }
+  pModule = pVtab->pModule;
+  nArg = pOp->p2;
+  assert( pOp->p4type==P4_VTAB );
+  if( ALWAYS(pModule->xUpdate) ){
+    u8 vtabOnConflict = db->vtabOnConflict;
+    apArg = p->apArg;
+    pX = &aMem[pOp->p3];
+    for(i=0; i<nArg; i++){
+      assert( memIsValid(pX) );
+      memAboutToChange(p, pX);
+      apArg[i] = pX;
+      pX++;
+    }
+    db->vtabOnConflict = pOp->p5;
+    rc = pModule->xUpdate(pVtab, nArg, apArg, &rowid);
+    db->vtabOnConflict = vtabOnConflict;
+    sqlite3VtabImportErrmsg(p, pVtab);
+    if( rc==SQLITE_OK && pOp->p1 ){
+      assert( nArg>1 && apArg[0] && (apArg[0]->flags&MEM_Null) );
+      db->lastRowid = rowid;
+    }
+    if( (rc&0xff)==SQLITE_CONSTRAINT && pOp->p4.pVtab->bConstraint ){
+      if( pOp->p5==OE_Ignore ){
+        rc = SQLITE_OK;
+      }else{
+        p->errorAction = ((pOp->p5==OE_Replace) ? OE_Abort : pOp->p5);
+      }
+    }else{
+      p->nChange++;
+    }
+    if( rc ) goto abort_due_to_error;
+  }
+  break;
+}
+#endif /* SQLITE_OMIT_VIRTUALTABLE */
+
+#ifndef  SQLITE_OMIT_PAGER_PRAGMAS
+/* Opcode: Pagecount P1 P2 * * *
+**
+** Write the current number of pages in database P1 to memory cell P2.
+*/
+case OP_Pagecount: {            /* out2 */
+  pOut = out2Prerelease(p, pOp);
+  pOut->u.i = sqlite3BtreeLastPage(db->aDb[pOp->p1].pBt);
+  break;
+}
+#endif
+
+
+#ifndef  SQLITE_OMIT_PAGER_PRAGMAS
+/* Opcode: MaxPgcnt P1 P2 P3 * *
+**
+** Try to set the maximum page count for database P1 to the value in P3.
+** Do not let the maximum page count fall below the current page count and
+** do not change the maximum page count value if P3==0.
+**
+** Store the maximum page count after the change in register P2.
+*/
+case OP_MaxPgcnt: {            /* out2 */
+  unsigned int newMax;
+  Btree *pBt;
+
+  pOut = out2Prerelease(p, pOp);
+  pBt = db->aDb[pOp->p1].pBt;
+  newMax = 0;
+  if( pOp->p3 ){
+    newMax = sqlite3BtreeLastPage(pBt);
+    if( newMax < (unsigned)pOp->p3 ) newMax = (unsigned)pOp->p3;
+  }
+  pOut->u.i = sqlite3BtreeMaxPageCount(pBt, newMax);
+  break;
+}
+#endif
+
+/* Opcode: Function P1 P2 P3 P4 *
+** Synopsis: r[P3]=func(r[P2@NP])
+**
+** Invoke a user function (P4 is a pointer to an sqlite3_context object that
+** contains a pointer to the function to be run) with arguments taken
+** from register P2 and successors.  The number of arguments is in
+** the sqlite3_context object that P4 points to.
+** The result of the function is stored
+** in register P3.  Register P3 must not be one of the function inputs.
+**
+** P1 is a 32-bit bitmask indicating whether or not each argument to the
+** function was determined to be constant at compile time. If the first
+** argument was constant then bit 0 of P1 is set. This is used to determine
+** whether meta data associated with a user function argument using the
+** sqlite3_set_auxdata() API may be safely retained until the next
+** invocation of this opcode.
+**
+** See also: AggStep, AggFinal, PureFunc
+*/
+/* Opcode: PureFunc P1 P2 P3 P4 *
+** Synopsis: r[P3]=func(r[P2@NP])
+**
+** Invoke a user function (P4 is a pointer to an sqlite3_context object that
+** contains a pointer to the function to be run) with arguments taken
+** from register P2 and successors.  The number of arguments is in
+** the sqlite3_context object that P4 points to.
+** The result of the function is stored
+** in register P3.  Register P3 must not be one of the function inputs.
+**
+** P1 is a 32-bit bitmask indicating whether or not each argument to the
+** function was determined to be constant at compile time. If the first
+** argument was constant then bit 0 of P1 is set. This is used to determine
+** whether meta data associated with a user function argument using the
+** sqlite3_set_auxdata() API may be safely retained until the next
+** invocation of this opcode.
+**
+** This opcode works exactly like OP_Function.  The only difference is in
+** its name.  This opcode is used in places where the function must be
+** purely non-deterministic.  Some built-in date/time functions can be
+** either determinitic of non-deterministic, depending on their arguments.
+** When those function are used in a non-deterministic way, they will check
+** to see if they were called using OP_PureFunc instead of OP_Function, and
+** if they were, they throw an error.
+**
+** See also: AggStep, AggFinal, Function
+*/
+case OP_PureFunc:              /* group */
+case OP_Function: {            /* group */
+  int i;
+  sqlite3_context *pCtx;
+
+  assert( pOp->p4type==P4_FUNCCTX );
+  pCtx = pOp->p4.pCtx;
+
+  /* If this function is inside of a trigger, the register array in aMem[]
+  ** might change from one evaluation to the next.  The next block of code
+  ** checks to see if the register array has changed, and if so it
+  ** reinitializes the relavant parts of the sqlite3_context object */
+  pOut = &aMem[pOp->p3];
+  if( pCtx->pOut != pOut ){
+    pCtx->pVdbe = p;
+    pCtx->pOut = pOut;
+    pCtx->enc = encoding;
+    for(i=pCtx->argc-1; i>=0; i--) pCtx->argv[i] = &aMem[pOp->p2+i];
+  }
+  assert( pCtx->pVdbe==p );
+
+  memAboutToChange(p, pOut);
+#ifdef SQLITE_DEBUG
+  for(i=0; i<pCtx->argc; i++){
+    assert( memIsValid(pCtx->argv[i]) );
+    REGISTER_TRACE(pOp->p2+i, pCtx->argv[i]);
+  }
+#endif
+  MemSetTypeFlag(pOut, MEM_Null);
+  assert( pCtx->isError==0 );
+  (*pCtx->pFunc->xSFunc)(pCtx, pCtx
