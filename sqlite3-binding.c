@@ -94847,4 +94847,214 @@ case OP_IdxGE:  {       /* jump */
   VdbeBranchTaken(res>0,2);
   assert( rc==SQLITE_OK );
   if( res>0 ) goto jump_to_p2;
-  br
+  break;
+}
+
+/* Opcode: Destroy P1 P2 P3 * *
+**
+** Delete an entire database table or index whose root page in the database
+** file is given by P1.
+**
+** The table being destroyed is in the main database file if P3==0.  If
+** P3==1 then the table to be clear is in the auxiliary database file
+** that is used to store tables create using CREATE TEMPORARY TABLE.
+**
+** If AUTOVACUUM is enabled then it is possible that another root page
+** might be moved into the newly deleted root page in order to keep all
+** root pages contiguous at the beginning of the database.  The former
+** value of the root page that moved - its value before the move occurred -
+** is stored in register P2. If no page movement was required (because the
+** table being dropped was already the last one in the database) then a
+** zero is stored in register P2.  If AUTOVACUUM is disabled then a zero
+** is stored in register P2.
+**
+** This opcode throws an error if there are any active reader VMs when
+** it is invoked. This is done to avoid the difficulty associated with
+** updating existing cursors when a root page is moved in an AUTOVACUUM
+** database. This error is thrown even if the database is not an AUTOVACUUM
+** db in order to avoid introducing an incompatibility between autovacuum
+** and non-autovacuum modes.
+**
+** See also: Clear
+*/
+case OP_Destroy: {     /* out2 */
+  int iMoved;
+  int iDb;
+
+  sqlite3VdbeIncrWriteCounter(p, 0);
+  assert( p->readOnly==0 );
+  assert( pOp->p1>1 );
+  pOut = out2Prerelease(p, pOp);
+  pOut->flags = MEM_Null;
+  if( db->nVdbeRead > db->nVDestroy+1 ){
+    rc = SQLITE_LOCKED;
+    p->errorAction = OE_Abort;
+    goto abort_due_to_error;
+  }else{
+    iDb = pOp->p3;
+    assert( DbMaskTest(p->btreeMask, iDb) );
+    iMoved = 0;  /* Not needed.  Only to silence a warning. */
+    rc = sqlite3BtreeDropTable(db->aDb[iDb].pBt, pOp->p1, &iMoved);
+    pOut->flags = MEM_Int;
+    pOut->u.i = iMoved;
+    if( rc ) goto abort_due_to_error;
+#ifndef SQLITE_OMIT_AUTOVACUUM
+    if( iMoved!=0 ){
+      sqlite3RootPageMoved(db, iDb, iMoved, pOp->p1);
+      /* All OP_Destroy operations occur on the same btree */
+      assert( resetSchemaOnFault==0 || resetSchemaOnFault==iDb+1 );
+      resetSchemaOnFault = iDb+1;
+    }
+#endif
+  }
+  break;
+}
+
+/* Opcode: Clear P1 P2 P3
+**
+** Delete all contents of the database table or index whose root page
+** in the database file is given by P1.  But, unlike Destroy, do not
+** remove the table or index from the database file.
+**
+** The table being clear is in the main database file if P2==0.  If
+** P2==1 then the table to be clear is in the auxiliary database file
+** that is used to store tables create using CREATE TEMPORARY TABLE.
+**
+** If the P3 value is non-zero, then the row change count is incremented
+** by the number of rows in the table being cleared. If P3 is greater
+** than zero, then the value stored in register P3 is also incremented
+** by the number of rows in the table being cleared.
+**
+** See also: Destroy
+*/
+case OP_Clear: {
+  i64 nChange;
+
+  sqlite3VdbeIncrWriteCounter(p, 0);
+  nChange = 0;
+  assert( p->readOnly==0 );
+  assert( DbMaskTest(p->btreeMask, pOp->p2) );
+  rc = sqlite3BtreeClearTable(db->aDb[pOp->p2].pBt, (u32)pOp->p1, &nChange);
+  if( pOp->p3 ){
+    p->nChange += nChange;
+    if( pOp->p3>0 ){
+      assert( memIsValid(&aMem[pOp->p3]) );
+      memAboutToChange(p, &aMem[pOp->p3]);
+      aMem[pOp->p3].u.i += nChange;
+    }
+  }
+  if( rc ) goto abort_due_to_error;
+  break;
+}
+
+/* Opcode: ResetSorter P1 * * * *
+**
+** Delete all contents from the ephemeral table or sorter
+** that is open on cursor P1.
+**
+** This opcode only works for cursors used for sorting and
+** opened with OP_OpenEphemeral or OP_SorterOpen.
+*/
+case OP_ResetSorter: {
+  VdbeCursor *pC;
+
+  assert( pOp->p1>=0 && pOp->p1<p->nCursor );
+  pC = p->apCsr[pOp->p1];
+  assert( pC!=0 );
+  if( isSorter(pC) ){
+    sqlite3VdbeSorterReset(db, pC->uc.pSorter);
+  }else{
+    assert( pC->eCurType==CURTYPE_BTREE );
+    assert( pC->isEphemeral );
+    rc = sqlite3BtreeClearTableOfCursor(pC->uc.pCursor);
+    if( rc ) goto abort_due_to_error;
+  }
+  break;
+}
+
+/* Opcode: CreateBtree P1 P2 P3 * *
+** Synopsis: r[P2]=root iDb=P1 flags=P3
+**
+** Allocate a new b-tree in the main database file if P1==0 or in the
+** TEMP database file if P1==1 or in an attached database if
+** P1>1.  The P3 argument must be 1 (BTREE_INTKEY) for a rowid table
+** it must be 2 (BTREE_BLOBKEY) for an index or WITHOUT ROWID table.
+** The root page number of the new b-tree is stored in register P2.
+*/
+case OP_CreateBtree: {          /* out2 */
+  Pgno pgno;
+  Db *pDb;
+
+  sqlite3VdbeIncrWriteCounter(p, 0);
+  pOut = out2Prerelease(p, pOp);
+  pgno = 0;
+  assert( pOp->p3==BTREE_INTKEY || pOp->p3==BTREE_BLOBKEY );
+  assert( pOp->p1>=0 && pOp->p1<db->nDb );
+  assert( DbMaskTest(p->btreeMask, pOp->p1) );
+  assert( p->readOnly==0 );
+  pDb = &db->aDb[pOp->p1];
+  assert( pDb->pBt!=0 );
+  rc = sqlite3BtreeCreateTable(pDb->pBt, &pgno, pOp->p3);
+  if( rc ) goto abort_due_to_error;
+  pOut->u.i = pgno;
+  break;
+}
+
+/* Opcode: SqlExec * * * P4 *
+**
+** Run the SQL statement or statements specified in the P4 string.
+*/
+case OP_SqlExec: {
+  sqlite3VdbeIncrWriteCounter(p, 0);
+  db->nSqlExec++;
+  rc = sqlite3_exec(db, pOp->p4.z, 0, 0, 0);
+  db->nSqlExec--;
+  if( rc ) goto abort_due_to_error;
+  break;
+}
+
+/* Opcode: ParseSchema P1 * * P4 *
+**
+** Read and parse all entries from the schema table of database P1
+** that match the WHERE clause P4.  If P4 is a NULL pointer, then the
+** entire schema for P1 is reparsed.
+**
+** This opcode invokes the parser to create a new virtual machine,
+** then runs the new virtual machine.  It is thus a re-entrant opcode.
+*/
+case OP_ParseSchema: {
+  int iDb;
+  const char *zSchema;
+  char *zSql;
+  InitData initData;
+
+  /* Any prepared statement that invokes this opcode will hold mutexes
+  ** on every btree.  This is a prerequisite for invoking
+  ** sqlite3InitCallback().
+  */
+#ifdef SQLITE_DEBUG
+  for(iDb=0; iDb<db->nDb; iDb++){
+    assert( iDb==1 || sqlite3BtreeHoldsMutex(db->aDb[iDb].pBt) );
+  }
+#endif
+
+  iDb = pOp->p1;
+  assert( iDb>=0 && iDb<db->nDb );
+  assert( DbHasProperty(db, iDb, DB_SchemaLoaded)
+           || db->mallocFailed
+           || (CORRUPT_DB && (db->flags & SQLITE_NoSchemaError)!=0) );
+
+#ifndef SQLITE_OMIT_ALTERTABLE
+  if( pOp->p4.z==0 ){
+    sqlite3SchemaClear(db->aDb[iDb].pSchema);
+    db->mDbFlags &= ~DBFLAG_SchemaKnownOk;
+    rc = sqlite3InitOne(db, iDb, &p->zErrMsg, pOp->p5);
+    db->mDbFlags |= DBFLAG_SchemaChange;
+    p->expired = 0;
+  }else
+#endif
+  {
+    zSchema = LEGACY_SCHEMA_TABLE;
+    initData.db = db;
+    initData.iDb = iDb;
+    initData.pzErrMsg = &p->
