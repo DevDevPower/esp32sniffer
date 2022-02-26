@@ -94027,4 +94027,215 @@ case OP_ResetCount: {
 ** of r[P3] and the sorter record are compared.
 **
 ** If either P3 or the sorter contains a NULL in one of their significant
-** fields (not counting the P4 fields at the end which are 
+** fields (not counting the P4 fields at the end which are ignored) then
+** the comparison is assumed to be equal.
+**
+** Fall through to next instruction if the two records compare equal to
+** each other.  Jump to P2 if they are different.
+*/
+case OP_SorterCompare: {
+  VdbeCursor *pC;
+  int res;
+  int nKeyCol;
+
+  pC = p->apCsr[pOp->p1];
+  assert( isSorter(pC) );
+  assert( pOp->p4type==P4_INT32 );
+  pIn3 = &aMem[pOp->p3];
+  nKeyCol = pOp->p4.i;
+  res = 0;
+  rc = sqlite3VdbeSorterCompare(pC, pIn3, nKeyCol, &res);
+  VdbeBranchTaken(res!=0,2);
+  if( rc ) goto abort_due_to_error;
+  if( res ) goto jump_to_p2;
+  break;
+};
+
+/* Opcode: SorterData P1 P2 P3 * *
+** Synopsis: r[P2]=data
+**
+** Write into register P2 the current sorter data for sorter cursor P1.
+** Then clear the column header cache on cursor P3.
+**
+** This opcode is normally use to move a record out of the sorter and into
+** a register that is the source for a pseudo-table cursor created using
+** OpenPseudo.  That pseudo-table cursor is the one that is identified by
+** parameter P3.  Clearing the P3 column cache as part of this opcode saves
+** us from having to issue a separate NullRow instruction to clear that cache.
+*/
+case OP_SorterData: {
+  VdbeCursor *pC;
+
+  pOut = &aMem[pOp->p2];
+  pC = p->apCsr[pOp->p1];
+  assert( isSorter(pC) );
+  rc = sqlite3VdbeSorterRowkey(pC, pOut);
+  assert( rc!=SQLITE_OK || (pOut->flags & MEM_Blob) );
+  assert( pOp->p1>=0 && pOp->p1<p->nCursor );
+  if( rc ) goto abort_due_to_error;
+  p->apCsr[pOp->p3]->cacheStatus = CACHE_STALE;
+  break;
+}
+
+/* Opcode: RowData P1 P2 P3 * *
+** Synopsis: r[P2]=data
+**
+** Write into register P2 the complete row content for the row at
+** which cursor P1 is currently pointing.
+** There is no interpretation of the data.
+** It is just copied onto the P2 register exactly as
+** it is found in the database file.
+**
+** If cursor P1 is an index, then the content is the key of the row.
+** If cursor P2 is a table, then the content extracted is the data.
+**
+** If the P1 cursor must be pointing to a valid row (not a NULL row)
+** of a real table, not a pseudo-table.
+**
+** If P3!=0 then this opcode is allowed to make an ephemeral pointer
+** into the database page.  That means that the content of the output
+** register will be invalidated as soon as the cursor moves - including
+** moves caused by other cursors that "save" the current cursors
+** position in order that they can write to the same table.  If P3==0
+** then a copy of the data is made into memory.  P3!=0 is faster, but
+** P3==0 is safer.
+**
+** If P3!=0 then the content of the P2 register is unsuitable for use
+** in OP_Result and any OP_Result will invalidate the P2 register content.
+** The P2 register content is invalidated by opcodes like OP_Function or
+** by any use of another cursor pointing to the same table.
+*/
+case OP_RowData: {
+  VdbeCursor *pC;
+  BtCursor *pCrsr;
+  u32 n;
+
+  pOut = out2Prerelease(p, pOp);
+
+  assert( pOp->p1>=0 && pOp->p1<p->nCursor );
+  pC = p->apCsr[pOp->p1];
+  assert( pC!=0 );
+  assert( pC->eCurType==CURTYPE_BTREE );
+  assert( isSorter(pC)==0 );
+  assert( pC->nullRow==0 );
+  assert( pC->uc.pCursor!=0 );
+  pCrsr = pC->uc.pCursor;
+
+  /* The OP_RowData opcodes always follow OP_NotExists or
+  ** OP_SeekRowid or OP_Rewind/Op_Next with no intervening instructions
+  ** that might invalidate the cursor.
+  ** If this where not the case, on of the following assert()s
+  ** would fail.  Should this ever change (because of changes in the code
+  ** generator) then the fix would be to insert a call to
+  ** sqlite3VdbeCursorMoveto().
+  */
+  assert( pC->deferredMoveto==0 );
+  assert( sqlite3BtreeCursorIsValid(pCrsr) );
+
+  n = sqlite3BtreePayloadSize(pCrsr);
+  if( n>(u32)db->aLimit[SQLITE_LIMIT_LENGTH] ){
+    goto too_big;
+  }
+  testcase( n==0 );
+  rc = sqlite3VdbeMemFromBtreeZeroOffset(pCrsr, n, pOut);
+  if( rc ) goto abort_due_to_error;
+  if( !pOp->p3 ) Deephemeralize(pOut);
+  UPDATE_MAX_BLOBSIZE(pOut);
+  REGISTER_TRACE(pOp->p2, pOut);
+  break;
+}
+
+/* Opcode: Rowid P1 P2 * * *
+** Synopsis: r[P2]=PX rowid of P1
+**
+** Store in register P2 an integer which is the key of the table entry that
+** P1 is currently point to.
+**
+** P1 can be either an ordinary table or a virtual table.  There used to
+** be a separate OP_VRowid opcode for use with virtual tables, but this
+** one opcode now works for both table types.
+*/
+case OP_Rowid: {                 /* out2 */
+  VdbeCursor *pC;
+  i64 v;
+  sqlite3_vtab *pVtab;
+  const sqlite3_module *pModule;
+
+  pOut = out2Prerelease(p, pOp);
+  assert( pOp->p1>=0 && pOp->p1<p->nCursor );
+  pC = p->apCsr[pOp->p1];
+  assert( pC!=0 );
+  assert( pC->eCurType!=CURTYPE_PSEUDO || pC->nullRow );
+  if( pC->nullRow ){
+    pOut->flags = MEM_Null;
+    break;
+  }else if( pC->deferredMoveto ){
+    v = pC->movetoTarget;
+#ifndef SQLITE_OMIT_VIRTUALTABLE
+  }else if( pC->eCurType==CURTYPE_VTAB ){
+    assert( pC->uc.pVCur!=0 );
+    pVtab = pC->uc.pVCur->pVtab;
+    pModule = pVtab->pModule;
+    assert( pModule->xRowid );
+    rc = pModule->xRowid(pC->uc.pVCur, &v);
+    sqlite3VtabImportErrmsg(p, pVtab);
+    if( rc ) goto abort_due_to_error;
+#endif /* SQLITE_OMIT_VIRTUALTABLE */
+  }else{
+    assert( pC->eCurType==CURTYPE_BTREE );
+    assert( pC->uc.pCursor!=0 );
+    rc = sqlite3VdbeCursorRestore(pC);
+    if( rc ) goto abort_due_to_error;
+    if( pC->nullRow ){
+      pOut->flags = MEM_Null;
+      break;
+    }
+    v = sqlite3BtreeIntegerKey(pC->uc.pCursor);
+  }
+  pOut->u.i = v;
+  break;
+}
+
+/* Opcode: NullRow P1 * * * *
+**
+** Move the cursor P1 to a null row.  Any OP_Column operations
+** that occur while the cursor is on the null row will always
+** write a NULL.
+**
+** If cursor P1 is not previously opened, open it now to a special
+** pseudo-cursor that always returns NULL for every column.
+*/
+case OP_NullRow: {
+  VdbeCursor *pC;
+
+  assert( pOp->p1>=0 && pOp->p1<p->nCursor );
+  pC = p->apCsr[pOp->p1];
+  if( pC==0 ){
+    /* If the cursor is not already open, create a special kind of
+    ** pseudo-cursor that always gives null rows. */
+    pC = allocateCursor(p, pOp->p1, 1, CURTYPE_PSEUDO);
+    if( pC==0 ) goto no_mem;
+    pC->seekResult = 0;
+    pC->isTable = 1;
+    pC->noReuse = 1;
+    pC->uc.pCursor = sqlite3BtreeFakeValidCursor();
+  }
+  pC->nullRow = 1;
+  pC->cacheStatus = CACHE_STALE;
+  if( pC->eCurType==CURTYPE_BTREE ){
+    assert( pC->uc.pCursor!=0 );
+    sqlite3BtreeClearCursor(pC->uc.pCursor);
+  }
+#ifdef SQLITE_DEBUG
+  if( pC->seekOp==0 ) pC->seekOp = OP_NullRow;
+#endif
+  break;
+}
+
+/* Opcode: SeekEnd P1 * * * *
+**
+** Position cursor P1 at the end of the btree for the purpose of
+** appending a new entry onto the btree.
+**
+** It is assumed that the cursor is used only for appending and so
+** if the cursor is valid, then the cursor must alr
