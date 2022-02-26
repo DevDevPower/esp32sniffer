@@ -95442,4 +95442,199 @@ case OP_Program: {        /* jump */
 #ifdef SQLITE_ENABLE_STMT_SCANSTATUS
   p->anExec = 0;
 #endif
-#ifde
+#ifdef SQLITE_DEBUG
+  /* Verify that second and subsequent executions of the same trigger do not
+  ** try to reuse register values from the first use. */
+  {
+    int i;
+    for(i=0; i<p->nMem; i++){
+      aMem[i].pScopyFrom = 0;  /* Prevent false-positive AboutToChange() errs */
+      MemSetTypeFlag(&aMem[i], MEM_Undefined); /* Fault if this reg is reused */
+    }
+  }
+#endif
+  pOp = &aOp[-1];
+  goto check_for_interrupt;
+}
+
+/* Opcode: Param P1 P2 * * *
+**
+** This opcode is only ever present in sub-programs called via the
+** OP_Program instruction. Copy a value currently stored in a memory
+** cell of the calling (parent) frame to cell P2 in the current frames
+** address space. This is used by trigger programs to access the new.*
+** and old.* values.
+**
+** The address of the cell in the parent frame is determined by adding
+** the value of the P1 argument to the value of the P1 argument to the
+** calling OP_Program instruction.
+*/
+case OP_Param: {           /* out2 */
+  VdbeFrame *pFrame;
+  Mem *pIn;
+  pOut = out2Prerelease(p, pOp);
+  pFrame = p->pFrame;
+  pIn = &pFrame->aMem[pOp->p1 + pFrame->aOp[pFrame->pc].p1];
+  sqlite3VdbeMemShallowCopy(pOut, pIn, MEM_Ephem);
+  break;
+}
+
+#endif /* #ifndef SQLITE_OMIT_TRIGGER */
+
+#ifndef SQLITE_OMIT_FOREIGN_KEY
+/* Opcode: FkCounter P1 P2 * * *
+** Synopsis: fkctr[P1]+=P2
+**
+** Increment a "constraint counter" by P2 (P2 may be negative or positive).
+** If P1 is non-zero, the database constraint counter is incremented
+** (deferred foreign key constraints). Otherwise, if P1 is zero, the
+** statement counter is incremented (immediate foreign key constraints).
+*/
+case OP_FkCounter: {
+  if( db->flags & SQLITE_DeferFKs ){
+    db->nDeferredImmCons += pOp->p2;
+  }else if( pOp->p1 ){
+    db->nDeferredCons += pOp->p2;
+  }else{
+    p->nFkConstraint += pOp->p2;
+  }
+  break;
+}
+
+/* Opcode: FkIfZero P1 P2 * * *
+** Synopsis: if fkctr[P1]==0 goto P2
+**
+** This opcode tests if a foreign key constraint-counter is currently zero.
+** If so, jump to instruction P2. Otherwise, fall through to the next
+** instruction.
+**
+** If P1 is non-zero, then the jump is taken if the database constraint-counter
+** is zero (the one that counts deferred constraint violations). If P1 is
+** zero, the jump is taken if the statement constraint-counter is zero
+** (immediate foreign key constraint violations).
+*/
+case OP_FkIfZero: {         /* jump */
+  if( pOp->p1 ){
+    VdbeBranchTaken(db->nDeferredCons==0 && db->nDeferredImmCons==0, 2);
+    if( db->nDeferredCons==0 && db->nDeferredImmCons==0 ) goto jump_to_p2;
+  }else{
+    VdbeBranchTaken(p->nFkConstraint==0 && db->nDeferredImmCons==0, 2);
+    if( p->nFkConstraint==0 && db->nDeferredImmCons==0 ) goto jump_to_p2;
+  }
+  break;
+}
+#endif /* #ifndef SQLITE_OMIT_FOREIGN_KEY */
+
+#ifndef SQLITE_OMIT_AUTOINCREMENT
+/* Opcode: MemMax P1 P2 * * *
+** Synopsis: r[P1]=max(r[P1],r[P2])
+**
+** P1 is a register in the root frame of this VM (the root frame is
+** different from the current frame if this instruction is being executed
+** within a sub-program). Set the value of register P1 to the maximum of
+** its current value and the value in register P2.
+**
+** This instruction throws an error if the memory cell is not initially
+** an integer.
+*/
+case OP_MemMax: {        /* in2 */
+  VdbeFrame *pFrame;
+  if( p->pFrame ){
+    for(pFrame=p->pFrame; pFrame->pParent; pFrame=pFrame->pParent);
+    pIn1 = &pFrame->aMem[pOp->p1];
+  }else{
+    pIn1 = &aMem[pOp->p1];
+  }
+  assert( memIsValid(pIn1) );
+  sqlite3VdbeMemIntegerify(pIn1);
+  pIn2 = &aMem[pOp->p2];
+  sqlite3VdbeMemIntegerify(pIn2);
+  if( pIn1->u.i<pIn2->u.i){
+    pIn1->u.i = pIn2->u.i;
+  }
+  break;
+}
+#endif /* SQLITE_OMIT_AUTOINCREMENT */
+
+/* Opcode: IfPos P1 P2 P3 * *
+** Synopsis: if r[P1]>0 then r[P1]-=P3, goto P2
+**
+** Register P1 must contain an integer.
+** If the value of register P1 is 1 or greater, subtract P3 from the
+** value in P1 and jump to P2.
+**
+** If the initial value of register P1 is less than 1, then the
+** value is unchanged and control passes through to the next instruction.
+*/
+case OP_IfPos: {        /* jump, in1 */
+  pIn1 = &aMem[pOp->p1];
+  assert( pIn1->flags&MEM_Int );
+  VdbeBranchTaken( pIn1->u.i>0, 2);
+  if( pIn1->u.i>0 ){
+    pIn1->u.i -= pOp->p3;
+    goto jump_to_p2;
+  }
+  break;
+}
+
+/* Opcode: OffsetLimit P1 P2 P3 * *
+** Synopsis: if r[P1]>0 then r[P2]=r[P1]+max(0,r[P3]) else r[P2]=(-1)
+**
+** This opcode performs a commonly used computation associated with
+** LIMIT and OFFSET process.  r[P1] holds the limit counter.  r[P3]
+** holds the offset counter.  The opcode computes the combined value
+** of the LIMIT and OFFSET and stores that value in r[P2].  The r[P2]
+** value computed is the total number of rows that will need to be
+** visited in order to complete the query.
+**
+** If r[P3] is zero or negative, that means there is no OFFSET
+** and r[P2] is set to be the value of the LIMIT, r[P1].
+**
+** if r[P1] is zero or negative, that means there is no LIMIT
+** and r[P2] is set to -1.
+**
+** Otherwise, r[P2] is set to the sum of r[P1] and r[P3].
+*/
+case OP_OffsetLimit: {    /* in1, out2, in3 */
+  i64 x;
+  pIn1 = &aMem[pOp->p1];
+  pIn3 = &aMem[pOp->p3];
+  pOut = out2Prerelease(p, pOp);
+  assert( pIn1->flags & MEM_Int );
+  assert( pIn3->flags & MEM_Int );
+  x = pIn1->u.i;
+  if( x<=0 || sqlite3AddInt64(&x, pIn3->u.i>0?pIn3->u.i:0) ){
+    /* If the LIMIT is less than or equal to zero, loop forever.  This
+    ** is documented.  But also, if the LIMIT+OFFSET exceeds 2^63 then
+    ** also loop forever.  This is undocumented.  In fact, one could argue
+    ** that the loop should terminate.  But assuming 1 billion iterations
+    ** per second (far exceeding the capabilities of any current hardware)
+    ** it would take nearly 300 years to actually reach the limit.  So
+    ** looping forever is a reasonable approximation. */
+    pOut->u.i = -1;
+  }else{
+    pOut->u.i = x;
+  }
+  break;
+}
+
+/* Opcode: IfNotZero P1 P2 * * *
+** Synopsis: if r[P1]!=0 then r[P1]--, goto P2
+**
+** Register P1 must contain an integer.  If the content of register P1 is
+** initially greater than zero, then decrement the value in register P1.
+** If it is non-zero (negative or positive) and then also jump to P2.
+** If register P1 is initially zero, leave it unchanged and fall through.
+*/
+case OP_IfNotZero: {        /* jump, in1 */
+  pIn1 = &aMem[pOp->p1];
+  assert( pIn1->flags&MEM_Int );
+  VdbeBranchTaken(pIn1->u.i<0, 2);
+  if( pIn1->u.i ){
+     if( pIn1->u.i>0 ) pIn1->u.i--;
+     goto jump_to_p2;
+  }
+  break;
+}
+
+/* Opcode: DecrJumpZero
