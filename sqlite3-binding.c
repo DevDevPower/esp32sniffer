@@ -97088,4 +97088,215 @@ too_big:
 no_mem:
   sqlite3OomFault(db);
   sqlite3VdbeError(p, "out of memory");
-  rc = SQLITE
+  rc = SQLITE_NOMEM_BKPT;
+  goto abort_due_to_error;
+
+  /* Jump to here if the sqlite3_interrupt() API sets the interrupt
+  ** flag.
+  */
+abort_due_to_interrupt:
+  assert( AtomicLoad(&db->u1.isInterrupted) );
+  rc = SQLITE_INTERRUPT;
+  goto abort_due_to_error;
+}
+
+
+/************** End of vdbe.c ************************************************/
+/************** Begin file vdbeblob.c ****************************************/
+/*
+** 2007 May 1
+**
+** The author disclaims copyright to this source code.  In place of
+** a legal notice, here is a blessing:
+**
+**    May you do good and not evil.
+**    May you find forgiveness for yourself and forgive others.
+**    May you share freely, never taking more than you give.
+**
+*************************************************************************
+**
+** This file contains code used to implement incremental BLOB I/O.
+*/
+
+/* #include "sqliteInt.h" */
+/* #include "vdbeInt.h" */
+
+#ifndef SQLITE_OMIT_INCRBLOB
+
+/*
+** Valid sqlite3_blob* handles point to Incrblob structures.
+*/
+typedef struct Incrblob Incrblob;
+struct Incrblob {
+  int nByte;              /* Size of open blob, in bytes */
+  int iOffset;            /* Byte offset of blob in cursor data */
+  u16 iCol;               /* Table column this handle is open on */
+  BtCursor *pCsr;         /* Cursor pointing at blob row */
+  sqlite3_stmt *pStmt;    /* Statement holding cursor open */
+  sqlite3 *db;            /* The associated database */
+  char *zDb;              /* Database name */
+  Table *pTab;            /* Table object */
+};
+
+
+/*
+** This function is used by both blob_open() and blob_reopen(). It seeks
+** the b-tree cursor associated with blob handle p to point to row iRow.
+** If successful, SQLITE_OK is returned and subsequent calls to
+** sqlite3_blob_read() or sqlite3_blob_write() access the specified row.
+**
+** If an error occurs, or if the specified row does not exist or does not
+** contain a value of type TEXT or BLOB in the column nominated when the
+** blob handle was opened, then an error code is returned and *pzErr may
+** be set to point to a buffer containing an error message. It is the
+** responsibility of the caller to free the error message buffer using
+** sqlite3DbFree().
+**
+** If an error does occur, then the b-tree cursor is closed. All subsequent
+** calls to sqlite3_blob_read(), blob_write() or blob_reopen() will
+** immediately return SQLITE_ABORT.
+*/
+static int blobSeekToRow(Incrblob *p, sqlite3_int64 iRow, char **pzErr){
+  int rc;                         /* Error code */
+  char *zErr = 0;                 /* Error message */
+  Vdbe *v = (Vdbe *)p->pStmt;
+
+  /* Set the value of register r[1] in the SQL statement to integer iRow.
+  ** This is done directly as a performance optimization
+  */
+  v->aMem[1].flags = MEM_Int;
+  v->aMem[1].u.i = iRow;
+
+  /* If the statement has been run before (and is paused at the OP_ResultRow)
+  ** then back it up to the point where it does the OP_NotExists.  This could
+  ** have been down with an extra OP_Goto, but simply setting the program
+  ** counter is faster. */
+  if( v->pc>4 ){
+    v->pc = 4;
+    assert( v->aOp[v->pc].opcode==OP_NotExists );
+    rc = sqlite3VdbeExec(v);
+  }else{
+    rc = sqlite3_step(p->pStmt);
+  }
+  if( rc==SQLITE_ROW ){
+    VdbeCursor *pC = v->apCsr[0];
+    u32 type;
+    assert( pC!=0 );
+    assert( pC->eCurType==CURTYPE_BTREE );
+    type = pC->nHdrParsed>p->iCol ? pC->aType[p->iCol] : 0;
+    testcase( pC->nHdrParsed==p->iCol );
+    testcase( pC->nHdrParsed==p->iCol+1 );
+    if( type<12 ){
+      zErr = sqlite3MPrintf(p->db, "cannot open value of type %s",
+          type==0?"null": type==7?"real": "integer"
+      );
+      rc = SQLITE_ERROR;
+      sqlite3_finalize(p->pStmt);
+      p->pStmt = 0;
+    }else{
+      p->iOffset = pC->aType[p->iCol + pC->nField];
+      p->nByte = sqlite3VdbeSerialTypeLen(type);
+      p->pCsr =  pC->uc.pCursor;
+      sqlite3BtreeIncrblobCursor(p->pCsr);
+    }
+  }
+
+  if( rc==SQLITE_ROW ){
+    rc = SQLITE_OK;
+  }else if( p->pStmt ){
+    rc = sqlite3_finalize(p->pStmt);
+    p->pStmt = 0;
+    if( rc==SQLITE_OK ){
+      zErr = sqlite3MPrintf(p->db, "no such rowid: %lld", iRow);
+      rc = SQLITE_ERROR;
+    }else{
+      zErr = sqlite3MPrintf(p->db, "%s", sqlite3_errmsg(p->db));
+    }
+  }
+
+  assert( rc!=SQLITE_OK || zErr==0 );
+  assert( rc!=SQLITE_ROW && rc!=SQLITE_DONE );
+
+  *pzErr = zErr;
+  return rc;
+}
+
+/*
+** Open a blob handle.
+*/
+SQLITE_API int sqlite3_blob_open(
+  sqlite3* db,            /* The database connection */
+  const char *zDb,        /* The attached database containing the blob */
+  const char *zTable,     /* The table containing the blob */
+  const char *zColumn,    /* The column containing the blob */
+  sqlite_int64 iRow,      /* The row containing the glob */
+  int wrFlag,             /* True -> read/write access, false -> read-only */
+  sqlite3_blob **ppBlob   /* Handle for accessing the blob returned here */
+){
+  int nAttempt = 0;
+  int iCol;               /* Index of zColumn in row-record */
+  int rc = SQLITE_OK;
+  char *zErr = 0;
+  Table *pTab;
+  Incrblob *pBlob = 0;
+  Parse sParse;
+
+#ifdef SQLITE_ENABLE_API_ARMOR
+  if( ppBlob==0 ){
+    return SQLITE_MISUSE_BKPT;
+  }
+#endif
+  *ppBlob = 0;
+#ifdef SQLITE_ENABLE_API_ARMOR
+  if( !sqlite3SafetyCheckOk(db) || zTable==0 ){
+    return SQLITE_MISUSE_BKPT;
+  }
+#endif
+  wrFlag = !!wrFlag;                /* wrFlag = (wrFlag ? 1 : 0); */
+
+  sqlite3_mutex_enter(db->mutex);
+
+  pBlob = (Incrblob *)sqlite3DbMallocZero(db, sizeof(Incrblob));
+  while(1){
+    sqlite3ParseObjectInit(&sParse,db);
+    if( !pBlob ) goto blob_open_out;
+    sqlite3DbFree(db, zErr);
+    zErr = 0;
+
+    sqlite3BtreeEnterAll(db);
+    pTab = sqlite3LocateTable(&sParse, 0, zTable, zDb);
+    if( pTab && IsVirtual(pTab) ){
+      pTab = 0;
+      sqlite3ErrorMsg(&sParse, "cannot open virtual table: %s", zTable);
+    }
+    if( pTab && !HasRowid(pTab) ){
+      pTab = 0;
+      sqlite3ErrorMsg(&sParse, "cannot open table without rowid: %s", zTable);
+    }
+#ifndef SQLITE_OMIT_VIEW
+    if( pTab && IsView(pTab) ){
+      pTab = 0;
+      sqlite3ErrorMsg(&sParse, "cannot open view: %s", zTable);
+    }
+#endif
+    if( !pTab ){
+      if( sParse.zErrMsg ){
+        sqlite3DbFree(db, zErr);
+        zErr = sParse.zErrMsg;
+        sParse.zErrMsg = 0;
+      }
+      rc = SQLITE_ERROR;
+      sqlite3BtreeLeaveAll(db);
+      goto blob_open_out;
+    }
+    pBlob->pTab = pTab;
+    pBlob->zDb = db->aDb[sqlite3SchemaToIndex(db, pTab->pSchema)].zDbSName;
+
+    /* Now search pTab for the exact column. */
+    for(iCol=0; iCol<pTab->nCol; iCol++) {
+      if( sqlite3StrICmp(pTab->aCol[iCol].zCnName, zColumn)==0 ){
+        break;
+      }
+    }
+    if( iCol==pTab->nCol ){
+      sqlite3DbFree(
