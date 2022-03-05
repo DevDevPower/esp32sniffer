@@ -99188,4 +99188,187 @@ static int vdbeSorterListToPMA(SortSubtask *pTask, SorterList *pList){
   if( pTask->file.pFd==0 ){
     rc = vdbeSorterOpenTempFile(db, 0, &pTask->file.pFd);
     assert( rc!=SQLITE_OK || pTask->file.pFd );
-    assert( pTask->file.iEof==0 )
+    assert( pTask->file.iEof==0 );
+    assert( pTask->nPMA==0 );
+  }
+
+  /* Try to get the file to memory map */
+  if( rc==SQLITE_OK ){
+    vdbeSorterExtendFile(db, pTask->file.pFd, pTask->file.iEof+pList->szPMA+9);
+  }
+
+  /* Sort the list */
+  if( rc==SQLITE_OK ){
+    rc = vdbeSorterSort(pTask, pList);
+  }
+
+  if( rc==SQLITE_OK ){
+    SorterRecord *p;
+    SorterRecord *pNext = 0;
+
+    vdbePmaWriterInit(pTask->file.pFd, &writer, pTask->pSorter->pgsz,
+                      pTask->file.iEof);
+    pTask->nPMA++;
+    vdbePmaWriteVarint(&writer, pList->szPMA);
+    for(p=pList->pList; p; p=pNext){
+      pNext = p->u.pNext;
+      vdbePmaWriteVarint(&writer, p->nVal);
+      vdbePmaWriteBlob(&writer, SRVAL(p), p->nVal);
+      if( pList->aMemory==0 ) sqlite3_free(p);
+    }
+    pList->pList = p;
+    rc = vdbePmaWriterFinish(&writer, &pTask->file.iEof);
+  }
+
+  vdbeSorterWorkDebug(pTask, "exit");
+  assert( rc!=SQLITE_OK || pList->pList==0 );
+  assert( rc!=SQLITE_OK || pTask->file.iEof==iSz );
+  return rc;
+}
+
+/*
+** Advance the MergeEngine to its next entry.
+** Set *pbEof to true there is no next entry because
+** the MergeEngine has reached the end of all its inputs.
+**
+** Return SQLITE_OK if successful or an error code if an error occurs.
+*/
+static int vdbeMergeEngineStep(
+  MergeEngine *pMerger,      /* The merge engine to advance to the next row */
+  int *pbEof                 /* Set TRUE at EOF.  Set false for more content */
+){
+  int rc;
+  int iPrev = pMerger->aTree[1];/* Index of PmaReader to advance */
+  SortSubtask *pTask = pMerger->pTask;
+
+  /* Advance the current PmaReader */
+  rc = vdbePmaReaderNext(&pMerger->aReadr[iPrev]);
+
+  /* Update contents of aTree[] */
+  if( rc==SQLITE_OK ){
+    int i;                      /* Index of aTree[] to recalculate */
+    PmaReader *pReadr1;         /* First PmaReader to compare */
+    PmaReader *pReadr2;         /* Second PmaReader to compare */
+    int bCached = 0;
+
+    /* Find the first two PmaReaders to compare. The one that was just
+    ** advanced (iPrev) and the one next to it in the array.  */
+    pReadr1 = &pMerger->aReadr[(iPrev & 0xFFFE)];
+    pReadr2 = &pMerger->aReadr[(iPrev | 0x0001)];
+
+    for(i=(pMerger->nTree+iPrev)/2; i>0; i=i/2){
+      /* Compare pReadr1 and pReadr2. Store the result in variable iRes. */
+      int iRes;
+      if( pReadr1->pFd==0 ){
+        iRes = +1;
+      }else if( pReadr2->pFd==0 ){
+        iRes = -1;
+      }else{
+        iRes = pTask->xCompare(pTask, &bCached,
+            pReadr1->aKey, pReadr1->nKey, pReadr2->aKey, pReadr2->nKey
+        );
+      }
+
+      /* If pReadr1 contained the smaller value, set aTree[i] to its index.
+      ** Then set pReadr2 to the next PmaReader to compare to pReadr1. In this
+      ** case there is no cache of pReadr2 in pTask->pUnpacked, so set
+      ** pKey2 to point to the record belonging to pReadr2.
+      **
+      ** Alternatively, if pReadr2 contains the smaller of the two values,
+      ** set aTree[i] to its index and update pReadr1. If vdbeSorterCompare()
+      ** was actually called above, then pTask->pUnpacked now contains
+      ** a value equivalent to pReadr2. So set pKey2 to NULL to prevent
+      ** vdbeSorterCompare() from decoding pReadr2 again.
+      **
+      ** If the two values were equal, then the value from the oldest
+      ** PMA should be considered smaller. The VdbeSorter.aReadr[] array
+      ** is sorted from oldest to newest, so pReadr1 contains older values
+      ** than pReadr2 iff (pReadr1<pReadr2).  */
+      if( iRes<0 || (iRes==0 && pReadr1<pReadr2) ){
+        pMerger->aTree[i] = (int)(pReadr1 - pMerger->aReadr);
+        pReadr2 = &pMerger->aReadr[ pMerger->aTree[i ^ 0x0001] ];
+        bCached = 0;
+      }else{
+        if( pReadr1->pFd ) bCached = 0;
+        pMerger->aTree[i] = (int)(pReadr2 - pMerger->aReadr);
+        pReadr1 = &pMerger->aReadr[ pMerger->aTree[i ^ 0x0001] ];
+      }
+    }
+    *pbEof = (pMerger->aReadr[pMerger->aTree[1]].pFd==0);
+  }
+
+  return (rc==SQLITE_OK ? pTask->pUnpacked->errCode : rc);
+}
+
+#if SQLITE_MAX_WORKER_THREADS>0
+/*
+** The main routine for background threads that write level-0 PMAs.
+*/
+static void *vdbeSorterFlushThread(void *pCtx){
+  SortSubtask *pTask = (SortSubtask*)pCtx;
+  int rc;                         /* Return code */
+  assert( pTask->bDone==0 );
+  rc = vdbeSorterListToPMA(pTask, &pTask->list);
+  pTask->bDone = 1;
+  return SQLITE_INT_TO_PTR(rc);
+}
+#endif /* SQLITE_MAX_WORKER_THREADS>0 */
+
+/*
+** Flush the current contents of VdbeSorter.list to a new PMA, possibly
+** using a background thread.
+*/
+static int vdbeSorterFlushPMA(VdbeSorter *pSorter){
+#if SQLITE_MAX_WORKER_THREADS==0
+  pSorter->bUsePMA = 1;
+  return vdbeSorterListToPMA(&pSorter->aTask[0], &pSorter->list);
+#else
+  int rc = SQLITE_OK;
+  int i;
+  SortSubtask *pTask = 0;    /* Thread context used to create new PMA */
+  int nWorker = (pSorter->nTask-1);
+
+  /* Set the flag to indicate that at least one PMA has been written.
+  ** Or will be, anyhow.  */
+  pSorter->bUsePMA = 1;
+
+  /* Select a sub-task to sort and flush the current list of in-memory
+  ** records to disk. If the sorter is running in multi-threaded mode,
+  ** round-robin between the first (pSorter->nTask-1) tasks. Except, if
+  ** the background thread from a sub-tasks previous turn is still running,
+  ** skip it. If the first (pSorter->nTask-1) sub-tasks are all still busy,
+  ** fall back to using the final sub-task. The first (pSorter->nTask-1)
+  ** sub-tasks are prefered as they use background threads - the final
+  ** sub-task uses the main thread. */
+  for(i=0; i<nWorker; i++){
+    int iTest = (pSorter->iPrev + i + 1) % nWorker;
+    pTask = &pSorter->aTask[iTest];
+    if( pTask->bDone ){
+      rc = vdbeSorterJoinThread(pTask);
+    }
+    if( rc!=SQLITE_OK || pTask->pThread==0 ) break;
+  }
+
+  if( rc==SQLITE_OK ){
+    if( i==nWorker ){
+      /* Use the foreground thread for this operation */
+      rc = vdbeSorterListToPMA(&pSorter->aTask[nWorker], &pSorter->list);
+    }else{
+      /* Launch a background thread for this operation */
+      u8 *aMem;
+      void *pCtx;
+
+      assert( pTask!=0 );
+      assert( pTask->pThread==0 && pTask->bDone==0 );
+      assert( pTask->list.pList==0 );
+      assert( pTask->list.aMemory==0 || pSorter->list.aMemory!=0 );
+
+      aMem = pTask->list.aMemory;
+      pCtx = (void*)pTask;
+      pSorter->iPrev = (u8)(pTask - pSorter->aTask);
+      pTask->list = pSorter->list;
+      pSorter->list.pList = 0;
+      pSorter->list.szPMA = 0;
+      if( aMem ){
+        pSorter->list.aMemory = aMem;
+        pSorter->nMemory = sqlite3MallocSize(aMem);
