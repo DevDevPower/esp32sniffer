@@ -97506,4 +97506,179 @@ static int blobReadWrite(
     */
     rc = SQLITE_ABORT;
   }else{
-    /* Call either BtreeData() or 
+    /* Call either BtreeData() or BtreePutData(). If SQLITE_ABORT is
+    ** returned, clean-up the statement handle.
+    */
+    assert( db == v->db );
+    sqlite3BtreeEnterCursor(p->pCsr);
+
+#ifdef SQLITE_ENABLE_PREUPDATE_HOOK
+    if( xCall==sqlite3BtreePutData && db->xPreUpdateCallback ){
+      /* If a pre-update hook is registered and this is a write cursor,
+      ** invoke it here.
+      **
+      ** TODO: The preupdate-hook is passed SQLITE_DELETE, even though this
+      ** operation should really be an SQLITE_UPDATE. This is probably
+      ** incorrect, but is convenient because at this point the new.* values
+      ** are not easily obtainable. And for the sessions module, an
+      ** SQLITE_UPDATE where the PK columns do not change is handled in the
+      ** same way as an SQLITE_DELETE (the SQLITE_DELETE code is actually
+      ** slightly more efficient). Since you cannot write to a PK column
+      ** using the incremental-blob API, this works. For the sessions module
+      ** anyhow.
+      */
+      sqlite3_int64 iKey;
+      iKey = sqlite3BtreeIntegerKey(p->pCsr);
+      assert( v->apCsr[0]!=0 );
+      assert( v->apCsr[0]->eCurType==CURTYPE_BTREE );
+      sqlite3VdbePreUpdateHook(
+          v, v->apCsr[0], SQLITE_DELETE, p->zDb, p->pTab, iKey, -1, p->iCol
+      );
+    }
+#endif
+
+    rc = xCall(p->pCsr, iOffset+p->iOffset, n, z);
+    sqlite3BtreeLeaveCursor(p->pCsr);
+    if( rc==SQLITE_ABORT ){
+      sqlite3VdbeFinalize(v);
+      p->pStmt = 0;
+    }else{
+      v->rc = rc;
+    }
+  }
+  sqlite3Error(db, rc);
+  rc = sqlite3ApiExit(db, rc);
+  sqlite3_mutex_leave(db->mutex);
+  return rc;
+}
+
+/*
+** Read data from a blob handle.
+*/
+SQLITE_API int sqlite3_blob_read(sqlite3_blob *pBlob, void *z, int n, int iOffset){
+  return blobReadWrite(pBlob, z, n, iOffset, sqlite3BtreePayloadChecked);
+}
+
+/*
+** Write data to a blob handle.
+*/
+SQLITE_API int sqlite3_blob_write(sqlite3_blob *pBlob, const void *z, int n, int iOffset){
+  return blobReadWrite(pBlob, (void *)z, n, iOffset, sqlite3BtreePutData);
+}
+
+/*
+** Query a blob handle for the size of the data.
+**
+** The Incrblob.nByte field is fixed for the lifetime of the Incrblob
+** so no mutex is required for access.
+*/
+SQLITE_API int sqlite3_blob_bytes(sqlite3_blob *pBlob){
+  Incrblob *p = (Incrblob *)pBlob;
+  return (p && p->pStmt) ? p->nByte : 0;
+}
+
+/*
+** Move an existing blob handle to point to a different row of the same
+** database table.
+**
+** If an error occurs, or if the specified row does not exist or does not
+** contain a blob or text value, then an error code is returned and the
+** database handle error code and message set. If this happens, then all
+** subsequent calls to sqlite3_blob_xxx() functions (except blob_close())
+** immediately return SQLITE_ABORT.
+*/
+SQLITE_API int sqlite3_blob_reopen(sqlite3_blob *pBlob, sqlite3_int64 iRow){
+  int rc;
+  Incrblob *p = (Incrblob *)pBlob;
+  sqlite3 *db;
+
+  if( p==0 ) return SQLITE_MISUSE_BKPT;
+  db = p->db;
+  sqlite3_mutex_enter(db->mutex);
+
+  if( p->pStmt==0 ){
+    /* If there is no statement handle, then the blob-handle has
+    ** already been invalidated. Return SQLITE_ABORT in this case.
+    */
+    rc = SQLITE_ABORT;
+  }else{
+    char *zErr;
+    ((Vdbe*)p->pStmt)->rc = SQLITE_OK;
+    rc = blobSeekToRow(p, iRow, &zErr);
+    if( rc!=SQLITE_OK ){
+      sqlite3ErrorWithMsg(db, rc, (zErr ? "%s" : 0), zErr);
+      sqlite3DbFree(db, zErr);
+    }
+    assert( rc!=SQLITE_SCHEMA );
+  }
+
+  rc = sqlite3ApiExit(db, rc);
+  assert( rc==SQLITE_OK || p->pStmt==0 );
+  sqlite3_mutex_leave(db->mutex);
+  return rc;
+}
+
+#endif /* #ifndef SQLITE_OMIT_INCRBLOB */
+
+/************** End of vdbeblob.c ********************************************/
+/************** Begin file vdbesort.c ****************************************/
+/*
+** 2011-07-09
+**
+** The author disclaims copyright to this source code.  In place of
+** a legal notice, here is a blessing:
+**
+**    May you do good and not evil.
+**    May you find forgiveness for yourself and forgive others.
+**    May you share freely, never taking more than you give.
+**
+*************************************************************************
+** This file contains code for the VdbeSorter object, used in concert with
+** a VdbeCursor to sort large numbers of keys for CREATE INDEX statements
+** or by SELECT statements with ORDER BY clauses that cannot be satisfied
+** using indexes and without LIMIT clauses.
+**
+** The VdbeSorter object implements a multi-threaded external merge sort
+** algorithm that is efficient even if the number of elements being sorted
+** exceeds the available memory.
+**
+** Here is the (internal, non-API) interface between this module and the
+** rest of the SQLite system:
+**
+**    sqlite3VdbeSorterInit()       Create a new VdbeSorter object.
+**
+**    sqlite3VdbeSorterWrite()      Add a single new row to the VdbeSorter
+**                                  object.  The row is a binary blob in the
+**                                  OP_MakeRecord format that contains both
+**                                  the ORDER BY key columns and result columns
+**                                  in the case of a SELECT w/ ORDER BY, or
+**                                  the complete record for an index entry
+**                                  in the case of a CREATE INDEX.
+**
+**    sqlite3VdbeSorterRewind()     Sort all content previously added.
+**                                  Position the read cursor on the
+**                                  first sorted element.
+**
+**    sqlite3VdbeSorterNext()       Advance the read cursor to the next sorted
+**                                  element.
+**
+**    sqlite3VdbeSorterRowkey()     Return the complete binary blob for the
+**                                  row currently under the read cursor.
+**
+**    sqlite3VdbeSorterCompare()    Compare the binary blob for the row
+**                                  currently under the read cursor against
+**                                  another binary blob X and report if
+**                                  X is strictly less than the read cursor.
+**                                  Used to enforce uniqueness in a
+**                                  CREATE UNIQUE INDEX statement.
+**
+**    sqlite3VdbeSorterClose()      Close the VdbeSorter object and reclaim
+**                                  all resources.
+**
+**    sqlite3VdbeSorterReset()      Refurbish the VdbeSorter for reuse.  This
+**                                  is like Close() followed by Init() only
+**                                  much faster.
+**
+** The interfaces above must be called in a particular order.  Write() can
+** only occur in between Init()/Reset() and Rewind().  Next(), Rowkey(), and
+** Compare() can only occur in between Rewind() and Close()/Re
