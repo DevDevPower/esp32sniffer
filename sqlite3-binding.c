@@ -98113,4 +98113,220 @@ static int vdbePmaReadBlob(
   u8 **ppOut                      /* OUT: Pointer to buffer containing data */
 ){
   int iBuf;                       /* Offset within buffer to read from */
-  int nAvail;                     /* Bytes of data available in buff
+  int nAvail;                     /* Bytes of data available in buffer */
+
+  if( p->aMap ){
+    *ppOut = &p->aMap[p->iReadOff];
+    p->iReadOff += nByte;
+    return SQLITE_OK;
+  }
+
+  assert( p->aBuffer );
+
+  /* If there is no more data to be read from the buffer, read the next
+  ** p->nBuffer bytes of data from the file into it. Or, if there are less
+  ** than p->nBuffer bytes remaining in the PMA, read all remaining data.  */
+  iBuf = p->iReadOff % p->nBuffer;
+  if( iBuf==0 ){
+    int nRead;                    /* Bytes to read from disk */
+    int rc;                       /* sqlite3OsRead() return code */
+
+    /* Determine how many bytes of data to read. */
+    if( (p->iEof - p->iReadOff) > (i64)p->nBuffer ){
+      nRead = p->nBuffer;
+    }else{
+      nRead = (int)(p->iEof - p->iReadOff);
+    }
+    assert( nRead>0 );
+
+    /* Readr data from the file. Return early if an error occurs. */
+    rc = sqlite3OsRead(p->pFd, p->aBuffer, nRead, p->iReadOff);
+    assert( rc!=SQLITE_IOERR_SHORT_READ );
+    if( rc!=SQLITE_OK ) return rc;
+  }
+  nAvail = p->nBuffer - iBuf;
+
+  if( nByte<=nAvail ){
+    /* The requested data is available in the in-memory buffer. In this
+    ** case there is no need to make a copy of the data, just return a
+    ** pointer into the buffer to the caller.  */
+    *ppOut = &p->aBuffer[iBuf];
+    p->iReadOff += nByte;
+  }else{
+    /* The requested data is not all available in the in-memory buffer.
+    ** In this case, allocate space at p->aAlloc[] to copy the requested
+    ** range into. Then return a copy of pointer p->aAlloc to the caller.  */
+    int nRem;                     /* Bytes remaining to copy */
+
+    /* Extend the p->aAlloc[] allocation if required. */
+    if( p->nAlloc<nByte ){
+      u8 *aNew;
+      sqlite3_int64 nNew = MAX(128, 2*(sqlite3_int64)p->nAlloc);
+      while( nByte>nNew ) nNew = nNew*2;
+      aNew = sqlite3Realloc(p->aAlloc, nNew);
+      if( !aNew ) return SQLITE_NOMEM_BKPT;
+      p->nAlloc = nNew;
+      p->aAlloc = aNew;
+    }
+
+    /* Copy as much data as is available in the buffer into the start of
+    ** p->aAlloc[].  */
+    memcpy(p->aAlloc, &p->aBuffer[iBuf], nAvail);
+    p->iReadOff += nAvail;
+    nRem = nByte - nAvail;
+
+    /* The following loop copies up to p->nBuffer bytes per iteration into
+    ** the p->aAlloc[] buffer.  */
+    while( nRem>0 ){
+      int rc;                     /* vdbePmaReadBlob() return code */
+      int nCopy;                  /* Number of bytes to copy */
+      u8 *aNext;                  /* Pointer to buffer to copy data from */
+
+      nCopy = nRem;
+      if( nRem>p->nBuffer ) nCopy = p->nBuffer;
+      rc = vdbePmaReadBlob(p, nCopy, &aNext);
+      if( rc!=SQLITE_OK ) return rc;
+      assert( aNext!=p->aAlloc );
+      memcpy(&p->aAlloc[nByte - nRem], aNext, nCopy);
+      nRem -= nCopy;
+    }
+
+    *ppOut = p->aAlloc;
+  }
+
+  return SQLITE_OK;
+}
+
+/*
+** Read a varint from the stream of data accessed by p. Set *pnOut to
+** the value read.
+*/
+static int vdbePmaReadVarint(PmaReader *p, u64 *pnOut){
+  int iBuf;
+
+  if( p->aMap ){
+    p->iReadOff += sqlite3GetVarint(&p->aMap[p->iReadOff], pnOut);
+  }else{
+    iBuf = p->iReadOff % p->nBuffer;
+    if( iBuf && (p->nBuffer-iBuf)>=9 ){
+      p->iReadOff += sqlite3GetVarint(&p->aBuffer[iBuf], pnOut);
+    }else{
+      u8 aVarint[16], *a;
+      int i = 0, rc;
+      do{
+        rc = vdbePmaReadBlob(p, 1, &a);
+        if( rc ) return rc;
+        aVarint[(i++)&0xf] = a[0];
+      }while( (a[0]&0x80)!=0 );
+      sqlite3GetVarint(aVarint, pnOut);
+    }
+  }
+
+  return SQLITE_OK;
+}
+
+/*
+** Attempt to memory map file pFile. If successful, set *pp to point to the
+** new mapping and return SQLITE_OK. If the mapping is not attempted
+** (because the file is too large or the VFS layer is configured not to use
+** mmap), return SQLITE_OK and set *pp to NULL.
+**
+** Or, if an error occurs, return an SQLite error code. The final value of
+** *pp is undefined in this case.
+*/
+static int vdbeSorterMapFile(SortSubtask *pTask, SorterFile *pFile, u8 **pp){
+  int rc = SQLITE_OK;
+  if( pFile->iEof<=(i64)(pTask->pSorter->db->nMaxSorterMmap) ){
+    sqlite3_file *pFd = pFile->pFd;
+    if( pFd->pMethods->iVersion>=3 ){
+      rc = sqlite3OsFetch(pFd, 0, (int)pFile->iEof, (void**)pp);
+      testcase( rc!=SQLITE_OK );
+    }
+  }
+  return rc;
+}
+
+/*
+** Attach PmaReader pReadr to file pFile (if it is not already attached to
+** that file) and seek it to offset iOff within the file.  Return SQLITE_OK
+** if successful, or an SQLite error code if an error occurs.
+*/
+static int vdbePmaReaderSeek(
+  SortSubtask *pTask,             /* Task context */
+  PmaReader *pReadr,              /* Reader whose cursor is to be moved */
+  SorterFile *pFile,              /* Sorter file to read from */
+  i64 iOff                        /* Offset in pFile */
+){
+  int rc = SQLITE_OK;
+
+  assert( pReadr->pIncr==0 || pReadr->pIncr->bEof==0 );
+
+  if( sqlite3FaultSim(201) ) return SQLITE_IOERR_READ;
+  if( pReadr->aMap ){
+    sqlite3OsUnfetch(pReadr->pFd, 0, pReadr->aMap);
+    pReadr->aMap = 0;
+  }
+  pReadr->iReadOff = iOff;
+  pReadr->iEof = pFile->iEof;
+  pReadr->pFd = pFile->pFd;
+
+  rc = vdbeSorterMapFile(pTask, pFile, &pReadr->aMap);
+  if( rc==SQLITE_OK && pReadr->aMap==0 ){
+    int pgsz = pTask->pSorter->pgsz;
+    int iBuf = pReadr->iReadOff % pgsz;
+    if( pReadr->aBuffer==0 ){
+      pReadr->aBuffer = (u8*)sqlite3Malloc(pgsz);
+      if( pReadr->aBuffer==0 ) rc = SQLITE_NOMEM_BKPT;
+      pReadr->nBuffer = pgsz;
+    }
+    if( rc==SQLITE_OK && iBuf ){
+      int nRead = pgsz - iBuf;
+      if( (pReadr->iReadOff + nRead) > pReadr->iEof ){
+        nRead = (int)(pReadr->iEof - pReadr->iReadOff);
+      }
+      rc = sqlite3OsRead(
+          pReadr->pFd, &pReadr->aBuffer[iBuf], nRead, pReadr->iReadOff
+      );
+      testcase( rc!=SQLITE_OK );
+    }
+  }
+
+  return rc;
+}
+
+/*
+** Advance PmaReader pReadr to the next key in its PMA. Return SQLITE_OK if
+** no error occurs, or an SQLite error code if one does.
+*/
+static int vdbePmaReaderNext(PmaReader *pReadr){
+  int rc = SQLITE_OK;             /* Return Code */
+  u64 nRec = 0;                   /* Size of record in bytes */
+
+
+  if( pReadr->iReadOff>=pReadr->iEof ){
+    IncrMerger *pIncr = pReadr->pIncr;
+    int bEof = 1;
+    if( pIncr ){
+      rc = vdbeIncrSwap(pIncr);
+      if( rc==SQLITE_OK && pIncr->bEof==0 ){
+        rc = vdbePmaReaderSeek(
+            pIncr->pTask, pReadr, &pIncr->aFile[0], pIncr->iStartOff
+        );
+        bEof = 0;
+      }
+    }
+
+    if( bEof ){
+      /* This is an EOF condition */
+      vdbePmaReaderClear(pReadr);
+      testcase( rc!=SQLITE_OK );
+      return rc;
+    }
+  }
+
+  if( rc==SQLITE_OK ){
+    rc = vdbePmaReadVarint(pReadr, &nRec);
+  }
+  if( rc==SQLITE_OK ){
+    pReadr->nKey = (int)nRec;
+    rc = vdbePmaReadBlob(pReadr, (int)nRec, &pReadr->aK
