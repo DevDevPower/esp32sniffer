@@ -97681,4 +97681,151 @@ SQLITE_API int sqlite3_blob_reopen(sqlite3_blob *pBlob, sqlite3_int64 iRow){
 **
 ** The interfaces above must be called in a particular order.  Write() can
 ** only occur in between Init()/Reset() and Rewind().  Next(), Rowkey(), and
-** Compare() can only occur in between Rewind() and Close()/Re
+** Compare() can only occur in between Rewind() and Close()/Reset(). i.e.
+**
+**   Init()
+**   for each record: Write()
+**   Rewind()
+**     Rowkey()/Compare()
+**   Next()
+**   Close()
+**
+** Algorithm:
+**
+** Records passed to the sorter via calls to Write() are initially held
+** unsorted in main memory. Assuming the amount of memory used never exceeds
+** a threshold, when Rewind() is called the set of records is sorted using
+** an in-memory merge sort. In this case, no temporary files are required
+** and subsequent calls to Rowkey(), Next() and Compare() read records
+** directly from main memory.
+**
+** If the amount of space used to store records in main memory exceeds the
+** threshold, then the set of records currently in memory are sorted and
+** written to a temporary file in "Packed Memory Array" (PMA) format.
+** A PMA created at this point is known as a "level-0 PMA". Higher levels
+** of PMAs may be created by merging existing PMAs together - for example
+** merging two or more level-0 PMAs together creates a level-1 PMA.
+**
+** The threshold for the amount of main memory to use before flushing
+** records to a PMA is roughly the same as the limit configured for the
+** page-cache of the main database. Specifically, the threshold is set to
+** the value returned by "PRAGMA main.page_size" multipled by
+** that returned by "PRAGMA main.cache_size", in bytes.
+**
+** If the sorter is running in single-threaded mode, then all PMAs generated
+** are appended to a single temporary file. Or, if the sorter is running in
+** multi-threaded mode then up to (N+1) temporary files may be opened, where
+** N is the configured number of worker threads. In this case, instead of
+** sorting the records and writing the PMA to a temporary file itself, the
+** calling thread usually launches a worker thread to do so. Except, if
+** there are already N worker threads running, the main thread does the work
+** itself.
+**
+** The sorter is running in multi-threaded mode if (a) the library was built
+** with pre-processor symbol SQLITE_MAX_WORKER_THREADS set to a value greater
+** than zero, and (b) worker threads have been enabled at runtime by calling
+** "PRAGMA threads=N" with some value of N greater than 0.
+**
+** When Rewind() is called, any data remaining in memory is flushed to a
+** final PMA. So at this point the data is stored in some number of sorted
+** PMAs within temporary files on disk.
+**
+** If there are fewer than SORTER_MAX_MERGE_COUNT PMAs in total and the
+** sorter is running in single-threaded mode, then these PMAs are merged
+** incrementally as keys are retreived from the sorter by the VDBE.  The
+** MergeEngine object, described in further detail below, performs this
+** merge.
+**
+** Or, if running in multi-threaded mode, then a background thread is
+** launched to merge the existing PMAs. Once the background thread has
+** merged T bytes of data into a single sorted PMA, the main thread
+** begins reading keys from that PMA while the background thread proceeds
+** with merging the next T bytes of data. And so on.
+**
+** Parameter T is set to half the value of the memory threshold used
+** by Write() above to determine when to create a new PMA.
+**
+** If there are more than SORTER_MAX_MERGE_COUNT PMAs in total when
+** Rewind() is called, then a hierarchy of incremental-merges is used.
+** First, T bytes of data from the first SORTER_MAX_MERGE_COUNT PMAs on
+** disk are merged together. Then T bytes of data from the second set, and
+** so on, such that no operation ever merges more than SORTER_MAX_MERGE_COUNT
+** PMAs at a time. This done is to improve locality.
+**
+** If running in multi-threaded mode and there are more than
+** SORTER_MAX_MERGE_COUNT PMAs on disk when Rewind() is called, then more
+** than one background thread may be created. Specifically, there may be
+** one background thread for each temporary file on disk, and one background
+** thread to merge the output of each of the others to a single PMA for
+** the main thread to read from.
+*/
+/* #include "sqliteInt.h" */
+/* #include "vdbeInt.h" */
+
+/*
+** If SQLITE_DEBUG_SORTER_THREADS is defined, this module outputs various
+** messages to stderr that may be helpful in understanding the performance
+** characteristics of the sorter in multi-threaded mode.
+*/
+#if 0
+# define SQLITE_DEBUG_SORTER_THREADS 1
+#endif
+
+/*
+** Hard-coded maximum amount of data to accumulate in memory before flushing
+** to a level 0 PMA. The purpose of this limit is to prevent various integer
+** overflows. 512MiB.
+*/
+#define SQLITE_MAX_PMASZ    (1<<29)
+
+/*
+** Private objects used by the sorter
+*/
+typedef struct MergeEngine MergeEngine;     /* Merge PMAs together */
+typedef struct PmaReader PmaReader;         /* Incrementally read one PMA */
+typedef struct PmaWriter PmaWriter;         /* Incrementally write one PMA */
+typedef struct SorterRecord SorterRecord;   /* A record being sorted */
+typedef struct SortSubtask SortSubtask;     /* A sub-task in the sort process */
+typedef struct SorterFile SorterFile;       /* Temporary file object wrapper */
+typedef struct SorterList SorterList;       /* In-memory list of records */
+typedef struct IncrMerger IncrMerger;       /* Read & merge multiple PMAs */
+
+/*
+** A container for a temp file handle and the current amount of data
+** stored in the file.
+*/
+struct SorterFile {
+  sqlite3_file *pFd;              /* File handle */
+  i64 iEof;                       /* Bytes of data stored in pFd */
+};
+
+/*
+** An in-memory list of objects to be sorted.
+**
+** If aMemory==0 then each object is allocated separately and the objects
+** are connected using SorterRecord.u.pNext.  If aMemory!=0 then all objects
+** are stored in the aMemory[] bulk memory, one right after the other, and
+** are connected using SorterRecord.u.iNext.
+*/
+struct SorterList {
+  SorterRecord *pList;            /* Linked list of records */
+  u8 *aMemory;                    /* If non-NULL, bulk memory to hold pList */
+  int szPMA;                      /* Size of pList as PMA in bytes */
+};
+
+/*
+** The MergeEngine object is used to combine two or more smaller PMAs into
+** one big PMA using a merge operation.  Separate PMAs all need to be
+** combined into one big PMA in order to be able to step through the sorted
+** records in order.
+**
+** The aReadr[] array contains a PmaReader object for each of the PMAs being
+** merged.  An aReadr[] object either points to a valid key or else is at EOF.
+** ("EOF" means "End Of File".  When aReadr[] is at EOF there is no more data.)
+** For the purposes of the paragraphs below, we assume that the array is
+** actually N elements in size, where N is the smallest power of 2 greater
+** to or equal to the number of PMAs being merged. The extra aReadr[] elements
+** are treated as if they are empty (always at EOF).
+**
+** The aTree[] array is also N elements in size. The value of N is stored in
+** the MergeEngi
