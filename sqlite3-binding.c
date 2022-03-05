@@ -98951,3 +98951,241 @@ static int vdbeSorterOpenTempFile(
 /*
 ** If it has not already been allocated, allocate the UnpackedRecord
 ** structure at pTask->pUnpacked. Return SQLITE_OK if successful (or
+** if no allocation was required), or SQLITE_NOMEM otherwise.
+*/
+static int vdbeSortAllocUnpacked(SortSubtask *pTask){
+  if( pTask->pUnpacked==0 ){
+    pTask->pUnpacked = sqlite3VdbeAllocUnpackedRecord(pTask->pSorter->pKeyInfo);
+    if( pTask->pUnpacked==0 ) return SQLITE_NOMEM_BKPT;
+    pTask->pUnpacked->nField = pTask->pSorter->pKeyInfo->nKeyField;
+    pTask->pUnpacked->errCode = 0;
+  }
+  return SQLITE_OK;
+}
+
+
+/*
+** Merge the two sorted lists p1 and p2 into a single list.
+*/
+static SorterRecord *vdbeSorterMerge(
+  SortSubtask *pTask,             /* Calling thread context */
+  SorterRecord *p1,               /* First list to merge */
+  SorterRecord *p2                /* Second list to merge */
+){
+  SorterRecord *pFinal = 0;
+  SorterRecord **pp = &pFinal;
+  int bCached = 0;
+
+  assert( p1!=0 && p2!=0 );
+  for(;;){
+    int res;
+    res = pTask->xCompare(
+        pTask, &bCached, SRVAL(p1), p1->nVal, SRVAL(p2), p2->nVal
+    );
+
+    if( res<=0 ){
+      *pp = p1;
+      pp = &p1->u.pNext;
+      p1 = p1->u.pNext;
+      if( p1==0 ){
+        *pp = p2;
+        break;
+      }
+    }else{
+      *pp = p2;
+      pp = &p2->u.pNext;
+      p2 = p2->u.pNext;
+      bCached = 0;
+      if( p2==0 ){
+        *pp = p1;
+        break;
+      }
+    }
+  }
+  return pFinal;
+}
+
+/*
+** Return the SorterCompare function to compare values collected by the
+** sorter object passed as the only argument.
+*/
+static SorterCompare vdbeSorterGetCompare(VdbeSorter *p){
+  if( p->typeMask==SORTER_TYPE_INTEGER ){
+    return vdbeSorterCompareInt;
+  }else if( p->typeMask==SORTER_TYPE_TEXT ){
+    return vdbeSorterCompareText;
+  }
+  return vdbeSorterCompare;
+}
+
+/*
+** Sort the linked list of records headed at pTask->pList. Return
+** SQLITE_OK if successful, or an SQLite error code (i.e. SQLITE_NOMEM) if
+** an error occurs.
+*/
+static int vdbeSorterSort(SortSubtask *pTask, SorterList *pList){
+  int i;
+  SorterRecord *p;
+  int rc;
+  SorterRecord *aSlot[64];
+
+  rc = vdbeSortAllocUnpacked(pTask);
+  if( rc!=SQLITE_OK ) return rc;
+
+  p = pList->pList;
+  pTask->xCompare = vdbeSorterGetCompare(pTask->pSorter);
+  memset(aSlot, 0, sizeof(aSlot));
+
+  while( p ){
+    SorterRecord *pNext;
+    if( pList->aMemory ){
+      if( (u8*)p==pList->aMemory ){
+        pNext = 0;
+      }else{
+        assert( p->u.iNext<sqlite3MallocSize(pList->aMemory) );
+        pNext = (SorterRecord*)&pList->aMemory[p->u.iNext];
+      }
+    }else{
+      pNext = p->u.pNext;
+    }
+
+    p->u.pNext = 0;
+    for(i=0; aSlot[i]; i++){
+      p = vdbeSorterMerge(pTask, p, aSlot[i]);
+      aSlot[i] = 0;
+    }
+    aSlot[i] = p;
+    p = pNext;
+  }
+
+  p = 0;
+  for(i=0; i<ArraySize(aSlot); i++){
+    if( aSlot[i]==0 ) continue;
+    p = p ? vdbeSorterMerge(pTask, p, aSlot[i]) : aSlot[i];
+  }
+  pList->pList = p;
+
+  assert( pTask->pUnpacked->errCode==SQLITE_OK
+       || pTask->pUnpacked->errCode==SQLITE_NOMEM
+  );
+  return pTask->pUnpacked->errCode;
+}
+
+/*
+** Initialize a PMA-writer object.
+*/
+static void vdbePmaWriterInit(
+  sqlite3_file *pFd,              /* File handle to write to */
+  PmaWriter *p,                   /* Object to populate */
+  int nBuf,                       /* Buffer size */
+  i64 iStart                      /* Offset of pFd to begin writing at */
+){
+  memset(p, 0, sizeof(PmaWriter));
+  p->aBuffer = (u8*)sqlite3Malloc(nBuf);
+  if( !p->aBuffer ){
+    p->eFWErr = SQLITE_NOMEM_BKPT;
+  }else{
+    p->iBufEnd = p->iBufStart = (iStart % nBuf);
+    p->iWriteOff = iStart - p->iBufStart;
+    p->nBuffer = nBuf;
+    p->pFd = pFd;
+  }
+}
+
+/*
+** Write nData bytes of data to the PMA. Return SQLITE_OK
+** if successful, or an SQLite error code if an error occurs.
+*/
+static void vdbePmaWriteBlob(PmaWriter *p, u8 *pData, int nData){
+  int nRem = nData;
+  while( nRem>0 && p->eFWErr==0 ){
+    int nCopy = nRem;
+    if( nCopy>(p->nBuffer - p->iBufEnd) ){
+      nCopy = p->nBuffer - p->iBufEnd;
+    }
+
+    memcpy(&p->aBuffer[p->iBufEnd], &pData[nData-nRem], nCopy);
+    p->iBufEnd += nCopy;
+    if( p->iBufEnd==p->nBuffer ){
+      p->eFWErr = sqlite3OsWrite(p->pFd,
+          &p->aBuffer[p->iBufStart], p->iBufEnd - p->iBufStart,
+          p->iWriteOff + p->iBufStart
+      );
+      p->iBufStart = p->iBufEnd = 0;
+      p->iWriteOff += p->nBuffer;
+    }
+    assert( p->iBufEnd<p->nBuffer );
+
+    nRem -= nCopy;
+  }
+}
+
+/*
+** Flush any buffered data to disk and clean up the PMA-writer object.
+** The results of using the PMA-writer after this call are undefined.
+** Return SQLITE_OK if flushing the buffered data succeeds or is not
+** required. Otherwise, return an SQLite error code.
+**
+** Before returning, set *piEof to the offset immediately following the
+** last byte written to the file.
+*/
+static int vdbePmaWriterFinish(PmaWriter *p, i64 *piEof){
+  int rc;
+  if( p->eFWErr==0 && ALWAYS(p->aBuffer) && p->iBufEnd>p->iBufStart ){
+    p->eFWErr = sqlite3OsWrite(p->pFd,
+        &p->aBuffer[p->iBufStart], p->iBufEnd - p->iBufStart,
+        p->iWriteOff + p->iBufStart
+    );
+  }
+  *piEof = (p->iWriteOff + p->iBufEnd);
+  sqlite3_free(p->aBuffer);
+  rc = p->eFWErr;
+  memset(p, 0, sizeof(PmaWriter));
+  return rc;
+}
+
+/*
+** Write value iVal encoded as a varint to the PMA. Return
+** SQLITE_OK if successful, or an SQLite error code if an error occurs.
+*/
+static void vdbePmaWriteVarint(PmaWriter *p, u64 iVal){
+  int nByte;
+  u8 aByte[10];
+  nByte = sqlite3PutVarint(aByte, iVal);
+  vdbePmaWriteBlob(p, aByte, nByte);
+}
+
+/*
+** Write the current contents of in-memory linked-list pList to a level-0
+** PMA in the temp file belonging to sub-task pTask. Return SQLITE_OK if
+** successful, or an SQLite error code otherwise.
+**
+** The format of a PMA is:
+**
+**     * A varint. This varint contains the total number of bytes of content
+**       in the PMA (not including the varint itself).
+**
+**     * One or more records packed end-to-end in order of ascending keys.
+**       Each record consists of a varint followed by a blob of data (the
+**       key). The varint is the number of bytes in the blob of data.
+*/
+static int vdbeSorterListToPMA(SortSubtask *pTask, SorterList *pList){
+  sqlite3 *db = pTask->pSorter->db;
+  int rc = SQLITE_OK;             /* Return code */
+  PmaWriter writer;               /* Object used to write to the file */
+
+#ifdef SQLITE_DEBUG
+  /* Set iSz to the expected size of file pTask->file after writing the PMA.
+  ** This is used by an assert() statement at the end of this function.  */
+  i64 iSz = pList->szPMA + sqlite3VarintLen(pList->szPMA) + pTask->file.iEof;
+#endif
+
+  vdbeSorterWorkDebug(pTask, "enter");
+  memset(&writer, 0, sizeof(PmaWriter));
+  assert( pList->szPMA>0 );
+
+  /* If the first temporary PMA file has not been opened, open it now. */
+  if( pTask->file.pFd==0 ){
+    rc = vdbeSorterOpenTempFile(db, 0, &pTask->file.pFd);
+    assert( rc!=SQLITE_OK || pTask->file.pFd );
+    assert( pTask->file.iEof==0 )
