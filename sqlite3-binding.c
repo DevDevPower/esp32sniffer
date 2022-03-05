@@ -98534,4 +98534,202 @@ static int vdbeSorterCompareInt(
 ** Initialize the temporary index cursor just opened as a sorter cursor.
 **
 ** Usually, the sorter module uses the value of (pCsr->pKeyInfo->nKeyField)
-** to determine the n
+** to determine the number of fields that should be compared from the
+** records being sorted. However, if the value passed as argument nField
+** is non-zero and the sorter is able to guarantee a stable sort, nField
+** is used instead. This is used when sorting records for a CREATE INDEX
+** statement. In this case, keys are always delivered to the sorter in
+** order of the primary key, which happens to be make up the final part
+** of the records being sorted. So if the sort is stable, there is never
+** any reason to compare PK fields and they can be ignored for a small
+** performance boost.
+**
+** The sorter can guarantee a stable sort when running in single-threaded
+** mode, but not in multi-threaded mode.
+**
+** SQLITE_OK is returned if successful, or an SQLite error code otherwise.
+*/
+SQLITE_PRIVATE int sqlite3VdbeSorterInit(
+  sqlite3 *db,                    /* Database connection (for malloc()) */
+  int nField,                     /* Number of key fields in each record */
+  VdbeCursor *pCsr                /* Cursor that holds the new sorter */
+){
+  int pgsz;                       /* Page size of main database */
+  int i;                          /* Used to iterate through aTask[] */
+  VdbeSorter *pSorter;            /* The new sorter */
+  KeyInfo *pKeyInfo;              /* Copy of pCsr->pKeyInfo with db==0 */
+  int szKeyInfo;                  /* Size of pCsr->pKeyInfo in bytes */
+  int sz;                         /* Size of pSorter in bytes */
+  int rc = SQLITE_OK;
+#if SQLITE_MAX_WORKER_THREADS==0
+# define nWorker 0
+#else
+  int nWorker;
+#endif
+
+  /* Initialize the upper limit on the number of worker threads */
+#if SQLITE_MAX_WORKER_THREADS>0
+  if( sqlite3TempInMemory(db) || sqlite3GlobalConfig.bCoreMutex==0 ){
+    nWorker = 0;
+  }else{
+    nWorker = db->aLimit[SQLITE_LIMIT_WORKER_THREADS];
+  }
+#endif
+
+  /* Do not allow the total number of threads (main thread + all workers)
+  ** to exceed the maximum merge count */
+#if SQLITE_MAX_WORKER_THREADS>=SORTER_MAX_MERGE_COUNT
+  if( nWorker>=SORTER_MAX_MERGE_COUNT ){
+    nWorker = SORTER_MAX_MERGE_COUNT-1;
+  }
+#endif
+
+  assert( pCsr->pKeyInfo );
+  assert( !pCsr->isEphemeral );
+  assert( pCsr->eCurType==CURTYPE_SORTER );
+  szKeyInfo = sizeof(KeyInfo) + (pCsr->pKeyInfo->nKeyField-1)*sizeof(CollSeq*);
+  sz = sizeof(VdbeSorter) + nWorker * sizeof(SortSubtask);
+
+  pSorter = (VdbeSorter*)sqlite3DbMallocZero(db, sz + szKeyInfo);
+  pCsr->uc.pSorter = pSorter;
+  if( pSorter==0 ){
+    rc = SQLITE_NOMEM_BKPT;
+  }else{
+    Btree *pBt = db->aDb[0].pBt;
+    pSorter->pKeyInfo = pKeyInfo = (KeyInfo*)((u8*)pSorter + sz);
+    memcpy(pKeyInfo, pCsr->pKeyInfo, szKeyInfo);
+    pKeyInfo->db = 0;
+    if( nField && nWorker==0 ){
+      pKeyInfo->nKeyField = nField;
+    }
+    sqlite3BtreeEnter(pBt);
+    pSorter->pgsz = pgsz = sqlite3BtreeGetPageSize(pBt);
+    sqlite3BtreeLeave(pBt);
+    pSorter->nTask = nWorker + 1;
+    pSorter->iPrev = (u8)(nWorker - 1);
+    pSorter->bUseThreads = (pSorter->nTask>1);
+    pSorter->db = db;
+    for(i=0; i<pSorter->nTask; i++){
+      SortSubtask *pTask = &pSorter->aTask[i];
+      pTask->pSorter = pSorter;
+    }
+
+    if( !sqlite3TempInMemory(db) ){
+      i64 mxCache;                /* Cache size in bytes*/
+      u32 szPma = sqlite3GlobalConfig.szPma;
+      pSorter->mnPmaSize = szPma * pgsz;
+
+      mxCache = db->aDb[0].pSchema->cache_size;
+      if( mxCache<0 ){
+        /* A negative cache-size value C indicates that the cache is abs(C)
+        ** KiB in size.  */
+        mxCache = mxCache * -1024;
+      }else{
+        mxCache = mxCache * pgsz;
+      }
+      mxCache = MIN(mxCache, SQLITE_MAX_PMASZ);
+      pSorter->mxPmaSize = MAX(pSorter->mnPmaSize, (int)mxCache);
+
+      /* Avoid large memory allocations if the application has requested
+      ** SQLITE_CONFIG_SMALL_MALLOC. */
+      if( sqlite3GlobalConfig.bSmallMalloc==0 ){
+        assert( pSorter->iMemory==0 );
+        pSorter->nMemory = pgsz;
+        pSorter->list.aMemory = (u8*)sqlite3Malloc(pgsz);
+        if( !pSorter->list.aMemory ) rc = SQLITE_NOMEM_BKPT;
+      }
+    }
+
+    if( pKeyInfo->nAllField<13
+     && (pKeyInfo->aColl[0]==0 || pKeyInfo->aColl[0]==db->pDfltColl)
+     && (pKeyInfo->aSortFlags[0] & KEYINFO_ORDER_BIGNULL)==0
+    ){
+      pSorter->typeMask = SORTER_TYPE_INTEGER | SORTER_TYPE_TEXT;
+    }
+  }
+
+  return rc;
+}
+#undef nWorker   /* Defined at the top of this function */
+
+/*
+** Free the list of sorted records starting at pRecord.
+*/
+static void vdbeSorterRecordFree(sqlite3 *db, SorterRecord *pRecord){
+  SorterRecord *p;
+  SorterRecord *pNext;
+  for(p=pRecord; p; p=pNext){
+    pNext = p->u.pNext;
+    sqlite3DbFree(db, p);
+  }
+}
+
+/*
+** Free all resources owned by the object indicated by argument pTask. All
+** fields of *pTask are zeroed before returning.
+*/
+static void vdbeSortSubtaskCleanup(sqlite3 *db, SortSubtask *pTask){
+  sqlite3DbFree(db, pTask->pUnpacked);
+#if SQLITE_MAX_WORKER_THREADS>0
+  /* pTask->list.aMemory can only be non-zero if it was handed memory
+  ** from the main thread.  That only occurs SQLITE_MAX_WORKER_THREADS>0 */
+  if( pTask->list.aMemory ){
+    sqlite3_free(pTask->list.aMemory);
+  }else
+#endif
+  {
+    assert( pTask->list.aMemory==0 );
+    vdbeSorterRecordFree(0, pTask->list.pList);
+  }
+  if( pTask->file.pFd ){
+    sqlite3OsCloseFree(pTask->file.pFd);
+  }
+  if( pTask->file2.pFd ){
+    sqlite3OsCloseFree(pTask->file2.pFd);
+  }
+  memset(pTask, 0, sizeof(SortSubtask));
+}
+
+#ifdef SQLITE_DEBUG_SORTER_THREADS
+static void vdbeSorterWorkDebug(SortSubtask *pTask, const char *zEvent){
+  i64 t;
+  int iTask = (pTask - pTask->pSorter->aTask);
+  sqlite3OsCurrentTimeInt64(pTask->pSorter->db->pVfs, &t);
+  fprintf(stderr, "%lld:%d %s\n", t, iTask, zEvent);
+}
+static void vdbeSorterRewindDebug(const char *zEvent){
+  i64 t = 0;
+  sqlite3_vfs *pVfs = sqlite3_vfs_find(0);
+  if( ALWAYS(pVfs) ) sqlite3OsCurrentTimeInt64(pVfs, &t);
+  fprintf(stderr, "%lld:X %s\n", t, zEvent);
+}
+static void vdbeSorterPopulateDebug(
+  SortSubtask *pTask,
+  const char *zEvent
+){
+  i64 t;
+  int iTask = (pTask - pTask->pSorter->aTask);
+  sqlite3OsCurrentTimeInt64(pTask->pSorter->db->pVfs, &t);
+  fprintf(stderr, "%lld:bg%d %s\n", t, iTask, zEvent);
+}
+static void vdbeSorterBlockDebug(
+  SortSubtask *pTask,
+  int bBlocked,
+  const char *zEvent
+){
+  if( bBlocked ){
+    i64 t;
+    sqlite3OsCurrentTimeInt64(pTask->pSorter->db->pVfs, &t);
+    fprintf(stderr, "%lld:main %s\n", t, zEvent);
+  }
+}
+#else
+# define vdbeSorterWorkDebug(x,y)
+# define vdbeSorterRewindDebug(y)
+# define vdbeSorterPopulateDebug(x,y)
+# define vdbeSorterBlockDebug(x,y,z)
+#endif
+
+#if SQLITE_MAX_WORKER_THREADS>0
+/*
+** Join thread pTask->thr
