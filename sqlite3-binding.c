@@ -99372,3 +99372,206 @@ static int vdbeSorterFlushPMA(VdbeSorter *pSorter){
       if( aMem ){
         pSorter->list.aMemory = aMem;
         pSorter->nMemory = sqlite3MallocSize(aMem);
+      }else if( pSorter->list.aMemory ){
+        pSorter->list.aMemory = sqlite3Malloc(pSorter->nMemory);
+        if( !pSorter->list.aMemory ) return SQLITE_NOMEM_BKPT;
+      }
+
+      rc = vdbeSorterCreateThread(pTask, vdbeSorterFlushThread, pCtx);
+    }
+  }
+
+  return rc;
+#endif /* SQLITE_MAX_WORKER_THREADS!=0 */
+}
+
+/*
+** Add a record to the sorter.
+*/
+SQLITE_PRIVATE int sqlite3VdbeSorterWrite(
+  const VdbeCursor *pCsr,         /* Sorter cursor */
+  Mem *pVal                       /* Memory cell containing record */
+){
+  VdbeSorter *pSorter;
+  int rc = SQLITE_OK;             /* Return Code */
+  SorterRecord *pNew;             /* New list element */
+  int bFlush;                     /* True to flush contents of memory to PMA */
+  int nReq;                       /* Bytes of memory required */
+  int nPMA;                       /* Bytes of PMA space required */
+  int t;                          /* serial type of first record field */
+
+  assert( pCsr->eCurType==CURTYPE_SORTER );
+  pSorter = pCsr->uc.pSorter;
+  getVarint32NR((const u8*)&pVal->z[1], t);
+  if( t>0 && t<10 && t!=7 ){
+    pSorter->typeMask &= SORTER_TYPE_INTEGER;
+  }else if( t>10 && (t & 0x01) ){
+    pSorter->typeMask &= SORTER_TYPE_TEXT;
+  }else{
+    pSorter->typeMask = 0;
+  }
+
+  assert( pSorter );
+
+  /* Figure out whether or not the current contents of memory should be
+  ** flushed to a PMA before continuing. If so, do so.
+  **
+  ** If using the single large allocation mode (pSorter->aMemory!=0), then
+  ** flush the contents of memory to a new PMA if (a) at least one value is
+  ** already in memory and (b) the new value will not fit in memory.
+  **
+  ** Or, if using separate allocations for each record, flush the contents
+  ** of memory to a PMA if either of the following are true:
+  **
+  **   * The total memory allocated for the in-memory list is greater
+  **     than (page-size * cache-size), or
+  **
+  **   * The total memory allocated for the in-memory list is greater
+  **     than (page-size * 10) and sqlite3HeapNearlyFull() returns true.
+  */
+  nReq = pVal->n + sizeof(SorterRecord);
+  nPMA = pVal->n + sqlite3VarintLen(pVal->n);
+  if( pSorter->mxPmaSize ){
+    if( pSorter->list.aMemory ){
+      bFlush = pSorter->iMemory && (pSorter->iMemory+nReq) > pSorter->mxPmaSize;
+    }else{
+      bFlush = (
+          (pSorter->list.szPMA > pSorter->mxPmaSize)
+       || (pSorter->list.szPMA > pSorter->mnPmaSize && sqlite3HeapNearlyFull())
+      );
+    }
+    if( bFlush ){
+      rc = vdbeSorterFlushPMA(pSorter);
+      pSorter->list.szPMA = 0;
+      pSorter->iMemory = 0;
+      assert( rc!=SQLITE_OK || pSorter->list.pList==0 );
+    }
+  }
+
+  pSorter->list.szPMA += nPMA;
+  if( nPMA>pSorter->mxKeysize ){
+    pSorter->mxKeysize = nPMA;
+  }
+
+  if( pSorter->list.aMemory ){
+    int nMin = pSorter->iMemory + nReq;
+
+    if( nMin>pSorter->nMemory ){
+      u8 *aNew;
+      sqlite3_int64 nNew = 2 * (sqlite3_int64)pSorter->nMemory;
+      int iListOff = -1;
+      if( pSorter->list.pList ){
+        iListOff = (u8*)pSorter->list.pList - pSorter->list.aMemory;
+      }
+      while( nNew < nMin ) nNew = nNew*2;
+      if( nNew > pSorter->mxPmaSize ) nNew = pSorter->mxPmaSize;
+      if( nNew < nMin ) nNew = nMin;
+      aNew = sqlite3Realloc(pSorter->list.aMemory, nNew);
+      if( !aNew ) return SQLITE_NOMEM_BKPT;
+      if( iListOff>=0 ){
+        pSorter->list.pList = (SorterRecord*)&aNew[iListOff];
+      }
+      pSorter->list.aMemory = aNew;
+      pSorter->nMemory = nNew;
+    }
+
+    pNew = (SorterRecord*)&pSorter->list.aMemory[pSorter->iMemory];
+    pSorter->iMemory += ROUND8(nReq);
+    if( pSorter->list.pList ){
+      pNew->u.iNext = (int)((u8*)(pSorter->list.pList) - pSorter->list.aMemory);
+    }
+  }else{
+    pNew = (SorterRecord *)sqlite3Malloc(nReq);
+    if( pNew==0 ){
+      return SQLITE_NOMEM_BKPT;
+    }
+    pNew->u.pNext = pSorter->list.pList;
+  }
+
+  memcpy(SRVAL(pNew), pVal->z, pVal->n);
+  pNew->nVal = pVal->n;
+  pSorter->list.pList = pNew;
+
+  return rc;
+}
+
+/*
+** Read keys from pIncr->pMerger and populate pIncr->aFile[1]. The format
+** of the data stored in aFile[1] is the same as that used by regular PMAs,
+** except that the number-of-bytes varint is omitted from the start.
+*/
+static int vdbeIncrPopulate(IncrMerger *pIncr){
+  int rc = SQLITE_OK;
+  int rc2;
+  i64 iStart = pIncr->iStartOff;
+  SorterFile *pOut = &pIncr->aFile[1];
+  SortSubtask *pTask = pIncr->pTask;
+  MergeEngine *pMerger = pIncr->pMerger;
+  PmaWriter writer;
+  assert( pIncr->bEof==0 );
+
+  vdbeSorterPopulateDebug(pTask, "enter");
+
+  vdbePmaWriterInit(pOut->pFd, &writer, pTask->pSorter->pgsz, iStart);
+  while( rc==SQLITE_OK ){
+    int dummy;
+    PmaReader *pReader = &pMerger->aReadr[ pMerger->aTree[1] ];
+    int nKey = pReader->nKey;
+    i64 iEof = writer.iWriteOff + writer.iBufEnd;
+
+    /* Check if the output file is full or if the input has been exhausted.
+    ** In either case exit the loop. */
+    if( pReader->pFd==0 ) break;
+    if( (iEof + nKey + sqlite3VarintLen(nKey))>(iStart + pIncr->mxSz) ) break;
+
+    /* Write the next key to the output. */
+    vdbePmaWriteVarint(&writer, nKey);
+    vdbePmaWriteBlob(&writer, pReader->aKey, nKey);
+    assert( pIncr->pMerger->pTask==pTask );
+    rc = vdbeMergeEngineStep(pIncr->pMerger, &dummy);
+  }
+
+  rc2 = vdbePmaWriterFinish(&writer, &pOut->iEof);
+  if( rc==SQLITE_OK ) rc = rc2;
+  vdbeSorterPopulateDebug(pTask, "exit");
+  return rc;
+}
+
+#if SQLITE_MAX_WORKER_THREADS>0
+/*
+** The main routine for background threads that populate aFile[1] of
+** multi-threaded IncrMerger objects.
+*/
+static void *vdbeIncrPopulateThread(void *pCtx){
+  IncrMerger *pIncr = (IncrMerger*)pCtx;
+  void *pRet = SQLITE_INT_TO_PTR( vdbeIncrPopulate(pIncr) );
+  pIncr->pTask->bDone = 1;
+  return pRet;
+}
+
+/*
+** Launch a background thread to populate aFile[1] of pIncr.
+*/
+static int vdbeIncrBgPopulate(IncrMerger *pIncr){
+  void *p = (void*)pIncr;
+  assert( pIncr->bUseThread );
+  return vdbeSorterCreateThread(pIncr->pTask, vdbeIncrPopulateThread, p);
+}
+#endif
+
+/*
+** This function is called when the PmaReader corresponding to pIncr has
+** finished reading the contents of aFile[0]. Its purpose is to "refill"
+** aFile[0] such that the PmaReader should start rereading it from the
+** beginning.
+**
+** For single-threaded objects, this is accomplished by literally reading
+** keys from pIncr->pMerger and repopulating aFile[0].
+**
+** For multi-threaded objects, all that is required is to wait until the
+** background thread is finished (if it is not already) and then swap
+** aFile[0] and aFile[1] in place. If the contents of pMerger have not
+** been exhausted, this function also launches a new background thread
+** to populate the new aFile[1].
+**
+** SQLITE_OK is returned on success, or an SQLite error 
