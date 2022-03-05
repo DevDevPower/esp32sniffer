@@ -97828,4 +97828,143 @@ struct SorterList {
 ** are treated as if they are empty (always at EOF).
 **
 ** The aTree[] array is also N elements in size. The value of N is stored in
-** the MergeEngi
+** the MergeEngine.nTree variable.
+**
+** The final (N/2) elements of aTree[] contain the results of comparing
+** pairs of PMA keys together. Element i contains the result of
+** comparing aReadr[2*i-N] and aReadr[2*i-N+1]. Whichever key is smaller, the
+** aTree element is set to the index of it.
+**
+** For the purposes of this comparison, EOF is considered greater than any
+** other key value. If the keys are equal (only possible with two EOF
+** values), it doesn't matter which index is stored.
+**
+** The (N/4) elements of aTree[] that precede the final (N/2) described
+** above contains the index of the smallest of each block of 4 PmaReaders
+** And so on. So that aTree[1] contains the index of the PmaReader that
+** currently points to the smallest key value. aTree[0] is unused.
+**
+** Example:
+**
+**     aReadr[0] -> Banana
+**     aReadr[1] -> Feijoa
+**     aReadr[2] -> Elderberry
+**     aReadr[3] -> Currant
+**     aReadr[4] -> Grapefruit
+**     aReadr[5] -> Apple
+**     aReadr[6] -> Durian
+**     aReadr[7] -> EOF
+**
+**     aTree[] = { X, 5   0, 5    0, 3, 5, 6 }
+**
+** The current element is "Apple" (the value of the key indicated by
+** PmaReader 5). When the Next() operation is invoked, PmaReader 5 will
+** be advanced to the next key in its segment. Say the next key is
+** "Eggplant":
+**
+**     aReadr[5] -> Eggplant
+**
+** The contents of aTree[] are updated first by comparing the new PmaReader
+** 5 key to the current key of PmaReader 4 (still "Grapefruit"). The PmaReader
+** 5 value is still smaller, so aTree[6] is set to 5. And so on up the tree.
+** The value of PmaReader 6 - "Durian" - is now smaller than that of PmaReader
+** 5, so aTree[3] is set to 6. Key 0 is smaller than key 6 (Banana<Durian),
+** so the value written into element 1 of the array is 0. As follows:
+**
+**     aTree[] = { X, 0   0, 6    0, 3, 5, 6 }
+**
+** In other words, each time we advance to the next sorter element, log2(N)
+** key comparison operations are required, where N is the number of segments
+** being merged (rounded up to the next power of 2).
+*/
+struct MergeEngine {
+  int nTree;                 /* Used size of aTree/aReadr (power of 2) */
+  SortSubtask *pTask;        /* Used by this thread only */
+  int *aTree;                /* Current state of incremental merge */
+  PmaReader *aReadr;         /* Array of PmaReaders to merge data from */
+};
+
+/*
+** This object represents a single thread of control in a sort operation.
+** Exactly VdbeSorter.nTask instances of this object are allocated
+** as part of each VdbeSorter object. Instances are never allocated any
+** other way. VdbeSorter.nTask is set to the number of worker threads allowed
+** (see SQLITE_CONFIG_WORKER_THREADS) plus one (the main thread).  Thus for
+** single-threaded operation, there is exactly one instance of this object
+** and for multi-threaded operation there are two or more instances.
+**
+** Essentially, this structure contains all those fields of the VdbeSorter
+** structure for which each thread requires a separate instance. For example,
+** each thread requries its own UnpackedRecord object to unpack records in
+** as part of comparison operations.
+**
+** Before a background thread is launched, variable bDone is set to 0. Then,
+** right before it exits, the thread itself sets bDone to 1. This is used for
+** two purposes:
+**
+**   1. When flushing the contents of memory to a level-0 PMA on disk, to
+**      attempt to select a SortSubtask for which there is not already an
+**      active background thread (since doing so causes the main thread
+**      to block until it finishes).
+**
+**   2. If SQLITE_DEBUG_SORTER_THREADS is defined, to determine if a call
+**      to sqlite3ThreadJoin() is likely to block. Cases that are likely to
+**      block provoke debugging output.
+**
+** In both cases, the effects of the main thread seeing (bDone==0) even
+** after the thread has finished are not dire. So we don't worry about
+** memory barriers and such here.
+*/
+typedef int (*SorterCompare)(SortSubtask*,int*,const void*,int,const void*,int);
+struct SortSubtask {
+  SQLiteThread *pThread;          /* Background thread, if any */
+  int bDone;                      /* Set if thread is finished but not joined */
+  VdbeSorter *pSorter;            /* Sorter that owns this sub-task */
+  UnpackedRecord *pUnpacked;      /* Space to unpack a record */
+  SorterList list;                /* List for thread to write to a PMA */
+  int nPMA;                       /* Number of PMAs currently in file */
+  SorterCompare xCompare;         /* Compare function to use */
+  SorterFile file;                /* Temp file for level-0 PMAs */
+  SorterFile file2;               /* Space for other PMAs */
+};
+
+
+/*
+** Main sorter structure. A single instance of this is allocated for each
+** sorter cursor created by the VDBE.
+**
+** mxKeysize:
+**   As records are added to the sorter by calls to sqlite3VdbeSorterWrite(),
+**   this variable is updated so as to be set to the size on disk of the
+**   largest record in the sorter.
+*/
+struct VdbeSorter {
+  int mnPmaSize;                  /* Minimum PMA size, in bytes */
+  int mxPmaSize;                  /* Maximum PMA size, in bytes.  0==no limit */
+  int mxKeysize;                  /* Largest serialized key seen so far */
+  int pgsz;                       /* Main database page size */
+  PmaReader *pReader;             /* Readr data from here after Rewind() */
+  MergeEngine *pMerger;           /* Or here, if bUseThreads==0 */
+  sqlite3 *db;                    /* Database connection */
+  KeyInfo *pKeyInfo;              /* How to compare records */
+  UnpackedRecord *pUnpacked;      /* Used by VdbeSorterCompare() */
+  SorterList list;                /* List of in-memory records */
+  int iMemory;                    /* Offset of free space in list.aMemory */
+  int nMemory;                    /* Size of list.aMemory allocation in bytes */
+  u8 bUsePMA;                     /* True if one or more PMAs created */
+  u8 bUseThreads;                 /* True to use background threads */
+  u8 iPrev;                       /* Previous thread used to flush PMA */
+  u8 nTask;                       /* Size of aTask[] array */
+  u8 typeMask;
+  SortSubtask aTask[1];           /* One or more subtasks */
+};
+
+#define SORTER_TYPE_INTEGER 0x01
+#define SORTER_TYPE_TEXT    0x02
+
+/*
+** An instance of the following object is used to read records out of a
+** PMA, in sorted order.  The next key to be read is cached in nKey/aKey.
+** aKey might point into aMap or into aBuffer.  If neither of those locations
+** contain a contiguous representation of the key, then aAlloc is allocated
+** and the key is copied into aAlloc and aKey is made to poitn to aAllo
