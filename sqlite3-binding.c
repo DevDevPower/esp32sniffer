@@ -98329,4 +98329,209 @@ static int vdbePmaReaderNext(PmaReader *pReadr){
   }
   if( rc==SQLITE_OK ){
     pReadr->nKey = (int)nRec;
-    rc = vdbePmaReadBlob(pReadr, (int)nRec, &pReadr->aK
+    rc = vdbePmaReadBlob(pReadr, (int)nRec, &pReadr->aKey);
+    testcase( rc!=SQLITE_OK );
+  }
+
+  return rc;
+}
+
+/*
+** Initialize PmaReader pReadr to scan through the PMA stored in file pFile
+** starting at offset iStart and ending at offset iEof-1. This function
+** leaves the PmaReader pointing to the first key in the PMA (or EOF if the
+** PMA is empty).
+**
+** If the pnByte parameter is NULL, then it is assumed that the file
+** contains a single PMA, and that that PMA omits the initial length varint.
+*/
+static int vdbePmaReaderInit(
+  SortSubtask *pTask,             /* Task context */
+  SorterFile *pFile,              /* Sorter file to read from */
+  i64 iStart,                     /* Start offset in pFile */
+  PmaReader *pReadr,              /* PmaReader to populate */
+  i64 *pnByte                     /* IN/OUT: Increment this value by PMA size */
+){
+  int rc;
+
+  assert( pFile->iEof>iStart );
+  assert( pReadr->aAlloc==0 && pReadr->nAlloc==0 );
+  assert( pReadr->aBuffer==0 );
+  assert( pReadr->aMap==0 );
+
+  rc = vdbePmaReaderSeek(pTask, pReadr, pFile, iStart);
+  if( rc==SQLITE_OK ){
+    u64 nByte = 0;                 /* Size of PMA in bytes */
+    rc = vdbePmaReadVarint(pReadr, &nByte);
+    pReadr->iEof = pReadr->iReadOff + nByte;
+    *pnByte += nByte;
+  }
+
+  if( rc==SQLITE_OK ){
+    rc = vdbePmaReaderNext(pReadr);
+  }
+  return rc;
+}
+
+/*
+** A version of vdbeSorterCompare() that assumes that it has already been
+** determined that the first field of key1 is equal to the first field of
+** key2.
+*/
+static int vdbeSorterCompareTail(
+  SortSubtask *pTask,             /* Subtask context (for pKeyInfo) */
+  int *pbKey2Cached,              /* True if pTask->pUnpacked is pKey2 */
+  const void *pKey1, int nKey1,   /* Left side of comparison */
+  const void *pKey2, int nKey2    /* Right side of comparison */
+){
+  UnpackedRecord *r2 = pTask->pUnpacked;
+  if( *pbKey2Cached==0 ){
+    sqlite3VdbeRecordUnpack(pTask->pSorter->pKeyInfo, nKey2, pKey2, r2);
+    *pbKey2Cached = 1;
+  }
+  return sqlite3VdbeRecordCompareWithSkip(nKey1, pKey1, r2, 1);
+}
+
+/*
+** Compare key1 (buffer pKey1, size nKey1 bytes) with key2 (buffer pKey2,
+** size nKey2 bytes). Use (pTask->pKeyInfo) for the collation sequences
+** used by the comparison. Return the result of the comparison.
+**
+** If IN/OUT parameter *pbKey2Cached is true when this function is called,
+** it is assumed that (pTask->pUnpacked) contains the unpacked version
+** of key2. If it is false, (pTask->pUnpacked) is populated with the unpacked
+** version of key2 and *pbKey2Cached set to true before returning.
+**
+** If an OOM error is encountered, (pTask->pUnpacked->error_rc) is set
+** to SQLITE_NOMEM.
+*/
+static int vdbeSorterCompare(
+  SortSubtask *pTask,             /* Subtask context (for pKeyInfo) */
+  int *pbKey2Cached,              /* True if pTask->pUnpacked is pKey2 */
+  const void *pKey1, int nKey1,   /* Left side of comparison */
+  const void *pKey2, int nKey2    /* Right side of comparison */
+){
+  UnpackedRecord *r2 = pTask->pUnpacked;
+  if( !*pbKey2Cached ){
+    sqlite3VdbeRecordUnpack(pTask->pSorter->pKeyInfo, nKey2, pKey2, r2);
+    *pbKey2Cached = 1;
+  }
+  return sqlite3VdbeRecordCompare(nKey1, pKey1, r2);
+}
+
+/*
+** A specially optimized version of vdbeSorterCompare() that assumes that
+** the first field of each key is a TEXT value and that the collation
+** sequence to compare them with is BINARY.
+*/
+static int vdbeSorterCompareText(
+  SortSubtask *pTask,             /* Subtask context (for pKeyInfo) */
+  int *pbKey2Cached,              /* True if pTask->pUnpacked is pKey2 */
+  const void *pKey1, int nKey1,   /* Left side of comparison */
+  const void *pKey2, int nKey2    /* Right side of comparison */
+){
+  const u8 * const p1 = (const u8 * const)pKey1;
+  const u8 * const p2 = (const u8 * const)pKey2;
+  const u8 * const v1 = &p1[ p1[0] ];   /* Pointer to value 1 */
+  const u8 * const v2 = &p2[ p2[0] ];   /* Pointer to value 2 */
+
+  int n1;
+  int n2;
+  int res;
+
+  getVarint32NR(&p1[1], n1);
+  getVarint32NR(&p2[1], n2);
+  res = memcmp(v1, v2, (MIN(n1, n2) - 13)/2);
+  if( res==0 ){
+    res = n1 - n2;
+  }
+
+  if( res==0 ){
+    if( pTask->pSorter->pKeyInfo->nKeyField>1 ){
+      res = vdbeSorterCompareTail(
+          pTask, pbKey2Cached, pKey1, nKey1, pKey2, nKey2
+      );
+    }
+  }else{
+    assert( !(pTask->pSorter->pKeyInfo->aSortFlags[0]&KEYINFO_ORDER_BIGNULL) );
+    if( pTask->pSorter->pKeyInfo->aSortFlags[0] ){
+      res = res * -1;
+    }
+  }
+
+  return res;
+}
+
+/*
+** A specially optimized version of vdbeSorterCompare() that assumes that
+** the first field of each key is an INTEGER value.
+*/
+static int vdbeSorterCompareInt(
+  SortSubtask *pTask,             /* Subtask context (for pKeyInfo) */
+  int *pbKey2Cached,              /* True if pTask->pUnpacked is pKey2 */
+  const void *pKey1, int nKey1,   /* Left side of comparison */
+  const void *pKey2, int nKey2    /* Right side of comparison */
+){
+  const u8 * const p1 = (const u8 * const)pKey1;
+  const u8 * const p2 = (const u8 * const)pKey2;
+  const int s1 = p1[1];                 /* Left hand serial type */
+  const int s2 = p2[1];                 /* Right hand serial type */
+  const u8 * const v1 = &p1[ p1[0] ];   /* Pointer to value 1 */
+  const u8 * const v2 = &p2[ p2[0] ];   /* Pointer to value 2 */
+  int res;                              /* Return value */
+
+  assert( (s1>0 && s1<7) || s1==8 || s1==9 );
+  assert( (s2>0 && s2<7) || s2==8 || s2==9 );
+
+  if( s1==s2 ){
+    /* The two values have the same sign. Compare using memcmp(). */
+    static const u8 aLen[] = {0, 1, 2, 3, 4, 6, 8, 0, 0, 0 };
+    const u8 n = aLen[s1];
+    int i;
+    res = 0;
+    for(i=0; i<n; i++){
+      if( (res = v1[i] - v2[i])!=0 ){
+        if( ((v1[0] ^ v2[0]) & 0x80)!=0 ){
+          res = v1[0] & 0x80 ? -1 : +1;
+        }
+        break;
+      }
+    }
+  }else if( s1>7 && s2>7 ){
+    res = s1 - s2;
+  }else{
+    if( s2>7 ){
+      res = +1;
+    }else if( s1>7 ){
+      res = -1;
+    }else{
+      res = s1 - s2;
+    }
+    assert( res!=0 );
+
+    if( res>0 ){
+      if( *v1 & 0x80 ) res = -1;
+    }else{
+      if( *v2 & 0x80 ) res = +1;
+    }
+  }
+
+  if( res==0 ){
+    if( pTask->pSorter->pKeyInfo->nKeyField>1 ){
+      res = vdbeSorterCompareTail(
+          pTask, pbKey2Cached, pKey1, nKey1, pKey2, nKey2
+      );
+    }
+  }else if( pTask->pSorter->pKeyInfo->aSortFlags[0] ){
+    assert( !(pTask->pSorter->pKeyInfo->aSortFlags[0]&KEYINFO_ORDER_BIGNULL) );
+    res = res * -1;
+  }
+
+  return res;
+}
+
+/*
+** Initialize the temporary index cursor just opened as a sorter cursor.
+**
+** Usually, the sorter module uses the value of (pCsr->pKeyInfo->nKeyField)
+** to determine the n
