@@ -99790,4 +99790,186 @@ static int vdbeMergeEngineInit(
 ** the first key in its range.
 **
 ** If argument eMode is set to INCRINIT_TASK, then pReadr is guaranteed
-** to be a multi-threaded PmaReader and this function is bei
+** to be a multi-threaded PmaReader and this function is being called in a
+** background thread. In this case all PmaReaders in the sub-tree are
+** initialized as for INCRINIT_NORMAL and the aFile[1] buffer belonging to
+** pReadr is populated. However, pReadr itself is not set up to point
+** to its first key. A call to vdbePmaReaderNext() is still required to do
+** that.
+**
+** The reason this function does not call vdbePmaReaderNext() immediately
+** in the INCRINIT_TASK case is that vdbePmaReaderNext() assumes that it has
+** to block on thread (pTask->thread) before accessing aFile[1]. But, since
+** this entire function is being run by thread (pTask->thread), that will
+** lead to the current background thread attempting to join itself.
+**
+** Finally, if argument eMode is set to INCRINIT_ROOT, it may be assumed
+** that pReadr->pIncr is a multi-threaded IncrMerge objects, and that all
+** child-trees have already been initialized using IncrInit(INCRINIT_TASK).
+** In this case vdbePmaReaderNext() is called on all child PmaReaders and
+** the current PmaReader set to point to the first key in its range.
+**
+** SQLITE_OK is returned if successful, or an SQLite error code otherwise.
+*/
+static int vdbePmaReaderIncrMergeInit(PmaReader *pReadr, int eMode){
+  int rc = SQLITE_OK;
+  IncrMerger *pIncr = pReadr->pIncr;
+  SortSubtask *pTask = pIncr->pTask;
+  sqlite3 *db = pTask->pSorter->db;
+
+  /* eMode is always INCRINIT_NORMAL in single-threaded mode */
+  assert( SQLITE_MAX_WORKER_THREADS>0 || eMode==INCRINIT_NORMAL );
+
+  rc = vdbeMergeEngineInit(pTask, pIncr->pMerger, eMode);
+
+  /* Set up the required files for pIncr. A multi-theaded IncrMerge object
+  ** requires two temp files to itself, whereas a single-threaded object
+  ** only requires a region of pTask->file2. */
+  if( rc==SQLITE_OK ){
+    int mxSz = pIncr->mxSz;
+#if SQLITE_MAX_WORKER_THREADS>0
+    if( pIncr->bUseThread ){
+      rc = vdbeSorterOpenTempFile(db, mxSz, &pIncr->aFile[0].pFd);
+      if( rc==SQLITE_OK ){
+        rc = vdbeSorterOpenTempFile(db, mxSz, &pIncr->aFile[1].pFd);
+      }
+    }else
+#endif
+    /*if( !pIncr->bUseThread )*/{
+      if( pTask->file2.pFd==0 ){
+        assert( pTask->file2.iEof>0 );
+        rc = vdbeSorterOpenTempFile(db, pTask->file2.iEof, &pTask->file2.pFd);
+        pTask->file2.iEof = 0;
+      }
+      if( rc==SQLITE_OK ){
+        pIncr->aFile[1].pFd = pTask->file2.pFd;
+        pIncr->iStartOff = pTask->file2.iEof;
+        pTask->file2.iEof += mxSz;
+      }
+    }
+  }
+
+#if SQLITE_MAX_WORKER_THREADS>0
+  if( rc==SQLITE_OK && pIncr->bUseThread ){
+    /* Use the current thread to populate aFile[1], even though this
+    ** PmaReader is multi-threaded. If this is an INCRINIT_TASK object,
+    ** then this function is already running in background thread
+    ** pIncr->pTask->thread.
+    **
+    ** If this is the INCRINIT_ROOT object, then it is running in the
+    ** main VDBE thread. But that is Ok, as that thread cannot return
+    ** control to the VDBE or proceed with anything useful until the
+    ** first results are ready from this merger object anyway.
+    */
+    assert( eMode==INCRINIT_ROOT || eMode==INCRINIT_TASK );
+    rc = vdbeIncrPopulate(pIncr);
+  }
+#endif
+
+  if( rc==SQLITE_OK && (SQLITE_MAX_WORKER_THREADS==0 || eMode!=INCRINIT_TASK) ){
+    rc = vdbePmaReaderNext(pReadr);
+  }
+
+  return rc;
+}
+
+#if SQLITE_MAX_WORKER_THREADS>0
+/*
+** The main routine for vdbePmaReaderIncrMergeInit() operations run in
+** background threads.
+*/
+static void *vdbePmaReaderBgIncrInit(void *pCtx){
+  PmaReader *pReader = (PmaReader*)pCtx;
+  void *pRet = SQLITE_INT_TO_PTR(
+                  vdbePmaReaderIncrMergeInit(pReader,INCRINIT_TASK)
+               );
+  pReader->pIncr->pTask->bDone = 1;
+  return pRet;
+}
+#endif
+
+/*
+** If the PmaReader passed as the first argument is not an incremental-reader
+** (if pReadr->pIncr==0), then this function is a no-op. Otherwise, it invokes
+** the vdbePmaReaderIncrMergeInit() function with the parameters passed to
+** this routine to initialize the incremental merge.
+**
+** If the IncrMerger object is multi-threaded (IncrMerger.bUseThread==1),
+** then a background thread is launched to call vdbePmaReaderIncrMergeInit().
+** Or, if the IncrMerger is single threaded, the same function is called
+** using the current thread.
+*/
+static int vdbePmaReaderIncrInit(PmaReader *pReadr, int eMode){
+  IncrMerger *pIncr = pReadr->pIncr;   /* Incremental merger */
+  int rc = SQLITE_OK;                  /* Return code */
+  if( pIncr ){
+#if SQLITE_MAX_WORKER_THREADS>0
+    assert( pIncr->bUseThread==0 || eMode==INCRINIT_TASK );
+    if( pIncr->bUseThread ){
+      void *pCtx = (void*)pReadr;
+      rc = vdbeSorterCreateThread(pIncr->pTask, vdbePmaReaderBgIncrInit, pCtx);
+    }else
+#endif
+    {
+      rc = vdbePmaReaderIncrMergeInit(pReadr, eMode);
+    }
+  }
+  return rc;
+}
+
+/*
+** Allocate a new MergeEngine object to merge the contents of nPMA level-0
+** PMAs from pTask->file. If no error occurs, set *ppOut to point to
+** the new object and return SQLITE_OK. Or, if an error does occur, set *ppOut
+** to NULL and return an SQLite error code.
+**
+** When this function is called, *piOffset is set to the offset of the
+** first PMA to read from pTask->file. Assuming no error occurs, it is
+** set to the offset immediately following the last byte of the last
+** PMA before returning. If an error does occur, then the final value of
+** *piOffset is undefined.
+*/
+static int vdbeMergeEngineLevel0(
+  SortSubtask *pTask,             /* Sorter task to read from */
+  int nPMA,                       /* Number of PMAs to read */
+  i64 *piOffset,                  /* IN/OUT: Readr offset in pTask->file */
+  MergeEngine **ppOut             /* OUT: New merge-engine */
+){
+  MergeEngine *pNew;              /* Merge engine to return */
+  i64 iOff = *piOffset;
+  int i;
+  int rc = SQLITE_OK;
+
+  *ppOut = pNew = vdbeMergeEngineNew(nPMA);
+  if( pNew==0 ) rc = SQLITE_NOMEM_BKPT;
+
+  for(i=0; i<nPMA && rc==SQLITE_OK; i++){
+    i64 nDummy = 0;
+    PmaReader *pReadr = &pNew->aReadr[i];
+    rc = vdbePmaReaderInit(pTask, &pTask->file, iOff, pReadr, &nDummy);
+    iOff = pReadr->iEof;
+  }
+
+  if( rc!=SQLITE_OK ){
+    vdbeMergeEngineFree(pNew);
+    *ppOut = 0;
+  }
+  *piOffset = iOff;
+  return rc;
+}
+
+/*
+** Return the depth of a tree comprising nPMA PMAs, assuming a fanout of
+** SORTER_MAX_MERGE_COUNT. The returned value does not include leaf nodes.
+**
+** i.e.
+**
+**   nPMA<=16    -> TreeDepth() == 0
+**   nPMA<=256   -> TreeDepth() == 1
+**   nPMA<=65536 -> TreeDepth() == 2
+*/
+static int vdbeSorterTreeDepth(int nPMA){
+  int nDepth = 0;
+  i64 nDiv = SORTER_MAX_MERGE_COUNT;
+  while( nDiv < (i64)nPMA ){
+    nDiv = nDiv * 
