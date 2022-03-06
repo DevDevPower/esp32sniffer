@@ -100167,4 +100167,217 @@ static int vdbeSorterSetupMerge(VdbeSorter *pSorter){
             **   b) If it is using task (nTask-1), it is configured to run
             **      in single-threaded mode. This is important, as the
             **      root merge (INCRINIT_ROOT) will be using the same task
-  
+            **      object.
+            */
+            PmaReader *p = &pMain->aReadr[iTask];
+            assert( p->pIncr==0 || (
+                (p->pIncr->pTask==&pSorter->aTask[iTask])             /* a */
+             && (iTask!=pSorter->nTask-1 || p->pIncr->bUseThread==0)  /* b */
+            ));
+            rc = vdbePmaReaderIncrInit(p, INCRINIT_TASK);
+          }
+        }
+        pMain = 0;
+      }
+      if( rc==SQLITE_OK ){
+        rc = vdbePmaReaderIncrMergeInit(pReadr, INCRINIT_ROOT);
+      }
+    }else
+#endif
+    {
+      rc = vdbeMergeEngineInit(pTask0, pMain, INCRINIT_NORMAL);
+      pSorter->pMerger = pMain;
+      pMain = 0;
+    }
+  }
+
+  if( rc!=SQLITE_OK ){
+    vdbeMergeEngineFree(pMain);
+  }
+  return rc;
+}
+
+
+/*
+** Once the sorter has been populated by calls to sqlite3VdbeSorterWrite,
+** this function is called to prepare for iterating through the records
+** in sorted order.
+*/
+SQLITE_PRIVATE int sqlite3VdbeSorterRewind(const VdbeCursor *pCsr, int *pbEof){
+  VdbeSorter *pSorter;
+  int rc = SQLITE_OK;             /* Return code */
+
+  assert( pCsr->eCurType==CURTYPE_SORTER );
+  pSorter = pCsr->uc.pSorter;
+  assert( pSorter );
+
+  /* If no data has been written to disk, then do not do so now. Instead,
+  ** sort the VdbeSorter.pRecord list. The vdbe layer will read data directly
+  ** from the in-memory list.  */
+  if( pSorter->bUsePMA==0 ){
+    if( pSorter->list.pList ){
+      *pbEof = 0;
+      rc = vdbeSorterSort(&pSorter->aTask[0], &pSorter->list);
+    }else{
+      *pbEof = 1;
+    }
+    return rc;
+  }
+
+  /* Write the current in-memory list to a PMA. When the VdbeSorterWrite()
+  ** function flushes the contents of memory to disk, it immediately always
+  ** creates a new list consisting of a single key immediately afterwards.
+  ** So the list is never empty at this point.  */
+  assert( pSorter->list.pList );
+  rc = vdbeSorterFlushPMA(pSorter);
+
+  /* Join all threads */
+  rc = vdbeSorterJoinAll(pSorter, rc);
+
+  vdbeSorterRewindDebug("rewind");
+
+  /* Assuming no errors have occurred, set up a merger structure to
+  ** incrementally read and merge all remaining PMAs.  */
+  assert( pSorter->pReader==0 );
+  if( rc==SQLITE_OK ){
+    rc = vdbeSorterSetupMerge(pSorter);
+    *pbEof = 0;
+  }
+
+  vdbeSorterRewindDebug("rewinddone");
+  return rc;
+}
+
+/*
+** Advance to the next element in the sorter.  Return value:
+**
+**    SQLITE_OK     success
+**    SQLITE_DONE   end of data
+**    otherwise     some kind of error.
+*/
+SQLITE_PRIVATE int sqlite3VdbeSorterNext(sqlite3 *db, const VdbeCursor *pCsr){
+  VdbeSorter *pSorter;
+  int rc;                         /* Return code */
+
+  assert( pCsr->eCurType==CURTYPE_SORTER );
+  pSorter = pCsr->uc.pSorter;
+  assert( pSorter->bUsePMA || (pSorter->pReader==0 && pSorter->pMerger==0) );
+  if( pSorter->bUsePMA ){
+    assert( pSorter->pReader==0 || pSorter->pMerger==0 );
+    assert( pSorter->bUseThreads==0 || pSorter->pReader );
+    assert( pSorter->bUseThreads==1 || pSorter->pMerger );
+#if SQLITE_MAX_WORKER_THREADS>0
+    if( pSorter->bUseThreads ){
+      rc = vdbePmaReaderNext(pSorter->pReader);
+      if( rc==SQLITE_OK && pSorter->pReader->pFd==0 ) rc = SQLITE_DONE;
+    }else
+#endif
+    /*if( !pSorter->bUseThreads )*/ {
+      int res = 0;
+      assert( pSorter->pMerger!=0 );
+      assert( pSorter->pMerger->pTask==(&pSorter->aTask[0]) );
+      rc = vdbeMergeEngineStep(pSorter->pMerger, &res);
+      if( rc==SQLITE_OK && res ) rc = SQLITE_DONE;
+    }
+  }else{
+    SorterRecord *pFree = pSorter->list.pList;
+    pSorter->list.pList = pFree->u.pNext;
+    pFree->u.pNext = 0;
+    if( pSorter->list.aMemory==0 ) vdbeSorterRecordFree(db, pFree);
+    rc = pSorter->list.pList ? SQLITE_OK : SQLITE_DONE;
+  }
+  return rc;
+}
+
+/*
+** Return a pointer to a buffer owned by the sorter that contains the
+** current key.
+*/
+static void *vdbeSorterRowkey(
+  const VdbeSorter *pSorter,      /* Sorter object */
+  int *pnKey                      /* OUT: Size of current key in bytes */
+){
+  void *pKey;
+  if( pSorter->bUsePMA ){
+    PmaReader *pReader;
+#if SQLITE_MAX_WORKER_THREADS>0
+    if( pSorter->bUseThreads ){
+      pReader = pSorter->pReader;
+    }else
+#endif
+    /*if( !pSorter->bUseThreads )*/{
+      pReader = &pSorter->pMerger->aReadr[pSorter->pMerger->aTree[1]];
+    }
+    *pnKey = pReader->nKey;
+    pKey = pReader->aKey;
+  }else{
+    *pnKey = pSorter->list.pList->nVal;
+    pKey = SRVAL(pSorter->list.pList);
+  }
+  return pKey;
+}
+
+/*
+** Copy the current sorter key into the memory cell pOut.
+*/
+SQLITE_PRIVATE int sqlite3VdbeSorterRowkey(const VdbeCursor *pCsr, Mem *pOut){
+  VdbeSorter *pSorter;
+  void *pKey; int nKey;           /* Sorter key to copy into pOut */
+
+  assert( pCsr->eCurType==CURTYPE_SORTER );
+  pSorter = pCsr->uc.pSorter;
+  pKey = vdbeSorterRowkey(pSorter, &nKey);
+  if( sqlite3VdbeMemClearAndResize(pOut, nKey) ){
+    return SQLITE_NOMEM_BKPT;
+  }
+  pOut->n = nKey;
+  MemSetTypeFlag(pOut, MEM_Blob);
+  memcpy(pOut->z, pKey, nKey);
+
+  return SQLITE_OK;
+}
+
+/*
+** Compare the key in memory cell pVal with the key that the sorter cursor
+** passed as the first argument currently points to. For the purposes of
+** the comparison, ignore the rowid field at the end of each record.
+**
+** If the sorter cursor key contains any NULL values, consider it to be
+** less than pVal. Even if pVal also contains NULL values.
+**
+** If an error occurs, return an SQLite error code (i.e. SQLITE_NOMEM).
+** Otherwise, set *pRes to a negative, zero or positive value if the
+** key in pVal is smaller than, equal to or larger than the current sorter
+** key.
+**
+** This routine forms the core of the OP_SorterCompare opcode, which in
+** turn is used to verify uniqueness when constructing a UNIQUE INDEX.
+*/
+SQLITE_PRIVATE int sqlite3VdbeSorterCompare(
+  const VdbeCursor *pCsr,         /* Sorter cursor */
+  Mem *pVal,                      /* Value to compare to current sorter key */
+  int nKeyCol,                    /* Compare this many columns */
+  int *pRes                       /* OUT: Result of comparison */
+){
+  VdbeSorter *pSorter;
+  UnpackedRecord *r2;
+  KeyInfo *pKeyInfo;
+  int i;
+  void *pKey; int nKey;           /* Sorter key to compare pVal with */
+
+  assert( pCsr->eCurType==CURTYPE_SORTER );
+  pSorter = pCsr->uc.pSorter;
+  r2 = pSorter->pUnpacked;
+  pKeyInfo = pCsr->pKeyInfo;
+  if( r2==0 ){
+    r2 = pSorter->pUnpacked = sqlite3VdbeAllocUnpackedRecord(pKeyInfo);
+    if( r2==0 ) return SQLITE_NOMEM_BKPT;
+    r2->nField = nKeyCol;
+  }
+  assert( r2->nField==nKeyCol );
+
+  pKey = vdbeSorterRowkey(pSorter, &nKey);
+  sqlite3VdbeRecordUnpack(pKeyInfo, nKey, pKey, r2);
+  for(i=0; i<nKeyCol; i++){
+    if( r2->aMem[i].flags & MEM_Null ){
+   
