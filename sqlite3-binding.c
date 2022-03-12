@@ -100836,4 +100836,210 @@ SQLITE_PRIVATE int sqlite3VdbeBytecodeVtabInit(sqlite3 *db){ return SQLITE_OK; }
 **
 ** Update:  The in-memory journal is also used to temporarily cache
 ** smaller journals that are not critical for power-loss recovery.
-** For example, statement journals t
+** For example, statement journals that are not too big will be held
+** entirely in memory, thus reducing the number of file I/O calls, and
+** more importantly, reducing temporary file creation events.  If these
+** journals become too large for memory, they are spilled to disk.  But
+** in the common case, they are usually small and no file I/O needs to
+** occur.
+*/
+/* #include "sqliteInt.h" */
+
+/* Forward references to internal structures */
+typedef struct MemJournal MemJournal;
+typedef struct FilePoint FilePoint;
+typedef struct FileChunk FileChunk;
+
+/*
+** The rollback journal is composed of a linked list of these structures.
+**
+** The zChunk array is always at least 8 bytes in size - usually much more.
+** Its actual size is stored in the MemJournal.nChunkSize variable.
+*/
+struct FileChunk {
+  FileChunk *pNext;               /* Next chunk in the journal */
+  u8 zChunk[8];                   /* Content of this chunk */
+};
+
+/*
+** By default, allocate this many bytes of memory for each FileChunk object.
+*/
+#define MEMJOURNAL_DFLT_FILECHUNKSIZE 1024
+
+/*
+** For chunk size nChunkSize, return the number of bytes that should
+** be allocated for each FileChunk structure.
+*/
+#define fileChunkSize(nChunkSize) (sizeof(FileChunk) + ((nChunkSize)-8))
+
+/*
+** An instance of this object serves as a cursor into the rollback journal.
+** The cursor can be either for reading or writing.
+*/
+struct FilePoint {
+  sqlite3_int64 iOffset;          /* Offset from the beginning of the file */
+  FileChunk *pChunk;              /* Specific chunk into which cursor points */
+};
+
+/*
+** This structure is a subclass of sqlite3_file. Each open memory-journal
+** is an instance of this class.
+*/
+struct MemJournal {
+  const sqlite3_io_methods *pMethod; /* Parent class. MUST BE FIRST */
+  int nChunkSize;                 /* In-memory chunk-size */
+
+  int nSpill;                     /* Bytes of data before flushing */
+  FileChunk *pFirst;              /* Head of in-memory chunk-list */
+  FilePoint endpoint;             /* Pointer to the end of the file */
+  FilePoint readpoint;            /* Pointer to the end of the last xRead() */
+
+  int flags;                      /* xOpen flags */
+  sqlite3_vfs *pVfs;              /* The "real" underlying VFS */
+  const char *zJournal;           /* Name of the journal file */
+};
+
+/*
+** Read data from the in-memory journal file.  This is the implementation
+** of the sqlite3_vfs.xRead method.
+*/
+static int memjrnlRead(
+  sqlite3_file *pJfd,    /* The journal file from which to read */
+  void *zBuf,            /* Put the results here */
+  int iAmt,              /* Number of bytes to read */
+  sqlite_int64 iOfst     /* Begin reading at this offset */
+){
+  MemJournal *p = (MemJournal *)pJfd;
+  u8 *zOut = zBuf;
+  int nRead = iAmt;
+  int iChunkOffset;
+  FileChunk *pChunk;
+
+  if( (iAmt+iOfst)>p->endpoint.iOffset ){
+    return SQLITE_IOERR_SHORT_READ;
+  }
+  assert( p->readpoint.iOffset==0 || p->readpoint.pChunk!=0 );
+  if( p->readpoint.iOffset!=iOfst || iOfst==0 ){
+    sqlite3_int64 iOff = 0;
+    for(pChunk=p->pFirst;
+        ALWAYS(pChunk) && (iOff+p->nChunkSize)<=iOfst;
+        pChunk=pChunk->pNext
+    ){
+      iOff += p->nChunkSize;
+    }
+  }else{
+    pChunk = p->readpoint.pChunk;
+    assert( pChunk!=0 );
+  }
+
+  iChunkOffset = (int)(iOfst%p->nChunkSize);
+  do {
+    int iSpace = p->nChunkSize - iChunkOffset;
+    int nCopy = MIN(nRead, (p->nChunkSize - iChunkOffset));
+    memcpy(zOut, (u8*)pChunk->zChunk + iChunkOffset, nCopy);
+    zOut += nCopy;
+    nRead -= iSpace;
+    iChunkOffset = 0;
+  } while( nRead>=0 && (pChunk=pChunk->pNext)!=0 && nRead>0 );
+  p->readpoint.iOffset = pChunk ? iOfst+iAmt : 0;
+  p->readpoint.pChunk = pChunk;
+
+  return SQLITE_OK;
+}
+
+/*
+** Free the list of FileChunk structures headed at MemJournal.pFirst.
+*/
+static void memjrnlFreeChunks(FileChunk *pFirst){
+  FileChunk *pIter;
+  FileChunk *pNext;
+  for(pIter=pFirst; pIter; pIter=pNext){
+    pNext = pIter->pNext;
+    sqlite3_free(pIter);
+  }
+}
+
+/*
+** Flush the contents of memory to a real file on disk.
+*/
+static int memjrnlCreateFile(MemJournal *p){
+  int rc;
+  sqlite3_file *pReal = (sqlite3_file*)p;
+  MemJournal copy = *p;
+
+  memset(p, 0, sizeof(MemJournal));
+  rc = sqlite3OsOpen(copy.pVfs, copy.zJournal, pReal, copy.flags, 0);
+  if( rc==SQLITE_OK ){
+    int nChunk = copy.nChunkSize;
+    i64 iOff = 0;
+    FileChunk *pIter;
+    for(pIter=copy.pFirst; pIter; pIter=pIter->pNext){
+      if( iOff + nChunk > copy.endpoint.iOffset ){
+        nChunk = copy.endpoint.iOffset - iOff;
+      }
+      rc = sqlite3OsWrite(pReal, (u8*)pIter->zChunk, nChunk, iOff);
+      if( rc ) break;
+      iOff += nChunk;
+    }
+    if( rc==SQLITE_OK ){
+      /* No error has occurred. Free the in-memory buffers. */
+      memjrnlFreeChunks(copy.pFirst);
+    }
+  }
+  if( rc!=SQLITE_OK ){
+    /* If an error occurred while creating or writing to the file, restore
+    ** the original before returning. This way, SQLite uses the in-memory
+    ** journal data to roll back changes made to the internal page-cache
+    ** before this function was called.  */
+    sqlite3OsClose(pReal);
+    *p = copy;
+  }
+  return rc;
+}
+
+
+/* Forward reference */
+static int memjrnlTruncate(sqlite3_file *pJfd, sqlite_int64 size);
+
+/*
+** Write data to the file.
+*/
+static int memjrnlWrite(
+  sqlite3_file *pJfd,    /* The journal file into which to write */
+  const void *zBuf,      /* Take data to be written from here */
+  int iAmt,              /* Number of bytes to write */
+  sqlite_int64 iOfst     /* Begin writing at this offset into the file */
+){
+  MemJournal *p = (MemJournal *)pJfd;
+  int nWrite = iAmt;
+  u8 *zWrite = (u8 *)zBuf;
+
+  /* If the file should be created now, create it and write the new data
+  ** into the file on disk. */
+  if( p->nSpill>0 && (iAmt+iOfst)>p->nSpill ){
+    int rc = memjrnlCreateFile(p);
+    if( rc==SQLITE_OK ){
+      rc = sqlite3OsWrite(pJfd, zBuf, iAmt, iOfst);
+    }
+    return rc;
+  }
+
+  /* If the contents of this write should be stored in memory */
+  else{
+    /* An in-memory journal file should only ever be appended to. Random
+    ** access writes are not required. The only exception to this is when
+    ** the in-memory journal is being used by a connection using the
+    ** atomic-write optimization. In this case the first 28 bytes of the
+    ** journal file may be written as part of committing the transaction. */
+    assert( iOfst<=p->endpoint.iOffset );
+    if( iOfst>0 && iOfst!=p->endpoint.iOffset ){
+      memjrnlTruncate(pJfd, iOfst);
+    }
+    if( iOfst==0 && p->pFirst ){
+      assert( p->nChunkSize>iAmt );
+      memcpy((u8*)p->pFirst->zChunk, zBuf, iAmt);
+    }else{
+      while( nWrite>0 ){
+        FileChunk *pChunk = p->endpoint.pChunk;
+        int iChunkOffset = (int)(p->endpoint.iOffset%p->nChunkSize);
+        int iSpace = MIN
