@@ -101460,4 +101460,209 @@ SQLITE_PRIVATE int sqlite3WalkSelectFrom(Walker *pWalker, Select *p){
 ** If the Walker does not have an xSelectCallback() then this routine
 ** is a no-op returning WRC_Continue.
 */
-SQLITE_PRIVATE i
+SQLITE_PRIVATE int sqlite3WalkSelect(Walker *pWalker, Select *p){
+  int rc;
+  if( p==0 ) return WRC_Continue;
+  if( pWalker->xSelectCallback==0 ) return WRC_Continue;
+  do{
+    rc = pWalker->xSelectCallback(pWalker, p);
+    if( rc ) return rc & WRC_Abort;
+    if( sqlite3WalkSelectExpr(pWalker, p)
+     || sqlite3WalkSelectFrom(pWalker, p)
+    ){
+      return WRC_Abort;
+    }
+    if( pWalker->xSelectCallback2 ){
+      pWalker->xSelectCallback2(pWalker, p);
+    }
+    p = p->pPrior;
+  }while( p!=0 );
+  return WRC_Continue;
+}
+
+/* Increase the walkerDepth when entering a subquery, and
+** descrease when leaving the subquery.
+*/
+SQLITE_PRIVATE int sqlite3WalkerDepthIncrease(Walker *pWalker, Select *pSelect){
+  UNUSED_PARAMETER(pSelect);
+  pWalker->walkerDepth++;
+  return WRC_Continue;
+}
+SQLITE_PRIVATE void sqlite3WalkerDepthDecrease(Walker *pWalker, Select *pSelect){
+  UNUSED_PARAMETER(pSelect);
+  pWalker->walkerDepth--;
+}
+
+
+/*
+** No-op routine for the parse-tree walker.
+**
+** When this routine is the Walker.xExprCallback then expression trees
+** are walked without any actions being taken at each node.  Presumably,
+** when this routine is used for Walker.xExprCallback then
+** Walker.xSelectCallback is set to do something useful for every
+** subquery in the parser tree.
+*/
+SQLITE_PRIVATE int sqlite3ExprWalkNoop(Walker *NotUsed, Expr *NotUsed2){
+  UNUSED_PARAMETER2(NotUsed, NotUsed2);
+  return WRC_Continue;
+}
+
+/*
+** No-op routine for the parse-tree walker for SELECT statements.
+** subquery in the parser tree.
+*/
+SQLITE_PRIVATE int sqlite3SelectWalkNoop(Walker *NotUsed, Select *NotUsed2){
+  UNUSED_PARAMETER2(NotUsed, NotUsed2);
+  return WRC_Continue;
+}
+
+/************** End of walker.c **********************************************/
+/************** Begin file resolve.c *****************************************/
+/*
+** 2008 August 18
+**
+** The author disclaims copyright to this source code.  In place of
+** a legal notice, here is a blessing:
+**
+**    May you do good and not evil.
+**    May you find forgiveness for yourself and forgive others.
+**    May you share freely, never taking more than you give.
+**
+*************************************************************************
+**
+** This file contains routines used for walking the parser tree and
+** resolve all identifiers by associating them with a particular
+** table and column.
+*/
+/* #include "sqliteInt.h" */
+
+/*
+** Magic table number to mean the EXCLUDED table in an UPSERT statement.
+*/
+#define EXCLUDED_TABLE_NUMBER  2
+
+/*
+** Walk the expression tree pExpr and increase the aggregate function
+** depth (the Expr.op2 field) by N on every TK_AGG_FUNCTION node.
+** This needs to occur when copying a TK_AGG_FUNCTION node from an
+** outer query into an inner subquery.
+**
+** incrAggFunctionDepth(pExpr,n) is the main routine.  incrAggDepth(..)
+** is a helper function - a callback for the tree walker.
+**
+** See also the sqlite3WindowExtraAggFuncDepth() routine in window.c
+*/
+static int incrAggDepth(Walker *pWalker, Expr *pExpr){
+  if( pExpr->op==TK_AGG_FUNCTION ) pExpr->op2 += pWalker->u.n;
+  return WRC_Continue;
+}
+static void incrAggFunctionDepth(Expr *pExpr, int N){
+  if( N>0 ){
+    Walker w;
+    memset(&w, 0, sizeof(w));
+    w.xExprCallback = incrAggDepth;
+    w.u.n = N;
+    sqlite3WalkExpr(&w, pExpr);
+  }
+}
+
+/*
+** Turn the pExpr expression into an alias for the iCol-th column of the
+** result set in pEList.
+**
+** If the reference is followed by a COLLATE operator, then make sure
+** the COLLATE operator is preserved.  For example:
+**
+**     SELECT a+b, c+d FROM t1 ORDER BY 1 COLLATE nocase;
+**
+** Should be transformed into:
+**
+**     SELECT a+b, c+d FROM t1 ORDER BY (a+b) COLLATE nocase;
+**
+** The nSubquery parameter specifies how many levels of subquery the
+** alias is removed from the original expression.  The usual value is
+** zero but it might be more if the alias is contained within a subquery
+** of the original expression.  The Expr.op2 field of TK_AGG_FUNCTION
+** structures must be increased by the nSubquery amount.
+*/
+static void resolveAlias(
+  Parse *pParse,         /* Parsing context */
+  ExprList *pEList,      /* A result set */
+  int iCol,              /* A column in the result set.  0..pEList->nExpr-1 */
+  Expr *pExpr,           /* Transform this into an alias to the result set */
+  int nSubquery          /* Number of subqueries that the label is moving */
+){
+  Expr *pOrig;           /* The iCol-th column of the result set */
+  Expr *pDup;            /* Copy of pOrig */
+  sqlite3 *db;           /* The database connection */
+
+  assert( iCol>=0 && iCol<pEList->nExpr );
+  pOrig = pEList->a[iCol].pExpr;
+  assert( pOrig!=0 );
+  db = pParse->db;
+  pDup = sqlite3ExprDup(db, pOrig, 0);
+  if( db->mallocFailed ){
+    sqlite3ExprDelete(db, pDup);
+    pDup = 0;
+  }else{
+    Expr temp;
+    incrAggFunctionDepth(pDup, nSubquery);
+    if( pExpr->op==TK_COLLATE ){
+      assert( !ExprHasProperty(pExpr, EP_IntValue) );
+      pDup = sqlite3ExprAddCollateString(pParse, pDup, pExpr->u.zToken);
+    }
+    memcpy(&temp, pDup, sizeof(Expr));
+    memcpy(pDup, pExpr, sizeof(Expr));
+    memcpy(pExpr, &temp, sizeof(Expr));
+    if( ExprHasProperty(pExpr, EP_WinFunc) ){
+      if( ALWAYS(pExpr->y.pWin!=0) ){
+        pExpr->y.pWin->pOwner = pExpr;
+      }
+    }
+    sqlite3ParserAddCleanup(pParse,
+      (void(*)(sqlite3*,void*))sqlite3ExprDelete,
+      pDup);
+  }
+}
+
+/*
+** Subqueries stores the original database, table and column names for their
+** result sets in ExprList.a[].zSpan, in the form "DATABASE.TABLE.COLUMN".
+** Check to see if the zSpan given to this routine matches the zDb, zTab,
+** and zCol.  If any of zDb, zTab, and zCol are NULL then those fields will
+** match anything.
+*/
+SQLITE_PRIVATE int sqlite3MatchEName(
+  const struct ExprList_item *pItem,
+  const char *zCol,
+  const char *zTab,
+  const char *zDb
+){
+  int n;
+  const char *zSpan;
+  if( pItem->fg.eEName!=ENAME_TAB ) return 0;
+  zSpan = pItem->zEName;
+  for(n=0; ALWAYS(zSpan[n]) && zSpan[n]!='.'; n++){}
+  if( zDb && (sqlite3StrNICmp(zSpan, zDb, n)!=0 || zDb[n]!=0) ){
+    return 0;
+  }
+  zSpan += n+1;
+  for(n=0; ALWAYS(zSpan[n]) && zSpan[n]!='.'; n++){}
+  if( zTab && (sqlite3StrNICmp(zSpan, zTab, n)!=0 || zTab[n]!=0) ){
+    return 0;
+  }
+  zSpan += n+1;
+  if( zCol && sqlite3StrICmp(zSpan, zCol)!=0 ){
+    return 0;
+  }
+  return 1;
+}
+
+/*
+** Return TRUE if the double-quoted string  mis-feature should be supported.
+*/
+static int areDoubleQuotedStringsEnabled(sqlite3 *db, NameContext *pTopNC){
+  if( db->init.busy ) return 1;  /* Always support for legacy schemas */
+  if( pTopNC->ncFlags & NC_IsDDL ){
+    /* C
