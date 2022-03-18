@@ -101665,4 +101665,168 @@ SQLITE_PRIVATE int sqlite3MatchEName(
 static int areDoubleQuotedStringsEnabled(sqlite3 *db, NameContext *pTopNC){
   if( db->init.busy ) return 1;  /* Always support for legacy schemas */
   if( pTopNC->ncFlags & NC_IsDDL ){
-    /* C
+    /* Currently parsing a DDL statement */
+    if( sqlite3WritableSchema(db) && (db->flags & SQLITE_DqsDML)!=0 ){
+      return 1;
+    }
+    return (db->flags & SQLITE_DqsDDL)!=0;
+  }else{
+    /* Currently parsing a DML statement */
+    return (db->flags & SQLITE_DqsDML)!=0;
+  }
+}
+
+/*
+** The argument is guaranteed to be a non-NULL Expr node of type TK_COLUMN.
+** return the appropriate colUsed mask.
+*/
+SQLITE_PRIVATE Bitmask sqlite3ExprColUsed(Expr *pExpr){
+  int n;
+  Table *pExTab;
+
+  n = pExpr->iColumn;
+  assert( ExprUseYTab(pExpr) );
+  pExTab = pExpr->y.pTab;
+  assert( pExTab!=0 );
+  if( (pExTab->tabFlags & TF_HasGenerated)!=0
+   && (pExTab->aCol[n].colFlags & COLFLAG_GENERATED)!=0
+  ){
+    testcase( pExTab->nCol==BMS-1 );
+    testcase( pExTab->nCol==BMS );
+    return pExTab->nCol>=BMS ? ALLBITS : MASKBIT(pExTab->nCol)-1;
+  }else{
+    testcase( n==BMS-1 );
+    testcase( n==BMS );
+    if( n>=BMS ) n = BMS-1;
+    return ((Bitmask)1)<<n;
+  }
+}
+
+/*
+** Create a new expression term for the column specified by pMatch and
+** iColumn.  Append this new expression term to the FULL JOIN Match set
+** in *ppList.  Create a new *ppList if this is the first term in the
+** set.
+*/
+static void extendFJMatch(
+  Parse *pParse,          /* Parsing context */
+  ExprList **ppList,      /* ExprList to extend */
+  SrcItem *pMatch,        /* Source table containing the column */
+  i16 iColumn             /* The column number */
+){
+  Expr *pNew = sqlite3ExprAlloc(pParse->db, TK_COLUMN, 0, 0);
+  if( pNew ){
+    pNew->iTable = pMatch->iCursor;
+    pNew->iColumn = iColumn;
+    pNew->y.pTab = pMatch->pTab;
+    assert( (pMatch->fg.jointype & (JT_LEFT|JT_LTORJ))!=0 );
+    ExprSetProperty(pNew, EP_CanBeNull);
+    *ppList = sqlite3ExprListAppend(pParse, *ppList, pNew);
+  }
+}
+
+/*
+** Given the name of a column of the form X.Y.Z or Y.Z or just Z, look up
+** that name in the set of source tables in pSrcList and make the pExpr
+** expression node refer back to that source column.  The following changes
+** are made to pExpr:
+**
+**    pExpr->iDb           Set the index in db->aDb[] of the database X
+**                         (even if X is implied).
+**    pExpr->iTable        Set to the cursor number for the table obtained
+**                         from pSrcList.
+**    pExpr->y.pTab        Points to the Table structure of X.Y (even if
+**                         X and/or Y are implied.)
+**    pExpr->iColumn       Set to the column number within the table.
+**    pExpr->op            Set to TK_COLUMN.
+**    pExpr->pLeft         Any expression this points to is deleted
+**    pExpr->pRight        Any expression this points to is deleted.
+**
+** The zDb variable is the name of the database (the "X").  This value may be
+** NULL meaning that name is of the form Y.Z or Z.  Any available database
+** can be used.  The zTable variable is the name of the table (the "Y").  This
+** value can be NULL if zDb is also NULL.  If zTable is NULL it
+** means that the form of the name is Z and that columns from any table
+** can be used.
+**
+** If the name cannot be resolved unambiguously, leave an error message
+** in pParse and return WRC_Abort.  Return WRC_Prune on success.
+*/
+static int lookupName(
+  Parse *pParse,       /* The parsing context */
+  const char *zDb,     /* Name of the database containing table, or NULL */
+  const char *zTab,    /* Name of table containing column, or NULL */
+  const char *zCol,    /* Name of the column. */
+  NameContext *pNC,    /* The name context used to resolve the name */
+  Expr *pExpr          /* Make this EXPR node point to the selected column */
+){
+  int i, j;                         /* Loop counters */
+  int cnt = 0;                      /* Number of matching column names */
+  int cntTab = 0;                   /* Number of matching table names */
+  int nSubquery = 0;                /* How many levels of subquery */
+  sqlite3 *db = pParse->db;         /* The database connection */
+  SrcItem *pItem;                   /* Use for looping over pSrcList items */
+  SrcItem *pMatch = 0;              /* The matching pSrcList item */
+  NameContext *pTopNC = pNC;        /* First namecontext in the list */
+  Schema *pSchema = 0;              /* Schema of the expression */
+  int eNewExprOp = TK_COLUMN;       /* New value for pExpr->op on success */
+  Table *pTab = 0;                  /* Table holding the row */
+  Column *pCol;                     /* A column of pTab */
+  ExprList *pFJMatch = 0;           /* Matches for FULL JOIN .. USING */
+
+  assert( pNC );     /* the name context cannot be NULL. */
+  assert( zCol );    /* The Z in X.Y.Z cannot be NULL */
+  assert( zDb==0 || zTab!=0 );
+  assert( !ExprHasProperty(pExpr, EP_TokenOnly|EP_Reduced) );
+
+  /* Initialize the node to no-match */
+  pExpr->iTable = -1;
+  ExprSetVVAProperty(pExpr, EP_NoReduce);
+
+  /* Translate the schema name in zDb into a pointer to the corresponding
+  ** schema.  If not found, pSchema will remain NULL and nothing will match
+  ** resulting in an appropriate error message toward the end of this routine
+  */
+  if( zDb ){
+    testcase( pNC->ncFlags & NC_PartIdx );
+    testcase( pNC->ncFlags & NC_IsCheck );
+    if( (pNC->ncFlags & (NC_PartIdx|NC_IsCheck))!=0 ){
+      /* Silently ignore database qualifiers inside CHECK constraints and
+      ** partial indices.  Do not raise errors because that might break
+      ** legacy and because it does not hurt anything to just ignore the
+      ** database name. */
+      zDb = 0;
+    }else{
+      for(i=0; i<db->nDb; i++){
+        assert( db->aDb[i].zDbSName );
+        if( sqlite3StrICmp(db->aDb[i].zDbSName,zDb)==0 ){
+          pSchema = db->aDb[i].pSchema;
+          break;
+        }
+      }
+      if( i==db->nDb && sqlite3StrICmp("main", zDb)==0 ){
+        /* This branch is taken when the main database has been renamed
+        ** using SQLITE_DBCONFIG_MAINDBNAME. */
+        pSchema = db->aDb[0].pSchema;
+        zDb = db->aDb[0].zDbSName;
+      }
+    }
+  }
+
+  /* Start at the inner-most context and move outward until a match is found */
+  assert( pNC && cnt==0 );
+  do{
+    ExprList *pEList;
+    SrcList *pSrcList = pNC->pSrcList;
+
+    if( pSrcList ){
+      for(i=0, pItem=pSrcList->a; i<pSrcList->nSrc; i++, pItem++){
+        u8 hCol;
+        pTab = pItem->pTab;
+        assert( pTab!=0 && pTab->zName!=0 );
+        assert( pTab->nCol>0 || pParse->nErr );
+        assert( (int)pItem->fg.isNestedFrom == IsNestedFrom(pItem->pSelect) );
+        if( pItem->fg.isNestedFrom ){
+          /* In this case, pItem is a subquery that has been formed from a
+          ** parenthesized subset of the FROM clause terms.  Example:
+          **   .... FROM t
