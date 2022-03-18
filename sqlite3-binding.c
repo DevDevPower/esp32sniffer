@@ -101829,4 +101829,183 @@ static int lookupName(
         if( pItem->fg.isNestedFrom ){
           /* In this case, pItem is a subquery that has been formed from a
           ** parenthesized subset of the FROM clause terms.  Example:
-          **   .... FROM t
+          **   .... FROM t1 LEFT JOIN (t2 RIGHT JOIN t3 USING(x)) USING(y) ...
+          **                          \_________________________/
+          **             This pItem -------------^
+          */
+          int hit = 0;
+          assert( pItem->pSelect!=0 );
+          pEList = pItem->pSelect->pEList;
+          assert( pEList!=0 );
+          assert( pEList->nExpr==pTab->nCol );
+          for(j=0; j<pEList->nExpr; j++){
+            if( !sqlite3MatchEName(&pEList->a[j], zCol, zTab, zDb) ){
+              continue;
+            }
+            if( cnt>0 ){
+              if( pItem->fg.isUsing==0
+               || sqlite3IdListIndex(pItem->u3.pUsing, zCol)<0
+              ){
+                /* Two or more tables have the same column name which is
+                ** not joined by USING.  This is an error.  Signal as much
+                ** by clearing pFJMatch and letting cnt go above 1. */
+                sqlite3ExprListDelete(db, pFJMatch);
+                pFJMatch = 0;
+              }else
+              if( (pItem->fg.jointype & JT_RIGHT)==0 ){
+                /* An INNER or LEFT JOIN.  Use the left-most table */
+                continue;
+              }else
+              if( (pItem->fg.jointype & JT_LEFT)==0 ){
+                /* A RIGHT JOIN.  Use the right-most table */
+                cnt = 0;
+                sqlite3ExprListDelete(db, pFJMatch);
+                pFJMatch = 0;
+              }else{
+                /* For a FULL JOIN, we must construct a coalesce() func */
+                extendFJMatch(pParse, &pFJMatch, pMatch, pExpr->iColumn);
+              }
+            }
+            cnt++;
+            cntTab = 2;
+            pMatch = pItem;
+            pExpr->iColumn = j;
+            pEList->a[j].fg.bUsed = 1;
+            hit = 1;
+            if( pEList->a[j].fg.bUsingTerm ) break;
+          }
+          if( hit || zTab==0 ) continue;
+        }
+        assert( zDb==0 || zTab!=0 );
+        if( zTab ){
+          const char *zTabName;
+          if( zDb ){
+            if( pTab->pSchema!=pSchema ) continue;
+            if( pSchema==0 && strcmp(zDb,"*")!=0 ) continue;
+          }
+          zTabName = pItem->zAlias ? pItem->zAlias : pTab->zName;
+          assert( zTabName!=0 );
+          if( sqlite3StrICmp(zTabName, zTab)!=0 ){
+            continue;
+          }
+          assert( ExprUseYTab(pExpr) );
+          if( IN_RENAME_OBJECT && pItem->zAlias ){
+            sqlite3RenameTokenRemap(pParse, 0, (void*)&pExpr->y.pTab);
+          }
+        }
+        hCol = sqlite3StrIHash(zCol);
+        for(j=0, pCol=pTab->aCol; j<pTab->nCol; j++, pCol++){
+          if( pCol->hName==hCol
+           && sqlite3StrICmp(pCol->zCnName, zCol)==0
+          ){
+            if( cnt>0 ){
+              if( pItem->fg.isUsing==0
+               || sqlite3IdListIndex(pItem->u3.pUsing, zCol)<0
+              ){
+                /* Two or more tables have the same column name which is
+                ** not joined by USING.  This is an error.  Signal as much
+                ** by clearing pFJMatch and letting cnt go above 1. */
+                sqlite3ExprListDelete(db, pFJMatch);
+                pFJMatch = 0;
+              }else
+              if( (pItem->fg.jointype & JT_RIGHT)==0 ){
+                /* An INNER or LEFT JOIN.  Use the left-most table */
+                continue;
+              }else
+              if( (pItem->fg.jointype & JT_LEFT)==0 ){
+                /* A RIGHT JOIN.  Use the right-most table */
+                cnt = 0;
+                sqlite3ExprListDelete(db, pFJMatch);
+                pFJMatch = 0;
+              }else{
+                /* For a FULL JOIN, we must construct a coalesce() func */
+                extendFJMatch(pParse, &pFJMatch, pMatch, pExpr->iColumn);
+              }
+            }
+            cnt++;
+            pMatch = pItem;
+            /* Substitute the rowid (column -1) for the INTEGER PRIMARY KEY */
+            pExpr->iColumn = j==pTab->iPKey ? -1 : (i16)j;
+            if( pItem->fg.isNestedFrom ){
+              sqlite3SrcItemColumnUsed(pItem, j);
+            }
+            break;
+          }
+        }
+        if( 0==cnt && VisibleRowid(pTab) ){
+          cntTab++;
+          pMatch = pItem;
+        }
+      }
+      if( pMatch ){
+        pExpr->iTable = pMatch->iCursor;
+        assert( ExprUseYTab(pExpr) );
+        pExpr->y.pTab = pMatch->pTab;
+        if( (pMatch->fg.jointype & (JT_LEFT|JT_LTORJ))!=0 ){
+          ExprSetProperty(pExpr, EP_CanBeNull);
+        }
+        pSchema = pExpr->y.pTab->pSchema;
+      }
+    } /* if( pSrcList ) */
+
+#if !defined(SQLITE_OMIT_TRIGGER) || !defined(SQLITE_OMIT_UPSERT)
+    /* If we have not already resolved the name, then maybe
+    ** it is a new.* or old.* trigger argument reference.  Or
+    ** maybe it is an excluded.* from an upsert.  Or maybe it is
+    ** a reference in the RETURNING clause to a table being modified.
+    */
+    if( cnt==0 && zDb==0 ){
+      pTab = 0;
+#ifndef SQLITE_OMIT_TRIGGER
+      if( pParse->pTriggerTab!=0 ){
+        int op = pParse->eTriggerOp;
+        assert( op==TK_DELETE || op==TK_UPDATE || op==TK_INSERT );
+        if( pParse->bReturning ){
+          if( (pNC->ncFlags & NC_UBaseReg)!=0
+           && (zTab==0 || sqlite3StrICmp(zTab,pParse->pTriggerTab->zName)==0)
+          ){
+            pExpr->iTable = op!=TK_DELETE;
+            pTab = pParse->pTriggerTab;
+          }
+        }else if( op!=TK_DELETE && zTab && sqlite3StrICmp("new",zTab) == 0 ){
+          pExpr->iTable = 1;
+          pTab = pParse->pTriggerTab;
+        }else if( op!=TK_INSERT && zTab && sqlite3StrICmp("old",zTab)==0 ){
+          pExpr->iTable = 0;
+          pTab = pParse->pTriggerTab;
+        }
+      }
+#endif /* SQLITE_OMIT_TRIGGER */
+#ifndef SQLITE_OMIT_UPSERT
+      if( (pNC->ncFlags & NC_UUpsert)!=0 && zTab!=0 ){
+        Upsert *pUpsert = pNC->uNC.pUpsert;
+        if( pUpsert && sqlite3StrICmp("excluded",zTab)==0 ){
+          pTab = pUpsert->pUpsertSrc->a[0].pTab;
+          pExpr->iTable = EXCLUDED_TABLE_NUMBER;
+        }
+      }
+#endif /* SQLITE_OMIT_UPSERT */
+
+      if( pTab ){
+        int iCol;
+        u8 hCol = sqlite3StrIHash(zCol);
+        pSchema = pTab->pSchema;
+        cntTab++;
+        for(iCol=0, pCol=pTab->aCol; iCol<pTab->nCol; iCol++, pCol++){
+          if( pCol->hName==hCol
+           && sqlite3StrICmp(pCol->zCnName, zCol)==0
+          ){
+            if( iCol==pTab->iPKey ){
+              iCol = -1;
+            }
+            break;
+          }
+        }
+        if( iCol>=pTab->nCol && sqlite3IsRowid(zCol) && VisibleRowid(pTab) ){
+          /* IMP: R-51414-32910 */
+          iCol = -1;
+        }
+        if( iCol<pTab->nCol ){
+          cnt++;
+          pMatch = 0;
+#ifndef SQLITE_OMIT_
