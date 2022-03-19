@@ -102396,4 +102396,179 @@ static int resolveExprStep(Walker *pWalker, Expr *pExpr){
 #endif
   switch( pExpr->op ){
 
-    /* The special operator TK
+    /* The special operator TK_ROW means use the rowid for the first
+    ** column in the FROM clause.  This is used by the LIMIT and ORDER BY
+    ** clause processing on UPDATE and DELETE statements, and by
+    ** UPDATE ... FROM statement processing.
+    */
+    case TK_ROW: {
+      SrcList *pSrcList = pNC->pSrcList;
+      SrcItem *pItem;
+      assert( pSrcList && pSrcList->nSrc>=1 );
+      pItem = pSrcList->a;
+      pExpr->op = TK_COLUMN;
+      assert( ExprUseYTab(pExpr) );
+      pExpr->y.pTab = pItem->pTab;
+      pExpr->iTable = pItem->iCursor;
+      pExpr->iColumn--;
+      pExpr->affExpr = SQLITE_AFF_INTEGER;
+      break;
+    }
+
+    /* An optimization:  Attempt to convert
+    **
+    **      "expr IS NOT NULL"  -->  "TRUE"
+    **      "expr IS NULL"      -->  "FALSE"
+    **
+    ** if we can prove that "expr" is never NULL.  Call this the
+    ** "NOT NULL strength reduction optimization".
+    **
+    ** If this optimization occurs, also restore the NameContext ref-counts
+    ** to the state they where in before the "column" LHS expression was
+    ** resolved.  This prevents "column" from being counted as having been
+    ** referenced, which might prevent a SELECT from being erroneously
+    ** marked as correlated.
+    */
+    case TK_NOTNULL:
+    case TK_ISNULL: {
+      int anRef[8];
+      NameContext *p;
+      int i;
+      for(i=0, p=pNC; p && i<ArraySize(anRef); p=p->pNext, i++){
+        anRef[i] = p->nRef;
+      }
+      sqlite3WalkExpr(pWalker, pExpr->pLeft);
+      if( 0==sqlite3ExprCanBeNull(pExpr->pLeft) && !IN_RENAME_OBJECT ){
+        testcase( ExprHasProperty(pExpr, EP_OuterON) );
+        assert( !ExprHasProperty(pExpr, EP_IntValue) );
+        if( pExpr->op==TK_NOTNULL ){
+          pExpr->u.zToken = "true";
+          ExprSetProperty(pExpr, EP_IsTrue);
+        }else{
+          pExpr->u.zToken = "false";
+          ExprSetProperty(pExpr, EP_IsFalse);
+        }
+        pExpr->op = TK_TRUEFALSE;
+        for(i=0, p=pNC; p && i<ArraySize(anRef); p=p->pNext, i++){
+          p->nRef = anRef[i];
+        }
+        sqlite3ExprDelete(pParse->db, pExpr->pLeft);
+        pExpr->pLeft = 0;
+      }
+      return WRC_Prune;
+    }
+
+    /* A column name:                    ID
+    ** Or table name and column name:    ID.ID
+    ** Or a database, table and column:  ID.ID.ID
+    **
+    ** The TK_ID and TK_OUT cases are combined so that there will only
+    ** be one call to lookupName().  Then the compiler will in-line
+    ** lookupName() for a size reduction and performance increase.
+    */
+    case TK_ID:
+    case TK_DOT: {
+      const char *zColumn;
+      const char *zTable;
+      const char *zDb;
+      Expr *pRight;
+
+      if( pExpr->op==TK_ID ){
+        zDb = 0;
+        zTable = 0;
+        assert( !ExprHasProperty(pExpr, EP_IntValue) );
+        zColumn = pExpr->u.zToken;
+      }else{
+        Expr *pLeft = pExpr->pLeft;
+        testcase( pNC->ncFlags & NC_IdxExpr );
+        testcase( pNC->ncFlags & NC_GenCol );
+        sqlite3ResolveNotValid(pParse, pNC, "the \".\" operator",
+                               NC_IdxExpr|NC_GenCol, 0, pExpr);
+        pRight = pExpr->pRight;
+        if( pRight->op==TK_ID ){
+          zDb = 0;
+        }else{
+          assert( pRight->op==TK_DOT );
+          assert( !ExprHasProperty(pRight, EP_IntValue) );
+          zDb = pLeft->u.zToken;
+          pLeft = pRight->pLeft;
+          pRight = pRight->pRight;
+        }
+        assert( ExprUseUToken(pLeft) && ExprUseUToken(pRight) );
+        zTable = pLeft->u.zToken;
+        zColumn = pRight->u.zToken;
+        assert( ExprUseYTab(pExpr) );
+        if( IN_RENAME_OBJECT ){
+          sqlite3RenameTokenRemap(pParse, (void*)pExpr, (void*)pRight);
+          sqlite3RenameTokenRemap(pParse, (void*)&pExpr->y.pTab, (void*)pLeft);
+        }
+      }
+      return lookupName(pParse, zDb, zTable, zColumn, pNC, pExpr);
+    }
+
+    /* Resolve function names
+    */
+    case TK_FUNCTION: {
+      ExprList *pList = pExpr->x.pList;    /* The argument list */
+      int n = pList ? pList->nExpr : 0;    /* Number of arguments */
+      int no_such_func = 0;       /* True if no such function exists */
+      int wrong_num_args = 0;     /* True if wrong number of arguments */
+      int is_agg = 0;             /* True if is an aggregate function */
+      const char *zId;            /* The function name. */
+      FuncDef *pDef;              /* Information about the function */
+      u8 enc = ENC(pParse->db);   /* The database encoding */
+      int savedAllowFlags = (pNC->ncFlags & (NC_AllowAgg | NC_AllowWin));
+#ifndef SQLITE_OMIT_WINDOWFUNC
+      Window *pWin = (IsWindowFunc(pExpr) ? pExpr->y.pWin : 0);
+#endif
+      assert( !ExprHasProperty(pExpr, EP_xIsSelect|EP_IntValue) );
+      zId = pExpr->u.zToken;
+      pDef = sqlite3FindFunction(pParse->db, zId, n, enc, 0);
+      if( pDef==0 ){
+        pDef = sqlite3FindFunction(pParse->db, zId, -2, enc, 0);
+        if( pDef==0 ){
+          no_such_func = 1;
+        }else{
+          wrong_num_args = 1;
+        }
+      }else{
+        is_agg = pDef->xFinalize!=0;
+        if( pDef->funcFlags & SQLITE_FUNC_UNLIKELY ){
+          ExprSetProperty(pExpr, EP_Unlikely);
+          if( n==2 ){
+            pExpr->iTable = exprProbability(pList->a[1].pExpr);
+            if( pExpr->iTable<0 ){
+              sqlite3ErrorMsg(pParse,
+                "second argument to %#T() must be a "
+                "constant between 0.0 and 1.0", pExpr);
+              pNC->nNcErr++;
+            }
+          }else{
+            /* EVIDENCE-OF: R-61304-29449 The unlikely(X) function is
+            ** equivalent to likelihood(X, 0.0625).
+            ** EVIDENCE-OF: R-01283-11636 The unlikely(X) function is
+            ** short-hand for likelihood(X,0.0625).
+            ** EVIDENCE-OF: R-36850-34127 The likely(X) function is short-hand
+            ** for likelihood(X,0.9375).
+            ** EVIDENCE-OF: R-53436-40973 The likely(X) function is equivalent
+            ** to likelihood(X,0.9375). */
+            /* TUNING: unlikely() probability is 0.0625.  likely() is 0.9375 */
+            pExpr->iTable = pDef->zName[0]=='u' ? 8388608 : 125829120;
+          }
+        }
+#ifndef SQLITE_OMIT_AUTHORIZATION
+        {
+          int auth = sqlite3AuthCheck(pParse, SQLITE_FUNCTION, 0,pDef->zName,0);
+          if( auth!=SQLITE_OK ){
+            if( auth==SQLITE_DENY ){
+              sqlite3ErrorMsg(pParse, "not authorized to use function: %#T",
+                                      pExpr);
+              pNC->nNcErr++;
+            }
+            pExpr->op = TK_NULL;
+            return WRC_Prune;
+          }
+        }
+#endif
+        if( pDef->funcFlags & (SQLITE_FUNC_CONSTANT|SQLITE_FUNC_SLOCHNG) ){
+          /* For the purposes of the EP_ConstFunc fla
