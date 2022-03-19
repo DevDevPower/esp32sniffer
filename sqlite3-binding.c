@@ -102571,4 +102571,174 @@ static int resolveExprStep(Walker *pWalker, Expr *pExpr){
         }
 #endif
         if( pDef->funcFlags & (SQLITE_FUNC_CONSTANT|SQLITE_FUNC_SLOCHNG) ){
-          /* For the purposes of the EP_ConstFunc fla
+          /* For the purposes of the EP_ConstFunc flag, date and time
+          ** functions and other functions that change slowly are considered
+          ** constant because they are constant for the duration of one query.
+          ** This allows them to be factored out of inner loops. */
+          ExprSetProperty(pExpr,EP_ConstFunc);
+        }
+        if( (pDef->funcFlags & SQLITE_FUNC_CONSTANT)==0 ){
+          /* Clearly non-deterministic functions like random(), but also
+          ** date/time functions that use 'now', and other functions like
+          ** sqlite_version() that might change over time cannot be used
+          ** in an index or generated column.  Curiously, they can be used
+          ** in a CHECK constraint.  SQLServer, MySQL, and PostgreSQL all
+          ** all this. */
+          sqlite3ResolveNotValid(pParse, pNC, "non-deterministic functions",
+                                 NC_IdxExpr|NC_PartIdx|NC_GenCol, 0, pExpr);
+        }else{
+          assert( (NC_SelfRef & 0xff)==NC_SelfRef ); /* Must fit in 8 bits */
+          pExpr->op2 = pNC->ncFlags & NC_SelfRef;
+          if( pNC->ncFlags & NC_FromDDL ) ExprSetProperty(pExpr, EP_FromDDL);
+        }
+        if( (pDef->funcFlags & SQLITE_FUNC_INTERNAL)!=0
+         && pParse->nested==0
+         && (pParse->db->mDbFlags & DBFLAG_InternalFunc)==0
+        ){
+          /* Internal-use-only functions are disallowed unless the
+          ** SQL is being compiled using sqlite3NestedParse() or
+          ** the SQLITE_TESTCTRL_INTERNAL_FUNCTIONS test-control has be
+          ** used to activate internal functions for testing purposes */
+          no_such_func = 1;
+          pDef = 0;
+        }else
+        if( (pDef->funcFlags & (SQLITE_FUNC_DIRECT|SQLITE_FUNC_UNSAFE))!=0
+         && !IN_RENAME_OBJECT
+        ){
+          sqlite3ExprFunctionUsable(pParse, pExpr, pDef);
+        }
+      }
+
+      if( 0==IN_RENAME_OBJECT ){
+#ifndef SQLITE_OMIT_WINDOWFUNC
+        assert( is_agg==0 || (pDef->funcFlags & SQLITE_FUNC_MINMAX)
+          || (pDef->xValue==0 && pDef->xInverse==0)
+          || (pDef->xValue && pDef->xInverse && pDef->xSFunc && pDef->xFinalize)
+        );
+        if( pDef && pDef->xValue==0 && pWin ){
+          sqlite3ErrorMsg(pParse,
+              "%#T() may not be used as a window function", pExpr
+          );
+          pNC->nNcErr++;
+        }else if(
+              (is_agg && (pNC->ncFlags & NC_AllowAgg)==0)
+           || (is_agg && (pDef->funcFlags&SQLITE_FUNC_WINDOW) && !pWin)
+           || (is_agg && pWin && (pNC->ncFlags & NC_AllowWin)==0)
+        ){
+          const char *zType;
+          if( (pDef->funcFlags & SQLITE_FUNC_WINDOW) || pWin ){
+            zType = "window";
+          }else{
+            zType = "aggregate";
+          }
+          sqlite3ErrorMsg(pParse, "misuse of %s function %#T()",zType,pExpr);
+          pNC->nNcErr++;
+          is_agg = 0;
+        }
+#else
+        if( (is_agg && (pNC->ncFlags & NC_AllowAgg)==0) ){
+          sqlite3ErrorMsg(pParse,"misuse of aggregate function %#T()",pExpr);
+          pNC->nNcErr++;
+          is_agg = 0;
+        }
+#endif
+        else if( no_such_func && pParse->db->init.busy==0
+#ifdef SQLITE_ENABLE_UNKNOWN_SQL_FUNCTION
+                  && pParse->explain==0
+#endif
+        ){
+          sqlite3ErrorMsg(pParse, "no such function: %#T", pExpr);
+          pNC->nNcErr++;
+        }else if( wrong_num_args ){
+          sqlite3ErrorMsg(pParse,"wrong number of arguments to function %#T()",
+               pExpr);
+          pNC->nNcErr++;
+        }
+#ifndef SQLITE_OMIT_WINDOWFUNC
+        else if( is_agg==0 && ExprHasProperty(pExpr, EP_WinFunc) ){
+          sqlite3ErrorMsg(pParse,
+              "FILTER may not be used with non-aggregate %#T()",
+              pExpr
+          );
+          pNC->nNcErr++;
+        }
+#endif
+        if( is_agg ){
+          /* Window functions may not be arguments of aggregate functions.
+          ** Or arguments of other window functions. But aggregate functions
+          ** may be arguments for window functions.  */
+#ifndef SQLITE_OMIT_WINDOWFUNC
+          pNC->ncFlags &= ~(NC_AllowWin | (!pWin ? NC_AllowAgg : 0));
+#else
+          pNC->ncFlags &= ~NC_AllowAgg;
+#endif
+        }
+      }
+#ifndef SQLITE_OMIT_WINDOWFUNC
+      else if( ExprHasProperty(pExpr, EP_WinFunc) ){
+        is_agg = 1;
+      }
+#endif
+      sqlite3WalkExprList(pWalker, pList);
+      if( is_agg ){
+#ifndef SQLITE_OMIT_WINDOWFUNC
+        if( pWin ){
+          Select *pSel = pNC->pWinSelect;
+          assert( pWin==0 || (ExprUseYWin(pExpr) && pWin==pExpr->y.pWin) );
+          if( IN_RENAME_OBJECT==0 ){
+            sqlite3WindowUpdate(pParse, pSel ? pSel->pWinDefn : 0, pWin, pDef);
+            if( pParse->db->mallocFailed ) break;
+          }
+          sqlite3WalkExprList(pWalker, pWin->pPartition);
+          sqlite3WalkExprList(pWalker, pWin->pOrderBy);
+          sqlite3WalkExpr(pWalker, pWin->pFilter);
+          sqlite3WindowLink(pSel, pWin);
+          pNC->ncFlags |= NC_HasWin;
+        }else
+#endif /* SQLITE_OMIT_WINDOWFUNC */
+        {
+          NameContext *pNC2;          /* For looping up thru outer contexts */
+          pExpr->op = TK_AGG_FUNCTION;
+          pExpr->op2 = 0;
+#ifndef SQLITE_OMIT_WINDOWFUNC
+          if( ExprHasProperty(pExpr, EP_WinFunc) ){
+            sqlite3WalkExpr(pWalker, pExpr->y.pWin->pFilter);
+          }
+#endif
+          pNC2 = pNC;
+          while( pNC2
+              && sqlite3ReferencesSrcList(pParse, pExpr, pNC2->pSrcList)==0
+          ){
+            pExpr->op2++;
+            pNC2 = pNC2->pNext;
+          }
+          assert( pDef!=0 || IN_RENAME_OBJECT );
+          if( pNC2 && pDef ){
+            assert( SQLITE_FUNC_MINMAX==NC_MinMaxAgg );
+            assert( SQLITE_FUNC_ANYORDER==NC_OrderAgg );
+            testcase( (pDef->funcFlags & SQLITE_FUNC_MINMAX)!=0 );
+            testcase( (pDef->funcFlags & SQLITE_FUNC_ANYORDER)!=0 );
+            pNC2->ncFlags |= NC_HasAgg
+              | ((pDef->funcFlags^SQLITE_FUNC_ANYORDER)
+                  & (SQLITE_FUNC_MINMAX|SQLITE_FUNC_ANYORDER));
+          }
+        }
+        pNC->ncFlags |= savedAllowFlags;
+      }
+      /* FIX ME:  Compute pExpr->affinity based on the expected return
+      ** type of the function
+      */
+      return WRC_Prune;
+    }
+#ifndef SQLITE_OMIT_SUBQUERY
+    case TK_SELECT:
+    case TK_EXISTS:  testcase( pExpr->op==TK_EXISTS );
+#endif
+    case TK_IN: {
+      testcase( pExpr->op==TK_IN );
+      if( ExprUseXSelect(pExpr) ){
+        int nRef = pNC->nRef;
+        testcase( pNC->ncFlags & NC_IsCheck );
+        testcase( pNC->ncFlags & NC_PartIdx );
+        testcase( pNC->ncFlags & NC_IdxExpr );
+        testcase( pNC->ncFl
