@@ -102008,4 +102008,185 @@ static int lookupName(
         if( iCol<pTab->nCol ){
           cnt++;
           pMatch = 0;
-#ifndef SQLITE_OMIT_
+#ifndef SQLITE_OMIT_UPSERT
+          if( pExpr->iTable==EXCLUDED_TABLE_NUMBER ){
+            testcase( iCol==(-1) );
+            assert( ExprUseYTab(pExpr) );
+            if( IN_RENAME_OBJECT ){
+              pExpr->iColumn = iCol;
+              pExpr->y.pTab = pTab;
+              eNewExprOp = TK_COLUMN;
+            }else{
+              pExpr->iTable = pNC->uNC.pUpsert->regData +
+                 sqlite3TableColumnToStorage(pTab, iCol);
+              eNewExprOp = TK_REGISTER;
+            }
+          }else
+#endif /* SQLITE_OMIT_UPSERT */
+          {
+            assert( ExprUseYTab(pExpr) );
+            pExpr->y.pTab = pTab;
+            if( pParse->bReturning ){
+              eNewExprOp = TK_REGISTER;
+              pExpr->op2 = TK_COLUMN;
+              pExpr->iTable = pNC->uNC.iBaseReg + (pTab->nCol+1)*pExpr->iTable +
+                 sqlite3TableColumnToStorage(pTab, iCol) + 1;
+            }else{
+              pExpr->iColumn = (i16)iCol;
+              eNewExprOp = TK_TRIGGER;
+#ifndef SQLITE_OMIT_TRIGGER
+              if( iCol<0 ){
+                pExpr->affExpr = SQLITE_AFF_INTEGER;
+              }else if( pExpr->iTable==0 ){
+                testcase( iCol==31 );
+                testcase( iCol==32 );
+                pParse->oldmask |= (iCol>=32 ? 0xffffffff : (((u32)1)<<iCol));
+              }else{
+                testcase( iCol==31 );
+                testcase( iCol==32 );
+                pParse->newmask |= (iCol>=32 ? 0xffffffff : (((u32)1)<<iCol));
+              }
+#endif /* SQLITE_OMIT_TRIGGER */
+            }
+          }
+        }
+      }
+    }
+#endif /* !defined(SQLITE_OMIT_TRIGGER) || !defined(SQLITE_OMIT_UPSERT) */
+
+    /*
+    ** Perhaps the name is a reference to the ROWID
+    */
+    if( cnt==0
+     && cntTab==1
+     && pMatch
+     && (pNC->ncFlags & (NC_IdxExpr|NC_GenCol))==0
+     && sqlite3IsRowid(zCol)
+     && ALWAYS(VisibleRowid(pMatch->pTab))
+    ){
+      cnt = 1;
+      pExpr->iColumn = -1;
+      pExpr->affExpr = SQLITE_AFF_INTEGER;
+    }
+
+    /*
+    ** If the input is of the form Z (not Y.Z or X.Y.Z) then the name Z
+    ** might refer to an result-set alias.  This happens, for example, when
+    ** we are resolving names in the WHERE clause of the following command:
+    **
+    **     SELECT a+b AS x FROM table WHERE x<10;
+    **
+    ** In cases like this, replace pExpr with a copy of the expression that
+    ** forms the result set entry ("a+b" in the example) and return immediately.
+    ** Note that the expression in the result set should have already been
+    ** resolved by the time the WHERE clause is resolved.
+    **
+    ** The ability to use an output result-set column in the WHERE, GROUP BY,
+    ** or HAVING clauses, or as part of a larger expression in the ORDER BY
+    ** clause is not standard SQL.  This is a (goofy) SQLite extension, that
+    ** is supported for backwards compatibility only. Hence, we issue a warning
+    ** on sqlite3_log() whenever the capability is used.
+    */
+    if( cnt==0
+     && (pNC->ncFlags & NC_UEList)!=0
+     && zTab==0
+    ){
+      pEList = pNC->uNC.pEList;
+      assert( pEList!=0 );
+      for(j=0; j<pEList->nExpr; j++){
+        char *zAs = pEList->a[j].zEName;
+        if( pEList->a[j].fg.eEName==ENAME_NAME
+         && sqlite3_stricmp(zAs, zCol)==0
+        ){
+          Expr *pOrig;
+          assert( pExpr->pLeft==0 && pExpr->pRight==0 );
+          assert( ExprUseXList(pExpr)==0 || pExpr->x.pList==0 );
+          assert( ExprUseXSelect(pExpr)==0 || pExpr->x.pSelect==0 );
+          pOrig = pEList->a[j].pExpr;
+          if( (pNC->ncFlags&NC_AllowAgg)==0 && ExprHasProperty(pOrig, EP_Agg) ){
+            sqlite3ErrorMsg(pParse, "misuse of aliased aggregate %s", zAs);
+            return WRC_Abort;
+          }
+          if( ExprHasProperty(pOrig, EP_Win)
+           && ((pNC->ncFlags&NC_AllowWin)==0 || pNC!=pTopNC )
+          ){
+            sqlite3ErrorMsg(pParse, "misuse of aliased window function %s",zAs);
+            return WRC_Abort;
+          }
+          if( sqlite3ExprVectorSize(pOrig)!=1 ){
+            sqlite3ErrorMsg(pParse, "row value misused");
+            return WRC_Abort;
+          }
+          resolveAlias(pParse, pEList, j, pExpr, nSubquery);
+          cnt = 1;
+          pMatch = 0;
+          assert( zTab==0 && zDb==0 );
+          if( IN_RENAME_OBJECT ){
+            sqlite3RenameTokenRemap(pParse, 0, (void*)pExpr);
+          }
+          goto lookupname_end;
+        }
+      }
+    }
+
+    /* Advance to the next name context.  The loop will exit when either
+    ** we have a match (cnt>0) or when we run out of name contexts.
+    */
+    if( cnt ) break;
+    pNC = pNC->pNext;
+    nSubquery++;
+  }while( pNC );
+
+
+  /*
+  ** If X and Y are NULL (in other words if only the column name Z is
+  ** supplied) and the value of Z is enclosed in double-quotes, then
+  ** Z is a string literal if it doesn't match any column names.  In that
+  ** case, we need to return right away and not make any changes to
+  ** pExpr.
+  **
+  ** Because no reference was made to outer contexts, the pNC->nRef
+  ** fields are not changed in any context.
+  */
+  if( cnt==0 && zTab==0 ){
+    assert( pExpr->op==TK_ID );
+    if( ExprHasProperty(pExpr,EP_DblQuoted)
+     && areDoubleQuotedStringsEnabled(db, pTopNC)
+    ){
+      /* If a double-quoted identifier does not match any known column name,
+      ** then treat it as a string.
+      **
+      ** This hack was added in the early days of SQLite in a misguided attempt
+      ** to be compatible with MySQL 3.x, which used double-quotes for strings.
+      ** I now sorely regret putting in this hack. The effect of this hack is
+      ** that misspelled identifier names are silently converted into strings
+      ** rather than causing an error, to the frustration of countless
+      ** programmers. To all those frustrated programmers, my apologies.
+      **
+      ** Someday, I hope to get rid of this hack. Unfortunately there is
+      ** a huge amount of legacy SQL that uses it. So for now, we just
+      ** issue a warning.
+      */
+      sqlite3_log(SQLITE_WARNING,
+        "double-quoted string literal: \"%w\"", zCol);
+#ifdef SQLITE_ENABLE_NORMALIZE
+      sqlite3VdbeAddDblquoteStr(db, pParse->pVdbe, zCol);
+#endif
+      pExpr->op = TK_STRING;
+      memset(&pExpr->y, 0, sizeof(pExpr->y));
+      return WRC_Prune;
+    }
+    if( sqlite3ExprIdToTrueFalse(pExpr) ){
+      return WRC_Prune;
+    }
+  }
+
+  /*
+  ** cnt==0 means there was not match.
+  ** cnt>1 means there were two or more matches.
+  **
+  ** cnt==0 is always an error.  cnt>1 is often an error, but might
+  ** be multiple matches for a NATURAL LEFT JOIN or a LEFT JOIN USING.
+  */
+  assert( pFJMatch==0 || cnt>0 );
+  assert( !ExprHasProperty(pExpr, EP_xIsSelect|EP_I
