@@ -103127,4 +103127,166 @@ static void windowRemoveExprFromSelect(Select *pSelect, Expr *pExpr){
 /*
 ** pOrderBy is an ORDER BY or GROUP BY clause in SELECT statement pSelect.
 ** The Name context of the SELECT statement is pNC.  zType is either
-** "ORDER" or "GROUP" depending on which type of 
+** "ORDER" or "GROUP" depending on which type of clause pOrderBy is.
+**
+** This routine resolves each term of the clause into an expression.
+** If the order-by term is an integer I between 1 and N (where N is the
+** number of columns in the result set of the SELECT) then the expression
+** in the resolution is a copy of the I-th result-set expression.  If
+** the order-by term is an identifier that corresponds to the AS-name of
+** a result-set expression, then the term resolves to a copy of the
+** result-set expression.  Otherwise, the expression is resolved in
+** the usual way - using sqlite3ResolveExprNames().
+**
+** This routine returns the number of errors.  If errors occur, then
+** an appropriate error message might be left in pParse.  (OOM errors
+** excepted.)
+*/
+static int resolveOrderGroupBy(
+  NameContext *pNC,     /* The name context of the SELECT statement */
+  Select *pSelect,      /* The SELECT statement holding pOrderBy */
+  ExprList *pOrderBy,   /* An ORDER BY or GROUP BY clause to resolve */
+  const char *zType     /* Either "ORDER" or "GROUP", as appropriate */
+){
+  int i, j;                      /* Loop counters */
+  int iCol;                      /* Column number */
+  struct ExprList_item *pItem;   /* A term of the ORDER BY clause */
+  Parse *pParse;                 /* Parsing context */
+  int nResult;                   /* Number of terms in the result set */
+
+  assert( pOrderBy!=0 );
+  nResult = pSelect->pEList->nExpr;
+  pParse = pNC->pParse;
+  for(i=0, pItem=pOrderBy->a; i<pOrderBy->nExpr; i++, pItem++){
+    Expr *pE = pItem->pExpr;
+    Expr *pE2 = sqlite3ExprSkipCollateAndLikely(pE);
+    if( NEVER(pE2==0) ) continue;
+    if( zType[0]!='G' ){
+      iCol = resolveAsName(pParse, pSelect->pEList, pE2);
+      if( iCol>0 ){
+        /* If an AS-name match is found, mark this ORDER BY column as being
+        ** a copy of the iCol-th result-set column.  The subsequent call to
+        ** sqlite3ResolveOrderGroupBy() will convert the expression to a
+        ** copy of the iCol-th result-set expression. */
+        pItem->u.x.iOrderByCol = (u16)iCol;
+        continue;
+      }
+    }
+    if( sqlite3ExprIsInteger(pE2, &iCol) ){
+      /* The ORDER BY term is an integer constant.  Again, set the column
+      ** number so that sqlite3ResolveOrderGroupBy() will convert the
+      ** order-by term to a copy of the result-set expression */
+      if( iCol<1 || iCol>0xffff ){
+        resolveOutOfRangeError(pParse, zType, i+1, nResult, pE2);
+        return 1;
+      }
+      pItem->u.x.iOrderByCol = (u16)iCol;
+      continue;
+    }
+
+    /* Otherwise, treat the ORDER BY term as an ordinary expression */
+    pItem->u.x.iOrderByCol = 0;
+    if( sqlite3ResolveExprNames(pNC, pE) ){
+      return 1;
+    }
+    for(j=0; j<pSelect->pEList->nExpr; j++){
+      if( sqlite3ExprCompare(0, pE, pSelect->pEList->a[j].pExpr, -1)==0 ){
+        /* Since this expresion is being changed into a reference
+        ** to an identical expression in the result set, remove all Window
+        ** objects belonging to the expression from the Select.pWin list. */
+        windowRemoveExprFromSelect(pSelect, pE);
+        pItem->u.x.iOrderByCol = j+1;
+      }
+    }
+  }
+  return sqlite3ResolveOrderGroupBy(pParse, pSelect, pOrderBy, zType);
+}
+
+/*
+** Resolve names in the SELECT statement p and all of its descendants.
+*/
+static int resolveSelectStep(Walker *pWalker, Select *p){
+  NameContext *pOuterNC;  /* Context that contains this SELECT */
+  NameContext sNC;        /* Name context of this SELECT */
+  int isCompound;         /* True if p is a compound select */
+  int nCompound;          /* Number of compound terms processed so far */
+  Parse *pParse;          /* Parsing context */
+  int i;                  /* Loop counter */
+  ExprList *pGroupBy;     /* The GROUP BY clause */
+  Select *pLeftmost;      /* Left-most of SELECT of a compound */
+  sqlite3 *db;            /* Database connection */
+
+
+  assert( p!=0 );
+  if( p->selFlags & SF_Resolved ){
+    return WRC_Prune;
+  }
+  pOuterNC = pWalker->u.pNC;
+  pParse = pWalker->pParse;
+  db = pParse->db;
+
+  /* Normally sqlite3SelectExpand() will be called first and will have
+  ** already expanded this SELECT.  However, if this is a subquery within
+  ** an expression, sqlite3ResolveExprNames() will be called without a
+  ** prior call to sqlite3SelectExpand().  When that happens, let
+  ** sqlite3SelectPrep() do all of the processing for this SELECT.
+  ** sqlite3SelectPrep() will invoke both sqlite3SelectExpand() and
+  ** this routine in the correct order.
+  */
+  if( (p->selFlags & SF_Expanded)==0 ){
+    sqlite3SelectPrep(pParse, p, pOuterNC);
+    return pParse->nErr ? WRC_Abort : WRC_Prune;
+  }
+
+  isCompound = p->pPrior!=0;
+  nCompound = 0;
+  pLeftmost = p;
+  while( p ){
+    assert( (p->selFlags & SF_Expanded)!=0 );
+    assert( (p->selFlags & SF_Resolved)==0 );
+    assert( db->suppressErr==0 ); /* SF_Resolved not set if errors suppressed */
+    p->selFlags |= SF_Resolved;
+
+
+    /* Resolve the expressions in the LIMIT and OFFSET clauses. These
+    ** are not allowed to refer to any names, so pass an empty NameContext.
+    */
+    memset(&sNC, 0, sizeof(sNC));
+    sNC.pParse = pParse;
+    sNC.pWinSelect = p;
+    if( sqlite3ResolveExprNames(&sNC, p->pLimit) ){
+      return WRC_Abort;
+    }
+
+    /* If the SF_Converted flags is set, then this Select object was
+    ** was created by the convertCompoundSelectToSubquery() function.
+    ** In this case the ORDER BY clause (p->pOrderBy) should be resolved
+    ** as if it were part of the sub-query, not the parent. This block
+    ** moves the pOrderBy down to the sub-query. It will be moved back
+    ** after the names have been resolved.  */
+    if( p->selFlags & SF_Converted ){
+      Select *pSub = p->pSrc->a[0].pSelect;
+      assert( p->pSrc->nSrc==1 && p->pOrderBy );
+      assert( pSub->pPrior && pSub->pOrderBy==0 );
+      pSub->pOrderBy = p->pOrderBy;
+      p->pOrderBy = 0;
+    }
+
+    /* Recursively resolve names in all subqueries in the FROM clause
+    */
+    for(i=0; i<p->pSrc->nSrc; i++){
+      SrcItem *pItem = &p->pSrc->a[i];
+      if( pItem->pSelect && (pItem->pSelect->selFlags & SF_Resolved)==0 ){
+        int nRef = pOuterNC ? pOuterNC->nRef : 0;
+        const char *zSavedContext = pParse->zAuthContext;
+
+        if( pItem->zName ) pParse->zAuthContext = pItem->zName;
+        sqlite3ResolveSelectNames(pParse, pItem->pSelect, pOuterNC);
+        pParse->zAuthContext = zSavedContext;
+        if( pParse->nErr ) return WRC_Abort;
+        assert( db->mallocFailed==0 );
+
+        /* If the number of references to the outer context changed when
+        ** expressions in the sub-select were resolved, the sub-select
+        ** is correlated. It is not required to check the refcount on any
+        ** but the innermost out
