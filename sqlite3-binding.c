@@ -103289,4 +103289,188 @@ static int resolveSelectStep(Walker *pWalker, Select *p){
         /* If the number of references to the outer context changed when
         ** expressions in the sub-select were resolved, the sub-select
         ** is correlated. It is not required to check the refcount on any
-        ** but the innermost out
+        ** but the innermost outer context object, as lookupName() increments
+        ** the refcount on all contexts between the current one and the
+        ** context containing the column when it resolves a name. */
+        if( pOuterNC ){
+          assert( pItem->fg.isCorrelated==0 && pOuterNC->nRef>=nRef );
+          pItem->fg.isCorrelated = (pOuterNC->nRef>nRef);
+        }
+      }
+    }
+
+    /* Set up the local name-context to pass to sqlite3ResolveExprNames() to
+    ** resolve the result-set expression list.
+    */
+    sNC.ncFlags = NC_AllowAgg|NC_AllowWin;
+    sNC.pSrcList = p->pSrc;
+    sNC.pNext = pOuterNC;
+
+    /* Resolve names in the result set. */
+    if( sqlite3ResolveExprListNames(&sNC, p->pEList) ) return WRC_Abort;
+    sNC.ncFlags &= ~NC_AllowWin;
+
+    /* If there are no aggregate functions in the result-set, and no GROUP BY
+    ** expression, do not allow aggregates in any of the other expressions.
+    */
+    assert( (p->selFlags & SF_Aggregate)==0 );
+    pGroupBy = p->pGroupBy;
+    if( pGroupBy || (sNC.ncFlags & NC_HasAgg)!=0 ){
+      assert( NC_MinMaxAgg==SF_MinMaxAgg );
+      assert( NC_OrderAgg==SF_OrderByReqd );
+      p->selFlags |= SF_Aggregate | (sNC.ncFlags&(NC_MinMaxAgg|NC_OrderAgg));
+    }else{
+      sNC.ncFlags &= ~NC_AllowAgg;
+    }
+
+    /* Add the output column list to the name-context before parsing the
+    ** other expressions in the SELECT statement. This is so that
+    ** expressions in the WHERE clause (etc.) can refer to expressions by
+    ** aliases in the result set.
+    **
+    ** Minor point: If this is the case, then the expression will be
+    ** re-evaluated for each reference to it.
+    */
+    assert( (sNC.ncFlags & (NC_UAggInfo|NC_UUpsert|NC_UBaseReg))==0 );
+    sNC.uNC.pEList = p->pEList;
+    sNC.ncFlags |= NC_UEList;
+    if( p->pHaving ){
+      if( (p->selFlags & SF_Aggregate)==0 ){
+        sqlite3ErrorMsg(pParse, "HAVING clause on a non-aggregate query");
+        return WRC_Abort;
+      }
+      if( sqlite3ResolveExprNames(&sNC, p->pHaving) ) return WRC_Abort;
+    }
+    if( sqlite3ResolveExprNames(&sNC, p->pWhere) ) return WRC_Abort;
+
+    /* Resolve names in table-valued-function arguments */
+    for(i=0; i<p->pSrc->nSrc; i++){
+      SrcItem *pItem = &p->pSrc->a[i];
+      if( pItem->fg.isTabFunc
+       && sqlite3ResolveExprListNames(&sNC, pItem->u1.pFuncArg)
+      ){
+        return WRC_Abort;
+      }
+    }
+
+#ifndef SQLITE_OMIT_WINDOWFUNC
+    if( IN_RENAME_OBJECT ){
+      Window *pWin;
+      for(pWin=p->pWinDefn; pWin; pWin=pWin->pNextWin){
+        if( sqlite3ResolveExprListNames(&sNC, pWin->pOrderBy)
+         || sqlite3ResolveExprListNames(&sNC, pWin->pPartition)
+        ){
+          return WRC_Abort;
+        }
+      }
+    }
+#endif
+
+    /* The ORDER BY and GROUP BY clauses may not refer to terms in
+    ** outer queries
+    */
+    sNC.pNext = 0;
+    sNC.ncFlags |= NC_AllowAgg|NC_AllowWin;
+
+    /* If this is a converted compound query, move the ORDER BY clause from
+    ** the sub-query back to the parent query. At this point each term
+    ** within the ORDER BY clause has been transformed to an integer value.
+    ** These integers will be replaced by copies of the corresponding result
+    ** set expressions by the call to resolveOrderGroupBy() below.  */
+    if( p->selFlags & SF_Converted ){
+      Select *pSub = p->pSrc->a[0].pSelect;
+      p->pOrderBy = pSub->pOrderBy;
+      pSub->pOrderBy = 0;
+    }
+
+    /* Process the ORDER BY clause for singleton SELECT statements.
+    ** The ORDER BY clause for compounds SELECT statements is handled
+    ** below, after all of the result-sets for all of the elements of
+    ** the compound have been resolved.
+    **
+    ** If there is an ORDER BY clause on a term of a compound-select other
+    ** than the right-most term, then that is a syntax error.  But the error
+    ** is not detected until much later, and so we need to go ahead and
+    ** resolve those symbols on the incorrect ORDER BY for consistency.
+    */
+    if( p->pOrderBy!=0
+     && isCompound<=nCompound  /* Defer right-most ORDER BY of a compound */
+     && resolveOrderGroupBy(&sNC, p, p->pOrderBy, "ORDER")
+    ){
+      return WRC_Abort;
+    }
+    if( db->mallocFailed ){
+      return WRC_Abort;
+    }
+    sNC.ncFlags &= ~NC_AllowWin;
+
+    /* Resolve the GROUP BY clause.  At the same time, make sure
+    ** the GROUP BY clause does not contain aggregate functions.
+    */
+    if( pGroupBy ){
+      struct ExprList_item *pItem;
+
+      if( resolveOrderGroupBy(&sNC, p, pGroupBy, "GROUP") || db->mallocFailed ){
+        return WRC_Abort;
+      }
+      for(i=0, pItem=pGroupBy->a; i<pGroupBy->nExpr; i++, pItem++){
+        if( ExprHasProperty(pItem->pExpr, EP_Agg) ){
+          sqlite3ErrorMsg(pParse, "aggregate functions are not allowed in "
+              "the GROUP BY clause");
+          return WRC_Abort;
+        }
+      }
+    }
+
+    /* If this is part of a compound SELECT, check that it has the right
+    ** number of expressions in the select list. */
+    if( p->pNext && p->pEList->nExpr!=p->pNext->pEList->nExpr ){
+      sqlite3SelectWrongNumTermsError(pParse, p->pNext);
+      return WRC_Abort;
+    }
+
+    /* Advance to the next term of the compound
+    */
+    p = p->pPrior;
+    nCompound++;
+  }
+
+  /* Resolve the ORDER BY on a compound SELECT after all terms of
+  ** the compound have been resolved.
+  */
+  if( isCompound && resolveCompoundOrderBy(pParse, pLeftmost) ){
+    return WRC_Abort;
+  }
+
+  return WRC_Prune;
+}
+
+/*
+** This routine walks an expression tree and resolves references to
+** table columns and result-set columns.  At the same time, do error
+** checking on function usage and set a flag if any aggregate functions
+** are seen.
+**
+** To resolve table columns references we look for nodes (or subtrees) of the
+** form X.Y.Z or Y.Z or just Z where
+**
+**      X:   The name of a database.  Ex:  "main" or "temp" or
+**           the symbolic name assigned to an ATTACH-ed database.
+**
+**      Y:   The name of a table in a FROM clause.  Or in a trigger
+**           one of the special names "old" or "new".
+**
+**      Z:   The name of a column in table Y.
+**
+** The node at the root of the subtree is modified as follows:
+**
+**    Expr.op        Changed to TK_COLUMN
+**    Expr.pTab      Points to the Table object for X.Y
+**    Expr.iColumn   The column index in X.Y.  -1 for the rowid.
+**    Expr.iTable    The VDBE cursor number for X.Y
+**
+**
+** To resolve result-set references, look for expression nodes of the
+** form Z (with no X and Y prefix) where the Z matches the right-hand
+** size of an AS clause in the result-set of a SELECT.  The Z expression
+** is replaced by a copy of the left-hand side of the result-set expressio
