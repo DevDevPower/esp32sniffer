@@ -102939,4 +102939,192 @@ static void resolveOutOfRangeError(
 /*
 ** Analyze the ORDER BY clause in a compound SELECT statement.   Modify
 ** each term of the ORDER BY clause is a constant integer between 1
-** an
+** and N where N is the number of columns in the compound SELECT.
+**
+** ORDER BY terms that are already an integer between 1 and N are
+** unmodified.  ORDER BY terms that are integers outside the range of
+** 1 through N generate an error.  ORDER BY terms that are expressions
+** are matched against result set expressions of compound SELECT
+** beginning with the left-most SELECT and working toward the right.
+** At the first match, the ORDER BY expression is transformed into
+** the integer column number.
+**
+** Return the number of errors seen.
+*/
+static int resolveCompoundOrderBy(
+  Parse *pParse,        /* Parsing context.  Leave error messages here */
+  Select *pSelect       /* The SELECT statement containing the ORDER BY */
+){
+  int i;
+  ExprList *pOrderBy;
+  ExprList *pEList;
+  sqlite3 *db;
+  int moreToDo = 1;
+
+  pOrderBy = pSelect->pOrderBy;
+  if( pOrderBy==0 ) return 0;
+  db = pParse->db;
+  if( pOrderBy->nExpr>db->aLimit[SQLITE_LIMIT_COLUMN] ){
+    sqlite3ErrorMsg(pParse, "too many terms in ORDER BY clause");
+    return 1;
+  }
+  for(i=0; i<pOrderBy->nExpr; i++){
+    pOrderBy->a[i].fg.done = 0;
+  }
+  pSelect->pNext = 0;
+  while( pSelect->pPrior ){
+    pSelect->pPrior->pNext = pSelect;
+    pSelect = pSelect->pPrior;
+  }
+  while( pSelect && moreToDo ){
+    struct ExprList_item *pItem;
+    moreToDo = 0;
+    pEList = pSelect->pEList;
+    assert( pEList!=0 );
+    for(i=0, pItem=pOrderBy->a; i<pOrderBy->nExpr; i++, pItem++){
+      int iCol = -1;
+      Expr *pE, *pDup;
+      if( pItem->fg.done ) continue;
+      pE = sqlite3ExprSkipCollateAndLikely(pItem->pExpr);
+      if( NEVER(pE==0) ) continue;
+      if( sqlite3ExprIsInteger(pE, &iCol) ){
+        if( iCol<=0 || iCol>pEList->nExpr ){
+          resolveOutOfRangeError(pParse, "ORDER", i+1, pEList->nExpr, pE);
+          return 1;
+        }
+      }else{
+        iCol = resolveAsName(pParse, pEList, pE);
+        if( iCol==0 ){
+          /* Now test if expression pE matches one of the values returned
+          ** by pSelect. In the usual case this is done by duplicating the
+          ** expression, resolving any symbols in it, and then comparing
+          ** it against each expression returned by the SELECT statement.
+          ** Once the comparisons are finished, the duplicate expression
+          ** is deleted.
+          **
+          ** If this is running as part of an ALTER TABLE operation and
+          ** the symbols resolve successfully, also resolve the symbols in the
+          ** actual expression. This allows the code in alter.c to modify
+          ** column references within the ORDER BY expression as required.  */
+          pDup = sqlite3ExprDup(db, pE, 0);
+          if( !db->mallocFailed ){
+            assert(pDup);
+            iCol = resolveOrderByTermToExprList(pParse, pSelect, pDup);
+            if( IN_RENAME_OBJECT && iCol>0 ){
+              resolveOrderByTermToExprList(pParse, pSelect, pE);
+            }
+          }
+          sqlite3ExprDelete(db, pDup);
+        }
+      }
+      if( iCol>0 ){
+        /* Convert the ORDER BY term into an integer column number iCol,
+        ** taking care to preserve the COLLATE clause if it exists. */
+        if( !IN_RENAME_OBJECT ){
+          Expr *pNew = sqlite3Expr(db, TK_INTEGER, 0);
+          if( pNew==0 ) return 1;
+          pNew->flags |= EP_IntValue;
+          pNew->u.iValue = iCol;
+          if( pItem->pExpr==pE ){
+            pItem->pExpr = pNew;
+          }else{
+            Expr *pParent = pItem->pExpr;
+            assert( pParent->op==TK_COLLATE );
+            while( pParent->pLeft->op==TK_COLLATE ) pParent = pParent->pLeft;
+            assert( pParent->pLeft==pE );
+            pParent->pLeft = pNew;
+          }
+          sqlite3ExprDelete(db, pE);
+          pItem->u.x.iOrderByCol = (u16)iCol;
+        }
+        pItem->fg.done = 1;
+      }else{
+        moreToDo = 1;
+      }
+    }
+    pSelect = pSelect->pNext;
+  }
+  for(i=0; i<pOrderBy->nExpr; i++){
+    if( pOrderBy->a[i].fg.done==0 ){
+      sqlite3ErrorMsg(pParse, "%r ORDER BY term does not match any "
+            "column in the result set", i+1);
+      return 1;
+    }
+  }
+  return 0;
+}
+
+/*
+** Check every term in the ORDER BY or GROUP BY clause pOrderBy of
+** the SELECT statement pSelect.  If any term is reference to a
+** result set expression (as determined by the ExprList.a.u.x.iOrderByCol
+** field) then convert that term into a copy of the corresponding result set
+** column.
+**
+** If any errors are detected, add an error message to pParse and
+** return non-zero.  Return zero if no errors are seen.
+*/
+SQLITE_PRIVATE int sqlite3ResolveOrderGroupBy(
+  Parse *pParse,        /* Parsing context.  Leave error messages here */
+  Select *pSelect,      /* The SELECT statement containing the clause */
+  ExprList *pOrderBy,   /* The ORDER BY or GROUP BY clause to be processed */
+  const char *zType     /* "ORDER" or "GROUP" */
+){
+  int i;
+  sqlite3 *db = pParse->db;
+  ExprList *pEList;
+  struct ExprList_item *pItem;
+
+  if( pOrderBy==0 || pParse->db->mallocFailed || IN_RENAME_OBJECT ) return 0;
+  if( pOrderBy->nExpr>db->aLimit[SQLITE_LIMIT_COLUMN] ){
+    sqlite3ErrorMsg(pParse, "too many terms in %s BY clause", zType);
+    return 1;
+  }
+  pEList = pSelect->pEList;
+  assert( pEList!=0 );  /* sqlite3SelectNew() guarantees this */
+  for(i=0, pItem=pOrderBy->a; i<pOrderBy->nExpr; i++, pItem++){
+    if( pItem->u.x.iOrderByCol ){
+      if( pItem->u.x.iOrderByCol>pEList->nExpr ){
+        resolveOutOfRangeError(pParse, zType, i+1, pEList->nExpr, 0);
+        return 1;
+      }
+      resolveAlias(pParse, pEList, pItem->u.x.iOrderByCol-1, pItem->pExpr,0);
+    }
+  }
+  return 0;
+}
+
+#ifndef SQLITE_OMIT_WINDOWFUNC
+/*
+** Walker callback for windowRemoveExprFromSelect().
+*/
+static int resolveRemoveWindowsCb(Walker *pWalker, Expr *pExpr){
+  UNUSED_PARAMETER(pWalker);
+  if( ExprHasProperty(pExpr, EP_WinFunc) ){
+    Window *pWin = pExpr->y.pWin;
+    sqlite3WindowUnlinkFromSelect(pWin);
+  }
+  return WRC_Continue;
+}
+
+/*
+** Remove any Window objects owned by the expression pExpr from the
+** Select.pWin list of Select object pSelect.
+*/
+static void windowRemoveExprFromSelect(Select *pSelect, Expr *pExpr){
+  if( pSelect->pWin ){
+    Walker sWalker;
+    memset(&sWalker, 0, sizeof(Walker));
+    sWalker.xExprCallback = resolveRemoveWindowsCb;
+    sWalker.u.pSelect = pSelect;
+    sqlite3WalkExpr(&sWalker, pExpr);
+  }
+}
+#else
+# define windowRemoveExprFromSelect(a, b)
+#endif /* SQLITE_OMIT_WINDOWFUNC */
+
+/*
+** pOrderBy is an ORDER BY or GROUP BY clause in SELECT statement pSelect.
+** The Name context of the SELECT statement is pNC.  zType is either
+** "ORDER" or "GROUP" depending on which type of 
