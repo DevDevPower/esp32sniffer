@@ -102189,4 +102189,211 @@ static int lookupName(
   ** be multiple matches for a NATURAL LEFT JOIN or a LEFT JOIN USING.
   */
   assert( pFJMatch==0 || cnt>0 );
-  assert( !ExprHasProperty(pExpr, EP_xIsSelect|EP_I
+  assert( !ExprHasProperty(pExpr, EP_xIsSelect|EP_IntValue) );
+  if( cnt!=1 ){
+    const char *zErr;
+    if( pFJMatch ){
+      if( pFJMatch->nExpr==cnt-1 ){
+        if( ExprHasProperty(pExpr,EP_Leaf) ){
+          ExprClearProperty(pExpr,EP_Leaf);
+        }else{
+          sqlite3ExprDelete(db, pExpr->pLeft);
+          pExpr->pLeft = 0;
+          sqlite3ExprDelete(db, pExpr->pRight);
+          pExpr->pRight = 0;
+        }
+        extendFJMatch(pParse, &pFJMatch, pMatch, pExpr->iColumn);
+        pExpr->op = TK_FUNCTION;
+        pExpr->u.zToken = "coalesce";
+        pExpr->x.pList = pFJMatch;
+        cnt = 1;
+        goto lookupname_end;
+      }else{
+        sqlite3ExprListDelete(db, pFJMatch);
+        pFJMatch = 0;
+      }
+    }
+    zErr = cnt==0 ? "no such column" : "ambiguous column name";
+    if( zDb ){
+      sqlite3ErrorMsg(pParse, "%s: %s.%s.%s", zErr, zDb, zTab, zCol);
+    }else if( zTab ){
+      sqlite3ErrorMsg(pParse, "%s: %s.%s", zErr, zTab, zCol);
+    }else{
+      sqlite3ErrorMsg(pParse, "%s: %s", zErr, zCol);
+    }
+    sqlite3RecordErrorOffsetOfExpr(pParse->db, pExpr);
+    pParse->checkSchema = 1;
+    pTopNC->nNcErr++;
+  }
+  assert( pFJMatch==0 );
+
+  /* Remove all substructure from pExpr */
+  if( !ExprHasProperty(pExpr,(EP_TokenOnly|EP_Leaf)) ){
+    sqlite3ExprDelete(db, pExpr->pLeft);
+    pExpr->pLeft = 0;
+    sqlite3ExprDelete(db, pExpr->pRight);
+    pExpr->pRight = 0;
+    ExprSetProperty(pExpr, EP_Leaf);
+  }
+
+  /* If a column from a table in pSrcList is referenced, then record
+  ** this fact in the pSrcList.a[].colUsed bitmask.  Column 0 causes
+  ** bit 0 to be set.  Column 1 sets bit 1.  And so forth.  Bit 63 is
+  ** set if the 63rd or any subsequent column is used.
+  **
+  ** The colUsed mask is an optimization used to help determine if an
+  ** index is a covering index.  The correct answer is still obtained
+  ** if the mask contains extra set bits.  However, it is important to
+  ** avoid setting bits beyond the maximum column number of the table.
+  ** (See ticket [b92e5e8ec2cdbaa1]).
+  **
+  ** If a generated column is referenced, set bits for every column
+  ** of the table.
+  */
+  if( pExpr->iColumn>=0 && pMatch!=0 ){
+    pMatch->colUsed |= sqlite3ExprColUsed(pExpr);
+  }
+
+  pExpr->op = eNewExprOp;
+lookupname_end:
+  if( cnt==1 ){
+    assert( pNC!=0 );
+#ifndef SQLITE_OMIT_AUTHORIZATION
+    if( pParse->db->xAuth
+     && (pExpr->op==TK_COLUMN || pExpr->op==TK_TRIGGER)
+    ){
+      sqlite3AuthRead(pParse, pExpr, pSchema, pNC->pSrcList);
+    }
+#endif
+    /* Increment the nRef value on all name contexts from TopNC up to
+    ** the point where the name matched. */
+    for(;;){
+      assert( pTopNC!=0 );
+      pTopNC->nRef++;
+      if( pTopNC==pNC ) break;
+      pTopNC = pTopNC->pNext;
+    }
+    return WRC_Prune;
+  } else {
+    return WRC_Abort;
+  }
+}
+
+/*
+** Allocate and return a pointer to an expression to load the column iCol
+** from datasource iSrc in SrcList pSrc.
+*/
+SQLITE_PRIVATE Expr *sqlite3CreateColumnExpr(sqlite3 *db, SrcList *pSrc, int iSrc, int iCol){
+  Expr *p = sqlite3ExprAlloc(db, TK_COLUMN, 0, 0);
+  if( p ){
+    SrcItem *pItem = &pSrc->a[iSrc];
+    Table *pTab;
+    assert( ExprUseYTab(p) );
+    pTab = p->y.pTab = pItem->pTab;
+    p->iTable = pItem->iCursor;
+    if( p->y.pTab->iPKey==iCol ){
+      p->iColumn = -1;
+    }else{
+      p->iColumn = (ynVar)iCol;
+      if( (pTab->tabFlags & TF_HasGenerated)!=0
+       && (pTab->aCol[iCol].colFlags & COLFLAG_GENERATED)!=0
+      ){
+        testcase( pTab->nCol==63 );
+        testcase( pTab->nCol==64 );
+        pItem->colUsed = pTab->nCol>=64 ? ALLBITS : MASKBIT(pTab->nCol)-1;
+      }else{
+        testcase( iCol==BMS );
+        testcase( iCol==BMS-1 );
+        pItem->colUsed |= ((Bitmask)1)<<(iCol>=BMS ? BMS-1 : iCol);
+      }
+    }
+  }
+  return p;
+}
+
+/*
+** Report an error that an expression is not valid for some set of
+** pNC->ncFlags values determined by validMask.
+**
+** static void notValid(
+**   Parse *pParse,       // Leave error message here
+**   NameContext *pNC,    // The name context
+**   const char *zMsg,    // Type of error
+**   int validMask,       // Set of contexts for which prohibited
+**   Expr *pExpr          // Invalidate this expression on error
+** ){...}
+**
+** As an optimization, since the conditional is almost always false
+** (because errors are rare), the conditional is moved outside of the
+** function call using a macro.
+*/
+static void notValidImpl(
+   Parse *pParse,       /* Leave error message here */
+   NameContext *pNC,    /* The name context */
+   const char *zMsg,    /* Type of error */
+   Expr *pExpr,         /* Invalidate this expression on error */
+   Expr *pError         /* Associate error with this expression */
+){
+  const char *zIn = "partial index WHERE clauses";
+  if( pNC->ncFlags & NC_IdxExpr )      zIn = "index expressions";
+#ifndef SQLITE_OMIT_CHECK
+  else if( pNC->ncFlags & NC_IsCheck ) zIn = "CHECK constraints";
+#endif
+#ifndef SQLITE_OMIT_GENERATED_COLUMNS
+  else if( pNC->ncFlags & NC_GenCol ) zIn = "generated columns";
+#endif
+  sqlite3ErrorMsg(pParse, "%s prohibited in %s", zMsg, zIn);
+  if( pExpr ) pExpr->op = TK_NULL;
+  sqlite3RecordErrorOffsetOfExpr(pParse->db, pError);
+}
+#define sqlite3ResolveNotValid(P,N,M,X,E,R) \
+  assert( ((X)&~(NC_IsCheck|NC_PartIdx|NC_IdxExpr|NC_GenCol))==0 ); \
+  if( ((N)->ncFlags & (X))!=0 ) notValidImpl(P,N,M,E,R);
+
+/*
+** Expression p should encode a floating point value between 1.0 and 0.0.
+** Return 1024 times this value.  Or return -1 if p is not a floating point
+** value between 1.0 and 0.0.
+*/
+static int exprProbability(Expr *p){
+  double r = -1.0;
+  if( p->op!=TK_FLOAT ) return -1;
+  assert( !ExprHasProperty(p, EP_IntValue) );
+  sqlite3AtoF(p->u.zToken, &r, sqlite3Strlen30(p->u.zToken), SQLITE_UTF8);
+  assert( r>=0.0 );
+  if( r>1.0 ) return -1;
+  return (int)(r*134217728.0);
+}
+
+/*
+** This routine is callback for sqlite3WalkExpr().
+**
+** Resolve symbolic names into TK_COLUMN operators for the current
+** node in the expression tree.  Return 0 to continue the search down
+** the tree or 2 to abort the tree walk.
+**
+** This routine also does error checking and name resolution for
+** function names.  The operator for aggregate functions is changed
+** to TK_AGG_FUNCTION.
+*/
+static int resolveExprStep(Walker *pWalker, Expr *pExpr){
+  NameContext *pNC;
+  Parse *pParse;
+
+  pNC = pWalker->u.pNC;
+  assert( pNC!=0 );
+  pParse = pNC->pParse;
+  assert( pParse==pWalker->pParse );
+
+#ifndef NDEBUG
+  if( pNC->pSrcList && pNC->pSrcList->nAlloc>0 ){
+    SrcList *pSrcList = pNC->pSrcList;
+    int i;
+    for(i=0; i<pNC->pSrcList->nSrc; i++){
+      assert( pSrcList->a[i].iCursor>=0 && pSrcList->a[i].iCursor<pParse->nTab);
+    }
+  }
+#endif
+  switch( pExpr->op ){
+
+    /* The special operator TK
