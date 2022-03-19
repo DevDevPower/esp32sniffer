@@ -102741,4 +102741,202 @@ static int resolveExprStep(Walker *pWalker, Expr *pExpr){
         testcase( pNC->ncFlags & NC_IsCheck );
         testcase( pNC->ncFlags & NC_PartIdx );
         testcase( pNC->ncFlags & NC_IdxExpr );
-        testcase( pNC->ncFl
+        testcase( pNC->ncFlags & NC_GenCol );
+        if( pNC->ncFlags & NC_SelfRef ){
+          notValidImpl(pParse, pNC, "subqueries", pExpr, pExpr);
+        }else{
+          sqlite3WalkSelect(pWalker, pExpr->x.pSelect);
+        }
+        assert( pNC->nRef>=nRef );
+        if( nRef!=pNC->nRef ){
+          ExprSetProperty(pExpr, EP_VarSelect);
+          pNC->ncFlags |= NC_VarSelect;
+        }
+      }
+      break;
+    }
+    case TK_VARIABLE: {
+      testcase( pNC->ncFlags & NC_IsCheck );
+      testcase( pNC->ncFlags & NC_PartIdx );
+      testcase( pNC->ncFlags & NC_IdxExpr );
+      testcase( pNC->ncFlags & NC_GenCol );
+      sqlite3ResolveNotValid(pParse, pNC, "parameters",
+               NC_IsCheck|NC_PartIdx|NC_IdxExpr|NC_GenCol, pExpr, pExpr);
+      break;
+    }
+    case TK_IS:
+    case TK_ISNOT: {
+      Expr *pRight = sqlite3ExprSkipCollateAndLikely(pExpr->pRight);
+      assert( !ExprHasProperty(pExpr, EP_Reduced) );
+      /* Handle special cases of "x IS TRUE", "x IS FALSE", "x IS NOT TRUE",
+      ** and "x IS NOT FALSE". */
+      if( ALWAYS(pRight) && (pRight->op==TK_ID || pRight->op==TK_TRUEFALSE) ){
+        int rc = resolveExprStep(pWalker, pRight);
+        if( rc==WRC_Abort ) return WRC_Abort;
+        if( pRight->op==TK_TRUEFALSE ){
+          pExpr->op2 = pExpr->op;
+          pExpr->op = TK_TRUTH;
+          return WRC_Continue;
+        }
+      }
+      /* no break */ deliberate_fall_through
+    }
+    case TK_BETWEEN:
+    case TK_EQ:
+    case TK_NE:
+    case TK_LT:
+    case TK_LE:
+    case TK_GT:
+    case TK_GE: {
+      int nLeft, nRight;
+      if( pParse->db->mallocFailed ) break;
+      assert( pExpr->pLeft!=0 );
+      nLeft = sqlite3ExprVectorSize(pExpr->pLeft);
+      if( pExpr->op==TK_BETWEEN ){
+        assert( ExprUseXList(pExpr) );
+        nRight = sqlite3ExprVectorSize(pExpr->x.pList->a[0].pExpr);
+        if( nRight==nLeft ){
+          nRight = sqlite3ExprVectorSize(pExpr->x.pList->a[1].pExpr);
+        }
+      }else{
+        assert( pExpr->pRight!=0 );
+        nRight = sqlite3ExprVectorSize(pExpr->pRight);
+      }
+      if( nLeft!=nRight ){
+        testcase( pExpr->op==TK_EQ );
+        testcase( pExpr->op==TK_NE );
+        testcase( pExpr->op==TK_LT );
+        testcase( pExpr->op==TK_LE );
+        testcase( pExpr->op==TK_GT );
+        testcase( pExpr->op==TK_GE );
+        testcase( pExpr->op==TK_IS );
+        testcase( pExpr->op==TK_ISNOT );
+        testcase( pExpr->op==TK_BETWEEN );
+        sqlite3ErrorMsg(pParse, "row value misused");
+        sqlite3RecordErrorOffsetOfExpr(pParse->db, pExpr);
+      }
+      break;
+    }
+  }
+  assert( pParse->db->mallocFailed==0 || pParse->nErr!=0 );
+  return pParse->nErr ? WRC_Abort : WRC_Continue;
+}
+
+/*
+** pEList is a list of expressions which are really the result set of the
+** a SELECT statement.  pE is a term in an ORDER BY or GROUP BY clause.
+** This routine checks to see if pE is a simple identifier which corresponds
+** to the AS-name of one of the terms of the expression list.  If it is,
+** this routine return an integer between 1 and N where N is the number of
+** elements in pEList, corresponding to the matching entry.  If there is
+** no match, or if pE is not a simple identifier, then this routine
+** return 0.
+**
+** pEList has been resolved.  pE has not.
+*/
+static int resolveAsName(
+  Parse *pParse,     /* Parsing context for error messages */
+  ExprList *pEList,  /* List of expressions to scan */
+  Expr *pE           /* Expression we are trying to match */
+){
+  int i;             /* Loop counter */
+
+  UNUSED_PARAMETER(pParse);
+
+  if( pE->op==TK_ID ){
+    const char *zCol;
+    assert( !ExprHasProperty(pE, EP_IntValue) );
+    zCol = pE->u.zToken;
+    for(i=0; i<pEList->nExpr; i++){
+      if( pEList->a[i].fg.eEName==ENAME_NAME
+       && sqlite3_stricmp(pEList->a[i].zEName, zCol)==0
+      ){
+        return i+1;
+      }
+    }
+  }
+  return 0;
+}
+
+/*
+** pE is a pointer to an expression which is a single term in the
+** ORDER BY of a compound SELECT.  The expression has not been
+** name resolved.
+**
+** At the point this routine is called, we already know that the
+** ORDER BY term is not an integer index into the result set.  That
+** case is handled by the calling routine.
+**
+** Attempt to match pE against result set columns in the left-most
+** SELECT statement.  Return the index i of the matching column,
+** as an indication to the caller that it should sort by the i-th column.
+** The left-most column is 1.  In other words, the value returned is the
+** same integer value that would be used in the SQL statement to indicate
+** the column.
+**
+** If there is no match, return 0.  Return -1 if an error occurs.
+*/
+static int resolveOrderByTermToExprList(
+  Parse *pParse,     /* Parsing context for error messages */
+  Select *pSelect,   /* The SELECT statement with the ORDER BY clause */
+  Expr *pE           /* The specific ORDER BY term */
+){
+  int i;             /* Loop counter */
+  ExprList *pEList;  /* The columns of the result set */
+  NameContext nc;    /* Name context for resolving pE */
+  sqlite3 *db;       /* Database connection */
+  int rc;            /* Return code from subprocedures */
+  u8 savedSuppErr;   /* Saved value of db->suppressErr */
+
+  assert( sqlite3ExprIsInteger(pE, &i)==0 );
+  pEList = pSelect->pEList;
+
+  /* Resolve all names in the ORDER BY term expression
+  */
+  memset(&nc, 0, sizeof(nc));
+  nc.pParse = pParse;
+  nc.pSrcList = pSelect->pSrc;
+  nc.uNC.pEList = pEList;
+  nc.ncFlags = NC_AllowAgg|NC_UEList|NC_NoSelect;
+  nc.nNcErr = 0;
+  db = pParse->db;
+  savedSuppErr = db->suppressErr;
+  db->suppressErr = 1;
+  rc = sqlite3ResolveExprNames(&nc, pE);
+  db->suppressErr = savedSuppErr;
+  if( rc ) return 0;
+
+  /* Try to match the ORDER BY expression against an expression
+  ** in the result set.  Return an 1-based index of the matching
+  ** result-set entry.
+  */
+  for(i=0; i<pEList->nExpr; i++){
+    if( sqlite3ExprCompare(0, pEList->a[i].pExpr, pE, -1)<2 ){
+      return i+1;
+    }
+  }
+
+  /* If no match, return 0. */
+  return 0;
+}
+
+/*
+** Generate an ORDER BY or GROUP BY term out-of-range error.
+*/
+static void resolveOutOfRangeError(
+  Parse *pParse,         /* The error context into which to write the error */
+  const char *zType,     /* "ORDER" or "GROUP" */
+  int i,                 /* The index (1-based) of the term out of range */
+  int mx,                /* Largest permissible value of i */
+  Expr *pError           /* Associate the error with the expression */
+){
+  sqlite3ErrorMsg(pParse,
+    "%r %s BY term out of range - should be "
+    "between 1 and %d", i, zType, mx);
+  sqlite3RecordErrorOffsetOfExpr(pParse->db, pError);
+}
+
+/*
+** Analyze the ORDER BY clause in a compound SELECT statement.   Modify
+** each term of the ORDER BY clause is a constant integer between 1
+** an
