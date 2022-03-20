@@ -104073,4 +104073,175 @@ static int codeCompare(
 /*
 ** Return true if expression pExpr is a vector, or false otherwise.
 **
-** A vector is defined as an
+** A vector is defined as any expression that results in two or more
+** columns of result.  Every TK_VECTOR node is an vector because the
+** parser will not generate a TK_VECTOR with fewer than two entries.
+** But a TK_SELECT might be either a vector or a scalar. It is only
+** considered a vector if it has two or more result columns.
+*/
+SQLITE_PRIVATE int sqlite3ExprIsVector(const Expr *pExpr){
+  return sqlite3ExprVectorSize(pExpr)>1;
+}
+
+/*
+** If the expression passed as the only argument is of type TK_VECTOR
+** return the number of expressions in the vector. Or, if the expression
+** is a sub-select, return the number of columns in the sub-select. For
+** any other type of expression, return 1.
+*/
+SQLITE_PRIVATE int sqlite3ExprVectorSize(const Expr *pExpr){
+  u8 op = pExpr->op;
+  if( op==TK_REGISTER ) op = pExpr->op2;
+  if( op==TK_VECTOR ){
+    assert( ExprUseXList(pExpr) );
+    return pExpr->x.pList->nExpr;
+  }else if( op==TK_SELECT ){
+    assert( ExprUseXSelect(pExpr) );
+    return pExpr->x.pSelect->pEList->nExpr;
+  }else{
+    return 1;
+  }
+}
+
+/*
+** Return a pointer to a subexpression of pVector that is the i-th
+** column of the vector (numbered starting with 0).  The caller must
+** ensure that i is within range.
+**
+** If pVector is really a scalar (and "scalar" here includes subqueries
+** that return a single column!) then return pVector unmodified.
+**
+** pVector retains ownership of the returned subexpression.
+**
+** If the vector is a (SELECT ...) then the expression returned is
+** just the expression for the i-th term of the result set, and may
+** not be ready for evaluation because the table cursor has not yet
+** been positioned.
+*/
+SQLITE_PRIVATE Expr *sqlite3VectorFieldSubexpr(Expr *pVector, int i){
+  assert( i<sqlite3ExprVectorSize(pVector) || pVector->op==TK_ERROR );
+  if( sqlite3ExprIsVector(pVector) ){
+    assert( pVector->op2==0 || pVector->op==TK_REGISTER );
+    if( pVector->op==TK_SELECT || pVector->op2==TK_SELECT ){
+      assert( ExprUseXSelect(pVector) );
+      return pVector->x.pSelect->pEList->a[i].pExpr;
+    }else{
+      assert( ExprUseXList(pVector) );
+      return pVector->x.pList->a[i].pExpr;
+    }
+  }
+  return pVector;
+}
+
+/*
+** Compute and return a new Expr object which when passed to
+** sqlite3ExprCode() will generate all necessary code to compute
+** the iField-th column of the vector expression pVector.
+**
+** It is ok for pVector to be a scalar (as long as iField==0).
+** In that case, this routine works like sqlite3ExprDup().
+**
+** The caller owns the returned Expr object and is responsible for
+** ensuring that the returned value eventually gets freed.
+**
+** The caller retains ownership of pVector.  If pVector is a TK_SELECT,
+** then the returned object will reference pVector and so pVector must remain
+** valid for the life of the returned object.  If pVector is a TK_VECTOR
+** or a scalar expression, then it can be deleted as soon as this routine
+** returns.
+**
+** A trick to cause a TK_SELECT pVector to be deleted together with
+** the returned Expr object is to attach the pVector to the pRight field
+** of the returned TK_SELECT_COLUMN Expr object.
+*/
+SQLITE_PRIVATE Expr *sqlite3ExprForVectorField(
+  Parse *pParse,       /* Parsing context */
+  Expr *pVector,       /* The vector.  List of expressions or a sub-SELECT */
+  int iField,          /* Which column of the vector to return */
+  int nField           /* Total number of columns in the vector */
+){
+  Expr *pRet;
+  if( pVector->op==TK_SELECT ){
+    assert( ExprUseXSelect(pVector) );
+    /* The TK_SELECT_COLUMN Expr node:
+    **
+    ** pLeft:           pVector containing TK_SELECT.  Not deleted.
+    ** pRight:          not used.  But recursively deleted.
+    ** iColumn:         Index of a column in pVector
+    ** iTable:          0 or the number of columns on the LHS of an assignment
+    ** pLeft->iTable:   First in an array of register holding result, or 0
+    **                  if the result is not yet computed.
+    **
+    ** sqlite3ExprDelete() specifically skips the recursive delete of
+    ** pLeft on TK_SELECT_COLUMN nodes.  But pRight is followed, so pVector
+    ** can be attached to pRight to cause this node to take ownership of
+    ** pVector.  Typically there will be multiple TK_SELECT_COLUMN nodes
+    ** with the same pLeft pointer to the pVector, but only one of them
+    ** will own the pVector.
+    */
+    pRet = sqlite3PExpr(pParse, TK_SELECT_COLUMN, 0, 0);
+    if( pRet ){
+      pRet->iTable = nField;
+      pRet->iColumn = iField;
+      pRet->pLeft = pVector;
+    }
+  }else{
+    if( pVector->op==TK_VECTOR ){
+      Expr **ppVector;
+      assert( ExprUseXList(pVector) );
+      ppVector = &pVector->x.pList->a[iField].pExpr;
+      pVector = *ppVector;
+      if( IN_RENAME_OBJECT ){
+        /* This must be a vector UPDATE inside a trigger */
+        *ppVector = 0;
+        return pVector;
+      }
+    }
+    pRet = sqlite3ExprDup(pParse->db, pVector, 0);
+  }
+  return pRet;
+}
+
+/*
+** If expression pExpr is of type TK_SELECT, generate code to evaluate
+** it. Return the register in which the result is stored (or, if the
+** sub-select returns more than one column, the first in an array
+** of registers in which the result is stored).
+**
+** If pExpr is not a TK_SELECT expression, return 0.
+*/
+static int exprCodeSubselect(Parse *pParse, Expr *pExpr){
+  int reg = 0;
+#ifndef SQLITE_OMIT_SUBQUERY
+  if( pExpr->op==TK_SELECT ){
+    reg = sqlite3CodeSubselect(pParse, pExpr);
+  }
+#endif
+  return reg;
+}
+
+/*
+** Argument pVector points to a vector expression - either a TK_VECTOR
+** or TK_SELECT that returns more than one column. This function returns
+** the register number of a register that contains the value of
+** element iField of the vector.
+**
+** If pVector is a TK_SELECT expression, then code for it must have
+** already been generated using the exprCodeSubselect() routine. In this
+** case parameter regSelect should be the first in an array of registers
+** containing the results of the sub-select.
+**
+** If pVector is of type TK_VECTOR, then code for the requested field
+** is generated. In this case (*pRegFree) may be set to the number of
+** a temporary register to be freed by the caller before returning.
+**
+** Before returning, output parameter (*ppExpr) is set to point to the
+** Expr object corresponding to element iElem of the vector.
+*/
+static int exprVectorRegister(
+  Parse *pParse,                  /* Parse context */
+  Expr *pVector,                  /* Vector to extract element from */
+  int iField,                     /* Field to extract from pVector */
+  int regSelect,                  /* First in array of registers */
+  Expr **ppExpr,                  /* OUT: Expression element */
+  in
