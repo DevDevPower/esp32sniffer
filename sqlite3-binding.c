@@ -103867,4 +103867,210 @@ SQLITE_PRIVATE CollSeq *sqlite3ExprCollSeq(Parse *pParse, const Expr *pExpr){
         p = p->pLeft;
       }else{
         Expr *pNext  = p->pRight;
-        /* The Expr.
+        /* The Expr.x union is never used at the same time as Expr.pRight */
+        assert( ExprUseXList(p) );
+        assert( p->x.pList==0 || p->pRight==0 );
+        if( p->x.pList!=0 && !db->mallocFailed ){
+          int i;
+          for(i=0; ALWAYS(i<p->x.pList->nExpr); i++){
+            if( ExprHasProperty(p->x.pList->a[i].pExpr, EP_Collate) ){
+              pNext = p->x.pList->a[i].pExpr;
+              break;
+            }
+          }
+        }
+        p = pNext;
+      }
+    }else{
+      break;
+    }
+  }
+  if( sqlite3CheckCollSeq(pParse, pColl) ){
+    pColl = 0;
+  }
+  return pColl;
+}
+
+/*
+** Return the collation sequence for the expression pExpr. If
+** there is no defined collating sequence, return a pointer to the
+** defautl collation sequence.
+**
+** See also: sqlite3ExprCollSeq()
+**
+** The sqlite3ExprCollSeq() routine works the same except that it
+** returns NULL if there is no defined collation.
+*/
+SQLITE_PRIVATE CollSeq *sqlite3ExprNNCollSeq(Parse *pParse, const Expr *pExpr){
+  CollSeq *p = sqlite3ExprCollSeq(pParse, pExpr);
+  if( p==0 ) p = pParse->db->pDfltColl;
+  assert( p!=0 );
+  return p;
+}
+
+/*
+** Return TRUE if the two expressions have equivalent collating sequences.
+*/
+SQLITE_PRIVATE int sqlite3ExprCollSeqMatch(Parse *pParse, const Expr *pE1, const Expr *pE2){
+  CollSeq *pColl1 = sqlite3ExprNNCollSeq(pParse, pE1);
+  CollSeq *pColl2 = sqlite3ExprNNCollSeq(pParse, pE2);
+  return sqlite3StrICmp(pColl1->zName, pColl2->zName)==0;
+}
+
+/*
+** pExpr is an operand of a comparison operator.  aff2 is the
+** type affinity of the other operand.  This routine returns the
+** type affinity that should be used for the comparison operator.
+*/
+SQLITE_PRIVATE char sqlite3CompareAffinity(const Expr *pExpr, char aff2){
+  char aff1 = sqlite3ExprAffinity(pExpr);
+  if( aff1>SQLITE_AFF_NONE && aff2>SQLITE_AFF_NONE ){
+    /* Both sides of the comparison are columns. If one has numeric
+    ** affinity, use that. Otherwise use no affinity.
+    */
+    if( sqlite3IsNumericAffinity(aff1) || sqlite3IsNumericAffinity(aff2) ){
+      return SQLITE_AFF_NUMERIC;
+    }else{
+      return SQLITE_AFF_BLOB;
+    }
+  }else{
+    /* One side is a column, the other is not. Use the columns affinity. */
+    assert( aff1<=SQLITE_AFF_NONE || aff2<=SQLITE_AFF_NONE );
+    return (aff1<=SQLITE_AFF_NONE ? aff2 : aff1) | SQLITE_AFF_NONE;
+  }
+}
+
+/*
+** pExpr is a comparison operator.  Return the type affinity that should
+** be applied to both operands prior to doing the comparison.
+*/
+static char comparisonAffinity(const Expr *pExpr){
+  char aff;
+  assert( pExpr->op==TK_EQ || pExpr->op==TK_IN || pExpr->op==TK_LT ||
+          pExpr->op==TK_GT || pExpr->op==TK_GE || pExpr->op==TK_LE ||
+          pExpr->op==TK_NE || pExpr->op==TK_IS || pExpr->op==TK_ISNOT );
+  assert( pExpr->pLeft );
+  aff = sqlite3ExprAffinity(pExpr->pLeft);
+  if( pExpr->pRight ){
+    aff = sqlite3CompareAffinity(pExpr->pRight, aff);
+  }else if( ExprUseXSelect(pExpr) ){
+    aff = sqlite3CompareAffinity(pExpr->x.pSelect->pEList->a[0].pExpr, aff);
+  }else if( aff==0 ){
+    aff = SQLITE_AFF_BLOB;
+  }
+  return aff;
+}
+
+/*
+** pExpr is a comparison expression, eg. '=', '<', IN(...) etc.
+** idx_affinity is the affinity of an indexed column. Return true
+** if the index with affinity idx_affinity may be used to implement
+** the comparison in pExpr.
+*/
+SQLITE_PRIVATE int sqlite3IndexAffinityOk(const Expr *pExpr, char idx_affinity){
+  char aff = comparisonAffinity(pExpr);
+  if( aff<SQLITE_AFF_TEXT ){
+    return 1;
+  }
+  if( aff==SQLITE_AFF_TEXT ){
+    return idx_affinity==SQLITE_AFF_TEXT;
+  }
+  return sqlite3IsNumericAffinity(idx_affinity);
+}
+
+/*
+** Return the P5 value that should be used for a binary comparison
+** opcode (OP_Eq, OP_Ge etc.) used to compare pExpr1 and pExpr2.
+*/
+static u8 binaryCompareP5(
+  const Expr *pExpr1,   /* Left operand */
+  const Expr *pExpr2,   /* Right operand */
+  int jumpIfNull        /* Extra flags added to P5 */
+){
+  u8 aff = (char)sqlite3ExprAffinity(pExpr2);
+  aff = (u8)sqlite3CompareAffinity(pExpr1, aff) | (u8)jumpIfNull;
+  return aff;
+}
+
+/*
+** Return a pointer to the collation sequence that should be used by
+** a binary comparison operator comparing pLeft and pRight.
+**
+** If the left hand expression has a collating sequence type, then it is
+** used. Otherwise the collation sequence for the right hand expression
+** is used, or the default (BINARY) if neither expression has a collating
+** type.
+**
+** Argument pRight (but not pLeft) may be a null pointer. In this case,
+** it is not considered.
+*/
+SQLITE_PRIVATE CollSeq *sqlite3BinaryCompareCollSeq(
+  Parse *pParse,
+  const Expr *pLeft,
+  const Expr *pRight
+){
+  CollSeq *pColl;
+  assert( pLeft );
+  if( pLeft->flags & EP_Collate ){
+    pColl = sqlite3ExprCollSeq(pParse, pLeft);
+  }else if( pRight && (pRight->flags & EP_Collate)!=0 ){
+    pColl = sqlite3ExprCollSeq(pParse, pRight);
+  }else{
+    pColl = sqlite3ExprCollSeq(pParse, pLeft);
+    if( !pColl ){
+      pColl = sqlite3ExprCollSeq(pParse, pRight);
+    }
+  }
+  return pColl;
+}
+
+/* Expresssion p is a comparison operator.  Return a collation sequence
+** appropriate for the comparison operator.
+**
+** This is normally just a wrapper around sqlite3BinaryCompareCollSeq().
+** However, if the OP_Commuted flag is set, then the order of the operands
+** is reversed in the sqlite3BinaryCompareCollSeq() call so that the
+** correct collating sequence is found.
+*/
+SQLITE_PRIVATE CollSeq *sqlite3ExprCompareCollSeq(Parse *pParse, const Expr *p){
+  if( ExprHasProperty(p, EP_Commuted) ){
+    return sqlite3BinaryCompareCollSeq(pParse, p->pRight, p->pLeft);
+  }else{
+    return sqlite3BinaryCompareCollSeq(pParse, p->pLeft, p->pRight);
+  }
+}
+
+/*
+** Generate code for a comparison operator.
+*/
+static int codeCompare(
+  Parse *pParse,    /* The parsing (and code generating) context */
+  Expr *pLeft,      /* The left operand */
+  Expr *pRight,     /* The right operand */
+  int opcode,       /* The comparison opcode */
+  int in1, int in2, /* Register holding operands */
+  int dest,         /* Jump here if true.  */
+  int jumpIfNull,   /* If true, jump if either operand is NULL */
+  int isCommuted    /* The comparison has been commuted */
+){
+  int p5;
+  int addr;
+  CollSeq *p4;
+
+  if( pParse->nErr ) return 0;
+  if( isCommuted ){
+    p4 = sqlite3BinaryCompareCollSeq(pParse, pRight, pLeft);
+  }else{
+    p4 = sqlite3BinaryCompareCollSeq(pParse, pLeft, pRight);
+  }
+  p5 = binaryCompareP5(pLeft, pRight, jumpIfNull);
+  addr = sqlite3VdbeAddOp4(pParse->pVdbe, opcode, in2, dest, in1,
+                           (void*)p4, P4_COLLSEQ);
+  sqlite3VdbeChangeP5(pParse->pVdbe, (u8)p5);
+  return addr;
+}
+
+/*
+** Return true if expression pExpr is a vector, or false otherwise.
+**
+** A vector is defined as an
