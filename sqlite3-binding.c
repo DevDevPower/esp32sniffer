@@ -104244,4 +104244,202 @@ static int exprVectorRegister(
   int iField,                     /* Field to extract from pVector */
   int regSelect,                  /* First in array of registers */
   Expr **ppExpr,                  /* OUT: Expression element */
-  in
+  int *pRegFree                   /* OUT: Temp register to free */
+){
+  u8 op = pVector->op;
+  assert( op==TK_VECTOR || op==TK_REGISTER || op==TK_SELECT || op==TK_ERROR );
+  if( op==TK_REGISTER ){
+    *ppExpr = sqlite3VectorFieldSubexpr(pVector, iField);
+    return pVector->iTable+iField;
+  }
+  if( op==TK_SELECT ){
+    assert( ExprUseXSelect(pVector) );
+    *ppExpr = pVector->x.pSelect->pEList->a[iField].pExpr;
+     return regSelect+iField;
+  }
+  if( op==TK_VECTOR ){
+    assert( ExprUseXList(pVector) );
+    *ppExpr = pVector->x.pList->a[iField].pExpr;
+    return sqlite3ExprCodeTemp(pParse, *ppExpr, pRegFree);
+  }
+  return 0;
+}
+
+/*
+** Expression pExpr is a comparison between two vector values. Compute
+** the result of the comparison (1, 0, or NULL) and write that
+** result into register dest.
+**
+** The caller must satisfy the following preconditions:
+**
+**    if pExpr->op==TK_IS:      op==TK_EQ and p5==SQLITE_NULLEQ
+**    if pExpr->op==TK_ISNOT:   op==TK_NE and p5==SQLITE_NULLEQ
+**    otherwise:                op==pExpr->op and p5==0
+*/
+static void codeVectorCompare(
+  Parse *pParse,        /* Code generator context */
+  Expr *pExpr,          /* The comparison operation */
+  int dest,             /* Write results into this register */
+  u8 op,                /* Comparison operator */
+  u8 p5                 /* SQLITE_NULLEQ or zero */
+){
+  Vdbe *v = pParse->pVdbe;
+  Expr *pLeft = pExpr->pLeft;
+  Expr *pRight = pExpr->pRight;
+  int nLeft = sqlite3ExprVectorSize(pLeft);
+  int i;
+  int regLeft = 0;
+  int regRight = 0;
+  u8 opx = op;
+  int addrCmp = 0;
+  int addrDone = sqlite3VdbeMakeLabel(pParse);
+  int isCommuted = ExprHasProperty(pExpr,EP_Commuted);
+
+  assert( !ExprHasVVAProperty(pExpr,EP_Immutable) );
+  if( pParse->nErr ) return;
+  if( nLeft!=sqlite3ExprVectorSize(pRight) ){
+    sqlite3ErrorMsg(pParse, "row value misused");
+    return;
+  }
+  assert( pExpr->op==TK_EQ || pExpr->op==TK_NE
+       || pExpr->op==TK_IS || pExpr->op==TK_ISNOT
+       || pExpr->op==TK_LT || pExpr->op==TK_GT
+       || pExpr->op==TK_LE || pExpr->op==TK_GE
+  );
+  assert( pExpr->op==op || (pExpr->op==TK_IS && op==TK_EQ)
+            || (pExpr->op==TK_ISNOT && op==TK_NE) );
+  assert( p5==0 || pExpr->op!=op );
+  assert( p5==SQLITE_NULLEQ || pExpr->op==op );
+
+  if( op==TK_LE ) opx = TK_LT;
+  if( op==TK_GE ) opx = TK_GT;
+  if( op==TK_NE ) opx = TK_EQ;
+
+  regLeft = exprCodeSubselect(pParse, pLeft);
+  regRight = exprCodeSubselect(pParse, pRight);
+
+  sqlite3VdbeAddOp2(v, OP_Integer, 1, dest);
+  for(i=0; 1 /*Loop exits by "break"*/; i++){
+    int regFree1 = 0, regFree2 = 0;
+    Expr *pL = 0, *pR = 0;
+    int r1, r2;
+    assert( i>=0 && i<nLeft );
+    if( addrCmp ) sqlite3VdbeJumpHere(v, addrCmp);
+    r1 = exprVectorRegister(pParse, pLeft, i, regLeft, &pL, &regFree1);
+    r2 = exprVectorRegister(pParse, pRight, i, regRight, &pR, &regFree2);
+    addrCmp = sqlite3VdbeCurrentAddr(v);
+    codeCompare(pParse, pL, pR, opx, r1, r2, addrDone, p5, isCommuted);
+    testcase(op==OP_Lt); VdbeCoverageIf(v,op==OP_Lt);
+    testcase(op==OP_Le); VdbeCoverageIf(v,op==OP_Le);
+    testcase(op==OP_Gt); VdbeCoverageIf(v,op==OP_Gt);
+    testcase(op==OP_Ge); VdbeCoverageIf(v,op==OP_Ge);
+    testcase(op==OP_Eq); VdbeCoverageIf(v,op==OP_Eq);
+    testcase(op==OP_Ne); VdbeCoverageIf(v,op==OP_Ne);
+    sqlite3ReleaseTempReg(pParse, regFree1);
+    sqlite3ReleaseTempReg(pParse, regFree2);
+    if( (opx==TK_LT || opx==TK_GT) && i<nLeft-1 ){
+      addrCmp = sqlite3VdbeAddOp0(v, OP_ElseEq);
+      testcase(opx==TK_LT); VdbeCoverageIf(v,opx==TK_LT);
+      testcase(opx==TK_GT); VdbeCoverageIf(v,opx==TK_GT);
+    }
+    if( p5==SQLITE_NULLEQ ){
+      sqlite3VdbeAddOp2(v, OP_Integer, 0, dest);
+    }else{
+      sqlite3VdbeAddOp3(v, OP_ZeroOrNull, r1, dest, r2);
+    }
+    if( i==nLeft-1 ){
+      break;
+    }
+    if( opx==TK_EQ ){
+      sqlite3VdbeAddOp2(v, OP_NotNull, dest, addrDone); VdbeCoverage(v);
+    }else{
+      assert( op==TK_LT || op==TK_GT || op==TK_LE || op==TK_GE );
+      sqlite3VdbeAddOp2(v, OP_Goto, 0, addrDone);
+      if( i==nLeft-2 ) opx = op;
+    }
+  }
+  sqlite3VdbeJumpHere(v, addrCmp);
+  sqlite3VdbeResolveLabel(v, addrDone);
+  if( op==TK_NE ){
+    sqlite3VdbeAddOp2(v, OP_Not, dest, dest);
+  }
+}
+
+#if SQLITE_MAX_EXPR_DEPTH>0
+/*
+** Check that argument nHeight is less than or equal to the maximum
+** expression depth allowed. If it is not, leave an error message in
+** pParse.
+*/
+SQLITE_PRIVATE int sqlite3ExprCheckHeight(Parse *pParse, int nHeight){
+  int rc = SQLITE_OK;
+  int mxHeight = pParse->db->aLimit[SQLITE_LIMIT_EXPR_DEPTH];
+  if( nHeight>mxHeight ){
+    sqlite3ErrorMsg(pParse,
+       "Expression tree is too large (maximum depth %d)", mxHeight
+    );
+    rc = SQLITE_ERROR;
+  }
+  return rc;
+}
+
+/* The following three functions, heightOfExpr(), heightOfExprList()
+** and heightOfSelect(), are used to determine the maximum height
+** of any expression tree referenced by the structure passed as the
+** first argument.
+**
+** If this maximum height is greater than the current value pointed
+** to by pnHeight, the second parameter, then set *pnHeight to that
+** value.
+*/
+static void heightOfExpr(const Expr *p, int *pnHeight){
+  if( p ){
+    if( p->nHeight>*pnHeight ){
+      *pnHeight = p->nHeight;
+    }
+  }
+}
+static void heightOfExprList(const ExprList *p, int *pnHeight){
+  if( p ){
+    int i;
+    for(i=0; i<p->nExpr; i++){
+      heightOfExpr(p->a[i].pExpr, pnHeight);
+    }
+  }
+}
+static void heightOfSelect(const Select *pSelect, int *pnHeight){
+  const Select *p;
+  for(p=pSelect; p; p=p->pPrior){
+    heightOfExpr(p->pWhere, pnHeight);
+    heightOfExpr(p->pHaving, pnHeight);
+    heightOfExpr(p->pLimit, pnHeight);
+    heightOfExprList(p->pEList, pnHeight);
+    heightOfExprList(p->pGroupBy, pnHeight);
+    heightOfExprList(p->pOrderBy, pnHeight);
+  }
+}
+
+/*
+** Set the Expr.nHeight variable in the structure passed as an
+** argument. An expression with no children, Expr.pList or
+** Expr.pSelect member has a height of 1. Any other expression
+** has a height equal to the maximum height of any other
+** referenced Expr plus one.
+**
+** Also propagate EP_Propagate flags up from Expr.x.pList to Expr.flags,
+** if appropriate.
+*/
+static void exprSetHeight(Expr *p){
+  int nHeight = p->pLeft ? p->pLeft->nHeight : 0;
+  if( p->pRight && p->pRight->nHeight>nHeight ) nHeight = p->pRight->nHeight;
+  if( ExprUseXSelect(p) ){
+    heightOfSelect(p->x.pSelect, &nHeight);
+  }else if( p->x.pList ){
+    heightOfExprList(p->x.pList, &nHeight);
+    p->flags |= EP_Propagate & sqlite3ExprListFlags(p->x.pList);
+  }
+  p->nHeight = nHeight + 1;
+}
+
+/*
+** Set the Expr.nHeight variable using the exprSetH
