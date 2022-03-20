@@ -103473,4 +103473,188 @@ static int resolveSelectStep(Walker *pWalker, Select *p){
 ** To resolve result-set references, look for expression nodes of the
 ** form Z (with no X and Y prefix) where the Z matches the right-hand
 ** size of an AS clause in the result-set of a SELECT.  The Z expression
-** is replaced by a copy of the left-hand side of the result-set expressio
+** is replaced by a copy of the left-hand side of the result-set expression.
+** Table-name and function resolution occurs on the substituted expression
+** tree.  For example, in:
+**
+**      SELECT a+b AS x, c+d AS y FROM t1 ORDER BY x;
+**
+** The "x" term of the order by is replaced by "a+b" to render:
+**
+**      SELECT a+b AS x, c+d AS y FROM t1 ORDER BY a+b;
+**
+** Function calls are checked to make sure that the function is
+** defined and that the correct number of arguments are specified.
+** If the function is an aggregate function, then the NC_HasAgg flag is
+** set and the opcode is changed from TK_FUNCTION to TK_AGG_FUNCTION.
+** If an expression contains aggregate functions then the EP_Agg
+** property on the expression is set.
+**
+** An error message is left in pParse if anything is amiss.  The number
+** if errors is returned.
+*/
+SQLITE_PRIVATE int sqlite3ResolveExprNames(
+  NameContext *pNC,       /* Namespace to resolve expressions in. */
+  Expr *pExpr             /* The expression to be analyzed. */
+){
+  int savedHasAgg;
+  Walker w;
+
+  if( pExpr==0 ) return SQLITE_OK;
+  savedHasAgg = pNC->ncFlags & (NC_HasAgg|NC_MinMaxAgg|NC_HasWin|NC_OrderAgg);
+  pNC->ncFlags &= ~(NC_HasAgg|NC_MinMaxAgg|NC_HasWin|NC_OrderAgg);
+  w.pParse = pNC->pParse;
+  w.xExprCallback = resolveExprStep;
+  w.xSelectCallback = (pNC->ncFlags & NC_NoSelect) ? 0 : resolveSelectStep;
+  w.xSelectCallback2 = 0;
+  w.u.pNC = pNC;
+#if SQLITE_MAX_EXPR_DEPTH>0
+  w.pParse->nHeight += pExpr->nHeight;
+  if( sqlite3ExprCheckHeight(w.pParse, w.pParse->nHeight) ){
+    return SQLITE_ERROR;
+  }
+#endif
+  sqlite3WalkExpr(&w, pExpr);
+#if SQLITE_MAX_EXPR_DEPTH>0
+  w.pParse->nHeight -= pExpr->nHeight;
+#endif
+  assert( EP_Agg==NC_HasAgg );
+  assert( EP_Win==NC_HasWin );
+  testcase( pNC->ncFlags & NC_HasAgg );
+  testcase( pNC->ncFlags & NC_HasWin );
+  ExprSetProperty(pExpr, pNC->ncFlags & (NC_HasAgg|NC_HasWin) );
+  pNC->ncFlags |= savedHasAgg;
+  return pNC->nNcErr>0 || w.pParse->nErr>0;
+}
+
+/*
+** Resolve all names for all expression in an expression list.  This is
+** just like sqlite3ResolveExprNames() except that it works for an expression
+** list rather than a single expression.
+*/
+SQLITE_PRIVATE int sqlite3ResolveExprListNames(
+  NameContext *pNC,       /* Namespace to resolve expressions in. */
+  ExprList *pList         /* The expression list to be analyzed. */
+){
+  int i;
+  int savedHasAgg = 0;
+  Walker w;
+  if( pList==0 ) return WRC_Continue;
+  w.pParse = pNC->pParse;
+  w.xExprCallback = resolveExprStep;
+  w.xSelectCallback = resolveSelectStep;
+  w.xSelectCallback2 = 0;
+  w.u.pNC = pNC;
+  savedHasAgg = pNC->ncFlags & (NC_HasAgg|NC_MinMaxAgg|NC_HasWin|NC_OrderAgg);
+  pNC->ncFlags &= ~(NC_HasAgg|NC_MinMaxAgg|NC_HasWin|NC_OrderAgg);
+  for(i=0; i<pList->nExpr; i++){
+    Expr *pExpr = pList->a[i].pExpr;
+    if( pExpr==0 ) continue;
+#if SQLITE_MAX_EXPR_DEPTH>0
+    w.pParse->nHeight += pExpr->nHeight;
+    if( sqlite3ExprCheckHeight(w.pParse, w.pParse->nHeight) ){
+      return WRC_Abort;
+    }
+#endif
+    sqlite3WalkExpr(&w, pExpr);
+#if SQLITE_MAX_EXPR_DEPTH>0
+    w.pParse->nHeight -= pExpr->nHeight;
+#endif
+    assert( EP_Agg==NC_HasAgg );
+    assert( EP_Win==NC_HasWin );
+    testcase( pNC->ncFlags & NC_HasAgg );
+    testcase( pNC->ncFlags & NC_HasWin );
+    if( pNC->ncFlags & (NC_HasAgg|NC_MinMaxAgg|NC_HasWin|NC_OrderAgg) ){
+      ExprSetProperty(pExpr, pNC->ncFlags & (NC_HasAgg|NC_HasWin) );
+      savedHasAgg |= pNC->ncFlags &
+                          (NC_HasAgg|NC_MinMaxAgg|NC_HasWin|NC_OrderAgg);
+      pNC->ncFlags &= ~(NC_HasAgg|NC_MinMaxAgg|NC_HasWin|NC_OrderAgg);
+    }
+    if( w.pParse->nErr>0 ) return WRC_Abort;
+  }
+  pNC->ncFlags |= savedHasAgg;
+  return WRC_Continue;
+}
+
+/*
+** Resolve all names in all expressions of a SELECT and in all
+** decendents of the SELECT, including compounds off of p->pPrior,
+** subqueries in expressions, and subqueries used as FROM clause
+** terms.
+**
+** See sqlite3ResolveExprNames() for a description of the kinds of
+** transformations that occur.
+**
+** All SELECT statements should have been expanded using
+** sqlite3SelectExpand() prior to invoking this routine.
+*/
+SQLITE_PRIVATE void sqlite3ResolveSelectNames(
+  Parse *pParse,         /* The parser context */
+  Select *p,             /* The SELECT statement being coded. */
+  NameContext *pOuterNC  /* Name context for parent SELECT statement */
+){
+  Walker w;
+
+  assert( p!=0 );
+  w.xExprCallback = resolveExprStep;
+  w.xSelectCallback = resolveSelectStep;
+  w.xSelectCallback2 = 0;
+  w.pParse = pParse;
+  w.u.pNC = pOuterNC;
+  sqlite3WalkSelect(&w, p);
+}
+
+/*
+** Resolve names in expressions that can only reference a single table
+** or which cannot reference any tables at all.  Examples:
+**
+**                                                    "type" flag
+**                                                    ------------
+**    (1)   CHECK constraints                         NC_IsCheck
+**    (2)   WHERE clauses on partial indices          NC_PartIdx
+**    (3)   Expressions in indexes on expressions     NC_IdxExpr
+**    (4)   Expression arguments to VACUUM INTO.      0
+**    (5)   GENERATED ALWAYS as expressions           NC_GenCol
+**
+** In all cases except (4), the Expr.iTable value for Expr.op==TK_COLUMN
+** nodes of the expression is set to -1 and the Expr.iColumn value is
+** set to the column number.  In case (4), TK_COLUMN nodes cause an error.
+**
+** Any errors cause an error message to be set in pParse.
+*/
+SQLITE_PRIVATE int sqlite3ResolveSelfReference(
+  Parse *pParse,   /* Parsing context */
+  Table *pTab,     /* The table being referenced, or NULL */
+  int type,        /* NC_IsCheck, NC_PartIdx, NC_IdxExpr, NC_GenCol, or 0 */
+  Expr *pExpr,     /* Expression to resolve.  May be NULL. */
+  ExprList *pList  /* Expression list to resolve.  May be NULL. */
+){
+  SrcList sSrc;                   /* Fake SrcList for pParse->pNewTable */
+  NameContext sNC;                /* Name context for pParse->pNewTable */
+  int rc;
+
+  assert( type==0 || pTab!=0 );
+  assert( type==NC_IsCheck || type==NC_PartIdx || type==NC_IdxExpr
+          || type==NC_GenCol || pTab==0 );
+  memset(&sNC, 0, sizeof(sNC));
+  memset(&sSrc, 0, sizeof(sSrc));
+  if( pTab ){
+    sSrc.nSrc = 1;
+    sSrc.a[0].zName = pTab->zName;
+    sSrc.a[0].pTab = pTab;
+    sSrc.a[0].iCursor = -1;
+    if( pTab->pSchema!=pParse->db->aDb[1].pSchema ){
+      /* Cause EP_FromDDL to be set on TK_FUNCTION nodes of non-TEMP
+      ** schema elements */
+      type |= NC_FromDDL;
+    }
+  }
+  sNC.pParse = pParse;
+  sNC.pSrcList = &sSrc;
+  sNC.ncFlags = type | NC_IsDDL;
+  if( (rc = sqlite3ResolveExprNames(&sNC, pExpr))!=SQLITE_OK ) return rc;
+  if( pList ) rc = sqlite3ResolveExprListNames(&sNC, pList);
+  return rc;
+}
+
+/************** End of resolve.c ******************************
