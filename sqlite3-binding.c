@@ -104654,4 +104654,207 @@ SQLITE_PRIVATE Select *sqlite3ExprListToValues(Parse *pParse, int nElem, ExprLis
   assert( nElem>1 );
   for(ii=0; ii<pEList->nExpr; ii++){
     Select *pSel;
-    Expr *pExpr = pEList->a
+    Expr *pExpr = pEList->a[ii].pExpr;
+    int nExprElem;
+    if( pExpr->op==TK_VECTOR ){
+      assert( ExprUseXList(pExpr) );
+      nExprElem = pExpr->x.pList->nExpr;
+    }else{
+      nExprElem = 1;
+    }
+    if( nExprElem!=nElem ){
+      sqlite3ErrorMsg(pParse, "IN(...) element has %d term%s - expected %d",
+          nExprElem, nExprElem>1?"s":"", nElem
+      );
+      break;
+    }
+    assert( ExprUseXList(pExpr) );
+    pSel = sqlite3SelectNew(pParse, pExpr->x.pList, 0, 0, 0, 0, 0, SF_Values,0);
+    pExpr->x.pList = 0;
+    if( pSel ){
+      if( pRet ){
+        pSel->op = TK_ALL;
+        pSel->pPrior = pRet;
+      }
+      pRet = pSel;
+    }
+  }
+
+  if( pRet && pRet->pPrior ){
+    pRet->selFlags |= SF_MultiValue;
+  }
+  sqlite3ExprListDelete(pParse->db, pEList);
+  return pRet;
+}
+
+/*
+** Join two expressions using an AND operator.  If either expression is
+** NULL, then just return the other expression.
+**
+** If one side or the other of the AND is known to be false, then instead
+** of returning an AND expression, just return a constant expression with
+** a value of false.
+*/
+SQLITE_PRIVATE Expr *sqlite3ExprAnd(Parse *pParse, Expr *pLeft, Expr *pRight){
+  sqlite3 *db = pParse->db;
+  if( pLeft==0  ){
+    return pRight;
+  }else if( pRight==0 ){
+    return pLeft;
+  }else if( (ExprAlwaysFalse(pLeft) || ExprAlwaysFalse(pRight))
+         && !IN_RENAME_OBJECT
+  ){
+    sqlite3ExprDeferredDelete(pParse, pLeft);
+    sqlite3ExprDeferredDelete(pParse, pRight);
+    return sqlite3Expr(db, TK_INTEGER, "0");
+  }else{
+    return sqlite3PExpr(pParse, TK_AND, pLeft, pRight);
+  }
+}
+
+/*
+** Construct a new expression node for a function with multiple
+** arguments.
+*/
+SQLITE_PRIVATE Expr *sqlite3ExprFunction(
+  Parse *pParse,        /* Parsing context */
+  ExprList *pList,      /* Argument list */
+  const Token *pToken,  /* Name of the function */
+  int eDistinct         /* SF_Distinct or SF_ALL or 0 */
+){
+  Expr *pNew;
+  sqlite3 *db = pParse->db;
+  assert( pToken );
+  pNew = sqlite3ExprAlloc(db, TK_FUNCTION, pToken, 1);
+  if( pNew==0 ){
+    sqlite3ExprListDelete(db, pList); /* Avoid memory leak when malloc fails */
+    return 0;
+  }
+  assert( !ExprHasProperty(pNew, EP_InnerON|EP_OuterON) );
+  pNew->w.iOfst = (int)(pToken->z - pParse->zTail);
+  if( pList
+   && pList->nExpr > pParse->db->aLimit[SQLITE_LIMIT_FUNCTION_ARG]
+   && !pParse->nested
+  ){
+    sqlite3ErrorMsg(pParse, "too many arguments on function %T", pToken);
+  }
+  pNew->x.pList = pList;
+  ExprSetProperty(pNew, EP_HasFunc);
+  assert( ExprUseXList(pNew) );
+  sqlite3ExprSetHeightAndFlags(pParse, pNew);
+  if( eDistinct==SF_Distinct ) ExprSetProperty(pNew, EP_Distinct);
+  return pNew;
+}
+
+/*
+** Check to see if a function is usable according to current access
+** rules:
+**
+**    SQLITE_FUNC_DIRECT    -     Only usable from top-level SQL
+**
+**    SQLITE_FUNC_UNSAFE    -     Usable if TRUSTED_SCHEMA or from
+**                                top-level SQL
+**
+** If the function is not usable, create an error.
+*/
+SQLITE_PRIVATE void sqlite3ExprFunctionUsable(
+  Parse *pParse,         /* Parsing and code generating context */
+  const Expr *pExpr,     /* The function invocation */
+  const FuncDef *pDef    /* The function being invoked */
+){
+  assert( !IN_RENAME_OBJECT );
+  assert( (pDef->funcFlags & (SQLITE_FUNC_DIRECT|SQLITE_FUNC_UNSAFE))!=0 );
+  if( ExprHasProperty(pExpr, EP_FromDDL) ){
+    if( (pDef->funcFlags & SQLITE_FUNC_DIRECT)!=0
+     || (pParse->db->flags & SQLITE_TrustedSchema)==0
+    ){
+      /* Functions prohibited in triggers and views if:
+      **     (1) tagged with SQLITE_DIRECTONLY
+      **     (2) not tagged with SQLITE_INNOCUOUS (which means it
+      **         is tagged with SQLITE_FUNC_UNSAFE) and
+      **         SQLITE_DBCONFIG_TRUSTED_SCHEMA is off (meaning
+      **         that the schema is possibly tainted).
+      */
+      sqlite3ErrorMsg(pParse, "unsafe use of %#T()", pExpr);
+    }
+  }
+}
+
+/*
+** Assign a variable number to an expression that encodes a wildcard
+** in the original SQL statement.
+**
+** Wildcards consisting of a single "?" are assigned the next sequential
+** variable number.
+**
+** Wildcards of the form "?nnn" are assigned the number "nnn".  We make
+** sure "nnn" is not too big to avoid a denial of service attack when
+** the SQL statement comes from an external source.
+**
+** Wildcards of the form ":aaa", "@aaa", or "$aaa" are assigned the same number
+** as the previous instance of the same wildcard.  Or if this is the first
+** instance of the wildcard, the next sequential variable number is
+** assigned.
+*/
+SQLITE_PRIVATE void sqlite3ExprAssignVarNumber(Parse *pParse, Expr *pExpr, u32 n){
+  sqlite3 *db = pParse->db;
+  const char *z;
+  ynVar x;
+
+  if( pExpr==0 ) return;
+  assert( !ExprHasProperty(pExpr, EP_IntValue|EP_Reduced|EP_TokenOnly) );
+  z = pExpr->u.zToken;
+  assert( z!=0 );
+  assert( z[0]!=0 );
+  assert( n==(u32)sqlite3Strlen30(z) );
+  if( z[1]==0 ){
+    /* Wildcard of the form "?".  Assign the next variable number */
+    assert( z[0]=='?' );
+    x = (ynVar)(++pParse->nVar);
+  }else{
+    int doAdd = 0;
+    if( z[0]=='?' ){
+      /* Wildcard of the form "?nnn".  Convert "nnn" to an integer and
+      ** use it as the variable number */
+      i64 i;
+      int bOk;
+      if( n==2 ){ /*OPTIMIZATION-IF-TRUE*/
+        i = z[1]-'0';  /* The common case of ?N for a single digit N */
+        bOk = 1;
+      }else{
+        bOk = 0==sqlite3Atoi64(&z[1], &i, n-1, SQLITE_UTF8);
+      }
+      testcase( i==0 );
+      testcase( i==1 );
+      testcase( i==db->aLimit[SQLITE_LIMIT_VARIABLE_NUMBER]-1 );
+      testcase( i==db->aLimit[SQLITE_LIMIT_VARIABLE_NUMBER] );
+      if( bOk==0 || i<1 || i>db->aLimit[SQLITE_LIMIT_VARIABLE_NUMBER] ){
+        sqlite3ErrorMsg(pParse, "variable number must be between ?1 and ?%d",
+            db->aLimit[SQLITE_LIMIT_VARIABLE_NUMBER]);
+        sqlite3RecordErrorOffsetOfExpr(pParse->db, pExpr);
+        return;
+      }
+      x = (ynVar)i;
+      if( x>pParse->nVar ){
+        pParse->nVar = (int)x;
+        doAdd = 1;
+      }else if( sqlite3VListNumToName(pParse->pVList, x)==0 ){
+        doAdd = 1;
+      }
+    }else{
+      /* Wildcards like ":aaa", "$aaa" or "@aaa".  Reuse the same variable
+      ** number as the prior appearance of the same name, or if the name
+      ** has never appeared before, reuse the same variable number
+      */
+      x = (ynVar)sqlite3VListNameToNum(pParse->pVList, z, n);
+      if( x==0 ){
+        x = (ynVar)(++pParse->nVar);
+        doAdd = 1;
+      }
+    }
+    if( doAdd ){
+      pParse->pVList = sqlite3VListAdd(db, pParse->pVList, z, n, x);
+    }
+  }
+  pExpr->iColumn = x;
+  if( x>db->aLimit[SQLITE_LIMIT_VARIABLE_NUMBER]
