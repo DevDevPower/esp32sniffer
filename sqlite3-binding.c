@@ -105629,4 +105629,210 @@ SQLITE_PRIVATE void sqlite3ExprListSetName(
     assert( pItem->fg.eEName==ENAME_NAME );
     pItem->zEName = sqlite3DbStrNDup(pParse->db, pName->z, pName->n);
     if( dequote ){
-      /* If dequote==0, then pName->z does not po
+      /* If dequote==0, then pName->z does not point to part of a DDL
+      ** statement handled by the parser. And so no token need be added
+      ** to the token-map.  */
+      sqlite3Dequote(pItem->zEName);
+      if( IN_RENAME_OBJECT ){
+        sqlite3RenameTokenMap(pParse, (const void*)pItem->zEName, pName);
+      }
+    }
+  }
+}
+
+/*
+** Set the ExprList.a[].zSpan element of the most recently added item
+** on the expression list.
+**
+** pList might be NULL following an OOM error.  But pSpan should never be
+** NULL.  If a memory allocation fails, the pParse->db->mallocFailed flag
+** is set.
+*/
+SQLITE_PRIVATE void sqlite3ExprListSetSpan(
+  Parse *pParse,          /* Parsing context */
+  ExprList *pList,        /* List to which to add the span. */
+  const char *zStart,     /* Start of the span */
+  const char *zEnd        /* End of the span */
+){
+  sqlite3 *db = pParse->db;
+  assert( pList!=0 || db->mallocFailed!=0 );
+  if( pList ){
+    struct ExprList_item *pItem = &pList->a[pList->nExpr-1];
+    assert( pList->nExpr>0 );
+    if( pItem->zEName==0 ){
+      pItem->zEName = sqlite3DbSpanDup(db, zStart, zEnd);
+      pItem->fg.eEName = ENAME_SPAN;
+    }
+  }
+}
+
+/*
+** If the expression list pEList contains more than iLimit elements,
+** leave an error message in pParse.
+*/
+SQLITE_PRIVATE void sqlite3ExprListCheckLength(
+  Parse *pParse,
+  ExprList *pEList,
+  const char *zObject
+){
+  int mx = pParse->db->aLimit[SQLITE_LIMIT_COLUMN];
+  testcase( pEList && pEList->nExpr==mx );
+  testcase( pEList && pEList->nExpr==mx+1 );
+  if( pEList && pEList->nExpr>mx ){
+    sqlite3ErrorMsg(pParse, "too many columns in %s", zObject);
+  }
+}
+
+/*
+** Delete an entire expression list.
+*/
+static SQLITE_NOINLINE void exprListDeleteNN(sqlite3 *db, ExprList *pList){
+  int i = pList->nExpr;
+  struct ExprList_item *pItem =  pList->a;
+  assert( pList->nExpr>0 );
+  do{
+    sqlite3ExprDelete(db, pItem->pExpr);
+    sqlite3DbFree(db, pItem->zEName);
+    pItem++;
+  }while( --i>0 );
+  sqlite3DbFreeNN(db, pList);
+}
+SQLITE_PRIVATE void sqlite3ExprListDelete(sqlite3 *db, ExprList *pList){
+  if( pList ) exprListDeleteNN(db, pList);
+}
+
+/*
+** Return the bitwise-OR of all Expr.flags fields in the given
+** ExprList.
+*/
+SQLITE_PRIVATE u32 sqlite3ExprListFlags(const ExprList *pList){
+  int i;
+  u32 m = 0;
+  assert( pList!=0 );
+  for(i=0; i<pList->nExpr; i++){
+     Expr *pExpr = pList->a[i].pExpr;
+     assert( pExpr!=0 );
+     m |= pExpr->flags;
+  }
+  return m;
+}
+
+/*
+** This is a SELECT-node callback for the expression walker that
+** always "fails".  By "fail" in this case, we mean set
+** pWalker->eCode to zero and abort.
+**
+** This callback is used by multiple expression walkers.
+*/
+SQLITE_PRIVATE int sqlite3SelectWalkFail(Walker *pWalker, Select *NotUsed){
+  UNUSED_PARAMETER(NotUsed);
+  pWalker->eCode = 0;
+  return WRC_Abort;
+}
+
+/*
+** Check the input string to see if it is "true" or "false" (in any case).
+**
+**       If the string is....           Return
+**         "true"                         EP_IsTrue
+**         "false"                        EP_IsFalse
+**         anything else                  0
+*/
+SQLITE_PRIVATE u32 sqlite3IsTrueOrFalse(const char *zIn){
+  if( sqlite3StrICmp(zIn, "true")==0  ) return EP_IsTrue;
+  if( sqlite3StrICmp(zIn, "false")==0 ) return EP_IsFalse;
+  return 0;
+}
+
+
+/*
+** If the input expression is an ID with the name "true" or "false"
+** then convert it into an TK_TRUEFALSE term.  Return non-zero if
+** the conversion happened, and zero if the expression is unaltered.
+*/
+SQLITE_PRIVATE int sqlite3ExprIdToTrueFalse(Expr *pExpr){
+  u32 v;
+  assert( pExpr->op==TK_ID || pExpr->op==TK_STRING );
+  if( !ExprHasProperty(pExpr, EP_Quoted|EP_IntValue)
+   && (v = sqlite3IsTrueOrFalse(pExpr->u.zToken))!=0
+  ){
+    pExpr->op = TK_TRUEFALSE;
+    ExprSetProperty(pExpr, v);
+    return 1;
+  }
+  return 0;
+}
+
+/*
+** The argument must be a TK_TRUEFALSE Expr node.  Return 1 if it is TRUE
+** and 0 if it is FALSE.
+*/
+SQLITE_PRIVATE int sqlite3ExprTruthValue(const Expr *pExpr){
+  pExpr = sqlite3ExprSkipCollate((Expr*)pExpr);
+  assert( pExpr->op==TK_TRUEFALSE );
+  assert( !ExprHasProperty(pExpr, EP_IntValue) );
+  assert( sqlite3StrICmp(pExpr->u.zToken,"true")==0
+       || sqlite3StrICmp(pExpr->u.zToken,"false")==0 );
+  return pExpr->u.zToken[4]==0;
+}
+
+/*
+** If pExpr is an AND or OR expression, try to simplify it by eliminating
+** terms that are always true or false.  Return the simplified expression.
+** Or return the original expression if no simplification is possible.
+**
+** Examples:
+**
+**     (x<10) AND true                =>   (x<10)
+**     (x<10) AND false               =>   false
+**     (x<10) AND (y=22 OR false)     =>   (x<10) AND (y=22)
+**     (x<10) AND (y=22 OR true)      =>   (x<10)
+**     (y=22) OR true                 =>   true
+*/
+SQLITE_PRIVATE Expr *sqlite3ExprSimplifiedAndOr(Expr *pExpr){
+  assert( pExpr!=0 );
+  if( pExpr->op==TK_AND || pExpr->op==TK_OR ){
+    Expr *pRight = sqlite3ExprSimplifiedAndOr(pExpr->pRight);
+    Expr *pLeft = sqlite3ExprSimplifiedAndOr(pExpr->pLeft);
+    if( ExprAlwaysTrue(pLeft) || ExprAlwaysFalse(pRight) ){
+      pExpr = pExpr->op==TK_AND ? pRight : pLeft;
+    }else if( ExprAlwaysTrue(pRight) || ExprAlwaysFalse(pLeft) ){
+      pExpr = pExpr->op==TK_AND ? pLeft : pRight;
+    }
+  }
+  return pExpr;
+}
+
+
+/*
+** These routines are Walker callbacks used to check expressions to
+** see if they are "constant" for some definition of constant.  The
+** Walker.eCode value determines the type of "constant" we are looking
+** for.
+**
+** These callback routines are used to implement the following:
+**
+**     sqlite3ExprIsConstant()                  pWalker->eCode==1
+**     sqlite3ExprIsConstantNotJoin()           pWalker->eCode==2
+**     sqlite3ExprIsTableConstant()             pWalker->eCode==3
+**     sqlite3ExprIsConstantOrFunction()        pWalker->eCode==4 or 5
+**
+** In all cases, the callbacks set Walker.eCode=0 and abort if the expression
+** is found to not be a constant.
+**
+** The sqlite3ExprIsConstantOrFunction() is used for evaluating DEFAULT
+** expressions in a CREATE TABLE statement.  The Walker.eCode value is 5
+** when parsing an existing schema out of the sqlite_schema table and 4
+** when processing a new CREATE TABLE statement.  A bound parameter raises
+** an error for new statements, but is silently converted
+** to NULL for existing schemas.  This allows sqlite_schema tables that
+** contain a bound parameter because they were generated by older versions
+** of SQLite to be parsed by newer versions of SQLite without raising a
+** malformed schema error.
+*/
+static int exprNodeIsConstant(Walker *pWalker, Expr *pExpr){
+
+  /* If pWalker->eCode is 2 then any term of the expression that comes from
+  ** the ON or USING clauses of an outer join disqualifies the expression
+  ** from being considered constant. */
+  if( pWalker->eCode==2 &
