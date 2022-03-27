@@ -104857,4 +104857,192 @@ SQLITE_PRIVATE void sqlite3ExprAssignVarNumber(Parse *pParse, Expr *pExpr, u32 n
     }
   }
   pExpr->iColumn = x;
-  if( x>db->aLimit[SQLITE_LIMIT_VARIABLE_NUMBER]
+  if( x>db->aLimit[SQLITE_LIMIT_VARIABLE_NUMBER] ){
+    sqlite3ErrorMsg(pParse, "too many SQL variables");
+    sqlite3RecordErrorOffsetOfExpr(pParse->db, pExpr);
+  }
+}
+
+/*
+** Recursively delete an expression tree.
+*/
+static SQLITE_NOINLINE void sqlite3ExprDeleteNN(sqlite3 *db, Expr *p){
+  assert( p!=0 );
+  assert( !ExprUseUValue(p) || p->u.iValue>=0 );
+  assert( !ExprUseYWin(p) || !ExprUseYSub(p) );
+  assert( !ExprUseYWin(p) || p->y.pWin!=0 || db->mallocFailed );
+  assert( p->op!=TK_FUNCTION || !ExprUseYSub(p) );
+#ifdef SQLITE_DEBUG
+  if( ExprHasProperty(p, EP_Leaf) && !ExprHasProperty(p, EP_TokenOnly) ){
+    assert( p->pLeft==0 );
+    assert( p->pRight==0 );
+    assert( !ExprUseXSelect(p) || p->x.pSelect==0 );
+    assert( !ExprUseXList(p) || p->x.pList==0 );
+  }
+#endif
+  if( !ExprHasProperty(p, (EP_TokenOnly|EP_Leaf)) ){
+    /* The Expr.x union is never used at the same time as Expr.pRight */
+    assert( (ExprUseXList(p) && p->x.pList==0) || p->pRight==0 );
+    if( p->pLeft && p->op!=TK_SELECT_COLUMN ) sqlite3ExprDeleteNN(db, p->pLeft);
+    if( p->pRight ){
+      assert( !ExprHasProperty(p, EP_WinFunc) );
+      sqlite3ExprDeleteNN(db, p->pRight);
+    }else if( ExprUseXSelect(p) ){
+      assert( !ExprHasProperty(p, EP_WinFunc) );
+      sqlite3SelectDelete(db, p->x.pSelect);
+    }else{
+      sqlite3ExprListDelete(db, p->x.pList);
+#ifndef SQLITE_OMIT_WINDOWFUNC
+      if( ExprHasProperty(p, EP_WinFunc) ){
+        sqlite3WindowDelete(db, p->y.pWin);
+      }
+#endif
+    }
+  }
+  if( ExprHasProperty(p, EP_MemToken) ){
+    assert( !ExprHasProperty(p, EP_IntValue) );
+    sqlite3DbFree(db, p->u.zToken);
+  }
+  if( !ExprHasProperty(p, EP_Static) ){
+    sqlite3DbFreeNN(db, p);
+  }
+}
+SQLITE_PRIVATE void sqlite3ExprDelete(sqlite3 *db, Expr *p){
+  if( p ) sqlite3ExprDeleteNN(db, p);
+}
+
+/*
+** Clear both elements of an OnOrUsing object
+*/
+SQLITE_PRIVATE void sqlite3ClearOnOrUsing(sqlite3 *db, OnOrUsing *p){
+  if( p==0 ){
+    /* Nothing to clear */
+  }else if( p->pOn ){
+    sqlite3ExprDeleteNN(db, p->pOn);
+  }else if( p->pUsing ){
+    sqlite3IdListDelete(db, p->pUsing);
+  }
+}
+
+/*
+** Arrange to cause pExpr to be deleted when the pParse is deleted.
+** This is similar to sqlite3ExprDelete() except that the delete is
+** deferred untilthe pParse is deleted.
+**
+** The pExpr might be deleted immediately on an OOM error.
+**
+** The deferred delete is (currently) implemented by adding the
+** pExpr to the pParse->pConstExpr list with a register number of 0.
+*/
+SQLITE_PRIVATE void sqlite3ExprDeferredDelete(Parse *pParse, Expr *pExpr){
+  pParse->pConstExpr =
+      sqlite3ExprListAppend(pParse, pParse->pConstExpr, pExpr);
+}
+
+/* Invoke sqlite3RenameExprUnmap() and sqlite3ExprDelete() on the
+** expression.
+*/
+SQLITE_PRIVATE void sqlite3ExprUnmapAndDelete(Parse *pParse, Expr *p){
+  if( p ){
+    if( IN_RENAME_OBJECT ){
+      sqlite3RenameExprUnmap(pParse, p);
+    }
+    sqlite3ExprDeleteNN(pParse->db, p);
+  }
+}
+
+/*
+** Return the number of bytes allocated for the expression structure
+** passed as the first argument. This is always one of EXPR_FULLSIZE,
+** EXPR_REDUCEDSIZE or EXPR_TOKENONLYSIZE.
+*/
+static int exprStructSize(const Expr *p){
+  if( ExprHasProperty(p, EP_TokenOnly) ) return EXPR_TOKENONLYSIZE;
+  if( ExprHasProperty(p, EP_Reduced) ) return EXPR_REDUCEDSIZE;
+  return EXPR_FULLSIZE;
+}
+
+/*
+** The dupedExpr*Size() routines each return the number of bytes required
+** to store a copy of an expression or expression tree.  They differ in
+** how much of the tree is measured.
+**
+**     dupedExprStructSize()     Size of only the Expr structure
+**     dupedExprNodeSize()       Size of Expr + space for token
+**     dupedExprSize()           Expr + token + subtree components
+**
+***************************************************************************
+**
+** The dupedExprStructSize() function returns two values OR-ed together:
+** (1) the space required for a copy of the Expr structure only and
+** (2) the EP_xxx flags that indicate what the structure size should be.
+** The return values is always one of:
+**
+**      EXPR_FULLSIZE
+**      EXPR_REDUCEDSIZE   | EP_Reduced
+**      EXPR_TOKENONLYSIZE | EP_TokenOnly
+**
+** The size of the structure can be found by masking the return value
+** of this routine with 0xfff.  The flags can be found by masking the
+** return value with EP_Reduced|EP_TokenOnly.
+**
+** Note that with flags==EXPRDUP_REDUCE, this routines works on full-size
+** (unreduced) Expr objects as they or originally constructed by the parser.
+** During expression analysis, extra information is computed and moved into
+** later parts of the Expr object and that extra information might get chopped
+** off if the expression is reduced.  Note also that it does not work to
+** make an EXPRDUP_REDUCE copy of a reduced expression.  It is only legal
+** to reduce a pristine expression tree from the parser.  The implementation
+** of dupedExprStructSize() contain multiple assert() statements that attempt
+** to enforce this constraint.
+*/
+static int dupedExprStructSize(const Expr *p, int flags){
+  int nSize;
+  assert( flags==EXPRDUP_REDUCE || flags==0 ); /* Only one flag value allowed */
+  assert( EXPR_FULLSIZE<=0xfff );
+  assert( (0xfff & (EP_Reduced|EP_TokenOnly))==0 );
+  if( 0==flags || p->op==TK_SELECT_COLUMN
+#ifndef SQLITE_OMIT_WINDOWFUNC
+   || ExprHasProperty(p, EP_WinFunc)
+#endif
+  ){
+    nSize = EXPR_FULLSIZE;
+  }else{
+    assert( !ExprHasProperty(p, EP_TokenOnly|EP_Reduced) );
+    assert( !ExprHasProperty(p, EP_OuterON) );
+    assert( !ExprHasProperty(p, EP_MemToken) );
+    assert( !ExprHasVVAProperty(p, EP_NoReduce) );
+    if( p->pLeft || p->x.pList ){
+      nSize = EXPR_REDUCEDSIZE | EP_Reduced;
+    }else{
+      assert( p->pRight==0 );
+      nSize = EXPR_TOKENONLYSIZE | EP_TokenOnly;
+    }
+  }
+  return nSize;
+}
+
+/*
+** This function returns the space in bytes required to store the copy
+** of the Expr structure and a copy of the Expr.u.zToken string (if that
+** string is defined.)
+*/
+static int dupedExprNodeSize(const Expr *p, int flags){
+  int nByte = dupedExprStructSize(p, flags) & 0xfff;
+  if( !ExprHasProperty(p, EP_IntValue) && p->u.zToken ){
+    nByte += sqlite3Strlen30NN(p->u.zToken)+1;
+  }
+  return ROUND8(nByte);
+}
+
+/*
+** Return the number of bytes required to create a duplicate of the
+** expression passed as the first argument. The second argument is a
+** mask containing EXPRDUP_XXX flags.
+**
+** The value returned includes space to create a copy of the Expr struct
+** itself and the buffer referred to by Expr.u.zToken, if any.
+**
+** If the EXPRDUP_REDUCE flag is set, then the return value includes
+** space to duplicate all Expr nodes in the tree formed by Expr.pLeft
+** and Expr.pRig
