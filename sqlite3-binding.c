@@ -105240,4 +105240,198 @@ static void gatherSelectWindows(Select *p){
 **
 ** The expression list, ID, and source lists return by sqlite3ExprListDup(),
 ** sqlite3IdListDup(), and sqlite3SrcListDup() can not be further expanded
-** by subseque
+** by subsequent calls to sqlite*ListAppend() routines.
+**
+** Any tables that the SrcList might point to are not duplicated.
+**
+** The flags parameter contains a combination of the EXPRDUP_XXX flags.
+** If the EXPRDUP_REDUCE flag is set, then the structure returned is a
+** truncated version of the usual Expr structure that will be stored as
+** part of the in-memory representation of the database schema.
+*/
+SQLITE_PRIVATE Expr *sqlite3ExprDup(sqlite3 *db, const Expr *p, int flags){
+  assert( flags==0 || flags==EXPRDUP_REDUCE );
+  return p ? exprDup(db, p, flags, 0) : 0;
+}
+SQLITE_PRIVATE ExprList *sqlite3ExprListDup(sqlite3 *db, const ExprList *p, int flags){
+  ExprList *pNew;
+  struct ExprList_item *pItem;
+  const struct ExprList_item *pOldItem;
+  int i;
+  Expr *pPriorSelectColOld = 0;
+  Expr *pPriorSelectColNew = 0;
+  assert( db!=0 );
+  if( p==0 ) return 0;
+  pNew = sqlite3DbMallocRawNN(db, sqlite3DbMallocSize(db, p));
+  if( pNew==0 ) return 0;
+  pNew->nExpr = p->nExpr;
+  pNew->nAlloc = p->nAlloc;
+  pItem = pNew->a;
+  pOldItem = p->a;
+  for(i=0; i<p->nExpr; i++, pItem++, pOldItem++){
+    Expr *pOldExpr = pOldItem->pExpr;
+    Expr *pNewExpr;
+    pItem->pExpr = sqlite3ExprDup(db, pOldExpr, flags);
+    if( pOldExpr
+     && pOldExpr->op==TK_SELECT_COLUMN
+     && (pNewExpr = pItem->pExpr)!=0
+    ){
+      if( pNewExpr->pRight ){
+        pPriorSelectColOld = pOldExpr->pRight;
+        pPriorSelectColNew = pNewExpr->pRight;
+        pNewExpr->pLeft = pNewExpr->pRight;
+      }else{
+        if( pOldExpr->pLeft!=pPriorSelectColOld ){
+          pPriorSelectColOld = pOldExpr->pLeft;
+          pPriorSelectColNew = sqlite3ExprDup(db, pPriorSelectColOld, flags);
+          pNewExpr->pRight = pPriorSelectColNew;
+        }
+        pNewExpr->pLeft = pPriorSelectColNew;
+      }
+    }
+    pItem->zEName = sqlite3DbStrDup(db, pOldItem->zEName);
+    pItem->fg = pOldItem->fg;
+    pItem->fg.done = 0;
+    pItem->u = pOldItem->u;
+  }
+  return pNew;
+}
+
+/*
+** If cursors, triggers, views and subqueries are all omitted from
+** the build, then none of the following routines, except for
+** sqlite3SelectDup(), can be called. sqlite3SelectDup() is sometimes
+** called with a NULL argument.
+*/
+#if !defined(SQLITE_OMIT_VIEW) || !defined(SQLITE_OMIT_TRIGGER) \
+ || !defined(SQLITE_OMIT_SUBQUERY)
+SQLITE_PRIVATE SrcList *sqlite3SrcListDup(sqlite3 *db, const SrcList *p, int flags){
+  SrcList *pNew;
+  int i;
+  int nByte;
+  assert( db!=0 );
+  if( p==0 ) return 0;
+  nByte = sizeof(*p) + (p->nSrc>0 ? sizeof(p->a[0]) * (p->nSrc-1) : 0);
+  pNew = sqlite3DbMallocRawNN(db, nByte );
+  if( pNew==0 ) return 0;
+  pNew->nSrc = pNew->nAlloc = p->nSrc;
+  for(i=0; i<p->nSrc; i++){
+    SrcItem *pNewItem = &pNew->a[i];
+    const SrcItem *pOldItem = &p->a[i];
+    Table *pTab;
+    pNewItem->pSchema = pOldItem->pSchema;
+    pNewItem->zDatabase = sqlite3DbStrDup(db, pOldItem->zDatabase);
+    pNewItem->zName = sqlite3DbStrDup(db, pOldItem->zName);
+    pNewItem->zAlias = sqlite3DbStrDup(db, pOldItem->zAlias);
+    pNewItem->fg = pOldItem->fg;
+    pNewItem->iCursor = pOldItem->iCursor;
+    pNewItem->addrFillSub = pOldItem->addrFillSub;
+    pNewItem->regReturn = pOldItem->regReturn;
+    if( pNewItem->fg.isIndexedBy ){
+      pNewItem->u1.zIndexedBy = sqlite3DbStrDup(db, pOldItem->u1.zIndexedBy);
+    }
+    pNewItem->u2 = pOldItem->u2;
+    if( pNewItem->fg.isCte ){
+      pNewItem->u2.pCteUse->nUse++;
+    }
+    if( pNewItem->fg.isTabFunc ){
+      pNewItem->u1.pFuncArg =
+          sqlite3ExprListDup(db, pOldItem->u1.pFuncArg, flags);
+    }
+    pTab = pNewItem->pTab = pOldItem->pTab;
+    if( pTab ){
+      pTab->nTabRef++;
+    }
+    pNewItem->pSelect = sqlite3SelectDup(db, pOldItem->pSelect, flags);
+    if( pOldItem->fg.isUsing ){
+      assert( pNewItem->fg.isUsing );
+      pNewItem->u3.pUsing = sqlite3IdListDup(db, pOldItem->u3.pUsing);
+    }else{
+      pNewItem->u3.pOn = sqlite3ExprDup(db, pOldItem->u3.pOn, flags);
+    }
+    pNewItem->colUsed = pOldItem->colUsed;
+  }
+  return pNew;
+}
+SQLITE_PRIVATE IdList *sqlite3IdListDup(sqlite3 *db, const IdList *p){
+  IdList *pNew;
+  int i;
+  assert( db!=0 );
+  if( p==0 ) return 0;
+  assert( p->eU4!=EU4_EXPR );
+  pNew = sqlite3DbMallocRawNN(db, sizeof(*pNew)+(p->nId-1)*sizeof(p->a[0]) );
+  if( pNew==0 ) return 0;
+  pNew->nId = p->nId;
+  pNew->eU4 = p->eU4;
+  for(i=0; i<p->nId; i++){
+    struct IdList_item *pNewItem = &pNew->a[i];
+    const struct IdList_item *pOldItem = &p->a[i];
+    pNewItem->zName = sqlite3DbStrDup(db, pOldItem->zName);
+    pNewItem->u4 = pOldItem->u4;
+  }
+  return pNew;
+}
+SQLITE_PRIVATE Select *sqlite3SelectDup(sqlite3 *db, const Select *pDup, int flags){
+  Select *pRet = 0;
+  Select *pNext = 0;
+  Select **pp = &pRet;
+  const Select *p;
+
+  assert( db!=0 );
+  for(p=pDup; p; p=p->pPrior){
+    Select *pNew = sqlite3DbMallocRawNN(db, sizeof(*p) );
+    if( pNew==0 ) break;
+    pNew->pEList = sqlite3ExprListDup(db, p->pEList, flags);
+    pNew->pSrc = sqlite3SrcListDup(db, p->pSrc, flags);
+    pNew->pWhere = sqlite3ExprDup(db, p->pWhere, flags);
+    pNew->pGroupBy = sqlite3ExprListDup(db, p->pGroupBy, flags);
+    pNew->pHaving = sqlite3ExprDup(db, p->pHaving, flags);
+    pNew->pOrderBy = sqlite3ExprListDup(db, p->pOrderBy, flags);
+    pNew->op = p->op;
+    pNew->pNext = pNext;
+    pNew->pPrior = 0;
+    pNew->pLimit = sqlite3ExprDup(db, p->pLimit, flags);
+    pNew->iLimit = 0;
+    pNew->iOffset = 0;
+    pNew->selFlags = p->selFlags & ~SF_UsesEphemeral;
+    pNew->addrOpenEphm[0] = -1;
+    pNew->addrOpenEphm[1] = -1;
+    pNew->nSelectRow = p->nSelectRow;
+    pNew->pWith = sqlite3WithDup(db, p->pWith);
+#ifndef SQLITE_OMIT_WINDOWFUNC
+    pNew->pWin = 0;
+    pNew->pWinDefn = sqlite3WindowListDup(db, p->pWinDefn);
+    if( p->pWin && db->mallocFailed==0 ) gatherSelectWindows(pNew);
+#endif
+    pNew->selId = p->selId;
+    if( db->mallocFailed ){
+      /* Any prior OOM might have left the Select object incomplete.
+      ** Delete the whole thing rather than allow an incomplete Select
+      ** to be used by the code generator. */
+      pNew->pNext = 0;
+      sqlite3SelectDelete(db, pNew);
+      break;
+    }
+    *pp = pNew;
+    pp = &pNew->pPrior;
+    pNext = pNew;
+  }
+
+  return pRet;
+}
+#else
+SQLITE_PRIVATE Select *sqlite3SelectDup(sqlite3 *db, const Select *p, int flags){
+  assert( p==0 );
+  return 0;
+}
+#endif
+
+
+/*
+** Add a new element to the end of an expression list.  If pList is
+** initially NULL, then create a new expression list.
+**
+** The pList argument must be either NULL or a pointer to an ExprList
+** obtained from a prior call to sqlite3ExprListAppend().  This routine
+** may not be used with an ExprList obtained from sqlite3ExprListDup().
+** Reason:  This r
