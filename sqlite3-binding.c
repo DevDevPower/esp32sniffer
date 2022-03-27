@@ -105835,4 +105835,194 @@ static int exprNodeIsConstant(Walker *pWalker, Expr *pExpr){
   /* If pWalker->eCode is 2 then any term of the expression that comes from
   ** the ON or USING clauses of an outer join disqualifies the expression
   ** from being considered constant. */
-  if( pWalker->eCode==2 &
+  if( pWalker->eCode==2 && ExprHasProperty(pExpr, EP_OuterON) ){
+    pWalker->eCode = 0;
+    return WRC_Abort;
+  }
+
+  switch( pExpr->op ){
+    /* Consider functions to be constant if all their arguments are constant
+    ** and either pWalker->eCode==4 or 5 or the function has the
+    ** SQLITE_FUNC_CONST flag. */
+    case TK_FUNCTION:
+      if( (pWalker->eCode>=4 || ExprHasProperty(pExpr,EP_ConstFunc))
+       && !ExprHasProperty(pExpr, EP_WinFunc)
+      ){
+        if( pWalker->eCode==5 ) ExprSetProperty(pExpr, EP_FromDDL);
+        return WRC_Continue;
+      }else{
+        pWalker->eCode = 0;
+        return WRC_Abort;
+      }
+    case TK_ID:
+      /* Convert "true" or "false" in a DEFAULT clause into the
+      ** appropriate TK_TRUEFALSE operator */
+      if( sqlite3ExprIdToTrueFalse(pExpr) ){
+        return WRC_Prune;
+      }
+      /* no break */ deliberate_fall_through
+    case TK_COLUMN:
+    case TK_AGG_FUNCTION:
+    case TK_AGG_COLUMN:
+      testcase( pExpr->op==TK_ID );
+      testcase( pExpr->op==TK_COLUMN );
+      testcase( pExpr->op==TK_AGG_FUNCTION );
+      testcase( pExpr->op==TK_AGG_COLUMN );
+      if( ExprHasProperty(pExpr, EP_FixedCol) && pWalker->eCode!=2 ){
+        return WRC_Continue;
+      }
+      if( pWalker->eCode==3 && pExpr->iTable==pWalker->u.iCur ){
+        return WRC_Continue;
+      }
+      /* no break */ deliberate_fall_through
+    case TK_IF_NULL_ROW:
+    case TK_REGISTER:
+    case TK_DOT:
+      testcase( pExpr->op==TK_REGISTER );
+      testcase( pExpr->op==TK_IF_NULL_ROW );
+      testcase( pExpr->op==TK_DOT );
+      pWalker->eCode = 0;
+      return WRC_Abort;
+    case TK_VARIABLE:
+      if( pWalker->eCode==5 ){
+        /* Silently convert bound parameters that appear inside of CREATE
+        ** statements into a NULL when parsing the CREATE statement text out
+        ** of the sqlite_schema table */
+        pExpr->op = TK_NULL;
+      }else if( pWalker->eCode==4 ){
+        /* A bound parameter in a CREATE statement that originates from
+        ** sqlite3_prepare() causes an error */
+        pWalker->eCode = 0;
+        return WRC_Abort;
+      }
+      /* no break */ deliberate_fall_through
+    default:
+      testcase( pExpr->op==TK_SELECT ); /* sqlite3SelectWalkFail() disallows */
+      testcase( pExpr->op==TK_EXISTS ); /* sqlite3SelectWalkFail() disallows */
+      return WRC_Continue;
+  }
+}
+static int exprIsConst(Expr *p, int initFlag, int iCur){
+  Walker w;
+  w.eCode = initFlag;
+  w.xExprCallback = exprNodeIsConstant;
+  w.xSelectCallback = sqlite3SelectWalkFail;
+#ifdef SQLITE_DEBUG
+  w.xSelectCallback2 = sqlite3SelectWalkAssert2;
+#endif
+  w.u.iCur = iCur;
+  sqlite3WalkExpr(&w, p);
+  return w.eCode;
+}
+
+/*
+** Walk an expression tree.  Return non-zero if the expression is constant
+** and 0 if it involves variables or function calls.
+**
+** For the purposes of this function, a double-quoted string (ex: "abc")
+** is considered a variable but a single-quoted string (ex: 'abc') is
+** a constant.
+*/
+SQLITE_PRIVATE int sqlite3ExprIsConstant(Expr *p){
+  return exprIsConst(p, 1, 0);
+}
+
+/*
+** Walk an expression tree.  Return non-zero if
+**
+**   (1) the expression is constant, and
+**   (2) the expression does originate in the ON or USING clause
+**       of a LEFT JOIN, and
+**   (3) the expression does not contain any EP_FixedCol TK_COLUMN
+**       operands created by the constant propagation optimization.
+**
+** When this routine returns true, it indicates that the expression
+** can be added to the pParse->pConstExpr list and evaluated once when
+** the prepared statement starts up.  See sqlite3ExprCodeRunJustOnce().
+*/
+SQLITE_PRIVATE int sqlite3ExprIsConstantNotJoin(Expr *p){
+  return exprIsConst(p, 2, 0);
+}
+
+/*
+** Walk an expression tree.  Return non-zero if the expression is constant
+** for any single row of the table with cursor iCur.  In other words, the
+** expression must not refer to any non-deterministic function nor any
+** table other than iCur.
+*/
+SQLITE_PRIVATE int sqlite3ExprIsTableConstant(Expr *p, int iCur){
+  return exprIsConst(p, 3, iCur);
+}
+
+/*
+** Check pExpr to see if it is an invariant constraint on data source pSrc.
+** This is an optimization.  False negatives will perhaps cause slower
+** queries, but false positives will yield incorrect answers.  So when in
+** doubt, return 0.
+**
+** To be an invariant constraint, the following must be true:
+**
+**   (1)  pExpr cannot refer to any table other than pSrc->iCursor.
+**
+**   (2)  pExpr cannot use subqueries or non-deterministic functions.
+**
+**   (3)  pSrc cannot be part of the left operand for a RIGHT JOIN.
+**        (Is there some way to relax this constraint?)
+**
+**   (4)  If pSrc is the right operand of a LEFT JOIN, then...
+**         (4a)  pExpr must come from an ON clause..
+           (4b)  and specifically the ON clause associated with the LEFT JOIN.
+**
+**   (5)  If pSrc is not the right operand of a LEFT JOIN or the left
+**        operand of a RIGHT JOIN, then pExpr must be from the WHERE
+**        clause, not an ON clause.
+*/
+SQLITE_PRIVATE int sqlite3ExprIsTableConstraint(Expr *pExpr, const SrcItem *pSrc){
+  if( pSrc->fg.jointype & JT_LTORJ ){
+    return 0;  /* rule (3) */
+  }
+  if( pSrc->fg.jointype & JT_LEFT ){
+    if( !ExprHasProperty(pExpr, EP_OuterON) ) return 0;   /* rule (4a) */
+    if( pExpr->w.iJoin!=pSrc->iCursor ) return 0;         /* rule (4b) */
+  }else{
+    if( ExprHasProperty(pExpr, EP_OuterON) ) return 0;    /* rule (5) */
+  }
+  return sqlite3ExprIsTableConstant(pExpr, pSrc->iCursor); /* rules (1), (2) */
+}
+
+
+/*
+** sqlite3WalkExpr() callback used by sqlite3ExprIsConstantOrGroupBy().
+*/
+static int exprNodeIsConstantOrGroupBy(Walker *pWalker, Expr *pExpr){
+  ExprList *pGroupBy = pWalker->u.pGroupBy;
+  int i;
+
+  /* Check if pExpr is identical to any GROUP BY term. If so, consider
+  ** it constant.  */
+  for(i=0; i<pGroupBy->nExpr; i++){
+    Expr *p = pGroupBy->a[i].pExpr;
+    if( sqlite3ExprCompare(0, pExpr, p, -1)<2 ){
+      CollSeq *pColl = sqlite3ExprNNCollSeq(pWalker->pParse, p);
+      if( sqlite3IsBinary(pColl) ){
+        return WRC_Prune;
+      }
+    }
+  }
+
+  /* Check if pExpr is a sub-select. If so, consider it variable. */
+  if( ExprUseXSelect(pExpr) ){
+    pWalker->eCode = 0;
+    return WRC_Abort;
+  }
+
+  return exprNodeIsConstant(pWalker, pExpr);
+}
+
+/*
+** Walk the expression tree passed as the first argument. Return non-zero
+** if the expression consists entirely of constants or copies of terms
+** in pGroupBy that sort with the BINARY collation sequence.
+**
+** This routine is used to determine if a term of the HAVING clause can
+** be promoted into the WHERE clause.  In
