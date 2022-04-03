@@ -106526,4 +106526,190 @@ SQLITE_PRIVATE int sqlite3FindInIndex(
             }
             if( j==nExpr ) break;
             mCol = MASKBIT(j);
-            if
+            if( mCol & colUsed ) break; /* Each column used only once */
+            colUsed |= mCol;
+            if( aiMap ) aiMap[i] = j;
+          }
+
+          assert( i==nExpr || colUsed!=(MASKBIT(nExpr)-1) );
+          if( colUsed==(MASKBIT(nExpr)-1) ){
+            /* If we reach this point, that means the index pIdx is usable */
+            int iAddr = sqlite3VdbeAddOp0(v, OP_Once); VdbeCoverage(v);
+            ExplainQueryPlan((pParse, 0,
+                              "USING INDEX %s FOR IN-OPERATOR",pIdx->zName));
+            sqlite3VdbeAddOp3(v, OP_OpenRead, iTab, pIdx->tnum, iDb);
+            sqlite3VdbeSetP4KeyInfo(pParse, pIdx);
+            VdbeComment((v, "%s", pIdx->zName));
+            assert( IN_INDEX_INDEX_DESC == IN_INDEX_INDEX_ASC+1 );
+            eType = IN_INDEX_INDEX_ASC + pIdx->aSortOrder[0];
+
+            if( prRhsHasNull ){
+#ifdef SQLITE_ENABLE_COLUMN_USED_MASK
+              i64 mask = (1<<nExpr)-1;
+              sqlite3VdbeAddOp4Dup8(v, OP_ColumnsUsed,
+                  iTab, 0, 0, (u8*)&mask, P4_INT64);
+#endif
+              *prRhsHasNull = ++pParse->nMem;
+              if( nExpr==1 ){
+                sqlite3SetHasNullFlag(v, iTab, *prRhsHasNull);
+              }
+            }
+            sqlite3VdbeJumpHere(v, iAddr);
+          }
+        } /* End loop over indexes */
+      } /* End if( affinity_ok ) */
+    } /* End if not an rowid index */
+  } /* End attempt to optimize using an index */
+
+  /* If no preexisting index is available for the IN clause
+  ** and IN_INDEX_NOOP is an allowed reply
+  ** and the RHS of the IN operator is a list, not a subquery
+  ** and the RHS is not constant or has two or fewer terms,
+  ** then it is not worth creating an ephemeral table to evaluate
+  ** the IN operator so return IN_INDEX_NOOP.
+  */
+  if( eType==0
+   && (inFlags & IN_INDEX_NOOP_OK)
+   && ExprUseXList(pX)
+   && (!sqlite3InRhsIsConstant(pX) || pX->x.pList->nExpr<=2)
+  ){
+    pParse->nTab--;  /* Back out the allocation of the unused cursor */
+    iTab = -1;       /* Cursor is not allocated */
+    eType = IN_INDEX_NOOP;
+  }
+
+  if( eType==0 ){
+    /* Could not find an existing table or index to use as the RHS b-tree.
+    ** We will have to generate an ephemeral table to do the job.
+    */
+    u32 savedNQueryLoop = pParse->nQueryLoop;
+    int rMayHaveNull = 0;
+    eType = IN_INDEX_EPH;
+    if( inFlags & IN_INDEX_LOOP ){
+      pParse->nQueryLoop = 0;
+    }else if( prRhsHasNull ){
+      *prRhsHasNull = rMayHaveNull = ++pParse->nMem;
+    }
+    assert( pX->op==TK_IN );
+    sqlite3CodeRhsOfIN(pParse, pX, iTab);
+    if( rMayHaveNull ){
+      sqlite3SetHasNullFlag(v, iTab, rMayHaveNull);
+    }
+    pParse->nQueryLoop = savedNQueryLoop;
+  }
+
+  if( aiMap && eType!=IN_INDEX_INDEX_ASC && eType!=IN_INDEX_INDEX_DESC ){
+    int i, n;
+    n = sqlite3ExprVectorSize(pX->pLeft);
+    for(i=0; i<n; i++) aiMap[i] = i;
+  }
+  *piTab = iTab;
+  return eType;
+}
+#endif
+
+#ifndef SQLITE_OMIT_SUBQUERY
+/*
+** Argument pExpr is an (?, ?...) IN(...) expression. This
+** function allocates and returns a nul-terminated string containing
+** the affinities to be used for each column of the comparison.
+**
+** It is the responsibility of the caller to ensure that the returned
+** string is eventually freed using sqlite3DbFree().
+*/
+static char *exprINAffinity(Parse *pParse, const Expr *pExpr){
+  Expr *pLeft = pExpr->pLeft;
+  int nVal = sqlite3ExprVectorSize(pLeft);
+  Select *pSelect = ExprUseXSelect(pExpr) ? pExpr->x.pSelect : 0;
+  char *zRet;
+
+  assert( pExpr->op==TK_IN );
+  zRet = sqlite3DbMallocRaw(pParse->db, nVal+1);
+  if( zRet ){
+    int i;
+    for(i=0; i<nVal; i++){
+      Expr *pA = sqlite3VectorFieldSubexpr(pLeft, i);
+      char a = sqlite3ExprAffinity(pA);
+      if( pSelect ){
+        zRet[i] = sqlite3CompareAffinity(pSelect->pEList->a[i].pExpr, a);
+      }else{
+        zRet[i] = a;
+      }
+    }
+    zRet[nVal] = '\0';
+  }
+  return zRet;
+}
+#endif
+
+#ifndef SQLITE_OMIT_SUBQUERY
+/*
+** Load the Parse object passed as the first argument with an error
+** message of the form:
+**
+**   "sub-select returns N columns - expected M"
+*/
+SQLITE_PRIVATE void sqlite3SubselectError(Parse *pParse, int nActual, int nExpect){
+  if( pParse->nErr==0 ){
+    const char *zFmt = "sub-select returns %d columns - expected %d";
+    sqlite3ErrorMsg(pParse, zFmt, nActual, nExpect);
+  }
+}
+#endif
+
+/*
+** Expression pExpr is a vector that has been used in a context where
+** it is not permitted. If pExpr is a sub-select vector, this routine
+** loads the Parse object with a message of the form:
+**
+**   "sub-select returns N columns - expected 1"
+**
+** Or, if it is a regular scalar vector:
+**
+**   "row value misused"
+*/
+SQLITE_PRIVATE void sqlite3VectorErrorMsg(Parse *pParse, Expr *pExpr){
+#ifndef SQLITE_OMIT_SUBQUERY
+  if( ExprUseXSelect(pExpr) ){
+    sqlite3SubselectError(pParse, pExpr->x.pSelect->pEList->nExpr, 1);
+  }else
+#endif
+  {
+    sqlite3ErrorMsg(pParse, "row value misused");
+  }
+}
+
+#ifndef SQLITE_OMIT_SUBQUERY
+/*
+** Generate code that will construct an ephemeral table containing all terms
+** in the RHS of an IN operator.  The IN operator can be in either of two
+** forms:
+**
+**     x IN (4,5,11)              -- IN operator with list on right-hand side
+**     x IN (SELECT a FROM b)     -- IN operator with subquery on the right
+**
+** The pExpr parameter is the IN operator.  The cursor number for the
+** constructed ephermeral table is returned.  The first time the ephemeral
+** table is computed, the cursor number is also stored in pExpr->iTable,
+** however the cursor number returned might not be the same, as it might
+** have been duplicated using OP_OpenDup.
+**
+** If the LHS expression ("x" in the examples) is a column value, or
+** the SELECT statement returns a column value, then the affinity of that
+** column is used to build the index keys. If both 'x' and the
+** SELECT... statement are columns, then numeric affinity is used
+** if either column has NUMERIC or INTEGER affinity. If neither
+** 'x' nor the SELECT... statement are columns, then numeric affinity
+** is used.
+*/
+SQLITE_PRIVATE void sqlite3CodeRhsOfIN(
+  Parse *pParse,          /* Parsing context */
+  Expr *pExpr,            /* The IN operator */
+  int iTab                /* Use this cursor number */
+){
+  int addrOnce = 0;           /* Address of the OP_Once instruction at top */
+  int addr;                   /* Address of OP_OpenEphemeral instruction */
+  Expr *pLeft;                /* the LHS of the IN operator */
+  KeyInfo *pKeyInfo = 0;      /* Key information */
+  int nVal;                   /* Size of vector pLeft */
+  Vdbe *v;                    /* The prepared statement under co
