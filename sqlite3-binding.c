@@ -106025,4 +106025,206 @@ static int exprNodeIsConstantOrGroupBy(Walker *pWalker, Expr *pExpr){
 ** in pGroupBy that sort with the BINARY collation sequence.
 **
 ** This routine is used to determine if a term of the HAVING clause can
-** be promoted into the WHERE clause.  In
+** be promoted into the WHERE clause.  In order for such a promotion to work,
+** the value of the HAVING clause term must be the same for all members of
+** a "group".  The requirement that the GROUP BY term must be BINARY
+** assumes that no other collating sequence will have a finer-grained
+** grouping than binary.  In other words (A=B COLLATE binary) implies
+** A=B in every other collating sequence.  The requirement that the
+** GROUP BY be BINARY is stricter than necessary.  It would also work
+** to promote HAVING clauses that use the same alternative collating
+** sequence as the GROUP BY term, but that is much harder to check,
+** alternative collating sequences are uncommon, and this is only an
+** optimization, so we take the easy way out and simply require the
+** GROUP BY to use the BINARY collating sequence.
+*/
+SQLITE_PRIVATE int sqlite3ExprIsConstantOrGroupBy(Parse *pParse, Expr *p, ExprList *pGroupBy){
+  Walker w;
+  w.eCode = 1;
+  w.xExprCallback = exprNodeIsConstantOrGroupBy;
+  w.xSelectCallback = 0;
+  w.u.pGroupBy = pGroupBy;
+  w.pParse = pParse;
+  sqlite3WalkExpr(&w, p);
+  return w.eCode;
+}
+
+/*
+** Walk an expression tree for the DEFAULT field of a column definition
+** in a CREATE TABLE statement.  Return non-zero if the expression is
+** acceptable for use as a DEFAULT.  That is to say, return non-zero if
+** the expression is constant or a function call with constant arguments.
+** Return and 0 if there are any variables.
+**
+** isInit is true when parsing from sqlite_schema.  isInit is false when
+** processing a new CREATE TABLE statement.  When isInit is true, parameters
+** (such as ? or $abc) in the expression are converted into NULL.  When
+** isInit is false, parameters raise an error.  Parameters should not be
+** allowed in a CREATE TABLE statement, but some legacy versions of SQLite
+** allowed it, so we need to support it when reading sqlite_schema for
+** backwards compatibility.
+**
+** If isInit is true, set EP_FromDDL on every TK_FUNCTION node.
+**
+** For the purposes of this function, a double-quoted string (ex: "abc")
+** is considered a variable but a single-quoted string (ex: 'abc') is
+** a constant.
+*/
+SQLITE_PRIVATE int sqlite3ExprIsConstantOrFunction(Expr *p, u8 isInit){
+  assert( isInit==0 || isInit==1 );
+  return exprIsConst(p, 4+isInit, 0);
+}
+
+#ifdef SQLITE_ENABLE_CURSOR_HINTS
+/*
+** Walk an expression tree.  Return 1 if the expression contains a
+** subquery of some kind.  Return 0 if there are no subqueries.
+*/
+SQLITE_PRIVATE int sqlite3ExprContainsSubquery(Expr *p){
+  Walker w;
+  w.eCode = 1;
+  w.xExprCallback = sqlite3ExprWalkNoop;
+  w.xSelectCallback = sqlite3SelectWalkFail;
+#ifdef SQLITE_DEBUG
+  w.xSelectCallback2 = sqlite3SelectWalkAssert2;
+#endif
+  sqlite3WalkExpr(&w, p);
+  return w.eCode==0;
+}
+#endif
+
+/*
+** If the expression p codes a constant integer that is small enough
+** to fit in a 32-bit integer, return 1 and put the value of the integer
+** in *pValue.  If the expression is not an integer or if it is too big
+** to fit in a signed 32-bit integer, return 0 and leave *pValue unchanged.
+*/
+SQLITE_PRIVATE int sqlite3ExprIsInteger(const Expr *p, int *pValue){
+  int rc = 0;
+  if( NEVER(p==0) ) return 0;  /* Used to only happen following on OOM */
+
+  /* If an expression is an integer literal that fits in a signed 32-bit
+  ** integer, then the EP_IntValue flag will have already been set */
+  assert( p->op!=TK_INTEGER || (p->flags & EP_IntValue)!=0
+           || sqlite3GetInt32(p->u.zToken, &rc)==0 );
+
+  if( p->flags & EP_IntValue ){
+    *pValue = p->u.iValue;
+    return 1;
+  }
+  switch( p->op ){
+    case TK_UPLUS: {
+      rc = sqlite3ExprIsInteger(p->pLeft, pValue);
+      break;
+    }
+    case TK_UMINUS: {
+      int v = 0;
+      if( sqlite3ExprIsInteger(p->pLeft, &v) ){
+        assert( ((unsigned int)v)!=0x80000000 );
+        *pValue = -v;
+        rc = 1;
+      }
+      break;
+    }
+    default: break;
+  }
+  return rc;
+}
+
+/*
+** Return FALSE if there is no chance that the expression can be NULL.
+**
+** If the expression might be NULL or if the expression is too complex
+** to tell return TRUE.
+**
+** This routine is used as an optimization, to skip OP_IsNull opcodes
+** when we know that a value cannot be NULL.  Hence, a false positive
+** (returning TRUE when in fact the expression can never be NULL) might
+** be a small performance hit but is otherwise harmless.  On the other
+** hand, a false negative (returning FALSE when the result could be NULL)
+** will likely result in an incorrect answer.  So when in doubt, return
+** TRUE.
+*/
+SQLITE_PRIVATE int sqlite3ExprCanBeNull(const Expr *p){
+  u8 op;
+  assert( p!=0 );
+  while( p->op==TK_UPLUS || p->op==TK_UMINUS ){
+    p = p->pLeft;
+    assert( p!=0 );
+  }
+  op = p->op;
+  if( op==TK_REGISTER ) op = p->op2;
+  switch( op ){
+    case TK_INTEGER:
+    case TK_STRING:
+    case TK_FLOAT:
+    case TK_BLOB:
+      return 0;
+    case TK_COLUMN:
+      assert( ExprUseYTab(p) );
+      return ExprHasProperty(p, EP_CanBeNull) ||
+             p->y.pTab==0 ||  /* Reference to column of index on expression */
+             (p->iColumn>=0
+              && p->y.pTab->aCol!=0 /* Possible due to prior error */
+              && p->y.pTab->aCol[p->iColumn].notNull==0);
+    default:
+      return 1;
+  }
+}
+
+/*
+** Return TRUE if the given expression is a constant which would be
+** unchanged by OP_Affinity with the affinity given in the second
+** argument.
+**
+** This routine is used to determine if the OP_Affinity operation
+** can be omitted.  When in doubt return FALSE.  A false negative
+** is harmless.  A false positive, however, can result in the wrong
+** answer.
+*/
+SQLITE_PRIVATE int sqlite3ExprNeedsNoAffinityChange(const Expr *p, char aff){
+  u8 op;
+  int unaryMinus = 0;
+  if( aff==SQLITE_AFF_BLOB ) return 1;
+  while( p->op==TK_UPLUS || p->op==TK_UMINUS ){
+    if( p->op==TK_UMINUS ) unaryMinus = 1;
+    p = p->pLeft;
+  }
+  op = p->op;
+  if( op==TK_REGISTER ) op = p->op2;
+  switch( op ){
+    case TK_INTEGER: {
+      return aff>=SQLITE_AFF_NUMERIC;
+    }
+    case TK_FLOAT: {
+      return aff>=SQLITE_AFF_NUMERIC;
+    }
+    case TK_STRING: {
+      return !unaryMinus && aff==SQLITE_AFF_TEXT;
+    }
+    case TK_BLOB: {
+      return !unaryMinus;
+    }
+    case TK_COLUMN: {
+      assert( p->iTable>=0 );  /* p cannot be part of a CHECK constraint */
+      return aff>=SQLITE_AFF_NUMERIC && p->iColumn<0;
+    }
+    default: {
+      return 0;
+    }
+  }
+}
+
+/*
+** Return TRUE if the given string is a row-id column name.
+*/
+SQLITE_PRIVATE int sqlite3IsRowid(const char *z){
+  if( sqlite3StrICmp(z, "_ROWID_")==0 ) return 1;
+  if( sqlite3StrICmp(z, "ROWID")==0 ) return 1;
+  if( sqlite3StrICmp(z, "OID")==0 ) return 1;
+  return 0;
+}
+
+/*
+** pX is the RHS of an IN operator.  If pX is a SELECT statement
+** that can be simp
