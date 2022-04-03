@@ -106227,4 +106227,151 @@ SQLITE_PRIVATE int sqlite3IsRowid(const char *z){
 
 /*
 ** pX is the RHS of an IN operator.  If pX is a SELECT statement
-** that can be simp
+** that can be simplified to a direct table access, then return
+** a pointer to the SELECT statement.  If pX is not a SELECT statement,
+** or if the SELECT statement needs to be manifested into a transient
+** table, then return NULL.
+*/
+#ifndef SQLITE_OMIT_SUBQUERY
+static Select *isCandidateForInOpt(const Expr *pX){
+  Select *p;
+  SrcList *pSrc;
+  ExprList *pEList;
+  Table *pTab;
+  int i;
+  if( !ExprUseXSelect(pX) ) return 0;                 /* Not a subquery */
+  if( ExprHasProperty(pX, EP_VarSelect)  ) return 0;  /* Correlated subq */
+  p = pX->x.pSelect;
+  if( p->pPrior ) return 0;              /* Not a compound SELECT */
+  if( p->selFlags & (SF_Distinct|SF_Aggregate) ){
+    testcase( (p->selFlags & (SF_Distinct|SF_Aggregate))==SF_Distinct );
+    testcase( (p->selFlags & (SF_Distinct|SF_Aggregate))==SF_Aggregate );
+    return 0; /* No DISTINCT keyword and no aggregate functions */
+  }
+  assert( p->pGroupBy==0 );              /* Has no GROUP BY clause */
+  if( p->pLimit ) return 0;              /* Has no LIMIT clause */
+  if( p->pWhere ) return 0;              /* Has no WHERE clause */
+  pSrc = p->pSrc;
+  assert( pSrc!=0 );
+  if( pSrc->nSrc!=1 ) return 0;          /* Single term in FROM clause */
+  if( pSrc->a[0].pSelect ) return 0;     /* FROM is not a subquery or view */
+  pTab = pSrc->a[0].pTab;
+  assert( pTab!=0 );
+  assert( !IsView(pTab)  );              /* FROM clause is not a view */
+  if( IsVirtual(pTab) ) return 0;        /* FROM clause not a virtual table */
+  pEList = p->pEList;
+  assert( pEList!=0 );
+  /* All SELECT results must be columns. */
+  for(i=0; i<pEList->nExpr; i++){
+    Expr *pRes = pEList->a[i].pExpr;
+    if( pRes->op!=TK_COLUMN ) return 0;
+    assert( pRes->iTable==pSrc->a[0].iCursor );  /* Not a correlated subquery */
+  }
+  return p;
+}
+#endif /* SQLITE_OMIT_SUBQUERY */
+
+#ifndef SQLITE_OMIT_SUBQUERY
+/*
+** Generate code that checks the left-most column of index table iCur to see if
+** it contains any NULL entries.  Cause the register at regHasNull to be set
+** to a non-NULL value if iCur contains no NULLs.  Cause register regHasNull
+** to be set to NULL if iCur contains one or more NULL values.
+*/
+static void sqlite3SetHasNullFlag(Vdbe *v, int iCur, int regHasNull){
+  int addr1;
+  sqlite3VdbeAddOp2(v, OP_Integer, 0, regHasNull);
+  addr1 = sqlite3VdbeAddOp1(v, OP_Rewind, iCur); VdbeCoverage(v);
+  sqlite3VdbeAddOp3(v, OP_Column, iCur, 0, regHasNull);
+  sqlite3VdbeChangeP5(v, OPFLAG_TYPEOFARG);
+  VdbeComment((v, "first_entry_in(%d)", iCur));
+  sqlite3VdbeJumpHere(v, addr1);
+}
+#endif
+
+
+#ifndef SQLITE_OMIT_SUBQUERY
+/*
+** The argument is an IN operator with a list (not a subquery) on the
+** right-hand side.  Return TRUE if that list is constant.
+*/
+static int sqlite3InRhsIsConstant(Expr *pIn){
+  Expr *pLHS;
+  int res;
+  assert( !ExprHasProperty(pIn, EP_xIsSelect) );
+  pLHS = pIn->pLeft;
+  pIn->pLeft = 0;
+  res = sqlite3ExprIsConstant(pIn);
+  pIn->pLeft = pLHS;
+  return res;
+}
+#endif
+
+/*
+** This function is used by the implementation of the IN (...) operator.
+** The pX parameter is the expression on the RHS of the IN operator, which
+** might be either a list of expressions or a subquery.
+**
+** The job of this routine is to find or create a b-tree object that can
+** be used either to test for membership in the RHS set or to iterate through
+** all members of the RHS set, skipping duplicates.
+**
+** A cursor is opened on the b-tree object that is the RHS of the IN operator
+** and the *piTab parameter is set to the index of that cursor.
+**
+** The returned value of this function indicates the b-tree type, as follows:
+**
+**   IN_INDEX_ROWID      - The cursor was opened on a database table.
+**   IN_INDEX_INDEX_ASC  - The cursor was opened on an ascending index.
+**   IN_INDEX_INDEX_DESC - The cursor was opened on a descending index.
+**   IN_INDEX_EPH        - The cursor was opened on a specially created and
+**                         populated epheremal table.
+**   IN_INDEX_NOOP       - No cursor was allocated.  The IN operator must be
+**                         implemented as a sequence of comparisons.
+**
+** An existing b-tree might be used if the RHS expression pX is a simple
+** subquery such as:
+**
+**     SELECT <column1>, <column2>... FROM <table>
+**
+** If the RHS of the IN operator is a list or a more complex subquery, then
+** an ephemeral table might need to be generated from the RHS and then
+** pX->iTable made to point to the ephemeral table instead of an
+** existing table.  In this case, the creation and initialization of the
+** ephmeral table might be put inside of a subroutine, the EP_Subrtn flag
+** will be set on pX and the pX->y.sub fields will be set to show where
+** the subroutine is coded.
+**
+** The inFlags parameter must contain, at a minimum, one of the bits
+** IN_INDEX_MEMBERSHIP or IN_INDEX_LOOP but not both.  If inFlags contains
+** IN_INDEX_MEMBERSHIP, then the generated table will be used for a fast
+** membership test.  When the IN_INDEX_LOOP bit is set, the IN index will
+** be used to loop over all values of the RHS of the IN operator.
+**
+** When IN_INDEX_LOOP is used (and the b-tree will be used to iterate
+** through the set members) then the b-tree must not contain duplicates.
+** An epheremal table will be created unless the selected columns are guaranteed
+** to be unique - either because it is an INTEGER PRIMARY KEY or due to
+** a UNIQUE constraint or index.
+**
+** When IN_INDEX_MEMBERSHIP is used (and the b-tree will be used
+** for fast set membership tests) then an epheremal table must
+** be used unless <columns> is a single INTEGER PRIMARY KEY column or an
+** index can be found with the specified <columns> as its left-most.
+**
+** If the IN_INDEX_NOOP_OK and IN_INDEX_MEMBERSHIP are both set and
+** if the RHS of the IN operator is a list (not a subquery) then this
+** routine might decide that creating an ephemeral b-tree for membership
+** testing is too expensive and return IN_INDEX_NOOP.  In that case, the
+** calling routine should implement the IN operator using a sequence
+** of Eq or Ne comparison operations.
+**
+** When the b-tree is being used for membership tests, the calling function
+** might need to know whether or not the RHS side of the IN operator
+** contains a NULL.  If prRhsHasNull is not a NULL pointer and
+** if there is any chance that the (...) might contain a NULL value at
+** runtime, then a register is allocated and the register number written
+** to *prRhsHasNull. If there is no chance that the (...) contains a
+** NULL value, then *prRhsHasNull is left unchanged.
+**
+** If a regist
