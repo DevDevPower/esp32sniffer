@@ -106897,4 +106897,180 @@ SQLITE_PRIVATE void sqlite3CodeRhsOfIN(
 **
 ** Return the register that holds the result.  For a multi-column SELECT,
 ** the result is stored in a contiguous array of registers and the
-** retur
+** return value is the register of the left-most result column.
+** Return 0 if an error occurs.
+*/
+#ifndef SQLITE_OMIT_SUBQUERY
+SQLITE_PRIVATE int sqlite3CodeSubselect(Parse *pParse, Expr *pExpr){
+  int addrOnce = 0;           /* Address of OP_Once at top of subroutine */
+  int rReg = 0;               /* Register storing resulting */
+  Select *pSel;               /* SELECT statement to encode */
+  SelectDest dest;            /* How to deal with SELECT result */
+  int nReg;                   /* Registers to allocate */
+  Expr *pLimit;               /* New limit expression */
+
+  Vdbe *v = pParse->pVdbe;
+  assert( v!=0 );
+  if( pParse->nErr ) return 0;
+  testcase( pExpr->op==TK_EXISTS );
+  testcase( pExpr->op==TK_SELECT );
+  assert( pExpr->op==TK_EXISTS || pExpr->op==TK_SELECT );
+  assert( ExprUseXSelect(pExpr) );
+  pSel = pExpr->x.pSelect;
+
+  /* If this routine has already been coded, then invoke it as a
+  ** subroutine. */
+  if( ExprHasProperty(pExpr, EP_Subrtn) ){
+    ExplainQueryPlan((pParse, 0, "REUSE SUBQUERY %d", pSel->selId));
+    assert( ExprUseYSub(pExpr) );
+    sqlite3VdbeAddOp2(v, OP_Gosub, pExpr->y.sub.regReturn,
+                      pExpr->y.sub.iAddr);
+    return pExpr->iTable;
+  }
+
+  /* Begin coding the subroutine */
+  assert( !ExprUseYWin(pExpr) );
+  assert( !ExprHasProperty(pExpr, EP_Reduced|EP_TokenOnly) );
+  ExprSetProperty(pExpr, EP_Subrtn);
+  pExpr->y.sub.regReturn = ++pParse->nMem;
+  pExpr->y.sub.iAddr =
+    sqlite3VdbeAddOp2(v, OP_BeginSubrtn, 0, pExpr->y.sub.regReturn) + 1;
+
+  /* The evaluation of the EXISTS/SELECT must be repeated every time it
+  ** is encountered if any of the following is true:
+  **
+  **    *  The right-hand side is a correlated subquery
+  **    *  The right-hand side is an expression list containing variables
+  **    *  We are inside a trigger
+  **
+  ** If all of the above are false, then we can run this code just once
+  ** save the results, and reuse the same result on subsequent invocations.
+  */
+  if( !ExprHasProperty(pExpr, EP_VarSelect) ){
+    addrOnce = sqlite3VdbeAddOp0(v, OP_Once); VdbeCoverage(v);
+  }
+
+  /* For a SELECT, generate code to put the values for all columns of
+  ** the first row into an array of registers and return the index of
+  ** the first register.
+  **
+  ** If this is an EXISTS, write an integer 0 (not exists) or 1 (exists)
+  ** into a register and return that register number.
+  **
+  ** In both cases, the query is augmented with "LIMIT 1".  Any
+  ** preexisting limit is discarded in place of the new LIMIT 1.
+  */
+  ExplainQueryPlan((pParse, 1, "%sSCALAR SUBQUERY %d",
+        addrOnce?"":"CORRELATED ", pSel->selId));
+  nReg = pExpr->op==TK_SELECT ? pSel->pEList->nExpr : 1;
+  sqlite3SelectDestInit(&dest, 0, pParse->nMem+1);
+  pParse->nMem += nReg;
+  if( pExpr->op==TK_SELECT ){
+    dest.eDest = SRT_Mem;
+    dest.iSdst = dest.iSDParm;
+    dest.nSdst = nReg;
+    sqlite3VdbeAddOp3(v, OP_Null, 0, dest.iSDParm, dest.iSDParm+nReg-1);
+    VdbeComment((v, "Init subquery result"));
+  }else{
+    dest.eDest = SRT_Exists;
+    sqlite3VdbeAddOp2(v, OP_Integer, 0, dest.iSDParm);
+    VdbeComment((v, "Init EXISTS result"));
+  }
+  if( pSel->pLimit ){
+    /* The subquery already has a limit.  If the pre-existing limit is X
+    ** then make the new limit X<>0 so that the new limit is either 1 or 0 */
+    sqlite3 *db = pParse->db;
+    pLimit = sqlite3Expr(db, TK_INTEGER, "0");
+    if( pLimit ){
+      pLimit->affExpr = SQLITE_AFF_NUMERIC;
+      pLimit = sqlite3PExpr(pParse, TK_NE,
+                            sqlite3ExprDup(db, pSel->pLimit->pLeft, 0), pLimit);
+    }
+    sqlite3ExprDelete(db, pSel->pLimit->pLeft);
+    pSel->pLimit->pLeft = pLimit;
+  }else{
+    /* If there is no pre-existing limit add a limit of 1 */
+    pLimit = sqlite3Expr(pParse->db, TK_INTEGER, "1");
+    pSel->pLimit = sqlite3PExpr(pParse, TK_LIMIT, pLimit, 0);
+  }
+  pSel->iLimit = 0;
+  if( sqlite3Select(pParse, pSel, &dest) ){
+    pExpr->op2 = pExpr->op;
+    pExpr->op = TK_ERROR;
+    return 0;
+  }
+  pExpr->iTable = rReg = dest.iSDParm;
+  ExprSetVVAProperty(pExpr, EP_NoReduce);
+  if( addrOnce ){
+    sqlite3VdbeJumpHere(v, addrOnce);
+  }
+
+  /* Subroutine return */
+  assert( ExprUseYSub(pExpr) );
+  assert( sqlite3VdbeGetOp(v,pExpr->y.sub.iAddr-1)->opcode==OP_BeginSubrtn
+          || pParse->nErr );
+  sqlite3VdbeAddOp3(v, OP_Return, pExpr->y.sub.regReturn,
+                    pExpr->y.sub.iAddr, 1);
+  VdbeCoverage(v);
+  sqlite3ClearTempRegCache(pParse);
+  return rReg;
+}
+#endif /* SQLITE_OMIT_SUBQUERY */
+
+#ifndef SQLITE_OMIT_SUBQUERY
+/*
+** Expr pIn is an IN(...) expression. This function checks that the
+** sub-select on the RHS of the IN() operator has the same number of
+** columns as the vector on the LHS. Or, if the RHS of the IN() is not
+** a sub-query, that the LHS is a vector of size 1.
+*/
+SQLITE_PRIVATE int sqlite3ExprCheckIN(Parse *pParse, Expr *pIn){
+  int nVector = sqlite3ExprVectorSize(pIn->pLeft);
+  if( ExprUseXSelect(pIn) && !pParse->db->mallocFailed ){
+    if( nVector!=pIn->x.pSelect->pEList->nExpr ){
+      sqlite3SubselectError(pParse, pIn->x.pSelect->pEList->nExpr, nVector);
+      return 1;
+    }
+  }else if( nVector!=1 ){
+    sqlite3VectorErrorMsg(pParse, pIn->pLeft);
+    return 1;
+  }
+  return 0;
+}
+#endif
+
+#ifndef SQLITE_OMIT_SUBQUERY
+/*
+** Generate code for an IN expression.
+**
+**      x IN (SELECT ...)
+**      x IN (value, value, ...)
+**
+** The left-hand side (LHS) is a scalar or vector expression.  The
+** right-hand side (RHS) is an array of zero or more scalar values, or a
+** subquery.  If the RHS is a subquery, the number of result columns must
+** match the number of columns in the vector on the LHS.  If the RHS is
+** a list of values, the LHS must be a scalar.
+**
+** The IN operator is true if the LHS value is contained within the RHS.
+** The result is false if the LHS is definitely not in the RHS.  The
+** result is NULL if the presence of the LHS in the RHS cannot be
+** determined due to NULLs.
+**
+** This routine generates code that jumps to destIfFalse if the LHS is not
+** contained within the RHS.  If due to NULLs we cannot determine if the LHS
+** is contained in the RHS then jump to destIfNull.  If the LHS is contained
+** within the RHS then fall through.
+**
+** See the separate in-operator.md documentation file in the canonical
+** SQLite source tree for additional information.
+*/
+static void sqlite3ExprCodeIN(
+  Parse *pParse,        /* Parsing and code generating context */
+  Expr *pExpr,          /* The IN expression */
+  int destIfFalse,      /* Jump here if LHS is not contained in the RHS */
+  int destIfNull        /* Jump here if the results are unknown due to NULLs */
+){
+  int rRhsHasNull = 0;  /* Register that is true if RHS contains NULL values */
+  int eType;            /* Type of the RHS */
+  i
