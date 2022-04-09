@@ -107231,4 +107231,196 @@ static void sqlite3ExprCodeIN(
   */
   if( eType==IN_INDEX_ROWID ){
     /* In this case, the RHS is the ROWID of table b-tree and so we also
-    ** know that the RHS
+    ** know that the RHS is non-NULL.  Hence, we combine steps 3 and 4
+    ** into a single opcode. */
+    sqlite3VdbeAddOp3(v, OP_SeekRowid, iTab, destIfFalse, rLhs);
+    VdbeCoverage(v);
+    addrTruthOp = sqlite3VdbeAddOp0(v, OP_Goto);  /* Return True */
+  }else{
+    sqlite3VdbeAddOp4(v, OP_Affinity, rLhs, nVector, 0, zAff, nVector);
+    if( destIfFalse==destIfNull ){
+      /* Combine Step 3 and Step 5 into a single opcode */
+      sqlite3VdbeAddOp4Int(v, OP_NotFound, iTab, destIfFalse,
+                           rLhs, nVector); VdbeCoverage(v);
+      goto sqlite3ExprCodeIN_finished;
+    }
+    /* Ordinary Step 3, for the case where FALSE and NULL are distinct */
+    addrTruthOp = sqlite3VdbeAddOp4Int(v, OP_Found, iTab, 0,
+                                      rLhs, nVector); VdbeCoverage(v);
+  }
+
+  /* Step 4.  If the RHS is known to be non-NULL and we did not find
+  ** an match on the search above, then the result must be FALSE.
+  */
+  if( rRhsHasNull && nVector==1 ){
+    sqlite3VdbeAddOp2(v, OP_NotNull, rRhsHasNull, destIfFalse);
+    VdbeCoverage(v);
+  }
+
+  /* Step 5.  If we do not care about the difference between NULL and
+  ** FALSE, then just return false.
+  */
+  if( destIfFalse==destIfNull ) sqlite3VdbeGoto(v, destIfFalse);
+
+  /* Step 6: Loop through rows of the RHS.  Compare each row to the LHS.
+  ** If any comparison is NULL, then the result is NULL.  If all
+  ** comparisons are FALSE then the final result is FALSE.
+  **
+  ** For a scalar LHS, it is sufficient to check just the first row
+  ** of the RHS.
+  */
+  if( destStep6 ) sqlite3VdbeResolveLabel(v, destStep6);
+  addrTop = sqlite3VdbeAddOp2(v, OP_Rewind, iTab, destIfFalse);
+  VdbeCoverage(v);
+  if( nVector>1 ){
+    destNotNull = sqlite3VdbeMakeLabel(pParse);
+  }else{
+    /* For nVector==1, combine steps 6 and 7 by immediately returning
+    ** FALSE if the first comparison is not NULL */
+    destNotNull = destIfFalse;
+  }
+  for(i=0; i<nVector; i++){
+    Expr *p;
+    CollSeq *pColl;
+    int r3 = sqlite3GetTempReg(pParse);
+    p = sqlite3VectorFieldSubexpr(pLeft, i);
+    pColl = sqlite3ExprCollSeq(pParse, p);
+    sqlite3VdbeAddOp3(v, OP_Column, iTab, i, r3);
+    sqlite3VdbeAddOp4(v, OP_Ne, rLhs+i, destNotNull, r3,
+                      (void*)pColl, P4_COLLSEQ);
+    VdbeCoverage(v);
+    sqlite3ReleaseTempReg(pParse, r3);
+  }
+  sqlite3VdbeAddOp2(v, OP_Goto, 0, destIfNull);
+  if( nVector>1 ){
+    sqlite3VdbeResolveLabel(v, destNotNull);
+    sqlite3VdbeAddOp2(v, OP_Next, iTab, addrTop+1);
+    VdbeCoverage(v);
+
+    /* Step 7:  If we reach this point, we know that the result must
+    ** be false. */
+    sqlite3VdbeAddOp2(v, OP_Goto, 0, destIfFalse);
+  }
+
+  /* Jumps here in order to return true. */
+  sqlite3VdbeJumpHere(v, addrTruthOp);
+
+sqlite3ExprCodeIN_finished:
+  if( rLhs!=rLhsOrig ) sqlite3ReleaseTempReg(pParse, rLhs);
+  VdbeComment((v, "end IN expr"));
+sqlite3ExprCodeIN_oom_error:
+  sqlite3DbFree(pParse->db, aiMap);
+  sqlite3DbFree(pParse->db, zAff);
+}
+#endif /* SQLITE_OMIT_SUBQUERY */
+
+#ifndef SQLITE_OMIT_FLOATING_POINT
+/*
+** Generate an instruction that will put the floating point
+** value described by z[0..n-1] into register iMem.
+**
+** The z[] string will probably not be zero-terminated.  But the
+** z[n] character is guaranteed to be something that does not look
+** like the continuation of the number.
+*/
+static void codeReal(Vdbe *v, const char *z, int negateFlag, int iMem){
+  if( ALWAYS(z!=0) ){
+    double value;
+    sqlite3AtoF(z, &value, sqlite3Strlen30(z), SQLITE_UTF8);
+    assert( !sqlite3IsNaN(value) ); /* The new AtoF never returns NaN */
+    if( negateFlag ) value = -value;
+    sqlite3VdbeAddOp4Dup8(v, OP_Real, 0, iMem, 0, (u8*)&value, P4_REAL);
+  }
+}
+#endif
+
+
+/*
+** Generate an instruction that will put the integer describe by
+** text z[0..n-1] into register iMem.
+**
+** Expr.u.zToken is always UTF8 and zero-terminated.
+*/
+static void codeInteger(Parse *pParse, Expr *pExpr, int negFlag, int iMem){
+  Vdbe *v = pParse->pVdbe;
+  if( pExpr->flags & EP_IntValue ){
+    int i = pExpr->u.iValue;
+    assert( i>=0 );
+    if( negFlag ) i = -i;
+    sqlite3VdbeAddOp2(v, OP_Integer, i, iMem);
+  }else{
+    int c;
+    i64 value;
+    const char *z = pExpr->u.zToken;
+    assert( z!=0 );
+    c = sqlite3DecOrHexToI64(z, &value);
+    if( (c==3 && !negFlag) || (c==2) || (negFlag && value==SMALLEST_INT64)){
+#ifdef SQLITE_OMIT_FLOATING_POINT
+      sqlite3ErrorMsg(pParse, "oversized integer: %s%#T", negFlag?"-":"",pExpr);
+#else
+#ifndef SQLITE_OMIT_HEX_INTEGER
+      if( sqlite3_strnicmp(z,"0x",2)==0 ){
+        sqlite3ErrorMsg(pParse, "hex literal too big: %s%#T",
+                        negFlag?"-":"",pExpr);
+      }else
+#endif
+      {
+        codeReal(v, z, negFlag, iMem);
+      }
+#endif
+    }else{
+      if( negFlag ){ value = c==3 ? SMALLEST_INT64 : -value; }
+      sqlite3VdbeAddOp4Dup8(v, OP_Int64, 0, iMem, 0, (u8*)&value, P4_INT64);
+    }
+  }
+}
+
+
+/* Generate code that will load into register regOut a value that is
+** appropriate for the iIdxCol-th column of index pIdx.
+*/
+SQLITE_PRIVATE void sqlite3ExprCodeLoadIndexColumn(
+  Parse *pParse,  /* The parsing context */
+  Index *pIdx,    /* The index whose column is to be loaded */
+  int iTabCur,    /* Cursor pointing to a table row */
+  int iIdxCol,    /* The column of the index to be loaded */
+  int regOut      /* Store the index column value in this register */
+){
+  i16 iTabCol = pIdx->aiColumn[iIdxCol];
+  if( iTabCol==XN_EXPR ){
+    assert( pIdx->aColExpr );
+    assert( pIdx->aColExpr->nExpr>iIdxCol );
+    pParse->iSelfTab = iTabCur + 1;
+    sqlite3ExprCodeCopy(pParse, pIdx->aColExpr->a[iIdxCol].pExpr, regOut);
+    pParse->iSelfTab = 0;
+  }else{
+    sqlite3ExprCodeGetColumnOfTable(pParse->pVdbe, pIdx->pTable, iTabCur,
+                                    iTabCol, regOut);
+  }
+}
+
+#ifndef SQLITE_OMIT_GENERATED_COLUMNS
+/*
+** Generate code that will compute the value of generated column pCol
+** and store the result in register regOut
+*/
+SQLITE_PRIVATE void sqlite3ExprCodeGeneratedColumn(
+  Parse *pParse,     /* Parsing context */
+  Table *pTab,       /* Table containing the generated column */
+  Column *pCol,      /* The generated column */
+  int regOut         /* Put the result in this register */
+){
+  int iAddr;
+  Vdbe *v = pParse->pVdbe;
+  assert( v!=0 );
+  assert( pParse->iSelfTab!=0 );
+  if( pParse->iSelfTab>0 ){
+    iAddr = sqlite3VdbeAddOp3(v, OP_IfNullRow, pParse->iSelfTab-1, 0, regOut);
+  }else{
+    iAddr = 0;
+  }
+  sqlite3ExprCodeCopy(pParse, sqlite3ColumnExpr(pTab,pCol), regOut);
+  if( pCol->affinity>=SQLITE_AFF_TEXT ){
+    sqlite3VdbeAddOp4(v, OP_Affinity, regOut, 1, 0, &pCol->affinity, 1);
+  }
+  if( iAddr ) sqlite3VdbeJumpHere(v
