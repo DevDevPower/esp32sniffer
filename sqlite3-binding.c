@@ -107628,4 +107628,185 @@ static int exprCodeInlineFunction(
     }
 #endif
     default: {
-      /* The UNLIKELY() function is a no-op.
+      /* The UNLIKELY() function is a no-op.  The result is the value
+      ** of the first argument.
+      */
+      assert( nFarg==1 || nFarg==2 );
+      target = sqlite3ExprCodeTarget(pParse, pFarg->a[0].pExpr, target);
+      break;
+    }
+
+  /***********************************************************************
+  ** Test-only SQL functions that are only usable if enabled
+  ** via SQLITE_TESTCTRL_INTERNAL_FUNCTIONS
+  */
+#if !defined(SQLITE_UNTESTABLE)
+    case INLINEFUNC_expr_compare: {
+      /* Compare two expressions using sqlite3ExprCompare() */
+      assert( nFarg==2 );
+      sqlite3VdbeAddOp2(v, OP_Integer,
+         sqlite3ExprCompare(0,pFarg->a[0].pExpr, pFarg->a[1].pExpr,-1),
+         target);
+      break;
+    }
+
+    case INLINEFUNC_expr_implies_expr: {
+      /* Compare two expressions using sqlite3ExprImpliesExpr() */
+      assert( nFarg==2 );
+      sqlite3VdbeAddOp2(v, OP_Integer,
+         sqlite3ExprImpliesExpr(pParse,pFarg->a[0].pExpr, pFarg->a[1].pExpr,-1),
+         target);
+      break;
+    }
+
+    case INLINEFUNC_implies_nonnull_row: {
+      /* REsult of sqlite3ExprImpliesNonNullRow() */
+      Expr *pA1;
+      assert( nFarg==2 );
+      pA1 = pFarg->a[1].pExpr;
+      if( pA1->op==TK_COLUMN ){
+        sqlite3VdbeAddOp2(v, OP_Integer,
+           sqlite3ExprImpliesNonNullRow(pFarg->a[0].pExpr,pA1->iTable),
+           target);
+      }else{
+        sqlite3VdbeAddOp2(v, OP_Null, 0, target);
+      }
+      break;
+    }
+
+    case INLINEFUNC_affinity: {
+      /* The AFFINITY() function evaluates to a string that describes
+      ** the type affinity of the argument.  This is used for testing of
+      ** the SQLite type logic.
+      */
+      const char *azAff[] = { "blob", "text", "numeric", "integer", "real" };
+      char aff;
+      assert( nFarg==1 );
+      aff = sqlite3ExprAffinity(pFarg->a[0].pExpr);
+      sqlite3VdbeLoadString(v, target,
+              (aff<=SQLITE_AFF_NONE) ? "none" : azAff[aff-SQLITE_AFF_BLOB]);
+      break;
+    }
+#endif /* !defined(SQLITE_UNTESTABLE) */
+  }
+  return target;
+}
+
+
+/*
+** Generate code into the current Vdbe to evaluate the given
+** expression.  Attempt to store the results in register "target".
+** Return the register where results are stored.
+**
+** With this routine, there is no guarantee that results will
+** be stored in target.  The result might be stored in some other
+** register if it is convenient to do so.  The calling function
+** must check the return code and move the results to the desired
+** register.
+*/
+SQLITE_PRIVATE int sqlite3ExprCodeTarget(Parse *pParse, Expr *pExpr, int target){
+  Vdbe *v = pParse->pVdbe;  /* The VM under construction */
+  int op;                   /* The opcode being coded */
+  int inReg = target;       /* Results stored in register inReg */
+  int regFree1 = 0;         /* If non-zero free this temporary register */
+  int regFree2 = 0;         /* If non-zero free this temporary register */
+  int r1, r2;               /* Various register numbers */
+  Expr tempX;               /* Temporary expression node */
+  int p5 = 0;
+
+  assert( target>0 && target<=pParse->nMem );
+  assert( v!=0 );
+
+expr_code_doover:
+  if( pExpr==0 ){
+    op = TK_NULL;
+  }else{
+    assert( !ExprHasVVAProperty(pExpr,EP_Immutable) );
+    op = pExpr->op;
+  }
+  switch( op ){
+    case TK_AGG_COLUMN: {
+      AggInfo *pAggInfo = pExpr->pAggInfo;
+      struct AggInfo_col *pCol;
+      assert( pAggInfo!=0 );
+      assert( pExpr->iAgg>=0 && pExpr->iAgg<pAggInfo->nColumn );
+      pCol = &pAggInfo->aCol[pExpr->iAgg];
+      if( !pAggInfo->directMode ){
+        assert( pCol->iMem>0 );
+        return pCol->iMem;
+      }else if( pAggInfo->useSortingIdx ){
+        Table *pTab = pCol->pTab;
+        sqlite3VdbeAddOp3(v, OP_Column, pAggInfo->sortingIdxPTab,
+                              pCol->iSorterColumn, target);
+        if( pCol->iColumn<0 ){
+          VdbeComment((v,"%s.rowid",pTab->zName));
+        }else{
+          VdbeComment((v,"%s.%s",
+              pTab->zName, pTab->aCol[pCol->iColumn].zCnName));
+          if( pTab->aCol[pCol->iColumn].affinity==SQLITE_AFF_REAL ){
+            sqlite3VdbeAddOp1(v, OP_RealAffinity, target);
+          }
+        }
+        return target;
+      }
+      /* Otherwise, fall thru into the TK_COLUMN case */
+      /* no break */ deliberate_fall_through
+    }
+    case TK_COLUMN: {
+      int iTab = pExpr->iTable;
+      int iReg;
+      if( ExprHasProperty(pExpr, EP_FixedCol) ){
+        /* This COLUMN expression is really a constant due to WHERE clause
+        ** constraints, and that constant is coded by the pExpr->pLeft
+        ** expresssion.  However, make sure the constant has the correct
+        ** datatype by applying the Affinity of the table column to the
+        ** constant.
+        */
+        int aff;
+        iReg = sqlite3ExprCodeTarget(pParse, pExpr->pLeft,target);
+        assert( ExprUseYTab(pExpr) );
+        if( pExpr->y.pTab ){
+          aff = sqlite3TableColumnAffinity(pExpr->y.pTab, pExpr->iColumn);
+        }else{
+          aff = pExpr->affExpr;
+        }
+        if( aff>SQLITE_AFF_BLOB ){
+          static const char zAff[] = "B\000C\000D\000E";
+          assert( SQLITE_AFF_BLOB=='A' );
+          assert( SQLITE_AFF_TEXT=='B' );
+          sqlite3VdbeAddOp4(v, OP_Affinity, iReg, 1, 0,
+                            &zAff[(aff-'B')*2], P4_STATIC);
+        }
+        return iReg;
+      }
+      if( iTab<0 ){
+        if( pParse->iSelfTab<0 ){
+          /* Other columns in the same row for CHECK constraints or
+          ** generated columns or for inserting into partial index.
+          ** The row is unpacked into registers beginning at
+          ** 0-(pParse->iSelfTab).  The rowid (if any) is in a register
+          ** immediately prior to the first column.
+          */
+          Column *pCol;
+          Table *pTab;
+          int iSrc;
+          int iCol = pExpr->iColumn;
+          assert( ExprUseYTab(pExpr) );
+          pTab = pExpr->y.pTab;
+          assert( pTab!=0 );
+          assert( iCol>=XN_ROWID );
+          assert( iCol<pTab->nCol );
+          if( iCol<0 ){
+            return -1-pParse->iSelfTab;
+          }
+          pCol = pTab->aCol + iCol;
+          testcase( iCol!=sqlite3TableColumnToStorage(pTab,iCol) );
+          iSrc = sqlite3TableColumnToStorage(pTab, iCol) - pParse->iSelfTab;
+#ifndef SQLITE_OMIT_GENERATED_COLUMNS
+          if( pCol->colFlags & COLFLAG_GENERATED ){
+            if( pCol->colFlags & COLFLAG_BUSY ){
+              sqlite3ErrorMsg(pParse, "generated column loop on \"%s\"",
+                              pCol->zCnName);
+              return 0;
+            }
+            pCol->colFla
