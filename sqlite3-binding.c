@@ -107423,4 +107423,209 @@ SQLITE_PRIVATE void sqlite3ExprCodeGeneratedColumn(
   if( pCol->affinity>=SQLITE_AFF_TEXT ){
     sqlite3VdbeAddOp4(v, OP_Affinity, regOut, 1, 0, &pCol->affinity, 1);
   }
-  if( iAddr ) sqlite3VdbeJumpHere(v
+  if( iAddr ) sqlite3VdbeJumpHere(v, iAddr);
+}
+#endif /* SQLITE_OMIT_GENERATED_COLUMNS */
+
+/*
+** Generate code to extract the value of the iCol-th column of a table.
+*/
+SQLITE_PRIVATE void sqlite3ExprCodeGetColumnOfTable(
+  Vdbe *v,        /* Parsing context */
+  Table *pTab,    /* The table containing the value */
+  int iTabCur,    /* The table cursor.  Or the PK cursor for WITHOUT ROWID */
+  int iCol,       /* Index of the column to extract */
+  int regOut      /* Extract the value into this register */
+){
+  Column *pCol;
+  assert( v!=0 );
+  if( pTab==0 ){
+    sqlite3VdbeAddOp3(v, OP_Column, iTabCur, iCol, regOut);
+    return;
+  }
+  if( iCol<0 || iCol==pTab->iPKey ){
+    sqlite3VdbeAddOp2(v, OP_Rowid, iTabCur, regOut);
+    VdbeComment((v, "%s.rowid", pTab->zName));
+  }else{
+    int op;
+    int x;
+    if( IsVirtual(pTab) ){
+      op = OP_VColumn;
+      x = iCol;
+#ifndef SQLITE_OMIT_GENERATED_COLUMNS
+    }else if( (pCol = &pTab->aCol[iCol])->colFlags & COLFLAG_VIRTUAL ){
+      Parse *pParse = sqlite3VdbeParser(v);
+      if( pCol->colFlags & COLFLAG_BUSY ){
+        sqlite3ErrorMsg(pParse, "generated column loop on \"%s\"",
+                        pCol->zCnName);
+      }else{
+        int savedSelfTab = pParse->iSelfTab;
+        pCol->colFlags |= COLFLAG_BUSY;
+        pParse->iSelfTab = iTabCur+1;
+        sqlite3ExprCodeGeneratedColumn(pParse, pTab, pCol, regOut);
+        pParse->iSelfTab = savedSelfTab;
+        pCol->colFlags &= ~COLFLAG_BUSY;
+      }
+      return;
+#endif
+    }else if( !HasRowid(pTab) ){
+      testcase( iCol!=sqlite3TableColumnToStorage(pTab, iCol) );
+      x = sqlite3TableColumnToIndex(sqlite3PrimaryKeyIndex(pTab), iCol);
+      op = OP_Column;
+    }else{
+      x = sqlite3TableColumnToStorage(pTab,iCol);
+      testcase( x!=iCol );
+      op = OP_Column;
+    }
+    sqlite3VdbeAddOp3(v, op, iTabCur, x, regOut);
+    sqlite3ColumnDefault(v, pTab, iCol, regOut);
+  }
+}
+
+/*
+** Generate code that will extract the iColumn-th column from
+** table pTab and store the column value in register iReg.
+**
+** There must be an open cursor to pTab in iTable when this routine
+** is called.  If iColumn<0 then code is generated that extracts the rowid.
+*/
+SQLITE_PRIVATE int sqlite3ExprCodeGetColumn(
+  Parse *pParse,   /* Parsing and code generating context */
+  Table *pTab,     /* Description of the table we are reading from */
+  int iColumn,     /* Index of the table column */
+  int iTable,      /* The cursor pointing to the table */
+  int iReg,        /* Store results here */
+  u8 p5            /* P5 value for OP_Column + FLAGS */
+){
+  assert( pParse->pVdbe!=0 );
+  sqlite3ExprCodeGetColumnOfTable(pParse->pVdbe, pTab, iTable, iColumn, iReg);
+  if( p5 ){
+    VdbeOp *pOp = sqlite3VdbeGetOp(pParse->pVdbe,-1);
+    if( pOp->opcode==OP_Column ) pOp->p5 = p5;
+  }
+  return iReg;
+}
+
+/*
+** Generate code to move content from registers iFrom...iFrom+nReg-1
+** over to iTo..iTo+nReg-1.
+*/
+SQLITE_PRIVATE void sqlite3ExprCodeMove(Parse *pParse, int iFrom, int iTo, int nReg){
+  sqlite3VdbeAddOp3(pParse->pVdbe, OP_Move, iFrom, iTo, nReg);
+}
+
+/*
+** Convert a scalar expression node to a TK_REGISTER referencing
+** register iReg.  The caller must ensure that iReg already contains
+** the correct value for the expression.
+*/
+static void exprToRegister(Expr *pExpr, int iReg){
+  Expr *p = sqlite3ExprSkipCollateAndLikely(pExpr);
+  if( NEVER(p==0) ) return;
+  p->op2 = p->op;
+  p->op = TK_REGISTER;
+  p->iTable = iReg;
+  ExprClearProperty(p, EP_Skip);
+}
+
+/*
+** Evaluate an expression (either a vector or a scalar expression) and store
+** the result in continguous temporary registers.  Return the index of
+** the first register used to store the result.
+**
+** If the returned result register is a temporary scalar, then also write
+** that register number into *piFreeable.  If the returned result register
+** is not a temporary or if the expression is a vector set *piFreeable
+** to 0.
+*/
+static int exprCodeVector(Parse *pParse, Expr *p, int *piFreeable){
+  int iResult;
+  int nResult = sqlite3ExprVectorSize(p);
+  if( nResult==1 ){
+    iResult = sqlite3ExprCodeTemp(pParse, p, piFreeable);
+  }else{
+    *piFreeable = 0;
+    if( p->op==TK_SELECT ){
+#if SQLITE_OMIT_SUBQUERY
+      iResult = 0;
+#else
+      iResult = sqlite3CodeSubselect(pParse, p);
+#endif
+    }else{
+      int i;
+      iResult = pParse->nMem+1;
+      pParse->nMem += nResult;
+      assert( ExprUseXList(p) );
+      for(i=0; i<nResult; i++){
+        sqlite3ExprCodeFactorable(pParse, p->x.pList->a[i].pExpr, i+iResult);
+      }
+    }
+  }
+  return iResult;
+}
+
+/*
+** If the last opcode is a OP_Copy, then set the do-not-merge flag (p5)
+** so that a subsequent copy will not be merged into this one.
+*/
+static void setDoNotMergeFlagOnCopy(Vdbe *v){
+  if( sqlite3VdbeGetOp(v, -1)->opcode==OP_Copy ){
+    sqlite3VdbeChangeP5(v, 1);  /* Tag trailing OP_Copy as not mergable */
+  }
+}
+
+/*
+** Generate code to implement special SQL functions that are implemented
+** in-line rather than by using the usual callbacks.
+*/
+static int exprCodeInlineFunction(
+  Parse *pParse,        /* Parsing context */
+  ExprList *pFarg,      /* List of function arguments */
+  int iFuncId,          /* Function ID.  One of the INTFUNC_... values */
+  int target            /* Store function result in this register */
+){
+  int nFarg;
+  Vdbe *v = pParse->pVdbe;
+  assert( v!=0 );
+  assert( pFarg!=0 );
+  nFarg = pFarg->nExpr;
+  assert( nFarg>0 );  /* All in-line functions have at least one argument */
+  switch( iFuncId ){
+    case INLINEFUNC_coalesce: {
+      /* Attempt a direct implementation of the built-in COALESCE() and
+      ** IFNULL() functions.  This avoids unnecessary evaluation of
+      ** arguments past the first non-NULL argument.
+      */
+      int endCoalesce = sqlite3VdbeMakeLabel(pParse);
+      int i;
+      assert( nFarg>=2 );
+      sqlite3ExprCode(pParse, pFarg->a[0].pExpr, target);
+      for(i=1; i<nFarg; i++){
+        sqlite3VdbeAddOp2(v, OP_NotNull, target, endCoalesce);
+        VdbeCoverage(v);
+        sqlite3ExprCode(pParse, pFarg->a[i].pExpr, target);
+      }
+      setDoNotMergeFlagOnCopy(v);
+      sqlite3VdbeResolveLabel(v, endCoalesce);
+      break;
+    }
+    case INLINEFUNC_iif: {
+      Expr caseExpr;
+      memset(&caseExpr, 0, sizeof(caseExpr));
+      caseExpr.op = TK_CASE;
+      caseExpr.x.pList = pFarg;
+      return sqlite3ExprCodeTarget(pParse, &caseExpr, target);
+    }
+#ifdef SQLITE_ENABLE_OFFSET_SQL_FUNC
+    case INLINEFUNC_sqlite_offset: {
+      Expr *pArg = pFarg->a[0].pExpr;
+      if( pArg->op==TK_COLUMN && pArg->iTable>=0 ){
+        sqlite3VdbeAddOp3(v, OP_Offset, pArg->iTable, pArg->iColumn, target);
+      }else{
+        sqlite3VdbeAddOp2(v, OP_Null, 0, target);
+      }
+      break;
+    }
+#endif
+    default: {
+      /* The UNLIKELY() function is a no-op.
