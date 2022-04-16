@@ -108336,4 +108336,178 @@ expr_code_doover:
       int addrINR;
       u8 okConstFactor = pParse->okConstFactor;
       addrINR = sqlite3VdbeAddOp1(v, OP_IfNullRow, pExpr->iTable);
-      /* Temporarily disable factoring of constant expressions, 
+      /* Temporarily disable factoring of constant expressions, since
+      ** even though expressions may appear to be constant, they are not
+      ** really constant because they originate from the right-hand side
+      ** of a LEFT JOIN. */
+      pParse->okConstFactor = 0;
+      inReg = sqlite3ExprCodeTarget(pParse, pExpr->pLeft, target);
+      pParse->okConstFactor = okConstFactor;
+      sqlite3VdbeJumpHere(v, addrINR);
+      sqlite3VdbeChangeP3(v, addrINR, inReg);
+      break;
+    }
+
+    /*
+    ** Form A:
+    **   CASE x WHEN e1 THEN r1 WHEN e2 THEN r2 ... WHEN eN THEN rN ELSE y END
+    **
+    ** Form B:
+    **   CASE WHEN e1 THEN r1 WHEN e2 THEN r2 ... WHEN eN THEN rN ELSE y END
+    **
+    ** Form A is can be transformed into the equivalent form B as follows:
+    **   CASE WHEN x=e1 THEN r1 WHEN x=e2 THEN r2 ...
+    **        WHEN x=eN THEN rN ELSE y END
+    **
+    ** X (if it exists) is in pExpr->pLeft.
+    ** Y is in the last element of pExpr->x.pList if pExpr->x.pList->nExpr is
+    ** odd.  The Y is also optional.  If the number of elements in x.pList
+    ** is even, then Y is omitted and the "otherwise" result is NULL.
+    ** Ei is in pExpr->pList->a[i*2] and Ri is pExpr->pList->a[i*2+1].
+    **
+    ** The result of the expression is the Ri for the first matching Ei,
+    ** or if there is no matching Ei, the ELSE term Y, or if there is
+    ** no ELSE term, NULL.
+    */
+    case TK_CASE: {
+      int endLabel;                     /* GOTO label for end of CASE stmt */
+      int nextCase;                     /* GOTO label for next WHEN clause */
+      int nExpr;                        /* 2x number of WHEN terms */
+      int i;                            /* Loop counter */
+      ExprList *pEList;                 /* List of WHEN terms */
+      struct ExprList_item *aListelem;  /* Array of WHEN terms */
+      Expr opCompare;                   /* The X==Ei expression */
+      Expr *pX;                         /* The X expression */
+      Expr *pTest = 0;                  /* X==Ei (form A) or just Ei (form B) */
+      Expr *pDel = 0;
+      sqlite3 *db = pParse->db;
+
+      assert( ExprUseXList(pExpr) && pExpr->x.pList!=0 );
+      assert(pExpr->x.pList->nExpr > 0);
+      pEList = pExpr->x.pList;
+      aListelem = pEList->a;
+      nExpr = pEList->nExpr;
+      endLabel = sqlite3VdbeMakeLabel(pParse);
+      if( (pX = pExpr->pLeft)!=0 ){
+        pDel = sqlite3ExprDup(db, pX, 0);
+        if( db->mallocFailed ){
+          sqlite3ExprDelete(db, pDel);
+          break;
+        }
+        testcase( pX->op==TK_COLUMN );
+        exprToRegister(pDel, exprCodeVector(pParse, pDel, &regFree1));
+        testcase( regFree1==0 );
+        memset(&opCompare, 0, sizeof(opCompare));
+        opCompare.op = TK_EQ;
+        opCompare.pLeft = pDel;
+        pTest = &opCompare;
+        /* Ticket b351d95f9cd5ef17e9d9dbae18f5ca8611190001:
+        ** The value in regFree1 might get SCopy-ed into the file result.
+        ** So make sure that the regFree1 register is not reused for other
+        ** purposes and possibly overwritten.  */
+        regFree1 = 0;
+      }
+      for(i=0; i<nExpr-1; i=i+2){
+        if( pX ){
+          assert( pTest!=0 );
+          opCompare.pRight = aListelem[i].pExpr;
+        }else{
+          pTest = aListelem[i].pExpr;
+        }
+        nextCase = sqlite3VdbeMakeLabel(pParse);
+        testcase( pTest->op==TK_COLUMN );
+        sqlite3ExprIfFalse(pParse, pTest, nextCase, SQLITE_JUMPIFNULL);
+        testcase( aListelem[i+1].pExpr->op==TK_COLUMN );
+        sqlite3ExprCode(pParse, aListelem[i+1].pExpr, target);
+        sqlite3VdbeGoto(v, endLabel);
+        sqlite3VdbeResolveLabel(v, nextCase);
+      }
+      if( (nExpr&1)!=0 ){
+        sqlite3ExprCode(pParse, pEList->a[nExpr-1].pExpr, target);
+      }else{
+        sqlite3VdbeAddOp2(v, OP_Null, 0, target);
+      }
+      sqlite3ExprDelete(db, pDel);
+      setDoNotMergeFlagOnCopy(v);
+      sqlite3VdbeResolveLabel(v, endLabel);
+      break;
+    }
+#ifndef SQLITE_OMIT_TRIGGER
+    case TK_RAISE: {
+      assert( pExpr->affExpr==OE_Rollback
+           || pExpr->affExpr==OE_Abort
+           || pExpr->affExpr==OE_Fail
+           || pExpr->affExpr==OE_Ignore
+      );
+      if( !pParse->pTriggerTab && !pParse->nested ){
+        sqlite3ErrorMsg(pParse,
+                       "RAISE() may only be used within a trigger-program");
+        return 0;
+      }
+      if( pExpr->affExpr==OE_Abort ){
+        sqlite3MayAbort(pParse);
+      }
+      assert( !ExprHasProperty(pExpr, EP_IntValue) );
+      if( pExpr->affExpr==OE_Ignore ){
+        sqlite3VdbeAddOp4(
+            v, OP_Halt, SQLITE_OK, OE_Ignore, 0, pExpr->u.zToken,0);
+        VdbeCoverage(v);
+      }else{
+        sqlite3HaltConstraint(pParse,
+             pParse->pTriggerTab ? SQLITE_CONSTRAINT_TRIGGER : SQLITE_ERROR,
+             pExpr->affExpr, pExpr->u.zToken, 0, 0);
+      }
+
+      break;
+    }
+#endif
+  }
+  sqlite3ReleaseTempReg(pParse, regFree1);
+  sqlite3ReleaseTempReg(pParse, regFree2);
+  return inReg;
+}
+
+/*
+** Generate code that will evaluate expression pExpr just one time
+** per prepared statement execution.
+**
+** If the expression uses functions (that might throw an exception) then
+** guard them with an OP_Once opcode to ensure that the code is only executed
+** once. If no functions are involved, then factor the code out and put it at
+** the end of the prepared statement in the initialization section.
+**
+** If regDest>=0 then the result is always stored in that register and the
+** result is not reusable.  If regDest<0 then this routine is free to
+** store the value whereever it wants.  The register where the expression
+** is stored is returned.  When regDest<0, two identical expressions might
+** code to the same register, if they do not contain function calls and hence
+** are factored out into the initialization section at the end of the
+** prepared statement.
+*/
+SQLITE_PRIVATE int sqlite3ExprCodeRunJustOnce(
+  Parse *pParse,    /* Parsing context */
+  Expr *pExpr,      /* The expression to code when the VDBE initializes */
+  int regDest       /* Store the value in this register */
+){
+  ExprList *p;
+  assert( ConstFactorOk(pParse) );
+  p = pParse->pConstExpr;
+  if( regDest<0 && p ){
+    struct ExprList_item *pItem;
+    int i;
+    for(pItem=p->a, i=p->nExpr; i>0; pItem++, i--){
+      if( pItem->fg.reusable
+       && sqlite3ExprCompare(0,pItem->pExpr,pExpr,-1)==0
+      ){
+        return pItem->u.iConstExprReg;
+      }
+    }
+  }
+  pExpr = sqlite3ExprDup(pParse->db, pExpr, 0);
+  if( pExpr!=0 && ExprHasProperty(pExpr, EP_HasFunc) ){
+    Vdbe *v = pParse->pVdbe;
+    int addr;
+    assert( v );
+    addr = sqlite3VdbeAddOp0(v, OP_Once); VdbeCoverage(v);
+    pParse->okConstFactor = 0;
+    if( !p
