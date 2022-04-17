@@ -108510,4 +108510,207 @@ SQLITE_PRIVATE int sqlite3ExprCodeRunJustOnce(
     assert( v );
     addr = sqlite3VdbeAddOp0(v, OP_Once); VdbeCoverage(v);
     pParse->okConstFactor = 0;
-    if( !p
+    if( !pParse->db->mallocFailed ){
+      if( regDest<0 ) regDest = ++pParse->nMem;
+      sqlite3ExprCode(pParse, pExpr, regDest);
+    }
+    pParse->okConstFactor = 1;
+    sqlite3ExprDelete(pParse->db, pExpr);
+    sqlite3VdbeJumpHere(v, addr);
+  }else{
+    p = sqlite3ExprListAppend(pParse, p, pExpr);
+    if( p ){
+       struct ExprList_item *pItem = &p->a[p->nExpr-1];
+       pItem->fg.reusable = regDest<0;
+       if( regDest<0 ) regDest = ++pParse->nMem;
+       pItem->u.iConstExprReg = regDest;
+    }
+    pParse->pConstExpr = p;
+  }
+  return regDest;
+}
+
+/*
+** Generate code to evaluate an expression and store the results
+** into a register.  Return the register number where the results
+** are stored.
+**
+** If the register is a temporary register that can be deallocated,
+** then write its number into *pReg.  If the result register is not
+** a temporary, then set *pReg to zero.
+**
+** If pExpr is a constant, then this routine might generate this
+** code to fill the register in the initialization section of the
+** VDBE program, in order to factor it out of the evaluation loop.
+*/
+SQLITE_PRIVATE int sqlite3ExprCodeTemp(Parse *pParse, Expr *pExpr, int *pReg){
+  int r2;
+  pExpr = sqlite3ExprSkipCollateAndLikely(pExpr);
+  if( ConstFactorOk(pParse)
+   && ALWAYS(pExpr!=0)
+   && pExpr->op!=TK_REGISTER
+   && sqlite3ExprIsConstantNotJoin(pExpr)
+  ){
+    *pReg  = 0;
+    r2 = sqlite3ExprCodeRunJustOnce(pParse, pExpr, -1);
+  }else{
+    int r1 = sqlite3GetTempReg(pParse);
+    r2 = sqlite3ExprCodeTarget(pParse, pExpr, r1);
+    if( r2==r1 ){
+      *pReg = r1;
+    }else{
+      sqlite3ReleaseTempReg(pParse, r1);
+      *pReg = 0;
+    }
+  }
+  return r2;
+}
+
+/*
+** Generate code that will evaluate expression pExpr and store the
+** results in register target.  The results are guaranteed to appear
+** in register target.
+*/
+SQLITE_PRIVATE void sqlite3ExprCode(Parse *pParse, Expr *pExpr, int target){
+  int inReg;
+
+  assert( pExpr==0 || !ExprHasVVAProperty(pExpr,EP_Immutable) );
+  assert( target>0 && target<=pParse->nMem );
+  assert( pParse->pVdbe!=0 || pParse->db->mallocFailed );
+  if( pParse->pVdbe==0 ) return;
+  inReg = sqlite3ExprCodeTarget(pParse, pExpr, target);
+  if( inReg!=target ){
+    u8 op;
+    if( ALWAYS(pExpr) && ExprHasProperty(pExpr,EP_Subquery) ){
+      op = OP_Copy;
+    }else{
+      op = OP_SCopy;
+    }
+    sqlite3VdbeAddOp2(pParse->pVdbe, op, inReg, target);
+  }
+}
+
+/*
+** Make a transient copy of expression pExpr and then code it using
+** sqlite3ExprCode().  This routine works just like sqlite3ExprCode()
+** except that the input expression is guaranteed to be unchanged.
+*/
+SQLITE_PRIVATE void sqlite3ExprCodeCopy(Parse *pParse, Expr *pExpr, int target){
+  sqlite3 *db = pParse->db;
+  pExpr = sqlite3ExprDup(db, pExpr, 0);
+  if( !db->mallocFailed ) sqlite3ExprCode(pParse, pExpr, target);
+  sqlite3ExprDelete(db, pExpr);
+}
+
+/*
+** Generate code that will evaluate expression pExpr and store the
+** results in register target.  The results are guaranteed to appear
+** in register target.  If the expression is constant, then this routine
+** might choose to code the expression at initialization time.
+*/
+SQLITE_PRIVATE void sqlite3ExprCodeFactorable(Parse *pParse, Expr *pExpr, int target){
+  if( pParse->okConstFactor && sqlite3ExprIsConstantNotJoin(pExpr) ){
+    sqlite3ExprCodeRunJustOnce(pParse, pExpr, target);
+  }else{
+    sqlite3ExprCodeCopy(pParse, pExpr, target);
+  }
+}
+
+/*
+** Generate code that pushes the value of every element of the given
+** expression list into a sequence of registers beginning at target.
+**
+** Return the number of elements evaluated.  The number returned will
+** usually be pList->nExpr but might be reduced if SQLITE_ECEL_OMITREF
+** is defined.
+**
+** The SQLITE_ECEL_DUP flag prevents the arguments from being
+** filled using OP_SCopy.  OP_Copy must be used instead.
+**
+** The SQLITE_ECEL_FACTOR argument allows constant arguments to be
+** factored out into initialization code.
+**
+** The SQLITE_ECEL_REF flag means that expressions in the list with
+** ExprList.a[].u.x.iOrderByCol>0 have already been evaluated and stored
+** in registers at srcReg, and so the value can be copied from there.
+** If SQLITE_ECEL_OMITREF is also set, then the values with u.x.iOrderByCol>0
+** are simply omitted rather than being copied from srcReg.
+*/
+SQLITE_PRIVATE int sqlite3ExprCodeExprList(
+  Parse *pParse,     /* Parsing context */
+  ExprList *pList,   /* The expression list to be coded */
+  int target,        /* Where to write results */
+  int srcReg,        /* Source registers if SQLITE_ECEL_REF */
+  u8 flags           /* SQLITE_ECEL_* flags */
+){
+  struct ExprList_item *pItem;
+  int i, j, n;
+  u8 copyOp = (flags & SQLITE_ECEL_DUP) ? OP_Copy : OP_SCopy;
+  Vdbe *v = pParse->pVdbe;
+  assert( pList!=0 );
+  assert( target>0 );
+  assert( pParse->pVdbe!=0 );  /* Never gets this far otherwise */
+  n = pList->nExpr;
+  if( !ConstFactorOk(pParse) ) flags &= ~SQLITE_ECEL_FACTOR;
+  for(pItem=pList->a, i=0; i<n; i++, pItem++){
+    Expr *pExpr = pItem->pExpr;
+#ifdef SQLITE_ENABLE_SORTER_REFERENCES
+    if( pItem->fg.bSorterRef ){
+      i--;
+      n--;
+    }else
+#endif
+    if( (flags & SQLITE_ECEL_REF)!=0 && (j = pItem->u.x.iOrderByCol)>0 ){
+      if( flags & SQLITE_ECEL_OMITREF ){
+        i--;
+        n--;
+      }else{
+        sqlite3VdbeAddOp2(v, copyOp, j+srcReg-1, target+i);
+      }
+    }else if( (flags & SQLITE_ECEL_FACTOR)!=0
+           && sqlite3ExprIsConstantNotJoin(pExpr)
+    ){
+      sqlite3ExprCodeRunJustOnce(pParse, pExpr, target+i);
+    }else{
+      int inReg = sqlite3ExprCodeTarget(pParse, pExpr, target+i);
+      if( inReg!=target+i ){
+        VdbeOp *pOp;
+        if( copyOp==OP_Copy
+         && (pOp=sqlite3VdbeGetOp(v, -1))->opcode==OP_Copy
+         && pOp->p1+pOp->p3+1==inReg
+         && pOp->p2+pOp->p3+1==target+i
+         && pOp->p5==0  /* The do-not-merge flag must be clear */
+        ){
+          pOp->p3++;
+        }else{
+          sqlite3VdbeAddOp2(v, copyOp, inReg, target+i);
+        }
+      }
+    }
+  }
+  return n;
+}
+
+/*
+** Generate code for a BETWEEN operator.
+**
+**    x BETWEEN y AND z
+**
+** The above is equivalent to
+**
+**    x>=y AND x<=z
+**
+** Code it as such, taking care to do the common subexpression
+** elimination of x.
+**
+** The xJumpIf parameter determines details:
+**
+**    NULL:                   Store the boolean result in reg[dest]
+**    sqlite3ExprIfTrue:      Jump to dest if true
+**    sqlite3ExprIfFalse:     Jump to dest if false
+**
+** The jumpIfNull parameter is ignored if xJumpIf is NULL.
+*/
+static void exprCodeBetween(
+  Parse *pParse,    /* Parsing and code generating context */
+  Expr *pExpr,      /* The BETWEEN exp
