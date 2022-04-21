@@ -109873,4 +109873,211 @@ static int analyzeAggregate(Walker *pWalker, Expr *pExpr){
               assert( ExprUseYTab(pExpr) );
               pCol->pTab = pExpr->y.pTab;
               pCol->iTable = pExpr->iTable;
-              pCol->iColumn = pExpr->iColum
+              pCol->iColumn = pExpr->iColumn;
+              pCol->iMem = ++pParse->nMem;
+              pCol->iSorterColumn = -1;
+              pCol->pCExpr = pExpr;
+              if( pAggInfo->pGroupBy ){
+                int j, n;
+                ExprList *pGB = pAggInfo->pGroupBy;
+                struct ExprList_item *pTerm = pGB->a;
+                n = pGB->nExpr;
+                for(j=0; j<n; j++, pTerm++){
+                  Expr *pE = pTerm->pExpr;
+                  if( pE->op==TK_COLUMN && pE->iTable==pExpr->iTable &&
+                      pE->iColumn==pExpr->iColumn ){
+                    pCol->iSorterColumn = j;
+                    break;
+                  }
+                }
+              }
+              if( pCol->iSorterColumn<0 ){
+                pCol->iSorterColumn = pAggInfo->nSortingColumn++;
+              }
+            }
+            /* There is now an entry for pExpr in pAggInfo->aCol[] (either
+            ** because it was there before or because we just created it).
+            ** Convert the pExpr to be a TK_AGG_COLUMN referring to that
+            ** pAggInfo->aCol[] entry.
+            */
+            ExprSetVVAProperty(pExpr, EP_NoReduce);
+            pExpr->pAggInfo = pAggInfo;
+            pExpr->op = TK_AGG_COLUMN;
+            pExpr->iAgg = (i16)k;
+            break;
+          } /* endif pExpr->iTable==pItem->iCursor */
+        } /* end loop over pSrcList */
+      }
+      return WRC_Prune;
+    }
+    case TK_AGG_FUNCTION: {
+      if( (pNC->ncFlags & NC_InAggFunc)==0
+       && pWalker->walkerDepth==pExpr->op2
+      ){
+        /* Check to see if pExpr is a duplicate of another aggregate
+        ** function that is already in the pAggInfo structure
+        */
+        struct AggInfo_func *pItem = pAggInfo->aFunc;
+        for(i=0; i<pAggInfo->nFunc; i++, pItem++){
+          if( pItem->pFExpr==pExpr ) break;
+          if( sqlite3ExprCompare(0, pItem->pFExpr, pExpr, -1)==0 ){
+            break;
+          }
+        }
+        if( i>=pAggInfo->nFunc ){
+          /* pExpr is original.  Make a new entry in pAggInfo->aFunc[]
+          */
+          u8 enc = ENC(pParse->db);
+          i = addAggInfoFunc(pParse->db, pAggInfo);
+          if( i>=0 ){
+            assert( !ExprHasProperty(pExpr, EP_xIsSelect) );
+            pItem = &pAggInfo->aFunc[i];
+            pItem->pFExpr = pExpr;
+            pItem->iMem = ++pParse->nMem;
+            assert( ExprUseUToken(pExpr) );
+            pItem->pFunc = sqlite3FindFunction(pParse->db,
+                   pExpr->u.zToken,
+                   pExpr->x.pList ? pExpr->x.pList->nExpr : 0, enc, 0);
+            if( pExpr->flags & EP_Distinct ){
+              pItem->iDistinct = pParse->nTab++;
+            }else{
+              pItem->iDistinct = -1;
+            }
+          }
+        }
+        /* Make pExpr point to the appropriate pAggInfo->aFunc[] entry
+        */
+        assert( !ExprHasProperty(pExpr, EP_TokenOnly|EP_Reduced) );
+        ExprSetVVAProperty(pExpr, EP_NoReduce);
+        pExpr->iAgg = (i16)i;
+        pExpr->pAggInfo = pAggInfo;
+        return WRC_Prune;
+      }else{
+        return WRC_Continue;
+      }
+    }
+  }
+  return WRC_Continue;
+}
+
+/*
+** Analyze the pExpr expression looking for aggregate functions and
+** for variables that need to be added to AggInfo object that pNC->pAggInfo
+** points to.  Additional entries are made on the AggInfo object as
+** necessary.
+**
+** This routine should only be called after the expression has been
+** analyzed by sqlite3ResolveExprNames().
+*/
+SQLITE_PRIVATE void sqlite3ExprAnalyzeAggregates(NameContext *pNC, Expr *pExpr){
+  Walker w;
+  w.xExprCallback = analyzeAggregate;
+  w.xSelectCallback = sqlite3WalkerDepthIncrease;
+  w.xSelectCallback2 = sqlite3WalkerDepthDecrease;
+  w.walkerDepth = 0;
+  w.u.pNC = pNC;
+  w.pParse = 0;
+  assert( pNC->pSrcList!=0 );
+  sqlite3WalkExpr(&w, pExpr);
+}
+
+/*
+** Call sqlite3ExprAnalyzeAggregates() for every expression in an
+** expression list.  Return the number of errors.
+**
+** If an error is found, the analysis is cut short.
+*/
+SQLITE_PRIVATE void sqlite3ExprAnalyzeAggList(NameContext *pNC, ExprList *pList){
+  struct ExprList_item *pItem;
+  int i;
+  if( pList ){
+    for(pItem=pList->a, i=0; i<pList->nExpr; i++, pItem++){
+      sqlite3ExprAnalyzeAggregates(pNC, pItem->pExpr);
+    }
+  }
+}
+
+/*
+** Allocate a single new register for use to hold some intermediate result.
+*/
+SQLITE_PRIVATE int sqlite3GetTempReg(Parse *pParse){
+  if( pParse->nTempReg==0 ){
+    return ++pParse->nMem;
+  }
+  return pParse->aTempReg[--pParse->nTempReg];
+}
+
+/*
+** Deallocate a register, making available for reuse for some other
+** purpose.
+*/
+SQLITE_PRIVATE void sqlite3ReleaseTempReg(Parse *pParse, int iReg){
+  if( iReg ){
+    sqlite3VdbeReleaseRegisters(pParse, iReg, 1, 0, 0);
+    if( pParse->nTempReg<ArraySize(pParse->aTempReg) ){
+      pParse->aTempReg[pParse->nTempReg++] = iReg;
+    }
+  }
+}
+
+/*
+** Allocate or deallocate a block of nReg consecutive registers.
+*/
+SQLITE_PRIVATE int sqlite3GetTempRange(Parse *pParse, int nReg){
+  int i, n;
+  if( nReg==1 ) return sqlite3GetTempReg(pParse);
+  i = pParse->iRangeReg;
+  n = pParse->nRangeReg;
+  if( nReg<=n ){
+    pParse->iRangeReg += nReg;
+    pParse->nRangeReg -= nReg;
+  }else{
+    i = pParse->nMem+1;
+    pParse->nMem += nReg;
+  }
+  return i;
+}
+SQLITE_PRIVATE void sqlite3ReleaseTempRange(Parse *pParse, int iReg, int nReg){
+  if( nReg==1 ){
+    sqlite3ReleaseTempReg(pParse, iReg);
+    return;
+  }
+  sqlite3VdbeReleaseRegisters(pParse, iReg, nReg, 0, 0);
+  if( nReg>pParse->nRangeReg ){
+    pParse->nRangeReg = nReg;
+    pParse->iRangeReg = iReg;
+  }
+}
+
+/*
+** Mark all temporary registers as being unavailable for reuse.
+**
+** Always invoke this procedure after coding a subroutine or co-routine
+** that might be invoked from other parts of the code, to ensure that
+** the sub/co-routine does not use registers in common with the code that
+** invokes the sub/co-routine.
+*/
+SQLITE_PRIVATE void sqlite3ClearTempRegCache(Parse *pParse){
+  pParse->nTempReg = 0;
+  pParse->nRangeReg = 0;
+}
+
+/*
+** Validate that no temporary register falls within the range of
+** iFirst..iLast, inclusive.  This routine is only call from within assert()
+** statements.
+*/
+#ifdef SQLITE_DEBUG
+SQLITE_PRIVATE int sqlite3NoTempsInRange(Parse *pParse, int iFirst, int iLast){
+  int i;
+  if( pParse->nRangeReg>0
+   && pParse->iRangeReg+pParse->nRangeReg > iFirst
+   && pParse->iRangeReg <= iLast
+  ){
+     return 0;
+  }
+  for(i=0; i<pParse->nTempReg; i++){
+    if( pParse->aTempReg[i]>=iFirst && pParse->aTempReg[i]<=iLast ){
+      return 0;
+    }
+  
