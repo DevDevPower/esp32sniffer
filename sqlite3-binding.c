@@ -109260,4 +109260,203 @@ SQLITE_PRIVATE int sqlite3ExprCompare(
 ** if they are certainly different, or 2 if it is not possible to
 ** determine if they are identical or not.
 **
-** If an
+** If any subelement of pB has Expr.iTable==(-1) then it is allowed
+** to compare equal to an equivalent element in pA with Expr.iTable==iTab.
+**
+** This routine might return non-zero for equivalent ExprLists.  The
+** only consequence will be disabled optimizations.  But this routine
+** must never return 0 if the two ExprList objects are different, or
+** a malfunction will result.
+**
+** Two NULL pointers are considered to be the same.  But a NULL pointer
+** always differs from a non-NULL pointer.
+*/
+SQLITE_PRIVATE int sqlite3ExprListCompare(const ExprList *pA, const ExprList *pB, int iTab){
+  int i;
+  if( pA==0 && pB==0 ) return 0;
+  if( pA==0 || pB==0 ) return 1;
+  if( pA->nExpr!=pB->nExpr ) return 1;
+  for(i=0; i<pA->nExpr; i++){
+    int res;
+    Expr *pExprA = pA->a[i].pExpr;
+    Expr *pExprB = pB->a[i].pExpr;
+    if( pA->a[i].fg.sortFlags!=pB->a[i].fg.sortFlags ) return 1;
+    if( (res = sqlite3ExprCompare(0, pExprA, pExprB, iTab)) ) return res;
+  }
+  return 0;
+}
+
+/*
+** Like sqlite3ExprCompare() except COLLATE operators at the top-level
+** are ignored.
+*/
+SQLITE_PRIVATE int sqlite3ExprCompareSkip(Expr *pA,Expr *pB, int iTab){
+  return sqlite3ExprCompare(0,
+             sqlite3ExprSkipCollateAndLikely(pA),
+             sqlite3ExprSkipCollateAndLikely(pB),
+             iTab);
+}
+
+/*
+** Return non-zero if Expr p can only be true if pNN is not NULL.
+**
+** Or if seenNot is true, return non-zero if Expr p can only be
+** non-NULL if pNN is not NULL
+*/
+static int exprImpliesNotNull(
+  const Parse *pParse,/* Parsing context */
+  const Expr *p,      /* The expression to be checked */
+  const Expr *pNN,    /* The expression that is NOT NULL */
+  int iTab,           /* Table being evaluated */
+  int seenNot         /* Return true only if p can be any non-NULL value */
+){
+  assert( p );
+  assert( pNN );
+  if( sqlite3ExprCompare(pParse, p, pNN, iTab)==0 ){
+    return pNN->op!=TK_NULL;
+  }
+  switch( p->op ){
+    case TK_IN: {
+      if( seenNot && ExprHasProperty(p, EP_xIsSelect) ) return 0;
+      assert( ExprUseXSelect(p) || (p->x.pList!=0 && p->x.pList->nExpr>0) );
+      return exprImpliesNotNull(pParse, p->pLeft, pNN, iTab, 1);
+    }
+    case TK_BETWEEN: {
+      ExprList *pList;
+      assert( ExprUseXList(p) );
+      pList = p->x.pList;
+      assert( pList!=0 );
+      assert( pList->nExpr==2 );
+      if( seenNot ) return 0;
+      if( exprImpliesNotNull(pParse, pList->a[0].pExpr, pNN, iTab, 1)
+       || exprImpliesNotNull(pParse, pList->a[1].pExpr, pNN, iTab, 1)
+      ){
+        return 1;
+      }
+      return exprImpliesNotNull(pParse, p->pLeft, pNN, iTab, 1);
+    }
+    case TK_EQ:
+    case TK_NE:
+    case TK_LT:
+    case TK_LE:
+    case TK_GT:
+    case TK_GE:
+    case TK_PLUS:
+    case TK_MINUS:
+    case TK_BITOR:
+    case TK_LSHIFT:
+    case TK_RSHIFT:
+    case TK_CONCAT:
+      seenNot = 1;
+      /* no break */ deliberate_fall_through
+    case TK_STAR:
+    case TK_REM:
+    case TK_BITAND:
+    case TK_SLASH: {
+      if( exprImpliesNotNull(pParse, p->pRight, pNN, iTab, seenNot) ) return 1;
+      /* no break */ deliberate_fall_through
+    }
+    case TK_SPAN:
+    case TK_COLLATE:
+    case TK_UPLUS:
+    case TK_UMINUS: {
+      return exprImpliesNotNull(pParse, p->pLeft, pNN, iTab, seenNot);
+    }
+    case TK_TRUTH: {
+      if( seenNot ) return 0;
+      if( p->op2!=TK_IS ) return 0;
+      return exprImpliesNotNull(pParse, p->pLeft, pNN, iTab, 1);
+    }
+    case TK_BITNOT:
+    case TK_NOT: {
+      return exprImpliesNotNull(pParse, p->pLeft, pNN, iTab, 1);
+    }
+  }
+  return 0;
+}
+
+/*
+** Return true if we can prove the pE2 will always be true if pE1 is
+** true.  Return false if we cannot complete the proof or if pE2 might
+** be false.  Examples:
+**
+**     pE1: x==5       pE2: x==5             Result: true
+**     pE1: x>0        pE2: x==5             Result: false
+**     pE1: x=21       pE2: x=21 OR y=43     Result: true
+**     pE1: x!=123     pE2: x IS NOT NULL    Result: true
+**     pE1: x!=?1      pE2: x IS NOT NULL    Result: true
+**     pE1: x IS NULL  pE2: x IS NOT NULL    Result: false
+**     pE1: x IS ?2    pE2: x IS NOT NULL    Reuslt: false
+**
+** When comparing TK_COLUMN nodes between pE1 and pE2, if pE2 has
+** Expr.iTable<0 then assume a table number given by iTab.
+**
+** If pParse is not NULL, then the values of bound variables in pE1 are
+** compared against literal values in pE2 and pParse->pVdbe->expmask is
+** modified to record which bound variables are referenced.  If pParse
+** is NULL, then false will be returned if pE1 contains any bound variables.
+**
+** When in doubt, return false.  Returning true might give a performance
+** improvement.  Returning false might cause a performance reduction, but
+** it will always give the correct answer and is hence always safe.
+*/
+SQLITE_PRIVATE int sqlite3ExprImpliesExpr(
+  const Parse *pParse,
+  const Expr *pE1,
+  const Expr *pE2,
+  int iTab
+){
+  if( sqlite3ExprCompare(pParse, pE1, pE2, iTab)==0 ){
+    return 1;
+  }
+  if( pE2->op==TK_OR
+   && (sqlite3ExprImpliesExpr(pParse, pE1, pE2->pLeft, iTab)
+             || sqlite3ExprImpliesExpr(pParse, pE1, pE2->pRight, iTab) )
+  ){
+    return 1;
+  }
+  if( pE2->op==TK_NOTNULL
+   && exprImpliesNotNull(pParse, pE1, pE2->pLeft, iTab, 0)
+  ){
+    return 1;
+  }
+  return 0;
+}
+
+/*
+** This is the Expr node callback for sqlite3ExprImpliesNonNullRow().
+** If the expression node requires that the table at pWalker->iCur
+** have one or more non-NULL column, then set pWalker->eCode to 1 and abort.
+**
+** This routine controls an optimization.  False positives (setting
+** pWalker->eCode to 1 when it should not be) are deadly, but false-negatives
+** (never setting pWalker->eCode) is a harmless missed optimization.
+*/
+static int impliesNotNullRow(Walker *pWalker, Expr *pExpr){
+  testcase( pExpr->op==TK_AGG_COLUMN );
+  testcase( pExpr->op==TK_AGG_FUNCTION );
+  if( ExprHasProperty(pExpr, EP_OuterON) ) return WRC_Prune;
+  switch( pExpr->op ){
+    case TK_ISNOT:
+    case TK_ISNULL:
+    case TK_NOTNULL:
+    case TK_IS:
+    case TK_OR:
+    case TK_VECTOR:
+    case TK_CASE:
+    case TK_IN:
+    case TK_FUNCTION:
+    case TK_TRUTH:
+      testcase( pExpr->op==TK_ISNOT );
+      testcase( pExpr->op==TK_ISNULL );
+      testcase( pExpr->op==TK_NOTNULL );
+      testcase( pExpr->op==TK_IS );
+      testcase( pExpr->op==TK_OR );
+      testcase( pExpr->op==TK_VECTOR );
+      testcase( pExpr->op==TK_CASE );
+      testcase( pExpr->op==TK_IN );
+      testcase( pExpr->op==TK_FUNCTION );
+      testcase( pExpr->op==TK_TRUTH );
+      return WRC_Prune;
+    case TK_COLUMN:
+      if( pWalker->u.iCur=
