@@ -109459,4 +109459,211 @@ static int impliesNotNullRow(Walker *pWalker, Expr *pExpr){
       testcase( pExpr->op==TK_TRUTH );
       return WRC_Prune;
     case TK_COLUMN:
-      if( pWalker->u.iCur=
+      if( pWalker->u.iCur==pExpr->iTable ){
+        pWalker->eCode = 1;
+        return WRC_Abort;
+      }
+      return WRC_Prune;
+
+    case TK_AND:
+      if( pWalker->eCode==0 ){
+        sqlite3WalkExpr(pWalker, pExpr->pLeft);
+        if( pWalker->eCode ){
+          pWalker->eCode = 0;
+          sqlite3WalkExpr(pWalker, pExpr->pRight);
+        }
+      }
+      return WRC_Prune;
+
+    case TK_BETWEEN:
+      if( sqlite3WalkExpr(pWalker, pExpr->pLeft)==WRC_Abort ){
+        assert( pWalker->eCode );
+        return WRC_Abort;
+      }
+      return WRC_Prune;
+
+    /* Virtual tables are allowed to use constraints like x=NULL.  So
+    ** a term of the form x=y does not prove that y is not null if x
+    ** is the column of a virtual table */
+    case TK_EQ:
+    case TK_NE:
+    case TK_LT:
+    case TK_LE:
+    case TK_GT:
+    case TK_GE: {
+      Expr *pLeft = pExpr->pLeft;
+      Expr *pRight = pExpr->pRight;
+      testcase( pExpr->op==TK_EQ );
+      testcase( pExpr->op==TK_NE );
+      testcase( pExpr->op==TK_LT );
+      testcase( pExpr->op==TK_LE );
+      testcase( pExpr->op==TK_GT );
+      testcase( pExpr->op==TK_GE );
+      /* The y.pTab=0 assignment in wherecode.c always happens after the
+      ** impliesNotNullRow() test */
+      assert( pLeft->op!=TK_COLUMN || ExprUseYTab(pLeft) );
+      assert( pRight->op!=TK_COLUMN || ExprUseYTab(pRight) );
+      if( (pLeft->op==TK_COLUMN
+           && pLeft->y.pTab!=0
+           && IsVirtual(pLeft->y.pTab))
+       || (pRight->op==TK_COLUMN
+           && pRight->y.pTab!=0
+           && IsVirtual(pRight->y.pTab))
+      ){
+        return WRC_Prune;
+      }
+      /* no break */ deliberate_fall_through
+    }
+    default:
+      return WRC_Continue;
+  }
+}
+
+/*
+** Return true (non-zero) if expression p can only be true if at least
+** one column of table iTab is non-null.  In other words, return true
+** if expression p will always be NULL or false if every column of iTab
+** is NULL.
+**
+** False negatives are acceptable.  In other words, it is ok to return
+** zero even if expression p will never be true of every column of iTab
+** is NULL.  A false negative is merely a missed optimization opportunity.
+**
+** False positives are not allowed, however.  A false positive may result
+** in an incorrect answer.
+**
+** Terms of p that are marked with EP_OuterON (and hence that come from
+** the ON or USING clauses of OUTER JOINS) are excluded from the analysis.
+**
+** This routine is used to check if a LEFT JOIN can be converted into
+** an ordinary JOIN.  The p argument is the WHERE clause.  If the WHERE
+** clause requires that some column of the right table of the LEFT JOIN
+** be non-NULL, then the LEFT JOIN can be safely converted into an
+** ordinary join.
+*/
+SQLITE_PRIVATE int sqlite3ExprImpliesNonNullRow(Expr *p, int iTab){
+  Walker w;
+  p = sqlite3ExprSkipCollateAndLikely(p);
+  if( p==0 ) return 0;
+  if( p->op==TK_NOTNULL ){
+    p = p->pLeft;
+  }else{
+    while( p->op==TK_AND ){
+      if( sqlite3ExprImpliesNonNullRow(p->pLeft, iTab) ) return 1;
+      p = p->pRight;
+    }
+  }
+  w.xExprCallback = impliesNotNullRow;
+  w.xSelectCallback = 0;
+  w.xSelectCallback2 = 0;
+  w.eCode = 0;
+  w.u.iCur = iTab;
+  sqlite3WalkExpr(&w, p);
+  return w.eCode;
+}
+
+/*
+** An instance of the following structure is used by the tree walker
+** to determine if an expression can be evaluated by reference to the
+** index only, without having to do a search for the corresponding
+** table entry.  The IdxCover.pIdx field is the index.  IdxCover.iCur
+** is the cursor for the table.
+*/
+struct IdxCover {
+  Index *pIdx;     /* The index to be tested for coverage */
+  int iCur;        /* Cursor number for the table corresponding to the index */
+};
+
+/*
+** Check to see if there are references to columns in table
+** pWalker->u.pIdxCover->iCur can be satisfied using the index
+** pWalker->u.pIdxCover->pIdx.
+*/
+static int exprIdxCover(Walker *pWalker, Expr *pExpr){
+  if( pExpr->op==TK_COLUMN
+   && pExpr->iTable==pWalker->u.pIdxCover->iCur
+   && sqlite3TableColumnToIndex(pWalker->u.pIdxCover->pIdx, pExpr->iColumn)<0
+  ){
+    pWalker->eCode = 1;
+    return WRC_Abort;
+  }
+  return WRC_Continue;
+}
+
+/*
+** Determine if an index pIdx on table with cursor iCur contains will
+** the expression pExpr.  Return true if the index does cover the
+** expression and false if the pExpr expression references table columns
+** that are not found in the index pIdx.
+**
+** An index covering an expression means that the expression can be
+** evaluated using only the index and without having to lookup the
+** corresponding table entry.
+*/
+SQLITE_PRIVATE int sqlite3ExprCoveredByIndex(
+  Expr *pExpr,        /* The index to be tested */
+  int iCur,           /* The cursor number for the corresponding table */
+  Index *pIdx         /* The index that might be used for coverage */
+){
+  Walker w;
+  struct IdxCover xcov;
+  memset(&w, 0, sizeof(w));
+  xcov.iCur = iCur;
+  xcov.pIdx = pIdx;
+  w.xExprCallback = exprIdxCover;
+  w.u.pIdxCover = &xcov;
+  sqlite3WalkExpr(&w, pExpr);
+  return !w.eCode;
+}
+
+
+/* Structure used to pass information throught the Walker in order to
+** implement sqlite3ReferencesSrcList().
+*/
+struct RefSrcList {
+  sqlite3 *db;         /* Database connection used for sqlite3DbRealloc() */
+  SrcList *pRef;       /* Looking for references to these tables */
+  i64 nExclude;        /* Number of tables to exclude from the search */
+  int *aiExclude;      /* Cursor IDs for tables to exclude from the search */
+};
+
+/*
+** Walker SELECT callbacks for sqlite3ReferencesSrcList().
+**
+** When entering a new subquery on the pExpr argument, add all FROM clause
+** entries for that subquery to the exclude list.
+**
+** When leaving the subquery, remove those entries from the exclude list.
+*/
+static int selectRefEnter(Walker *pWalker, Select *pSelect){
+  struct RefSrcList *p = pWalker->u.pRefSrcList;
+  SrcList *pSrc = pSelect->pSrc;
+  i64 i, j;
+  int *piNew;
+  if( pSrc->nSrc==0 ) return WRC_Continue;
+  j = p->nExclude;
+  p->nExclude += pSrc->nSrc;
+  piNew = sqlite3DbRealloc(p->db, p->aiExclude, p->nExclude*sizeof(int));
+  if( piNew==0 ){
+    p->nExclude = 0;
+    return WRC_Abort;
+  }else{
+    p->aiExclude = piNew;
+  }
+  for(i=0; i<pSrc->nSrc; i++, j++){
+     p->aiExclude[j] = pSrc->a[i].iCursor;
+  }
+  return WRC_Continue;
+}
+static void selectRefLeave(Walker *pWalker, Select *pSelect){
+  struct RefSrcList *p = pWalker->u.pRefSrcList;
+  SrcList *pSrc = pSelect->pSrc;
+  if( p->nExclude ){
+    assert( p->nExclude>=pSrc->nSrc );
+    p->nExclude -= pSrc->nSrc;
+  }
+}
+
+/* This is the Walker EXPR callback for sqlite3ReferencesSrcList().
+**
+** Set the 0x01 bit of pWalker->eCode if there 
