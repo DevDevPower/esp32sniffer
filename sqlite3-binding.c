@@ -109666,4 +109666,211 @@ static void selectRefLeave(Walker *pWalker, Select *pSelect){
 
 /* This is the Walker EXPR callback for sqlite3ReferencesSrcList().
 **
-** Set the 0x01 bit of pWalker->eCode if there 
+** Set the 0x01 bit of pWalker->eCode if there is a reference to any
+** of the tables shown in RefSrcList.pRef.
+**
+** Set the 0x02 bit of pWalker->eCode if there is a reference to a
+** table is in neither RefSrcList.pRef nor RefSrcList.aiExclude.
+*/
+static int exprRefToSrcList(Walker *pWalker, Expr *pExpr){
+  if( pExpr->op==TK_COLUMN
+   || pExpr->op==TK_AGG_COLUMN
+  ){
+    int i;
+    struct RefSrcList *p = pWalker->u.pRefSrcList;
+    SrcList *pSrc = p->pRef;
+    int nSrc = pSrc ? pSrc->nSrc : 0;
+    for(i=0; i<nSrc; i++){
+      if( pExpr->iTable==pSrc->a[i].iCursor ){
+        pWalker->eCode |= 1;
+        return WRC_Continue;
+      }
+    }
+    for(i=0; i<p->nExclude && p->aiExclude[i]!=pExpr->iTable; i++){}
+    if( i>=p->nExclude ){
+      pWalker->eCode |= 2;
+    }
+  }
+  return WRC_Continue;
+}
+
+/*
+** Check to see if pExpr references any tables in pSrcList.
+** Possible return values:
+**
+**    1         pExpr does references a table in pSrcList.
+**
+**    0         pExpr references some table that is not defined in either
+**              pSrcList or in subqueries of pExpr itself.
+**
+**   -1         pExpr only references no tables at all, or it only
+**              references tables defined in subqueries of pExpr itself.
+**
+** As currently used, pExpr is always an aggregate function call.  That
+** fact is exploited for efficiency.
+*/
+SQLITE_PRIVATE int sqlite3ReferencesSrcList(Parse *pParse, Expr *pExpr, SrcList *pSrcList){
+  Walker w;
+  struct RefSrcList x;
+  memset(&w, 0, sizeof(w));
+  memset(&x, 0, sizeof(x));
+  w.xExprCallback = exprRefToSrcList;
+  w.xSelectCallback = selectRefEnter;
+  w.xSelectCallback2 = selectRefLeave;
+  w.u.pRefSrcList = &x;
+  x.db = pParse->db;
+  x.pRef = pSrcList;
+  assert( pExpr->op==TK_AGG_FUNCTION );
+  assert( ExprUseXList(pExpr) );
+  sqlite3WalkExprList(&w, pExpr->x.pList);
+#ifndef SQLITE_OMIT_WINDOWFUNC
+  if( ExprHasProperty(pExpr, EP_WinFunc) ){
+    sqlite3WalkExpr(&w, pExpr->y.pWin->pFilter);
+  }
+#endif
+  sqlite3DbFree(pParse->db, x.aiExclude);
+  if( w.eCode & 0x01 ){
+    return 1;
+  }else if( w.eCode ){
+    return 0;
+  }else{
+    return -1;
+  }
+}
+
+/*
+** This is a Walker expression node callback.
+**
+** For Expr nodes that contain pAggInfo pointers, make sure the AggInfo
+** object that is referenced does not refer directly to the Expr.  If
+** it does, make a copy.  This is done because the pExpr argument is
+** subject to change.
+**
+** The copy is stored on pParse->pConstExpr with a register number of 0.
+** This will cause the expression to be deleted automatically when the
+** Parse object is destroyed, but the zero register number means that it
+** will not generate any code in the preamble.
+*/
+static int agginfoPersistExprCb(Walker *pWalker, Expr *pExpr){
+  if( ALWAYS(!ExprHasProperty(pExpr, EP_TokenOnly|EP_Reduced))
+   && pExpr->pAggInfo!=0
+  ){
+    AggInfo *pAggInfo = pExpr->pAggInfo;
+    int iAgg = pExpr->iAgg;
+    Parse *pParse = pWalker->pParse;
+    sqlite3 *db = pParse->db;
+    assert( pExpr->op==TK_AGG_COLUMN || pExpr->op==TK_AGG_FUNCTION );
+    if( pExpr->op==TK_AGG_COLUMN ){
+      assert( iAgg>=0 && iAgg<pAggInfo->nColumn );
+      if( pAggInfo->aCol[iAgg].pCExpr==pExpr ){
+        pExpr = sqlite3ExprDup(db, pExpr, 0);
+        if( pExpr ){
+          pAggInfo->aCol[iAgg].pCExpr = pExpr;
+          sqlite3ExprDeferredDelete(pParse, pExpr);
+        }
+      }
+    }else{
+      assert( iAgg>=0 && iAgg<pAggInfo->nFunc );
+      if( pAggInfo->aFunc[iAgg].pFExpr==pExpr ){
+        pExpr = sqlite3ExprDup(db, pExpr, 0);
+        if( pExpr ){
+          pAggInfo->aFunc[iAgg].pFExpr = pExpr;
+          sqlite3ExprDeferredDelete(pParse, pExpr);
+        }
+      }
+    }
+  }
+  return WRC_Continue;
+}
+
+/*
+** Initialize a Walker object so that will persist AggInfo entries referenced
+** by the tree that is walked.
+*/
+SQLITE_PRIVATE void sqlite3AggInfoPersistWalkerInit(Walker *pWalker, Parse *pParse){
+  memset(pWalker, 0, sizeof(*pWalker));
+  pWalker->pParse = pParse;
+  pWalker->xExprCallback = agginfoPersistExprCb;
+  pWalker->xSelectCallback = sqlite3SelectWalkNoop;
+}
+
+/*
+** Add a new element to the pAggInfo->aCol[] array.  Return the index of
+** the new element.  Return a negative number if malloc fails.
+*/
+static int addAggInfoColumn(sqlite3 *db, AggInfo *pInfo){
+  int i;
+  pInfo->aCol = sqlite3ArrayAllocate(
+       db,
+       pInfo->aCol,
+       sizeof(pInfo->aCol[0]),
+       &pInfo->nColumn,
+       &i
+  );
+  return i;
+}
+
+/*
+** Add a new element to the pAggInfo->aFunc[] array.  Return the index of
+** the new element.  Return a negative number if malloc fails.
+*/
+static int addAggInfoFunc(sqlite3 *db, AggInfo *pInfo){
+  int i;
+  pInfo->aFunc = sqlite3ArrayAllocate(
+       db,
+       pInfo->aFunc,
+       sizeof(pInfo->aFunc[0]),
+       &pInfo->nFunc,
+       &i
+  );
+  return i;
+}
+
+/*
+** This is the xExprCallback for a tree walker.  It is used to
+** implement sqlite3ExprAnalyzeAggregates().  See sqlite3ExprAnalyzeAggregates
+** for additional information.
+*/
+static int analyzeAggregate(Walker *pWalker, Expr *pExpr){
+  int i;
+  NameContext *pNC = pWalker->u.pNC;
+  Parse *pParse = pNC->pParse;
+  SrcList *pSrcList = pNC->pSrcList;
+  AggInfo *pAggInfo = pNC->uNC.pAggInfo;
+
+  assert( pNC->ncFlags & NC_UAggInfo );
+  switch( pExpr->op ){
+    case TK_AGG_COLUMN:
+    case TK_COLUMN: {
+      testcase( pExpr->op==TK_AGG_COLUMN );
+      testcase( pExpr->op==TK_COLUMN );
+      /* Check to see if the column is in one of the tables in the FROM
+      ** clause of the aggregate query */
+      if( ALWAYS(pSrcList!=0) ){
+        SrcItem *pItem = pSrcList->a;
+        for(i=0; i<pSrcList->nSrc; i++, pItem++){
+          struct AggInfo_col *pCol;
+          assert( !ExprHasProperty(pExpr, EP_TokenOnly|EP_Reduced) );
+          if( pExpr->iTable==pItem->iCursor ){
+            /* If we reach this point, it means that pExpr refers to a table
+            ** that is in the FROM clause of the aggregate query.
+            **
+            ** Make an entry for the column in pAggInfo->aCol[] if there
+            ** is not an entry there already.
+            */
+            int k;
+            pCol = pAggInfo->aCol;
+            for(k=0; k<pAggInfo->nColumn; k++, pCol++){
+              if( pCol->iTable==pExpr->iTable &&
+                  pCol->iColumn==pExpr->iColumn ){
+                break;
+              }
+            }
+            if( (k>=pAggInfo->nColumn)
+             && (k = addAggInfoColumn(pParse->db, pAggInfo))>=0
+            ){
+              pCol = &pAggInfo->aCol[k];
+              assert( ExprUseYTab(pExpr) );
+              pCol->pTab = pExpr->y.pTab;
+              pCol->iTable = pExpr->iTable;
+              pCol->iColumn = pExpr->iColum
