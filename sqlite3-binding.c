@@ -109065,3 +109065,199 @@ SQLITE_PRIVATE void sqlite3ExprIfFalse(Parse *pParse, Expr *pExpr, int dest, int
       if( jumpIfNull ){
         sqlite3ExprCodeIN(pParse, pExpr, dest, dest);
       }else{
+        int destIfNull = sqlite3VdbeMakeLabel(pParse);
+        sqlite3ExprCodeIN(pParse, pExpr, dest, destIfNull);
+        sqlite3VdbeResolveLabel(v, destIfNull);
+      }
+      break;
+    }
+#endif
+    default: {
+    default_expr:
+      if( ExprAlwaysFalse(pExpr) ){
+        sqlite3VdbeGoto(v, dest);
+      }else if( ExprAlwaysTrue(pExpr) ){
+        /* no-op */
+      }else{
+        r1 = sqlite3ExprCodeTemp(pParse, pExpr, &regFree1);
+        sqlite3VdbeAddOp3(v, OP_IfNot, r1, dest, jumpIfNull!=0);
+        VdbeCoverage(v);
+        testcase( regFree1==0 );
+        testcase( jumpIfNull==0 );
+      }
+      break;
+    }
+  }
+  sqlite3ReleaseTempReg(pParse, regFree1);
+  sqlite3ReleaseTempReg(pParse, regFree2);
+}
+
+/*
+** Like sqlite3ExprIfFalse() except that a copy is made of pExpr before
+** code generation, and that copy is deleted after code generation. This
+** ensures that the original pExpr is unchanged.
+*/
+SQLITE_PRIVATE void sqlite3ExprIfFalseDup(Parse *pParse, Expr *pExpr, int dest,int jumpIfNull){
+  sqlite3 *db = pParse->db;
+  Expr *pCopy = sqlite3ExprDup(db, pExpr, 0);
+  if( db->mallocFailed==0 ){
+    sqlite3ExprIfFalse(pParse, pCopy, dest, jumpIfNull);
+  }
+  sqlite3ExprDelete(db, pCopy);
+}
+
+/*
+** Expression pVar is guaranteed to be an SQL variable. pExpr may be any
+** type of expression.
+**
+** If pExpr is a simple SQL value - an integer, real, string, blob
+** or NULL value - then the VDBE currently being prepared is configured
+** to re-prepare each time a new value is bound to variable pVar.
+**
+** Additionally, if pExpr is a simple SQL value and the value is the
+** same as that currently bound to variable pVar, non-zero is returned.
+** Otherwise, if the values are not the same or if pExpr is not a simple
+** SQL value, zero is returned.
+*/
+static int exprCompareVariable(
+  const Parse *pParse,
+  const Expr *pVar,
+  const Expr *pExpr
+){
+  int res = 0;
+  int iVar;
+  sqlite3_value *pL, *pR = 0;
+
+  sqlite3ValueFromExpr(pParse->db, pExpr, SQLITE_UTF8, SQLITE_AFF_BLOB, &pR);
+  if( pR ){
+    iVar = pVar->iColumn;
+    sqlite3VdbeSetVarmask(pParse->pVdbe, iVar);
+    pL = sqlite3VdbeGetBoundValue(pParse->pReprepare, iVar, SQLITE_AFF_BLOB);
+    if( pL ){
+      if( sqlite3_value_type(pL)==SQLITE_TEXT ){
+        sqlite3_value_text(pL); /* Make sure the encoding is UTF-8 */
+      }
+      res =  0==sqlite3MemCompare(pL, pR, 0);
+    }
+    sqlite3ValueFree(pR);
+    sqlite3ValueFree(pL);
+  }
+
+  return res;
+}
+
+/*
+** Do a deep comparison of two expression trees.  Return 0 if the two
+** expressions are completely identical.  Return 1 if they differ only
+** by a COLLATE operator at the top level.  Return 2 if there are differences
+** other than the top-level COLLATE operator.
+**
+** If any subelement of pB has Expr.iTable==(-1) then it is allowed
+** to compare equal to an equivalent element in pA with Expr.iTable==iTab.
+**
+** The pA side might be using TK_REGISTER.  If that is the case and pB is
+** not using TK_REGISTER but is otherwise equivalent, then still return 0.
+**
+** Sometimes this routine will return 2 even if the two expressions
+** really are equivalent.  If we cannot prove that the expressions are
+** identical, we return 2 just to be safe.  So if this routine
+** returns 2, then you do not really know for certain if the two
+** expressions are the same.  But if you get a 0 or 1 return, then you
+** can be sure the expressions are the same.  In the places where
+** this routine is used, it does not hurt to get an extra 2 - that
+** just might result in some slightly slower code.  But returning
+** an incorrect 0 or 1 could lead to a malfunction.
+**
+** If pParse is not NULL then TK_VARIABLE terms in pA with bindings in
+** pParse->pReprepare can be matched against literals in pB.  The
+** pParse->pVdbe->expmask bitmask is updated for each variable referenced.
+** If pParse is NULL (the normal case) then any TK_VARIABLE term in
+** Argument pParse should normally be NULL. If it is not NULL and pA or
+** pB causes a return value of 2.
+*/
+SQLITE_PRIVATE int sqlite3ExprCompare(
+  const Parse *pParse,
+  const Expr *pA,
+  const Expr *pB,
+  int iTab
+){
+  u32 combinedFlags;
+  if( pA==0 || pB==0 ){
+    return pB==pA ? 0 : 2;
+  }
+  if( pParse && pA->op==TK_VARIABLE && exprCompareVariable(pParse, pA, pB) ){
+    return 0;
+  }
+  combinedFlags = pA->flags | pB->flags;
+  if( combinedFlags & EP_IntValue ){
+    if( (pA->flags&pB->flags&EP_IntValue)!=0 && pA->u.iValue==pB->u.iValue ){
+      return 0;
+    }
+    return 2;
+  }
+  if( pA->op!=pB->op || pA->op==TK_RAISE ){
+    if( pA->op==TK_COLLATE && sqlite3ExprCompare(pParse, pA->pLeft,pB,iTab)<2 ){
+      return 1;
+    }
+    if( pB->op==TK_COLLATE && sqlite3ExprCompare(pParse, pA,pB->pLeft,iTab)<2 ){
+      return 1;
+    }
+    return 2;
+  }
+  assert( !ExprHasProperty(pA, EP_IntValue) );
+  assert( !ExprHasProperty(pB, EP_IntValue) );
+  if( pA->u.zToken ){
+    if( pA->op==TK_FUNCTION || pA->op==TK_AGG_FUNCTION ){
+      if( sqlite3StrICmp(pA->u.zToken,pB->u.zToken)!=0 ) return 2;
+#ifndef SQLITE_OMIT_WINDOWFUNC
+      assert( pA->op==pB->op );
+      if( ExprHasProperty(pA,EP_WinFunc)!=ExprHasProperty(pB,EP_WinFunc) ){
+        return 2;
+      }
+      if( ExprHasProperty(pA,EP_WinFunc) ){
+        if( sqlite3WindowCompare(pParse, pA->y.pWin, pB->y.pWin, 1)!=0 ){
+          return 2;
+        }
+      }
+#endif
+    }else if( pA->op==TK_NULL ){
+      return 0;
+    }else if( pA->op==TK_COLLATE ){
+      if( sqlite3_stricmp(pA->u.zToken,pB->u.zToken)!=0 ) return 2;
+    }else
+    if( pB->u.zToken!=0
+     && pA->op!=TK_COLUMN
+     && pA->op!=TK_AGG_COLUMN
+     && strcmp(pA->u.zToken,pB->u.zToken)!=0
+    ){
+      return 2;
+    }
+  }
+  if( (pA->flags & (EP_Distinct|EP_Commuted))
+     != (pB->flags & (EP_Distinct|EP_Commuted)) ) return 2;
+  if( ALWAYS((combinedFlags & EP_TokenOnly)==0) ){
+    if( combinedFlags & EP_xIsSelect ) return 2;
+    if( (combinedFlags & EP_FixedCol)==0
+     && sqlite3ExprCompare(pParse, pA->pLeft, pB->pLeft, iTab) ) return 2;
+    if( sqlite3ExprCompare(pParse, pA->pRight, pB->pRight, iTab) ) return 2;
+    if( sqlite3ExprListCompare(pA->x.pList, pB->x.pList, iTab) ) return 2;
+    if( pA->op!=TK_STRING
+     && pA->op!=TK_TRUEFALSE
+     && ALWAYS((combinedFlags & EP_Reduced)==0)
+    ){
+      if( pA->iColumn!=pB->iColumn ) return 2;
+      if( pA->op2!=pB->op2 && pA->op==TK_TRUTH ) return 2;
+      if( pA->op!=TK_IN && pA->iTable!=pB->iTable && pA->iTable!=iTab ){
+        return 2;
+      }
+    }
+  }
+  return 0;
+}
+
+/*
+** Compare two ExprList objects.  Return 0 if they are identical, 1
+** if they are certainly different, or 2 if it is not possible to
+** determine if they are identical or not.
+**
+** If an
