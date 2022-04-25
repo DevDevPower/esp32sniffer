@@ -110677,4 +110677,191 @@ static int isRealTable(Parse *pParse, Table *pTab, int bDrop){
 **
 **  cmd ::= ALTER TABLE pSrc RENAME COLUMN pOld TO pNew
 */
-SQLITE_PRIVATE void sqlit
+SQLITE_PRIVATE void sqlite3AlterRenameColumn(
+  Parse *pParse,                  /* Parsing context */
+  SrcList *pSrc,                  /* Table being altered.  pSrc->nSrc==1 */
+  Token *pOld,                    /* Name of column being changed */
+  Token *pNew                     /* New column name */
+){
+  sqlite3 *db = pParse->db;       /* Database connection */
+  Table *pTab;                    /* Table being updated */
+  int iCol;                       /* Index of column being renamed */
+  char *zOld = 0;                 /* Old column name */
+  char *zNew = 0;                 /* New column name */
+  const char *zDb;                /* Name of schema containing the table */
+  int iSchema;                    /* Index of the schema */
+  int bQuote;                     /* True to quote the new name */
+
+  /* Locate the table to be altered */
+  pTab = sqlite3LocateTableItem(pParse, 0, &pSrc->a[0]);
+  if( !pTab ) goto exit_rename_column;
+
+  /* Cannot alter a system table */
+  if( SQLITE_OK!=isAlterableTable(pParse, pTab) ) goto exit_rename_column;
+  if( SQLITE_OK!=isRealTable(pParse, pTab, 0) ) goto exit_rename_column;
+
+  /* Which schema holds the table to be altered */
+  iSchema = sqlite3SchemaToIndex(db, pTab->pSchema);
+  assert( iSchema>=0 );
+  zDb = db->aDb[iSchema].zDbSName;
+
+#ifndef SQLITE_OMIT_AUTHORIZATION
+  /* Invoke the authorization callback. */
+  if( sqlite3AuthCheck(pParse, SQLITE_ALTER_TABLE, zDb, pTab->zName, 0) ){
+    goto exit_rename_column;
+  }
+#endif
+
+  /* Make sure the old name really is a column name in the table to be
+  ** altered.  Set iCol to be the index of the column being renamed */
+  zOld = sqlite3NameFromToken(db, pOld);
+  if( !zOld ) goto exit_rename_column;
+  for(iCol=0; iCol<pTab->nCol; iCol++){
+    if( 0==sqlite3StrICmp(pTab->aCol[iCol].zCnName, zOld) ) break;
+  }
+  if( iCol==pTab->nCol ){
+    sqlite3ErrorMsg(pParse, "no such column: \"%T\"", pOld);
+    goto exit_rename_column;
+  }
+
+  /* Ensure the schema contains no double-quoted strings */
+  renameTestSchema(pParse, zDb, iSchema==1, "", 0);
+  renameFixQuotes(pParse, zDb, iSchema==1);
+
+  /* Do the rename operation using a recursive UPDATE statement that
+  ** uses the sqlite_rename_column() SQL function to compute the new
+  ** CREATE statement text for the sqlite_schema table.
+  */
+  sqlite3MayAbort(pParse);
+  zNew = sqlite3NameFromToken(db, pNew);
+  if( !zNew ) goto exit_rename_column;
+  assert( pNew->n>0 );
+  bQuote = sqlite3Isquote(pNew->z[0]);
+  sqlite3NestedParse(pParse,
+      "UPDATE \"%w\"." LEGACY_SCHEMA_TABLE " SET "
+      "sql = sqlite_rename_column(sql, type, name, %Q, %Q, %d, %Q, %d, %d) "
+      "WHERE name NOT LIKE 'sqliteX_%%' ESCAPE 'X' "
+      " AND (type != 'index' OR tbl_name = %Q)",
+      zDb,
+      zDb, pTab->zName, iCol, zNew, bQuote, iSchema==1,
+      pTab->zName
+  );
+
+  sqlite3NestedParse(pParse,
+      "UPDATE temp." LEGACY_SCHEMA_TABLE " SET "
+      "sql = sqlite_rename_column(sql, type, name, %Q, %Q, %d, %Q, %d, 1) "
+      "WHERE type IN ('trigger', 'view')",
+      zDb, pTab->zName, iCol, zNew, bQuote
+  );
+
+  /* Drop and reload the database schema. */
+  renameReloadSchema(pParse, iSchema, INITFLAG_AlterRename);
+  renameTestSchema(pParse, zDb, iSchema==1, "after rename", 1);
+
+ exit_rename_column:
+  sqlite3SrcListDelete(db, pSrc);
+  sqlite3DbFree(db, zOld);
+  sqlite3DbFree(db, zNew);
+  return;
+}
+
+/*
+** Each RenameToken object maps an element of the parse tree into
+** the token that generated that element.  The parse tree element
+** might be one of:
+**
+**     *  A pointer to an Expr that represents an ID
+**     *  The name of a table column in Column.zName
+**
+** A list of RenameToken objects can be constructed during parsing.
+** Each new object is created by sqlite3RenameTokenMap().
+** As the parse tree is transformed, the sqlite3RenameTokenRemap()
+** routine is used to keep the mapping current.
+**
+** After the parse finishes, renameTokenFind() routine can be used
+** to look up the actual token value that created some element in
+** the parse tree.
+*/
+struct RenameToken {
+  const void *p;         /* Parse tree element created by token t */
+  Token t;               /* The token that created parse tree element p */
+  RenameToken *pNext;    /* Next is a list of all RenameToken objects */
+};
+
+/*
+** The context of an ALTER TABLE RENAME COLUMN operation that gets passed
+** down into the Walker.
+*/
+typedef struct RenameCtx RenameCtx;
+struct RenameCtx {
+  RenameToken *pList;             /* List of tokens to overwrite */
+  int nList;                      /* Number of tokens in pList */
+  int iCol;                       /* Index of column being renamed */
+  Table *pTab;                    /* Table being ALTERed */
+  const char *zOld;               /* Old column name */
+};
+
+#ifdef SQLITE_DEBUG
+/*
+** This function is only for debugging. It performs two tasks:
+**
+**   1. Checks that pointer pPtr does not already appear in the
+**      rename-token list.
+**
+**   2. Dereferences each pointer in the rename-token list.
+**
+** The second is most effective when debugging under valgrind or
+** address-sanitizer or similar. If any of these pointers no longer
+** point to valid objects, an exception is raised by the memory-checking
+** tool.
+**
+** The point of this is to prevent comparisons of invalid pointer values.
+** Even though this always seems to work, it is undefined according to the
+** C standard. Example of undefined comparison:
+**
+**     sqlite3_free(x);
+**     if( x==y ) ...
+**
+** Technically, as x no longer points into a valid object or to the byte
+** following a valid object, it may not be used in comparison operations.
+*/
+static void renameTokenCheckAll(Parse *pParse, const void *pPtr){
+  assert( pParse==pParse->db->pParse );
+  assert( pParse->db->mallocFailed==0 || pParse->nErr!=0 );
+  if( pParse->nErr==0 ){
+    const RenameToken *p;
+    u8 i = 0;
+    for(p=pParse->pRename; p; p=p->pNext){
+      if( p->p ){
+        assert( p->p!=pPtr );
+        i += *(u8*)(p->p);
+      }
+    }
+  }
+}
+#else
+# define renameTokenCheckAll(x,y)
+#endif
+
+/*
+** Remember that the parser tree element pPtr was created using
+** the token pToken.
+**
+** In other words, construct a new RenameToken object and add it
+** to the list of RenameToken objects currently being built up
+** in pParse->pRename.
+**
+** The pPtr argument is returned so that this routine can be used
+** with tail recursion in tokenExpr() routine, for a small performance
+** improvement.
+*/
+SQLITE_PRIVATE const void *sqlite3RenameTokenMap(
+  Parse *pParse,
+  const void *pPtr,
+  const Token *pToken
+){
+  RenameToken *pNew;
+  assert( pPtr || pParse->db->mallocFailed );
+  renameTokenCheckAll(pParse, pPtr);
+  if( ALWAYS(pParse->eParseMode!=PARSE_MODE_UNMAP) ){
+    pNew = sqlite3DbMallocZero(pParse->db, sizeof(RenameToken)
