@@ -112834,4 +112834,210 @@ static void statInit(
     p->aBest = &p->a[mxSample];
     pSpace = (u8*)(&p->a[mxSample+nCol]);
     for(i=0; i<(mxSample+nCol); i++){
-      p->a[i].anEq = (tRowcnt *)
+      p->a[i].anEq = (tRowcnt *)pSpace; pSpace += (sizeof(tRowcnt) * nColUp);
+      p->a[i].anLt = (tRowcnt *)pSpace; pSpace += (sizeof(tRowcnt) * nColUp);
+      p->a[i].anDLt = (tRowcnt *)pSpace; pSpace += (sizeof(tRowcnt) * nColUp);
+    }
+    assert( (pSpace - (u8*)p)==n );
+
+    for(i=0; i<nCol; i++){
+      p->aBest[i].iCol = i;
+    }
+  }
+#endif
+
+  /* Return a pointer to the allocated object to the caller.  Note that
+  ** only the pointer (the 2nd parameter) matters.  The size of the object
+  ** (given by the 3rd parameter) is never used and can be any positive
+  ** value. */
+  sqlite3_result_blob(context, p, sizeof(*p), statAccumDestructor);
+}
+static const FuncDef statInitFuncdef = {
+  4,               /* nArg */
+  SQLITE_UTF8,     /* funcFlags */
+  0,               /* pUserData */
+  0,               /* pNext */
+  statInit,        /* xSFunc */
+  0,               /* xFinalize */
+  0, 0,            /* xValue, xInverse */
+  "stat_init",     /* zName */
+  {0}
+};
+
+#ifdef SQLITE_ENABLE_STAT4
+/*
+** pNew and pOld are both candidate non-periodic samples selected for
+** the same column (pNew->iCol==pOld->iCol). Ignoring this column and
+** considering only any trailing columns and the sample hash value, this
+** function returns true if sample pNew is to be preferred over pOld.
+** In other words, if we assume that the cardinalities of the selected
+** column for pNew and pOld are equal, is pNew to be preferred over pOld.
+**
+** This function assumes that for each argument sample, the contents of
+** the anEq[] array from pSample->anEq[pSample->iCol+1] onwards are valid.
+*/
+static int sampleIsBetterPost(
+  StatAccum *pAccum,
+  StatSample *pNew,
+  StatSample *pOld
+){
+  int nCol = pAccum->nCol;
+  int i;
+  assert( pNew->iCol==pOld->iCol );
+  for(i=pNew->iCol+1; i<nCol; i++){
+    if( pNew->anEq[i]>pOld->anEq[i] ) return 1;
+    if( pNew->anEq[i]<pOld->anEq[i] ) return 0;
+  }
+  if( pNew->iHash>pOld->iHash ) return 1;
+  return 0;
+}
+#endif
+
+#ifdef SQLITE_ENABLE_STAT4
+/*
+** Return true if pNew is to be preferred over pOld.
+**
+** This function assumes that for each argument sample, the contents of
+** the anEq[] array from pSample->anEq[pSample->iCol] onwards are valid.
+*/
+static int sampleIsBetter(
+  StatAccum *pAccum,
+  StatSample *pNew,
+  StatSample *pOld
+){
+  tRowcnt nEqNew = pNew->anEq[pNew->iCol];
+  tRowcnt nEqOld = pOld->anEq[pOld->iCol];
+
+  assert( pOld->isPSample==0 && pNew->isPSample==0 );
+  assert( IsStat4 || (pNew->iCol==0 && pOld->iCol==0) );
+
+  if( (nEqNew>nEqOld) ) return 1;
+  if( nEqNew==nEqOld ){
+    if( pNew->iCol<pOld->iCol ) return 1;
+    return (pNew->iCol==pOld->iCol && sampleIsBetterPost(pAccum, pNew, pOld));
+  }
+  return 0;
+}
+
+/*
+** Copy the contents of sample *pNew into the p->a[] array. If necessary,
+** remove the least desirable sample from p->a[] to make room.
+*/
+static void sampleInsert(StatAccum *p, StatSample *pNew, int nEqZero){
+  StatSample *pSample = 0;
+  int i;
+
+  assert( IsStat4 || nEqZero==0 );
+
+  /* StatAccum.nMaxEqZero is set to the maximum number of leading 0
+  ** values in the anEq[] array of any sample in StatAccum.a[]. In
+  ** other words, if nMaxEqZero is n, then it is guaranteed that there
+  ** are no samples with StatSample.anEq[m]==0 for (m>=n). */
+  if( nEqZero>p->nMaxEqZero ){
+    p->nMaxEqZero = nEqZero;
+  }
+  if( pNew->isPSample==0 ){
+    StatSample *pUpgrade = 0;
+    assert( pNew->anEq[pNew->iCol]>0 );
+
+    /* This sample is being added because the prefix that ends in column
+    ** iCol occurs many times in the table. However, if we have already
+    ** added a sample that shares this prefix, there is no need to add
+    ** this one. Instead, upgrade the priority of the highest priority
+    ** existing sample that shares this prefix.  */
+    for(i=p->nSample-1; i>=0; i--){
+      StatSample *pOld = &p->a[i];
+      if( pOld->anEq[pNew->iCol]==0 ){
+        if( pOld->isPSample ) return;
+        assert( pOld->iCol>pNew->iCol );
+        assert( sampleIsBetter(p, pNew, pOld) );
+        if( pUpgrade==0 || sampleIsBetter(p, pOld, pUpgrade) ){
+          pUpgrade = pOld;
+        }
+      }
+    }
+    if( pUpgrade ){
+      pUpgrade->iCol = pNew->iCol;
+      pUpgrade->anEq[pUpgrade->iCol] = pNew->anEq[pUpgrade->iCol];
+      goto find_new_min;
+    }
+  }
+
+  /* If necessary, remove sample iMin to make room for the new sample. */
+  if( p->nSample>=p->mxSample ){
+    StatSample *pMin = &p->a[p->iMin];
+    tRowcnt *anEq = pMin->anEq;
+    tRowcnt *anLt = pMin->anLt;
+    tRowcnt *anDLt = pMin->anDLt;
+    sampleClear(p->db, pMin);
+    memmove(pMin, &pMin[1], sizeof(p->a[0])*(p->nSample-p->iMin-1));
+    pSample = &p->a[p->nSample-1];
+    pSample->nRowid = 0;
+    pSample->anEq = anEq;
+    pSample->anDLt = anDLt;
+    pSample->anLt = anLt;
+    p->nSample = p->mxSample-1;
+  }
+
+  /* The "rows less-than" for the rowid column must be greater than that
+  ** for the last sample in the p->a[] array. Otherwise, the samples would
+  ** be out of order. */
+  assert( p->nSample==0
+       || pNew->anLt[p->nCol-1] > p->a[p->nSample-1].anLt[p->nCol-1] );
+
+  /* Insert the new sample */
+  pSample = &p->a[p->nSample];
+  sampleCopy(p, pSample, pNew);
+  p->nSample++;
+
+  /* Zero the first nEqZero entries in the anEq[] array. */
+  memset(pSample->anEq, 0, sizeof(tRowcnt)*nEqZero);
+
+find_new_min:
+  if( p->nSample>=p->mxSample ){
+    int iMin = -1;
+    for(i=0; i<p->mxSample; i++){
+      if( p->a[i].isPSample ) continue;
+      if( iMin<0 || sampleIsBetter(p, &p->a[iMin], &p->a[i]) ){
+        iMin = i;
+      }
+    }
+    assert( iMin>=0 );
+    p->iMin = iMin;
+  }
+}
+#endif /* SQLITE_ENABLE_STAT4 */
+
+#ifdef SQLITE_ENABLE_STAT4
+/*
+** Field iChng of the index being scanned has changed. So at this point
+** p->current contains a sample that reflects the previous row of the
+** index. The value of anEq[iChng] and subsequent anEq[] elements are
+** correct at this point.
+*/
+static void samplePushPrevious(StatAccum *p, int iChng){
+  int i;
+
+  /* Check if any samples from the aBest[] array should be pushed
+  ** into IndexSample.a[] at this point.  */
+  for(i=(p->nCol-2); i>=iChng; i--){
+    StatSample *pBest = &p->aBest[i];
+    pBest->anEq[i] = p->current.anEq[i];
+    if( p->nSample<p->mxSample || sampleIsBetter(p, pBest, &p->a[p->iMin]) ){
+      sampleInsert(p, pBest, i);
+    }
+  }
+
+  /* Check that no sample contains an anEq[] entry with an index of
+  ** p->nMaxEqZero or greater set to zero. */
+  for(i=p->nSample-1; i>=0; i--){
+    int j;
+    for(j=p->nMaxEqZero; j<p->nCol; j++) assert( p->a[i].anEq[j]>0 );
+  }
+
+  /* Update the anEq[] fields of any samples already collected. */
+  if( iChng<p->nMaxEqZero ){
+    for(i=p->nSample-1; i>=0; i--){
+      int j;
+      for(j=iChng; j<p->nCol; j++){
+        if( p->a[i]
