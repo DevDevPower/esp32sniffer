@@ -113417,4 +113417,194 @@ static void analyzeOneTable(
     int nCol;                     /* Number of columns in pIdx. "N" */
     int addrRewind;               /* Address of "OP_Rewind iIdxCur" */
     int addrNextRow;              /* Address of "next_row:" */
-    const char *zIdxName;         /* Name of the
+    const char *zIdxName;         /* Name of the index */
+    int nColTest;                 /* Number of columns to test for changes */
+
+    if( pOnlyIdx && pOnlyIdx!=pIdx ) continue;
+    if( pIdx->pPartIdxWhere==0 ) needTableCnt = 0;
+    if( !HasRowid(pTab) && IsPrimaryKeyIndex(pIdx) ){
+      nCol = pIdx->nKeyCol;
+      zIdxName = pTab->zName;
+      nColTest = nCol - 1;
+    }else{
+      nCol = pIdx->nColumn;
+      zIdxName = pIdx->zName;
+      nColTest = pIdx->uniqNotNull ? pIdx->nKeyCol-1 : nCol-1;
+    }
+
+    /* Populate the register containing the index name. */
+    sqlite3VdbeLoadString(v, regIdxname, zIdxName);
+    VdbeComment((v, "Analysis for %s.%s", pTab->zName, zIdxName));
+
+    /*
+    ** Pseudo-code for loop that calls stat_push():
+    **
+    **   Rewind csr
+    **   if eof(csr) goto end_of_scan;
+    **   regChng = 0
+    **   goto chng_addr_0;
+    **
+    **  next_row:
+    **   regChng = 0
+    **   if( idx(0) != regPrev(0) ) goto chng_addr_0
+    **   regChng = 1
+    **   if( idx(1) != regPrev(1) ) goto chng_addr_1
+    **   ...
+    **   regChng = N
+    **   goto chng_addr_N
+    **
+    **  chng_addr_0:
+    **   regPrev(0) = idx(0)
+    **  chng_addr_1:
+    **   regPrev(1) = idx(1)
+    **  ...
+    **
+    **  endDistinctTest:
+    **   regRowid = idx(rowid)
+    **   stat_push(P, regChng, regRowid)
+    **   Next csr
+    **   if !eof(csr) goto next_row;
+    **
+    **  end_of_scan:
+    */
+
+    /* Make sure there are enough memory cells allocated to accommodate
+    ** the regPrev array and a trailing rowid (the rowid slot is required
+    ** when building a record to insert into the sample column of
+    ** the sqlite_stat4 table.  */
+    pParse->nMem = MAX(pParse->nMem, regPrev+nColTest);
+
+    /* Open a read-only cursor on the index being analyzed. */
+    assert( iDb==sqlite3SchemaToIndex(db, pIdx->pSchema) );
+    sqlite3VdbeAddOp3(v, OP_OpenRead, iIdxCur, pIdx->tnum, iDb);
+    sqlite3VdbeSetP4KeyInfo(pParse, pIdx);
+    VdbeComment((v, "%s", pIdx->zName));
+
+    /* Invoke the stat_init() function. The arguments are:
+    **
+    **    (1) the number of columns in the index including the rowid
+    **        (or for a WITHOUT ROWID table, the number of PK columns),
+    **    (2) the number of columns in the key without the rowid/pk
+    **    (3) estimated number of rows in the index,
+    */
+    sqlite3VdbeAddOp2(v, OP_Integer, nCol, regStat+1);
+    assert( regRowid==regStat+2 );
+    sqlite3VdbeAddOp2(v, OP_Integer, pIdx->nKeyCol, regRowid);
+#ifdef SQLITE_ENABLE_STAT4
+    if( OptimizationEnabled(db, SQLITE_Stat4) ){
+      sqlite3VdbeAddOp2(v, OP_Count, iIdxCur, regTemp);
+      addrRewind = sqlite3VdbeAddOp1(v, OP_Rewind, iIdxCur);
+      VdbeCoverage(v);
+    }else
+#endif
+    {
+      addrRewind = sqlite3VdbeAddOp1(v, OP_Rewind, iIdxCur);
+      VdbeCoverage(v);
+      sqlite3VdbeAddOp3(v, OP_Count, iIdxCur, regTemp, 1);
+    }
+    assert( regTemp2==regStat+4 );
+    sqlite3VdbeAddOp2(v, OP_Integer, db->nAnalysisLimit, regTemp2);
+    sqlite3VdbeAddFunctionCall(pParse, 0, regStat+1, regStat, 4,
+                               &statInitFuncdef, 0);
+
+    /* Implementation of the following:
+    **
+    **   Rewind csr
+    **   if eof(csr) goto end_of_scan;
+    **   regChng = 0
+    **   goto next_push_0;
+    **
+    */
+    sqlite3VdbeAddOp2(v, OP_Integer, 0, regChng);
+    addrNextRow = sqlite3VdbeCurrentAddr(v);
+
+    if( nColTest>0 ){
+      int endDistinctTest = sqlite3VdbeMakeLabel(pParse);
+      int *aGotoChng;               /* Array of jump instruction addresses */
+      aGotoChng = sqlite3DbMallocRawNN(db, sizeof(int)*nColTest);
+      if( aGotoChng==0 ) continue;
+
+      /*
+      **  next_row:
+      **   regChng = 0
+      **   if( idx(0) != regPrev(0) ) goto chng_addr_0
+      **   regChng = 1
+      **   if( idx(1) != regPrev(1) ) goto chng_addr_1
+      **   ...
+      **   regChng = N
+      **   goto endDistinctTest
+      */
+      sqlite3VdbeAddOp0(v, OP_Goto);
+      addrNextRow = sqlite3VdbeCurrentAddr(v);
+      if( nColTest==1 && pIdx->nKeyCol==1 && IsUniqueIndex(pIdx) ){
+        /* For a single-column UNIQUE index, once we have found a non-NULL
+        ** row, we know that all the rest will be distinct, so skip
+        ** subsequent distinctness tests. */
+        sqlite3VdbeAddOp2(v, OP_NotNull, regPrev, endDistinctTest);
+        VdbeCoverage(v);
+      }
+      for(i=0; i<nColTest; i++){
+        char *pColl = (char*)sqlite3LocateCollSeq(pParse, pIdx->azColl[i]);
+        sqlite3VdbeAddOp2(v, OP_Integer, i, regChng);
+        sqlite3VdbeAddOp3(v, OP_Column, iIdxCur, i, regTemp);
+        analyzeVdbeCommentIndexWithColumnName(v,pIdx,i);
+        aGotoChng[i] =
+        sqlite3VdbeAddOp4(v, OP_Ne, regTemp, 0, regPrev+i, pColl, P4_COLLSEQ);
+        sqlite3VdbeChangeP5(v, SQLITE_NULLEQ);
+        VdbeCoverage(v);
+      }
+      sqlite3VdbeAddOp2(v, OP_Integer, nColTest, regChng);
+      sqlite3VdbeGoto(v, endDistinctTest);
+
+
+      /*
+      **  chng_addr_0:
+      **   regPrev(0) = idx(0)
+      **  chng_addr_1:
+      **   regPrev(1) = idx(1)
+      **  ...
+      */
+      sqlite3VdbeJumpHere(v, addrNextRow-1);
+      for(i=0; i<nColTest; i++){
+        sqlite3VdbeJumpHere(v, aGotoChng[i]);
+        sqlite3VdbeAddOp3(v, OP_Column, iIdxCur, i, regPrev+i);
+        analyzeVdbeCommentIndexWithColumnName(v,pIdx,i);
+      }
+      sqlite3VdbeResolveLabel(v, endDistinctTest);
+      sqlite3DbFree(db, aGotoChng);
+    }
+
+    /*
+    **  chng_addr_N:
+    **   regRowid = idx(rowid)            // STAT4 only
+    **   stat_push(P, regChng, regRowid)  // 3rd parameter STAT4 only
+    **   Next csr
+    **   if !eof(csr) goto next_row;
+    */
+#ifdef SQLITE_ENABLE_STAT4
+    if( OptimizationEnabled(db, SQLITE_Stat4) ){
+      assert( regRowid==(regStat+2) );
+      if( HasRowid(pTab) ){
+        sqlite3VdbeAddOp2(v, OP_IdxRowid, iIdxCur, regRowid);
+      }else{
+        Index *pPk = sqlite3PrimaryKeyIndex(pIdx->pTable);
+        int j, k, regKey;
+        regKey = sqlite3GetTempRange(pParse, pPk->nKeyCol);
+        for(j=0; j<pPk->nKeyCol; j++){
+          k = sqlite3TableColumnToIndex(pIdx, pPk->aiColumn[j]);
+          assert( k>=0 && k<pIdx->nColumn );
+          sqlite3VdbeAddOp3(v, OP_Column, iIdxCur, k, regKey+j);
+          analyzeVdbeCommentIndexWithColumnName(v,pIdx,k);
+        }
+        sqlite3VdbeAddOp3(v, OP_MakeRecord, regKey, pPk->nKeyCol, regRowid);
+        sqlite3ReleaseTempRange(pParse, regKey, pPk->nKeyCol);
+      }
+    }
+#endif
+    assert( regChng==(regStat+1) );
+    {
+      sqlite3VdbeAddFunctionCall(pParse, 1, regStat, regTemp, 2+IsStat4,
+                                 &statPushFuncdef, 0);
+      if( db->nAnalysisLimit ){
+        int j1, j2, j3;
+        j1 = sqlite3VdbeAddOp1(v, O
