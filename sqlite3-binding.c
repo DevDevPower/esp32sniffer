@@ -113607,4 +113607,191 @@ static void analyzeOneTable(
                                  &statPushFuncdef, 0);
       if( db->nAnalysisLimit ){
         int j1, j2, j3;
-        j1 = sqlite3VdbeAddOp1(v, O
+        j1 = sqlite3VdbeAddOp1(v, OP_IsNull, regTemp); VdbeCoverage(v);
+        j2 = sqlite3VdbeAddOp1(v, OP_If, regTemp); VdbeCoverage(v);
+        j3 = sqlite3VdbeAddOp4Int(v, OP_SeekGT, iIdxCur, 0, regPrev, 1);
+        VdbeCoverage(v);
+        sqlite3VdbeJumpHere(v, j1);
+        sqlite3VdbeAddOp2(v, OP_Next, iIdxCur, addrNextRow); VdbeCoverage(v);
+        sqlite3VdbeJumpHere(v, j2);
+        sqlite3VdbeJumpHere(v, j3);
+      }else{
+        sqlite3VdbeAddOp2(v, OP_Next, iIdxCur, addrNextRow); VdbeCoverage(v);
+      }
+    }
+
+    /* Add the entry to the stat1 table. */
+    callStatGet(pParse, regStat, STAT_GET_STAT1, regStat1);
+    assert( "BBB"[0]==SQLITE_AFF_TEXT );
+    sqlite3VdbeAddOp4(v, OP_MakeRecord, regTabname, 3, regTemp, "BBB", 0);
+    sqlite3VdbeAddOp2(v, OP_NewRowid, iStatCur, regNewRowid);
+    sqlite3VdbeAddOp3(v, OP_Insert, iStatCur, regTemp, regNewRowid);
+#ifdef SQLITE_ENABLE_PREUPDATE_HOOK
+    sqlite3VdbeChangeP4(v, -1, (char*)pStat1, P4_TABLE);
+#endif
+    sqlite3VdbeChangeP5(v, OPFLAG_APPEND);
+
+    /* Add the entries to the stat4 table. */
+#ifdef SQLITE_ENABLE_STAT4
+    if( OptimizationEnabled(db, SQLITE_Stat4) && db->nAnalysisLimit==0 ){
+      int regEq = regStat1;
+      int regLt = regStat1+1;
+      int regDLt = regStat1+2;
+      int regSample = regStat1+3;
+      int regCol = regStat1+4;
+      int regSampleRowid = regCol + nCol;
+      int addrNext;
+      int addrIsNull;
+      u8 seekOp = HasRowid(pTab) ? OP_NotExists : OP_NotFound;
+
+      pParse->nMem = MAX(pParse->nMem, regCol+nCol);
+
+      addrNext = sqlite3VdbeCurrentAddr(v);
+      callStatGet(pParse, regStat, STAT_GET_ROWID, regSampleRowid);
+      addrIsNull = sqlite3VdbeAddOp1(v, OP_IsNull, regSampleRowid);
+      VdbeCoverage(v);
+      callStatGet(pParse, regStat, STAT_GET_NEQ, regEq);
+      callStatGet(pParse, regStat, STAT_GET_NLT, regLt);
+      callStatGet(pParse, regStat, STAT_GET_NDLT, regDLt);
+      sqlite3VdbeAddOp4Int(v, seekOp, iTabCur, addrNext, regSampleRowid, 0);
+      VdbeCoverage(v);
+      for(i=0; i<nCol; i++){
+        sqlite3ExprCodeLoadIndexColumn(pParse, pIdx, iTabCur, i, regCol+i);
+      }
+      sqlite3VdbeAddOp3(v, OP_MakeRecord, regCol, nCol, regSample);
+      sqlite3VdbeAddOp3(v, OP_MakeRecord, regTabname, 6, regTemp);
+      sqlite3VdbeAddOp2(v, OP_NewRowid, iStatCur+1, regNewRowid);
+      sqlite3VdbeAddOp3(v, OP_Insert, iStatCur+1, regTemp, regNewRowid);
+      sqlite3VdbeAddOp2(v, OP_Goto, 1, addrNext); /* P1==1 for end-of-loop */
+      sqlite3VdbeJumpHere(v, addrIsNull);
+    }
+#endif /* SQLITE_ENABLE_STAT4 */
+
+    /* End of analysis */
+    sqlite3VdbeJumpHere(v, addrRewind);
+  }
+
+
+  /* Create a single sqlite_stat1 entry containing NULL as the index
+  ** name and the row count as the content.
+  */
+  if( pOnlyIdx==0 && needTableCnt ){
+    VdbeComment((v, "%s", pTab->zName));
+    sqlite3VdbeAddOp2(v, OP_Count, iTabCur, regStat1);
+    jZeroRows = sqlite3VdbeAddOp1(v, OP_IfNot, regStat1); VdbeCoverage(v);
+    sqlite3VdbeAddOp2(v, OP_Null, 0, regIdxname);
+    assert( "BBB"[0]==SQLITE_AFF_TEXT );
+    sqlite3VdbeAddOp4(v, OP_MakeRecord, regTabname, 3, regTemp, "BBB", 0);
+    sqlite3VdbeAddOp2(v, OP_NewRowid, iStatCur, regNewRowid);
+    sqlite3VdbeAddOp3(v, OP_Insert, iStatCur, regTemp, regNewRowid);
+    sqlite3VdbeChangeP5(v, OPFLAG_APPEND);
+#ifdef SQLITE_ENABLE_PREUPDATE_HOOK
+    sqlite3VdbeChangeP4(v, -1, (char*)pStat1, P4_TABLE);
+#endif
+    sqlite3VdbeJumpHere(v, jZeroRows);
+  }
+}
+
+
+/*
+** Generate code that will cause the most recent index analysis to
+** be loaded into internal hash tables where is can be used.
+*/
+static void loadAnalysis(Parse *pParse, int iDb){
+  Vdbe *v = sqlite3GetVdbe(pParse);
+  if( v ){
+    sqlite3VdbeAddOp1(v, OP_LoadAnalysis, iDb);
+  }
+}
+
+/*
+** Generate code that will do an analysis of an entire database
+*/
+static void analyzeDatabase(Parse *pParse, int iDb){
+  sqlite3 *db = pParse->db;
+  Schema *pSchema = db->aDb[iDb].pSchema;    /* Schema of database iDb */
+  HashElem *k;
+  int iStatCur;
+  int iMem;
+  int iTab;
+
+  sqlite3BeginWriteOperation(pParse, 0, iDb);
+  iStatCur = pParse->nTab;
+  pParse->nTab += 3;
+  openStatTable(pParse, iDb, iStatCur, 0, 0);
+  iMem = pParse->nMem+1;
+  iTab = pParse->nTab;
+  assert( sqlite3SchemaMutexHeld(db, iDb, 0) );
+  for(k=sqliteHashFirst(&pSchema->tblHash); k; k=sqliteHashNext(k)){
+    Table *pTab = (Table*)sqliteHashData(k);
+    analyzeOneTable(pParse, pTab, 0, iStatCur, iMem, iTab);
+  }
+  loadAnalysis(pParse, iDb);
+}
+
+/*
+** Generate code that will do an analysis of a single table in
+** a database.  If pOnlyIdx is not NULL then it is a single index
+** in pTab that should be analyzed.
+*/
+static void analyzeTable(Parse *pParse, Table *pTab, Index *pOnlyIdx){
+  int iDb;
+  int iStatCur;
+
+  assert( pTab!=0 );
+  assert( sqlite3BtreeHoldsAllMutexes(pParse->db) );
+  iDb = sqlite3SchemaToIndex(pParse->db, pTab->pSchema);
+  sqlite3BeginWriteOperation(pParse, 0, iDb);
+  iStatCur = pParse->nTab;
+  pParse->nTab += 3;
+  if( pOnlyIdx ){
+    openStatTable(pParse, iDb, iStatCur, pOnlyIdx->zName, "idx");
+  }else{
+    openStatTable(pParse, iDb, iStatCur, pTab->zName, "tbl");
+  }
+  analyzeOneTable(pParse, pTab, pOnlyIdx, iStatCur,pParse->nMem+1,pParse->nTab);
+  loadAnalysis(pParse, iDb);
+}
+
+/*
+** Generate code for the ANALYZE command.  The parser calls this routine
+** when it recognizes an ANALYZE command.
+**
+**        ANALYZE                            -- 1
+**        ANALYZE  <database>                -- 2
+**        ANALYZE  ?<database>.?<tablename>  -- 3
+**
+** Form 1 causes all indices in all attached databases to be analyzed.
+** Form 2 analyzes all indices the single database named.
+** Form 3 analyzes all indices associated with the named table.
+*/
+SQLITE_PRIVATE void sqlite3Analyze(Parse *pParse, Token *pName1, Token *pName2){
+  sqlite3 *db = pParse->db;
+  int iDb;
+  int i;
+  char *z, *zDb;
+  Table *pTab;
+  Index *pIdx;
+  Token *pTableName;
+  Vdbe *v;
+
+  /* Read the database schema. If an error occurs, leave an error message
+  ** and code in pParse and return NULL. */
+  assert( sqlite3BtreeHoldsAllMutexes(pParse->db) );
+  if( SQLITE_OK!=sqlite3ReadSchema(pParse) ){
+    return;
+  }
+
+  assert( pName2!=0 || pName1==0 );
+  if( pName1==0 ){
+    /* Form 1:  Analyze everything */
+    for(i=0; i<db->nDb; i++){
+      if( i==1 ) continue;  /* Do not analyze the TEMP database */
+      analyzeDatabase(pParse, i);
+    }
+  }else if( pName2->n==0 && (iDb = sqlite3FindDb(db, pName1))>=0 ){
+    /* Analyze the schema named as the argument */
+    analyzeDatabase(pParse, iDb);
+  }else{
+    /* Form 3: Analyze the table or index named as an argument */
+    iDb = sqlite3TwoPartName(pParse, pName1,
