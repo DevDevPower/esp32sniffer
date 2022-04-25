@@ -112333,4 +112333,147 @@ SQLITE_PRIVATE void sqlite3AlterDropColumn(Parse *pParse, SrcList *pSrc, const T
       sqlite3VdbeAddOp2(v, OP_Null, 0, reg+1);
       nField = 1;
     }
-    sqlite3VdbeAddOp3(v, OP_MakeRecord, reg+1, nFi
+    sqlite3VdbeAddOp3(v, OP_MakeRecord, reg+1, nField, regRec);
+    if( pPk ){
+      sqlite3VdbeAddOp4Int(v, OP_IdxInsert, iCur, regRec, reg+1, pPk->nKeyCol);
+    }else{
+      sqlite3VdbeAddOp3(v, OP_Insert, iCur, regRec, reg);
+    }
+    sqlite3VdbeChangeP5(v, OPFLAG_SAVEPOSITION);
+
+    sqlite3VdbeAddOp2(v, OP_Next, iCur, addr+1); VdbeCoverage(v);
+    sqlite3VdbeJumpHere(v, addr);
+  }
+
+exit_drop_column:
+  sqlite3DbFree(db, zCol);
+  sqlite3SrcListDelete(db, pSrc);
+}
+
+/*
+** Register built-in functions used to help implement ALTER TABLE
+*/
+SQLITE_PRIVATE void sqlite3AlterFunctions(void){
+  static FuncDef aAlterTableFuncs[] = {
+    INTERNAL_FUNCTION(sqlite_rename_column,  9, renameColumnFunc),
+    INTERNAL_FUNCTION(sqlite_rename_table,   7, renameTableFunc),
+    INTERNAL_FUNCTION(sqlite_rename_test,    7, renameTableTest),
+    INTERNAL_FUNCTION(sqlite_drop_column,    3, dropColumnFunc),
+    INTERNAL_FUNCTION(sqlite_rename_quotefix,2, renameQuotefixFunc),
+  };
+  sqlite3InsertBuiltinFuncs(aAlterTableFuncs, ArraySize(aAlterTableFuncs));
+}
+#endif  /* SQLITE_ALTER_TABLE */
+
+/************** End of alter.c ***********************************************/
+/************** Begin file analyze.c *****************************************/
+/*
+** 2005-07-08
+**
+** The author disclaims copyright to this source code.  In place of
+** a legal notice, here is a blessing:
+**
+**    May you do good and not evil.
+**    May you find forgiveness for yourself and forgive others.
+**    May you share freely, never taking more than you give.
+**
+*************************************************************************
+** This file contains code associated with the ANALYZE command.
+**
+** The ANALYZE command gather statistics about the content of tables
+** and indices.  These statistics are made available to the query planner
+** to help it make better decisions about how to perform queries.
+**
+** The following system tables are or have been supported:
+**
+**    CREATE TABLE sqlite_stat1(tbl, idx, stat);
+**    CREATE TABLE sqlite_stat2(tbl, idx, sampleno, sample);
+**    CREATE TABLE sqlite_stat3(tbl, idx, nEq, nLt, nDLt, sample);
+**    CREATE TABLE sqlite_stat4(tbl, idx, nEq, nLt, nDLt, sample);
+**
+** Additional tables might be added in future releases of SQLite.
+** The sqlite_stat2 table is not created or used unless the SQLite version
+** is between 3.6.18 and 3.7.8, inclusive, and unless SQLite is compiled
+** with SQLITE_ENABLE_STAT2.  The sqlite_stat2 table is deprecated.
+** The sqlite_stat2 table is superseded by sqlite_stat3, which is only
+** created and used by SQLite versions 3.7.9 through 3.29.0 when
+** SQLITE_ENABLE_STAT3 defined.  The functionality of sqlite_stat3
+** is a superset of sqlite_stat2 and is also now deprecated.  The
+** sqlite_stat4 is an enhanced version of sqlite_stat3 and is only
+** available when compiled with SQLITE_ENABLE_STAT4 and in SQLite
+** versions 3.8.1 and later.  STAT4 is the only variant that is still
+** supported.
+**
+** For most applications, sqlite_stat1 provides all the statistics required
+** for the query planner to make good choices.
+**
+** Format of sqlite_stat1:
+**
+** There is normally one row per index, with the index identified by the
+** name in the idx column.  The tbl column is the name of the table to
+** which the index belongs.  In each such row, the stat column will be
+** a string consisting of a list of integers.  The first integer in this
+** list is the number of rows in the index.  (This is the same as the
+** number of rows in the table, except for partial indices.)  The second
+** integer is the average number of rows in the index that have the same
+** value in the first column of the index.  The third integer is the average
+** number of rows in the index that have the same value for the first two
+** columns.  The N-th integer (for N>1) is the average number of rows in
+** the index which have the same value for the first N-1 columns.  For
+** a K-column index, there will be K+1 integers in the stat column.  If
+** the index is unique, then the last integer will be 1.
+**
+** The list of integers in the stat column can optionally be followed
+** by the keyword "unordered".  The "unordered" keyword, if it is present,
+** must be separated from the last integer by a single space.  If the
+** "unordered" keyword is present, then the query planner assumes that
+** the index is unordered and will not use the index for a range query.
+**
+** If the sqlite_stat1.idx column is NULL, then the sqlite_stat1.stat
+** column contains a single integer which is the (estimated) number of
+** rows in the table identified by sqlite_stat1.tbl.
+**
+** Format of sqlite_stat2:
+**
+** The sqlite_stat2 is only created and is only used if SQLite is compiled
+** with SQLITE_ENABLE_STAT2 and if the SQLite version number is between
+** 3.6.18 and 3.7.8.  The "stat2" table contains additional information
+** about the distribution of keys within an index.  The index is identified by
+** the "idx" column and the "tbl" column is the name of the table to which
+** the index belongs.  There are usually 10 rows in the sqlite_stat2
+** table for each index.
+**
+** The sqlite_stat2 entries for an index that have sampleno between 0 and 9
+** inclusive are samples of the left-most key value in the index taken at
+** evenly spaced points along the index.  Let the number of samples be S
+** (10 in the standard build) and let C be the number of rows in the index.
+** Then the sampled rows are given by:
+**
+**     rownumber = (i*C*2 + C)/(S*2)
+**
+** For i between 0 and S-1.  Conceptually, the index space is divided into
+** S uniform buckets and the samples are the middle row from each bucket.
+**
+** The format for sqlite_stat2 is recorded here for legacy reference.  This
+** version of SQLite does not support sqlite_stat2.  It neither reads nor
+** writes the sqlite_stat2 table.  This version of SQLite only supports
+** sqlite_stat3.
+**
+** Format for sqlite_stat3:
+**
+** The sqlite_stat3 format is a subset of sqlite_stat4.  Hence, the
+** sqlite_stat4 format will be described first.  Further information
+** about sqlite_stat3 follows the sqlite_stat4 description.
+**
+** Format for sqlite_stat4:
+**
+** As with sqlite_stat2, the sqlite_stat4 table contains histogram data
+** to aid the query planner in choosing good indices based on the values
+** that indexed columns are compared against in the WHERE clauses of
+** queries.
+**
+** The sqlite_stat4 table contains multiple entries for each index.
+** The idx column names the index and the tbl column is the table of the
+** index.  If the idx and tbl columns are the same, then the sample is
+** of the INTEGER PRIMARY KEY.  The sample column is a blob which is the
+** binary encoding of a key 
