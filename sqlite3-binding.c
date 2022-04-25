@@ -112644,4 +112644,194 @@ struct StatSample {
   u32 nRowid;                     /* Sizeof aRowid[] */
   u8 isPSample;                   /* True if a periodic sample */
   int iCol;                       /* If !isPSample, the reason for inclusion */
-  u32 iHash;                      /* Tiebreaker has
+  u32 iHash;                      /* Tiebreaker hash */
+#endif
+};
+struct StatAccum {
+  sqlite3 *db;              /* Database connection, for malloc() */
+  tRowcnt nEst;             /* Estimated number of rows */
+  tRowcnt nRow;             /* Number of rows visited so far */
+  int nLimit;               /* Analysis row-scan limit */
+  int nCol;                 /* Number of columns in index + pk/rowid */
+  int nKeyCol;              /* Number of index columns w/o the pk/rowid */
+  u8 nSkipAhead;            /* Number of times of skip-ahead */
+  StatSample current;       /* Current row as a StatSample */
+#ifdef SQLITE_ENABLE_STAT4
+  tRowcnt nPSample;         /* How often to do a periodic sample */
+  int mxSample;             /* Maximum number of samples to accumulate */
+  u32 iPrn;                 /* Pseudo-random number used for sampling */
+  StatSample *aBest;        /* Array of nCol best samples */
+  int iMin;                 /* Index in a[] of entry with minimum score */
+  int nSample;              /* Current number of samples */
+  int nMaxEqZero;           /* Max leading 0 in anEq[] for any a[] entry */
+  int iGet;                 /* Index of current sample accessed by stat_get() */
+  StatSample *a;            /* Array of mxSample StatSample objects */
+#endif
+};
+
+/* Reclaim memory used by a StatSample
+*/
+#ifdef SQLITE_ENABLE_STAT4
+static void sampleClear(sqlite3 *db, StatSample *p){
+  assert( db!=0 );
+  if( p->nRowid ){
+    sqlite3DbFree(db, p->u.aRowid);
+    p->nRowid = 0;
+  }
+}
+#endif
+
+/* Initialize the BLOB value of a ROWID
+*/
+#ifdef SQLITE_ENABLE_STAT4
+static void sampleSetRowid(sqlite3 *db, StatSample *p, int n, const u8 *pData){
+  assert( db!=0 );
+  if( p->nRowid ) sqlite3DbFree(db, p->u.aRowid);
+  p->u.aRowid = sqlite3DbMallocRawNN(db, n);
+  if( p->u.aRowid ){
+    p->nRowid = n;
+    memcpy(p->u.aRowid, pData, n);
+  }else{
+    p->nRowid = 0;
+  }
+}
+#endif
+
+/* Initialize the INTEGER value of a ROWID.
+*/
+#ifdef SQLITE_ENABLE_STAT4
+static void sampleSetRowidInt64(sqlite3 *db, StatSample *p, i64 iRowid){
+  assert( db!=0 );
+  if( p->nRowid ) sqlite3DbFree(db, p->u.aRowid);
+  p->nRowid = 0;
+  p->u.iRowid = iRowid;
+}
+#endif
+
+
+/*
+** Copy the contents of object (*pFrom) into (*pTo).
+*/
+#ifdef SQLITE_ENABLE_STAT4
+static void sampleCopy(StatAccum *p, StatSample *pTo, StatSample *pFrom){
+  pTo->isPSample = pFrom->isPSample;
+  pTo->iCol = pFrom->iCol;
+  pTo->iHash = pFrom->iHash;
+  memcpy(pTo->anEq, pFrom->anEq, sizeof(tRowcnt)*p->nCol);
+  memcpy(pTo->anLt, pFrom->anLt, sizeof(tRowcnt)*p->nCol);
+  memcpy(pTo->anDLt, pFrom->anDLt, sizeof(tRowcnt)*p->nCol);
+  if( pFrom->nRowid ){
+    sampleSetRowid(p->db, pTo, pFrom->nRowid, pFrom->u.aRowid);
+  }else{
+    sampleSetRowidInt64(p->db, pTo, pFrom->u.iRowid);
+  }
+}
+#endif
+
+/*
+** Reclaim all memory of a StatAccum structure.
+*/
+static void statAccumDestructor(void *pOld){
+  StatAccum *p = (StatAccum*)pOld;
+#ifdef SQLITE_ENABLE_STAT4
+  if( p->mxSample ){
+    int i;
+    for(i=0; i<p->nCol; i++) sampleClear(p->db, p->aBest+i);
+    for(i=0; i<p->mxSample; i++) sampleClear(p->db, p->a+i);
+    sampleClear(p->db, &p->current);
+  }
+#endif
+  sqlite3DbFree(p->db, p);
+}
+
+/*
+** Implementation of the stat_init(N,K,C,L) SQL function. The four parameters
+** are:
+**     N:    The number of columns in the index including the rowid/pk (note 1)
+**     K:    The number of columns in the index excluding the rowid/pk.
+**     C:    Estimated number of rows in the index
+**     L:    A limit on the number of rows to scan, or 0 for no-limit
+**
+** Note 1:  In the special case of the covering index that implements a
+** WITHOUT ROWID table, N is the number of PRIMARY KEY columns, not the
+** total number of columns in the table.
+**
+** For indexes on ordinary rowid tables, N==K+1.  But for indexes on
+** WITHOUT ROWID tables, N=K+P where P is the number of columns in the
+** PRIMARY KEY of the table.  The covering index that implements the
+** original WITHOUT ROWID table as N==K as a special case.
+**
+** This routine allocates the StatAccum object in heap memory. The return
+** value is a pointer to the StatAccum object.  The datatype of the
+** return value is BLOB, but it is really just a pointer to the StatAccum
+** object.
+*/
+static void statInit(
+  sqlite3_context *context,
+  int argc,
+  sqlite3_value **argv
+){
+  StatAccum *p;
+  int nCol;                       /* Number of columns in index being sampled */
+  int nKeyCol;                    /* Number of key columns */
+  int nColUp;                     /* nCol rounded up for alignment */
+  int n;                          /* Bytes of space to allocate */
+  sqlite3 *db = sqlite3_context_db_handle(context);   /* Database connection */
+#ifdef SQLITE_ENABLE_STAT4
+  /* Maximum number of samples.  0 if STAT4 data is not collected */
+  int mxSample = OptimizationEnabled(db,SQLITE_Stat4) ?SQLITE_STAT4_SAMPLES :0;
+#endif
+
+  /* Decode the three function arguments */
+  UNUSED_PARAMETER(argc);
+  nCol = sqlite3_value_int(argv[0]);
+  assert( nCol>0 );
+  nColUp = sizeof(tRowcnt)<8 ? (nCol+1)&~1 : nCol;
+  nKeyCol = sqlite3_value_int(argv[1]);
+  assert( nKeyCol<=nCol );
+  assert( nKeyCol>0 );
+
+  /* Allocate the space required for the StatAccum object */
+  n = sizeof(*p)
+    + sizeof(tRowcnt)*nColUp                  /* StatAccum.anEq */
+    + sizeof(tRowcnt)*nColUp;                 /* StatAccum.anDLt */
+#ifdef SQLITE_ENABLE_STAT4
+  if( mxSample ){
+    n += sizeof(tRowcnt)*nColUp                  /* StatAccum.anLt */
+      + sizeof(StatSample)*(nCol+mxSample)       /* StatAccum.aBest[], a[] */
+      + sizeof(tRowcnt)*3*nColUp*(nCol+mxSample);
+  }
+#endif
+  p = sqlite3DbMallocZero(db, n);
+  if( p==0 ){
+    sqlite3_result_error_nomem(context);
+    return;
+  }
+
+  p->db = db;
+  p->nEst = sqlite3_value_int64(argv[2]);
+  p->nRow = 0;
+  p->nLimit = sqlite3_value_int64(argv[3]);
+  p->nCol = nCol;
+  p->nKeyCol = nKeyCol;
+  p->nSkipAhead = 0;
+  p->current.anDLt = (tRowcnt*)&p[1];
+  p->current.anEq = &p->current.anDLt[nColUp];
+
+#ifdef SQLITE_ENABLE_STAT4
+  p->mxSample = p->nLimit==0 ? mxSample : 0;
+  if( mxSample ){
+    u8 *pSpace;                     /* Allocated space not yet assigned */
+    int i;                          /* Used to iterate through p->aSample[] */
+
+    p->iGet = -1;
+    p->nPSample = (tRowcnt)(p->nEst/(mxSample/3+1) + 1);
+    p->current.anLt = &p->current.anEq[nColUp];
+    p->iPrn = 0x689e962d*(u32)nCol ^ 0xd0944565*(u32)sqlite3_value_int(argv[2]);
+
+    /* Set up the StatAccum.a[] and aBest[] arrays */
+    p->a = (struct StatSample*)&p->current.anLt[nColUp];
+    p->aBest = &p->a[mxSample];
+    pSpace = (u8*)(&p->a[mxSample+nCol]);
+    for(i=0; i<(mxSample+nCol); i++){
+      p->a[i].anEq = (tRowcnt *)
