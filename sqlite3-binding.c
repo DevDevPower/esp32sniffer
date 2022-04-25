@@ -111094,4 +111094,218 @@ static int renameColumnSelectCb(Walker *pWalker, Select *p){
 ** RenameToken object to the list of RenameToken objects being
 ** constructed in RenameCtx object at pWalker->u.pRename.
 */
-static int re
+static int renameColumnExprCb(Walker *pWalker, Expr *pExpr){
+  RenameCtx *p = pWalker->u.pRename;
+  if( pExpr->op==TK_TRIGGER
+   && pExpr->iColumn==p->iCol
+   && pWalker->pParse->pTriggerTab==p->pTab
+  ){
+    renameTokenFind(pWalker->pParse, p, (void*)pExpr);
+  }else if( pExpr->op==TK_COLUMN
+   && pExpr->iColumn==p->iCol
+   && ALWAYS(ExprUseYTab(pExpr))
+   && p->pTab==pExpr->y.pTab
+  ){
+    renameTokenFind(pWalker->pParse, p, (void*)pExpr);
+  }
+  return WRC_Continue;
+}
+
+/*
+** The RenameCtx contains a list of tokens that reference a column that
+** is being renamed by an ALTER TABLE statement.  Return the "last"
+** RenameToken in the RenameCtx and remove that RenameToken from the
+** RenameContext.  "Last" means the last RenameToken encountered when
+** the input SQL is parsed from left to right.  Repeated calls to this routine
+** return all column name tokens in the order that they are encountered
+** in the SQL statement.
+*/
+static RenameToken *renameColumnTokenNext(RenameCtx *pCtx){
+  RenameToken *pBest = pCtx->pList;
+  RenameToken *pToken;
+  RenameToken **pp;
+
+  for(pToken=pBest->pNext; pToken; pToken=pToken->pNext){
+    if( pToken->t.z>pBest->t.z ) pBest = pToken;
+  }
+  for(pp=&pCtx->pList; *pp!=pBest; pp=&(*pp)->pNext);
+  *pp = pBest->pNext;
+
+  return pBest;
+}
+
+/*
+** An error occured while parsing or otherwise processing a database
+** object (either pParse->pNewTable, pNewIndex or pNewTrigger) as part of an
+** ALTER TABLE RENAME COLUMN program. The error message emitted by the
+** sub-routine is currently stored in pParse->zErrMsg. This function
+** adds context to the error message and then stores it in pCtx.
+*/
+static void renameColumnParseError(
+  sqlite3_context *pCtx,
+  const char *zWhen,
+  sqlite3_value *pType,
+  sqlite3_value *pObject,
+  Parse *pParse
+){
+  const char *zT = (const char*)sqlite3_value_text(pType);
+  const char *zN = (const char*)sqlite3_value_text(pObject);
+  char *zErr;
+
+  zErr = sqlite3MPrintf(pParse->db, "error in %s %s%s%s: %s",
+      zT, zN, (zWhen[0] ? " " : ""), zWhen,
+      pParse->zErrMsg
+  );
+  sqlite3_result_error(pCtx, zErr, -1);
+  sqlite3DbFree(pParse->db, zErr);
+}
+
+/*
+** For each name in the the expression-list pEList (i.e. each
+** pEList->a[i].zName) that matches the string in zOld, extract the
+** corresponding rename-token from Parse object pParse and add it
+** to the RenameCtx pCtx.
+*/
+static void renameColumnElistNames(
+  Parse *pParse,
+  RenameCtx *pCtx,
+  const ExprList *pEList,
+  const char *zOld
+){
+  if( pEList ){
+    int i;
+    for(i=0; i<pEList->nExpr; i++){
+      const char *zName = pEList->a[i].zEName;
+      if( ALWAYS(pEList->a[i].fg.eEName==ENAME_NAME)
+       && ALWAYS(zName!=0)
+       && 0==sqlite3_stricmp(zName, zOld)
+      ){
+        renameTokenFind(pParse, pCtx, (const void*)zName);
+      }
+    }
+  }
+}
+
+/*
+** For each name in the the id-list pIdList (i.e. each pIdList->a[i].zName)
+** that matches the string in zOld, extract the corresponding rename-token
+** from Parse object pParse and add it to the RenameCtx pCtx.
+*/
+static void renameColumnIdlistNames(
+  Parse *pParse,
+  RenameCtx *pCtx,
+  const IdList *pIdList,
+  const char *zOld
+){
+  if( pIdList ){
+    int i;
+    for(i=0; i<pIdList->nId; i++){
+      const char *zName = pIdList->a[i].zName;
+      if( 0==sqlite3_stricmp(zName, zOld) ){
+        renameTokenFind(pParse, pCtx, (const void*)zName);
+      }
+    }
+  }
+}
+
+
+/*
+** Parse the SQL statement zSql using Parse object (*p). The Parse object
+** is initialized by this function before it is used.
+*/
+static int renameParseSql(
+  Parse *p,                       /* Memory to use for Parse object */
+  const char *zDb,                /* Name of schema SQL belongs to */
+  sqlite3 *db,                    /* Database handle */
+  const char *zSql,               /* SQL to parse */
+  int bTemp                       /* True if SQL is from temp schema */
+){
+  int rc;
+
+  sqlite3ParseObjectInit(p, db);
+  if( zSql==0 ){
+    return SQLITE_NOMEM;
+  }
+  if( sqlite3StrNICmp(zSql,"CREATE ",7)!=0 ){
+    return SQLITE_CORRUPT_BKPT;
+  }
+  db->init.iDb = bTemp ? 1 : sqlite3FindDbName(db, zDb);
+  p->eParseMode = PARSE_MODE_RENAME;
+  p->db = db;
+  p->nQueryLoop = 1;
+  rc = sqlite3RunParser(p, zSql);
+  if( db->mallocFailed ) rc = SQLITE_NOMEM;
+  if( rc==SQLITE_OK
+   && NEVER(p->pNewTable==0 && p->pNewIndex==0 && p->pNewTrigger==0)
+  ){
+    rc = SQLITE_CORRUPT_BKPT;
+  }
+
+#ifdef SQLITE_DEBUG
+  /* Ensure that all mappings in the Parse.pRename list really do map to
+  ** a part of the input string.  */
+  if( rc==SQLITE_OK ){
+    int nSql = sqlite3Strlen30(zSql);
+    RenameToken *pToken;
+    for(pToken=p->pRename; pToken; pToken=pToken->pNext){
+      assert( pToken->t.z>=zSql && &pToken->t.z[pToken->t.n]<=&zSql[nSql] );
+    }
+  }
+#endif
+
+  db->init.iDb = 0;
+  return rc;
+}
+
+/*
+** This function edits SQL statement zSql, replacing each token identified
+** by the linked list pRename with the text of zNew. If argument bQuote is
+** true, then zNew is always quoted first. If no error occurs, the result
+** is loaded into context object pCtx as the result.
+**
+** Or, if an error occurs (i.e. an OOM condition), an error is left in
+** pCtx and an SQLite error code returned.
+*/
+static int renameEditSql(
+  sqlite3_context *pCtx,          /* Return result here */
+  RenameCtx *pRename,             /* Rename context */
+  const char *zSql,               /* SQL statement to edit */
+  const char *zNew,               /* New token text */
+  int bQuote                      /* True to always quote token */
+){
+  i64 nNew = sqlite3Strlen30(zNew);
+  i64 nSql = sqlite3Strlen30(zSql);
+  sqlite3 *db = sqlite3_context_db_handle(pCtx);
+  int rc = SQLITE_OK;
+  char *zQuot = 0;
+  char *zOut;
+  i64 nQuot = 0;
+  char *zBuf1 = 0;
+  char *zBuf2 = 0;
+
+  if( zNew ){
+    /* Set zQuot to point to a buffer containing a quoted copy of the
+    ** identifier zNew. If the corresponding identifier in the original
+    ** ALTER TABLE statement was quoted (bQuote==1), then set zNew to
+    ** point to zQuot so that all substitutions are made using the
+    ** quoted version of the new column name.  */
+    zQuot = sqlite3MPrintf(db, "\"%w\" ", zNew);
+    if( zQuot==0 ){
+      return SQLITE_NOMEM;
+    }else{
+      nQuot = sqlite3Strlen30(zQuot)-1;
+    }
+
+    assert( nQuot>=nNew );
+    zOut = sqlite3DbMallocZero(db, nSql + pRename->nList*nQuot + 1);
+  }else{
+    zOut = (char*)sqlite3DbMallocZero(db, (nSql*2+1) * 3);
+    if( zOut ){
+      zBuf1 = &zOut[nSql*2+1];
+      zBuf2 = &zOut[nSql*4+2];
+    }
+  }
+
+  /* At this point pRename->pList contains a list of RenameToken objects
+  ** corresponding to all tokens in the input SQL that must be replaced
+  ** with
