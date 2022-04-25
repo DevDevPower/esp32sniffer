@@ -113230,4 +113230,191 @@ static void statGet(
 
     sqlite3StrAccumInit(&sStat, 0, 0, 0, (p->nKeyCol+1)*100);
     sqlite3_str_appendf(&sStat, "%llu",
-        p->nSkipAhead ? (u64)p->nEst : (u64
+        p->nSkipAhead ? (u64)p->nEst : (u64)p->nRow);
+    for(i=0; i<p->nKeyCol; i++){
+      u64 nDistinct = p->current.anDLt[i] + 1;
+      u64 iVal = (p->nRow + nDistinct - 1) / nDistinct;
+      if( iVal==2 && p->nRow*10 <= nDistinct*11 ) iVal = 1;
+      sqlite3_str_appendf(&sStat, " %llu", iVal);
+      assert( p->current.anEq[i] );
+    }
+    sqlite3ResultStrAccum(context, &sStat);
+  }
+#ifdef SQLITE_ENABLE_STAT4
+  else if( eCall==STAT_GET_ROWID ){
+    if( p->iGet<0 ){
+      samplePushPrevious(p, 0);
+      p->iGet = 0;
+    }
+    if( p->iGet<p->nSample ){
+      StatSample *pS = p->a + p->iGet;
+      if( pS->nRowid==0 ){
+        sqlite3_result_int64(context, pS->u.iRowid);
+      }else{
+        sqlite3_result_blob(context, pS->u.aRowid, pS->nRowid,
+                            SQLITE_TRANSIENT);
+      }
+    }
+  }else{
+    tRowcnt *aCnt = 0;
+    sqlite3_str sStat;
+    int i;
+
+    assert( p->iGet<p->nSample );
+    switch( eCall ){
+      case STAT_GET_NEQ:  aCnt = p->a[p->iGet].anEq; break;
+      case STAT_GET_NLT:  aCnt = p->a[p->iGet].anLt; break;
+      default: {
+        aCnt = p->a[p->iGet].anDLt;
+        p->iGet++;
+        break;
+      }
+    }
+    sqlite3StrAccumInit(&sStat, 0, 0, 0, p->nCol*100);
+    for(i=0; i<p->nCol; i++){
+      sqlite3_str_appendf(&sStat, "%llu ", (u64)aCnt[i]);
+    }
+    if( sStat.nChar ) sStat.nChar--;
+    sqlite3ResultStrAccum(context, &sStat);
+  }
+#endif /* SQLITE_ENABLE_STAT4 */
+#ifndef SQLITE_DEBUG
+  UNUSED_PARAMETER( argc );
+#endif
+}
+static const FuncDef statGetFuncdef = {
+  1+IsStat4,       /* nArg */
+  SQLITE_UTF8,     /* funcFlags */
+  0,               /* pUserData */
+  0,               /* pNext */
+  statGet,         /* xSFunc */
+  0,               /* xFinalize */
+  0, 0,            /* xValue, xInverse */
+  "stat_get",      /* zName */
+  {0}
+};
+
+static void callStatGet(Parse *pParse, int regStat, int iParam, int regOut){
+#ifdef SQLITE_ENABLE_STAT4
+  sqlite3VdbeAddOp2(pParse->pVdbe, OP_Integer, iParam, regStat+1);
+#elif SQLITE_DEBUG
+  assert( iParam==STAT_GET_STAT1 );
+#else
+  UNUSED_PARAMETER( iParam );
+#endif
+  assert( regOut!=regStat && regOut!=regStat+1 );
+  sqlite3VdbeAddFunctionCall(pParse, 0, regStat, regOut, 1+IsStat4,
+                             &statGetFuncdef, 0);
+}
+
+#ifdef SQLITE_ENABLE_EXPLAIN_COMMENTS
+/* Add a comment to the most recent VDBE opcode that is the name
+** of the k-th column of the pIdx index.
+*/
+static void analyzeVdbeCommentIndexWithColumnName(
+  Vdbe *v,         /* Prepared statement under construction */
+  Index *pIdx,     /* Index whose column is being loaded */
+  int k            /* Which column index */
+){
+  int i;           /* Index of column in the table */
+  assert( k>=0 && k<pIdx->nColumn );
+  i = pIdx->aiColumn[k];
+  if( NEVER(i==XN_ROWID) ){
+    VdbeComment((v,"%s.rowid",pIdx->zName));
+  }else if( i==XN_EXPR ){
+    VdbeComment((v,"%s.expr(%d)",pIdx->zName, k));
+  }else{
+    VdbeComment((v,"%s.%s", pIdx->zName, pIdx->pTable->aCol[i].zCnName));
+  }
+}
+#else
+# define analyzeVdbeCommentIndexWithColumnName(a,b,c)
+#endif /* SQLITE_DEBUG */
+
+/*
+** Generate code to do an analysis of all indices associated with
+** a single table.
+*/
+static void analyzeOneTable(
+  Parse *pParse,   /* Parser context */
+  Table *pTab,     /* Table whose indices are to be analyzed */
+  Index *pOnlyIdx, /* If not NULL, only analyze this one index */
+  int iStatCur,    /* Index of VdbeCursor that writes the sqlite_stat1 table */
+  int iMem,        /* Available memory locations begin here */
+  int iTab         /* Next available cursor */
+){
+  sqlite3 *db = pParse->db;    /* Database handle */
+  Index *pIdx;                 /* An index to being analyzed */
+  int iIdxCur;                 /* Cursor open on index being analyzed */
+  int iTabCur;                 /* Table cursor */
+  Vdbe *v;                     /* The virtual machine being built up */
+  int i;                       /* Loop counter */
+  int jZeroRows = -1;          /* Jump from here if number of rows is zero */
+  int iDb;                     /* Index of database containing pTab */
+  u8 needTableCnt = 1;         /* True to count the table */
+  int regNewRowid = iMem++;    /* Rowid for the inserted record */
+  int regStat = iMem++;        /* Register to hold StatAccum object */
+  int regChng = iMem++;        /* Index of changed index field */
+  int regRowid = iMem++;       /* Rowid argument passed to stat_push() */
+  int regTemp = iMem++;        /* Temporary use register */
+  int regTemp2 = iMem++;       /* Second temporary use register */
+  int regTabname = iMem++;     /* Register containing table name */
+  int regIdxname = iMem++;     /* Register containing index name */
+  int regStat1 = iMem++;       /* Value for the stat column of sqlite_stat1 */
+  int regPrev = iMem;          /* MUST BE LAST (see below) */
+#ifdef SQLITE_ENABLE_PREUPDATE_HOOK
+  Table *pStat1 = 0;
+#endif
+
+  pParse->nMem = MAX(pParse->nMem, iMem);
+  v = sqlite3GetVdbe(pParse);
+  if( v==0 || NEVER(pTab==0) ){
+    return;
+  }
+  if( !IsOrdinaryTable(pTab) ){
+    /* Do not gather statistics on views or virtual tables */
+    return;
+  }
+  if( sqlite3_strlike("sqlite\\_%", pTab->zName, '\\')==0 ){
+    /* Do not gather statistics on system tables */
+    return;
+  }
+  assert( sqlite3BtreeHoldsAllMutexes(db) );
+  iDb = sqlite3SchemaToIndex(db, pTab->pSchema);
+  assert( iDb>=0 );
+  assert( sqlite3SchemaMutexHeld(db, iDb, 0) );
+#ifndef SQLITE_OMIT_AUTHORIZATION
+  if( sqlite3AuthCheck(pParse, SQLITE_ANALYZE, pTab->zName, 0,
+      db->aDb[iDb].zDbSName ) ){
+    return;
+  }
+#endif
+
+#ifdef SQLITE_ENABLE_PREUPDATE_HOOK
+  if( db->xPreUpdateCallback ){
+    pStat1 = (Table*)sqlite3DbMallocZero(db, sizeof(Table) + 13);
+    if( pStat1==0 ) return;
+    pStat1->zName = (char*)&pStat1[1];
+    memcpy(pStat1->zName, "sqlite_stat1", 13);
+    pStat1->nCol = 3;
+    pStat1->iPKey = -1;
+    sqlite3VdbeAddOp4(pParse->pVdbe, OP_Noop, 0, 0, 0,(char*)pStat1,P4_DYNAMIC);
+  }
+#endif
+
+  /* Establish a read-lock on the table at the shared-cache level.
+  ** Open a read-only cursor on the table. Also allocate a cursor number
+  ** to use for scanning indexes (iIdxCur). No index cursor is opened at
+  ** this time though.  */
+  sqlite3TableLock(pParse, iDb, pTab->tnum, 0, pTab->zName);
+  iTabCur = iTab++;
+  iIdxCur = iTab++;
+  pParse->nTab = MAX(pParse->nTab, iTab);
+  sqlite3OpenTable(pParse, iTabCur, iDb, pTab, OP_OpenRead);
+  sqlite3VdbeLoadString(v, regTabname, pTab->zName);
+
+  for(pIdx=pTab->pIndex; pIdx; pIdx=pIdx->pNext){
+    int nCol;                     /* Number of columns in pIdx. "N" */
+    int addrRewind;               /* Address of "OP_Rewind iIdxCur" */
+    int addrNextRow;              /* Address of "next_row:" */
+    const char *zIdxName;         /* Name of the
