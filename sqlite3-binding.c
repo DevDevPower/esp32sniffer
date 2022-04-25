@@ -110864,4 +110864,234 @@ SQLITE_PRIVATE const void *sqlite3RenameTokenMap(
   assert( pPtr || pParse->db->mallocFailed );
   renameTokenCheckAll(pParse, pPtr);
   if( ALWAYS(pParse->eParseMode!=PARSE_MODE_UNMAP) ){
-    pNew = sqlite3DbMallocZero(pParse->db, sizeof(RenameToken)
+    pNew = sqlite3DbMallocZero(pParse->db, sizeof(RenameToken));
+    if( pNew ){
+      pNew->p = pPtr;
+      pNew->t = *pToken;
+      pNew->pNext = pParse->pRename;
+      pParse->pRename = pNew;
+    }
+  }
+
+  return pPtr;
+}
+
+/*
+** It is assumed that there is already a RenameToken object associated
+** with parse tree element pFrom. This function remaps the associated token
+** to parse tree element pTo.
+*/
+SQLITE_PRIVATE void sqlite3RenameTokenRemap(Parse *pParse, const void *pTo, const void *pFrom){
+  RenameToken *p;
+  renameTokenCheckAll(pParse, pTo);
+  for(p=pParse->pRename; p; p=p->pNext){
+    if( p->p==pFrom ){
+      p->p = pTo;
+      break;
+    }
+  }
+}
+
+/*
+** Walker callback used by sqlite3RenameExprUnmap().
+*/
+static int renameUnmapExprCb(Walker *pWalker, Expr *pExpr){
+  Parse *pParse = pWalker->pParse;
+  sqlite3RenameTokenRemap(pParse, 0, (const void*)pExpr);
+  if( ExprUseYTab(pExpr) ){
+    sqlite3RenameTokenRemap(pParse, 0, (const void*)&pExpr->y.pTab);
+  }
+  return WRC_Continue;
+}
+
+/*
+** Iterate through the Select objects that are part of WITH clauses attached
+** to select statement pSelect.
+*/
+static void renameWalkWith(Walker *pWalker, Select *pSelect){
+  With *pWith = pSelect->pWith;
+  if( pWith ){
+    Parse *pParse = pWalker->pParse;
+    int i;
+    With *pCopy = 0;
+    assert( pWith->nCte>0 );
+    if( (pWith->a[0].pSelect->selFlags & SF_Expanded)==0 ){
+      /* Push a copy of the With object onto the with-stack. We use a copy
+      ** here as the original will be expanded and resolved (flags SF_Expanded
+      ** and SF_Resolved) below. And the parser code that uses the with-stack
+      ** fails if the Select objects on it have already been expanded and
+      ** resolved.  */
+      pCopy = sqlite3WithDup(pParse->db, pWith);
+      pCopy = sqlite3WithPush(pParse, pCopy, 1);
+    }
+    for(i=0; i<pWith->nCte; i++){
+      Select *p = pWith->a[i].pSelect;
+      NameContext sNC;
+      memset(&sNC, 0, sizeof(sNC));
+      sNC.pParse = pParse;
+      if( pCopy ) sqlite3SelectPrep(sNC.pParse, p, &sNC);
+      if( sNC.pParse->db->mallocFailed ) return;
+      sqlite3WalkSelect(pWalker, p);
+      sqlite3RenameExprlistUnmap(pParse, pWith->a[i].pCols);
+    }
+    if( pCopy && pParse->pWith==pCopy ){
+      pParse->pWith = pCopy->pOuter;
+    }
+  }
+}
+
+/*
+** Unmap all tokens in the IdList object passed as the second argument.
+*/
+static void unmapColumnIdlistNames(
+  Parse *pParse,
+  const IdList *pIdList
+){
+  int ii;
+  assert( pIdList!=0 );
+  for(ii=0; ii<pIdList->nId; ii++){
+    sqlite3RenameTokenRemap(pParse, 0, (const void*)pIdList->a[ii].zName);
+  }
+}
+
+/*
+** Walker callback used by sqlite3RenameExprUnmap().
+*/
+static int renameUnmapSelectCb(Walker *pWalker, Select *p){
+  Parse *pParse = pWalker->pParse;
+  int i;
+  if( pParse->nErr ) return WRC_Abort;
+  testcase( p->selFlags & SF_View );
+  testcase( p->selFlags & SF_CopyCte );
+  if( p->selFlags & (SF_View|SF_CopyCte) ){
+    return WRC_Prune;
+  }
+  if( ALWAYS(p->pEList) ){
+    ExprList *pList = p->pEList;
+    for(i=0; i<pList->nExpr; i++){
+      if( pList->a[i].zEName && pList->a[i].fg.eEName==ENAME_NAME ){
+        sqlite3RenameTokenRemap(pParse, 0, (void*)pList->a[i].zEName);
+      }
+    }
+  }
+  if( ALWAYS(p->pSrc) ){  /* Every Select as a SrcList, even if it is empty */
+    SrcList *pSrc = p->pSrc;
+    for(i=0; i<pSrc->nSrc; i++){
+      sqlite3RenameTokenRemap(pParse, 0, (void*)pSrc->a[i].zName);
+      if( pSrc->a[i].fg.isUsing==0 ){
+        sqlite3WalkExpr(pWalker, pSrc->a[i].u3.pOn);
+      }else{
+        unmapColumnIdlistNames(pParse, pSrc->a[i].u3.pUsing);
+      }
+    }
+  }
+
+  renameWalkWith(pWalker, p);
+  return WRC_Continue;
+}
+
+/*
+** Remove all nodes that are part of expression pExpr from the rename list.
+*/
+SQLITE_PRIVATE void sqlite3RenameExprUnmap(Parse *pParse, Expr *pExpr){
+  u8 eMode = pParse->eParseMode;
+  Walker sWalker;
+  memset(&sWalker, 0, sizeof(Walker));
+  sWalker.pParse = pParse;
+  sWalker.xExprCallback = renameUnmapExprCb;
+  sWalker.xSelectCallback = renameUnmapSelectCb;
+  pParse->eParseMode = PARSE_MODE_UNMAP;
+  sqlite3WalkExpr(&sWalker, pExpr);
+  pParse->eParseMode = eMode;
+}
+
+/*
+** Remove all nodes that are part of expression-list pEList from the
+** rename list.
+*/
+SQLITE_PRIVATE void sqlite3RenameExprlistUnmap(Parse *pParse, ExprList *pEList){
+  if( pEList ){
+    int i;
+    Walker sWalker;
+    memset(&sWalker, 0, sizeof(Walker));
+    sWalker.pParse = pParse;
+    sWalker.xExprCallback = renameUnmapExprCb;
+    sqlite3WalkExprList(&sWalker, pEList);
+    for(i=0; i<pEList->nExpr; i++){
+      if( ALWAYS(pEList->a[i].fg.eEName==ENAME_NAME) ){
+        sqlite3RenameTokenRemap(pParse, 0, (void*)pEList->a[i].zEName);
+      }
+    }
+  }
+}
+
+/*
+** Free the list of RenameToken objects given in the second argument
+*/
+static void renameTokenFree(sqlite3 *db, RenameToken *pToken){
+  RenameToken *pNext;
+  RenameToken *p;
+  for(p=pToken; p; p=pNext){
+    pNext = p->pNext;
+    sqlite3DbFree(db, p);
+  }
+}
+
+/*
+** Search the Parse object passed as the first argument for a RenameToken
+** object associated with parse tree element pPtr. If found, return a pointer
+** to it. Otherwise, return NULL.
+**
+** If the second argument passed to this function is not NULL and a matching
+** RenameToken object is found, remove it from the Parse object and add it to
+** the list maintained by the RenameCtx object.
+*/
+static RenameToken *renameTokenFind(
+  Parse *pParse,
+  struct RenameCtx *pCtx,
+  const void *pPtr
+){
+  RenameToken **pp;
+  if( NEVER(pPtr==0) ){
+    return 0;
+  }
+  for(pp=&pParse->pRename; (*pp); pp=&(*pp)->pNext){
+    if( (*pp)->p==pPtr ){
+      RenameToken *pToken = *pp;
+      if( pCtx ){
+        *pp = pToken->pNext;
+        pToken->pNext = pCtx->pList;
+        pCtx->pList = pToken;
+        pCtx->nList++;
+      }
+      return pToken;
+    }
+  }
+  return 0;
+}
+
+/*
+** This is a Walker select callback. It does nothing. It is only required
+** because without a dummy callback, sqlite3WalkExpr() and similar do not
+** descend into sub-select statements.
+*/
+static int renameColumnSelectCb(Walker *pWalker, Select *p){
+  if( p->selFlags & (SF_View|SF_CopyCte) ){
+    testcase( p->selFlags & SF_View );
+    testcase( p->selFlags & SF_CopyCte );
+    return WRC_Prune;
+  }
+  renameWalkWith(pWalker, p);
+  return WRC_Continue;
+}
+
+/*
+** This is a Walker expression callback.
+**
+** For every TK_COLUMN node in the expression tree, search to see
+** if the column being references is the column being renamed by an
+** ALTER TABLE statement.  If it is, then attach its associated
+** RenameToken object to the list of RenameToken objects being
+** constructed in RenameCtx object at pWalker->u.pRename.
+*/
+static int re
