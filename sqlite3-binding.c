@@ -111503,4 +111503,198 @@ static void renameWalkTrigger(Walker *pWalker, Trigger *pTrigger){
 }
 
 /*
-** Free the contents of Parse object (*pParse). Do not free 
+** Free the contents of Parse object (*pParse). Do not free the memory
+** occupied by the Parse object itself.
+*/
+static void renameParseCleanup(Parse *pParse){
+  sqlite3 *db = pParse->db;
+  Index *pIdx;
+  if( pParse->pVdbe ){
+    sqlite3VdbeFinalize(pParse->pVdbe);
+  }
+  sqlite3DeleteTable(db, pParse->pNewTable);
+  while( (pIdx = pParse->pNewIndex)!=0 ){
+    pParse->pNewIndex = pIdx->pNext;
+    sqlite3FreeIndex(db, pIdx);
+  }
+  sqlite3DeleteTrigger(db, pParse->pNewTrigger);
+  sqlite3DbFree(db, pParse->zErrMsg);
+  renameTokenFree(db, pParse->pRename);
+  sqlite3ParseObjectReset(pParse);
+}
+
+/*
+** SQL function:
+**
+**     sqlite_rename_column(SQL,TYPE,OBJ,DB,TABLE,COL,NEWNAME,QUOTE,TEMP)
+**
+**   0. zSql:     SQL statement to rewrite
+**   1. type:     Type of object ("table", "view" etc.)
+**   2. object:   Name of object
+**   3. Database: Database name (e.g. "main")
+**   4. Table:    Table name
+**   5. iCol:     Index of column to rename
+**   6. zNew:     New column name
+**   7. bQuote:   Non-zero if the new column name should be quoted.
+**   8. bTemp:    True if zSql comes from temp schema
+**
+** Do a column rename operation on the CREATE statement given in zSql.
+** The iCol-th column (left-most is 0) of table zTable is renamed from zCol
+** into zNew.  The name should be quoted if bQuote is true.
+**
+** This function is used internally by the ALTER TABLE RENAME COLUMN command.
+** It is only accessible to SQL created using sqlite3NestedParse().  It is
+** not reachable from ordinary SQL passed into sqlite3_prepare() unless the
+** SQLITE_TESTCTRL_INTERNAL_FUNCTIONS test setting is enabled.
+*/
+static void renameColumnFunc(
+  sqlite3_context *context,
+  int NotUsed,
+  sqlite3_value **argv
+){
+  sqlite3 *db = sqlite3_context_db_handle(context);
+  RenameCtx sCtx;
+  const char *zSql = (const char*)sqlite3_value_text(argv[0]);
+  const char *zDb = (const char*)sqlite3_value_text(argv[3]);
+  const char *zTable = (const char*)sqlite3_value_text(argv[4]);
+  int iCol = sqlite3_value_int(argv[5]);
+  const char *zNew = (const char*)sqlite3_value_text(argv[6]);
+  int bQuote = sqlite3_value_int(argv[7]);
+  int bTemp = sqlite3_value_int(argv[8]);
+  const char *zOld;
+  int rc;
+  Parse sParse;
+  Walker sWalker;
+  Index *pIdx;
+  int i;
+  Table *pTab;
+#ifndef SQLITE_OMIT_AUTHORIZATION
+  sqlite3_xauth xAuth = db->xAuth;
+#endif
+
+  UNUSED_PARAMETER(NotUsed);
+  if( zSql==0 ) return;
+  if( zTable==0 ) return;
+  if( zNew==0 ) return;
+  if( iCol<0 ) return;
+  sqlite3BtreeEnterAll(db);
+  pTab = sqlite3FindTable(db, zTable, zDb);
+  if( pTab==0 || iCol>=pTab->nCol ){
+    sqlite3BtreeLeaveAll(db);
+    return;
+  }
+  zOld = pTab->aCol[iCol].zCnName;
+  memset(&sCtx, 0, sizeof(sCtx));
+  sCtx.iCol = ((iCol==pTab->iPKey) ? -1 : iCol);
+
+#ifndef SQLITE_OMIT_AUTHORIZATION
+  db->xAuth = 0;
+#endif
+  rc = renameParseSql(&sParse, zDb, db, zSql, bTemp);
+
+  /* Find tokens that need to be replaced. */
+  memset(&sWalker, 0, sizeof(Walker));
+  sWalker.pParse = &sParse;
+  sWalker.xExprCallback = renameColumnExprCb;
+  sWalker.xSelectCallback = renameColumnSelectCb;
+  sWalker.u.pRename = &sCtx;
+
+  sCtx.pTab = pTab;
+  if( rc!=SQLITE_OK ) goto renameColumnFunc_done;
+  if( sParse.pNewTable ){
+    if( IsView(sParse.pNewTable) ){
+      Select *pSelect = sParse.pNewTable->u.view.pSelect;
+      pSelect->selFlags &= ~SF_View;
+      sParse.rc = SQLITE_OK;
+      sqlite3SelectPrep(&sParse, pSelect, 0);
+      rc = (db->mallocFailed ? SQLITE_NOMEM : sParse.rc);
+      if( rc==SQLITE_OK ){
+        sqlite3WalkSelect(&sWalker, pSelect);
+      }
+      if( rc!=SQLITE_OK ) goto renameColumnFunc_done;
+    }else if( IsOrdinaryTable(sParse.pNewTable) ){
+      /* A regular table */
+      int bFKOnly = sqlite3_stricmp(zTable, sParse.pNewTable->zName);
+      FKey *pFKey;
+      sCtx.pTab = sParse.pNewTable;
+      if( bFKOnly==0 ){
+        if( iCol<sParse.pNewTable->nCol ){
+          renameTokenFind(
+              &sParse, &sCtx, (void*)sParse.pNewTable->aCol[iCol].zCnName
+          );
+        }
+        if( sCtx.iCol<0 ){
+          renameTokenFind(&sParse, &sCtx, (void*)&sParse.pNewTable->iPKey);
+        }
+        sqlite3WalkExprList(&sWalker, sParse.pNewTable->pCheck);
+        for(pIdx=sParse.pNewTable->pIndex; pIdx; pIdx=pIdx->pNext){
+          sqlite3WalkExprList(&sWalker, pIdx->aColExpr);
+        }
+        for(pIdx=sParse.pNewIndex; pIdx; pIdx=pIdx->pNext){
+          sqlite3WalkExprList(&sWalker, pIdx->aColExpr);
+        }
+#ifndef SQLITE_OMIT_GENERATED_COLUMNS
+        for(i=0; i<sParse.pNewTable->nCol; i++){
+          Expr *pExpr = sqlite3ColumnExpr(sParse.pNewTable,
+                                                  &sParse.pNewTable->aCol[i]);
+          sqlite3WalkExpr(&sWalker, pExpr);
+        }
+#endif
+      }
+
+      assert( IsOrdinaryTable(sParse.pNewTable) );
+      for(pFKey=sParse.pNewTable->u.tab.pFKey; pFKey; pFKey=pFKey->pNextFrom){
+        for(i=0; i<pFKey->nCol; i++){
+          if( bFKOnly==0 && pFKey->aCol[i].iFrom==iCol ){
+            renameTokenFind(&sParse, &sCtx, (void*)&pFKey->aCol[i]);
+          }
+          if( 0==sqlite3_stricmp(pFKey->zTo, zTable)
+           && 0==sqlite3_stricmp(pFKey->aCol[i].zCol, zOld)
+          ){
+            renameTokenFind(&sParse, &sCtx, (void*)pFKey->aCol[i].zCol);
+          }
+        }
+      }
+    }
+  }else if( sParse.pNewIndex ){
+    sqlite3WalkExprList(&sWalker, sParse.pNewIndex->aColExpr);
+    sqlite3WalkExpr(&sWalker, sParse.pNewIndex->pPartIdxWhere);
+  }else{
+    /* A trigger */
+    TriggerStep *pStep;
+    rc = renameResolveTrigger(&sParse);
+    if( rc!=SQLITE_OK ) goto renameColumnFunc_done;
+
+    for(pStep=sParse.pNewTrigger->step_list; pStep; pStep=pStep->pNext){
+      if( pStep->zTarget ){
+        Table *pTarget = sqlite3LocateTable(&sParse, 0, pStep->zTarget, zDb);
+        if( pTarget==pTab ){
+          if( pStep->pUpsert ){
+            ExprList *pUpsertSet = pStep->pUpsert->pUpsertSet;
+            renameColumnElistNames(&sParse, &sCtx, pUpsertSet, zOld);
+          }
+          renameColumnIdlistNames(&sParse, &sCtx, pStep->pIdList, zOld);
+          renameColumnElistNames(&sParse, &sCtx, pStep->pExprList, zOld);
+        }
+      }
+    }
+
+
+    /* Find tokens to edit in UPDATE OF clause */
+    if( sParse.pTriggerTab==pTab ){
+      renameColumnIdlistNames(&sParse, &sCtx,sParse.pNewTrigger->pColumns,zOld);
+    }
+
+    /* Find tokens to edit in various expressions and selects */
+    renameWalkTrigger(&sWalker, sParse.pNewTrigger);
+  }
+
+  assert( rc==SQLITE_OK );
+  rc = renameEditSql(context, &sCtx, zSql, zNew, bQuote);
+
+renameColumnFunc_done:
+  if( rc!=SQLITE_OK ){
+    if( rc==SQLITE_ERROR && sqlite3WritableSchema(db) ){
+      sqlite3_result_value(context, argv[0]);
+    }else if( sParse.zErrMsg ){
+      renameColumnParseError(context, "", argv[1], argv[2], &sPa
