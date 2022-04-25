@@ -110080,4 +110080,204 @@ SQLITE_PRIVATE int sqlite3NoTempsInRange(Parse *pParse, int iFirst, int iLast){
     if( pParse->aTempReg[i]>=iFirst && pParse->aTempReg[i]<=iLast ){
       return 0;
     }
-  
+  }
+  return 1;
+}
+#endif /* SQLITE_DEBUG */
+
+/************** End of expr.c ************************************************/
+/************** Begin file alter.c *******************************************/
+/*
+** 2005 February 15
+**
+** The author disclaims copyright to this source code.  In place of
+** a legal notice, here is a blessing:
+**
+**    May you do good and not evil.
+**    May you find forgiveness for yourself and forgive others.
+**    May you share freely, never taking more than you give.
+**
+*************************************************************************
+** This file contains C code routines that used to generate VDBE code
+** that implements the ALTER TABLE command.
+*/
+/* #include "sqliteInt.h" */
+
+/*
+** The code in this file only exists if we are not omitting the
+** ALTER TABLE logic from the build.
+*/
+#ifndef SQLITE_OMIT_ALTERTABLE
+
+/*
+** Parameter zName is the name of a table that is about to be altered
+** (either with ALTER TABLE ... RENAME TO or ALTER TABLE ... ADD COLUMN).
+** If the table is a system table, this function leaves an error message
+** in pParse->zErr (system tables may not be altered) and returns non-zero.
+**
+** Or, if zName is not a system table, zero is returned.
+*/
+static int isAlterableTable(Parse *pParse, Table *pTab){
+  if( 0==sqlite3StrNICmp(pTab->zName, "sqlite_", 7)
+#ifndef SQLITE_OMIT_VIRTUALTABLE
+   || (pTab->tabFlags & TF_Eponymous)!=0
+   || ( (pTab->tabFlags & TF_Shadow)!=0
+        && sqlite3ReadOnlyShadowTables(pParse->db)
+   )
+#endif
+  ){
+    sqlite3ErrorMsg(pParse, "table %s may not be altered", pTab->zName);
+    return 1;
+  }
+  return 0;
+}
+
+/*
+** Generate code to verify that the schemas of database zDb and, if
+** bTemp is not true, database "temp", can still be parsed. This is
+** called at the end of the generation of an ALTER TABLE ... RENAME ...
+** statement to ensure that the operation has not rendered any schema
+** objects unusable.
+*/
+static void renameTestSchema(
+  Parse *pParse,                  /* Parse context */
+  const char *zDb,                /* Name of db to verify schema of */
+  int bTemp,                      /* True if this is the temp db */
+  const char *zWhen,              /* "when" part of error message */
+  int bNoDQS                      /* Do not allow DQS in the schema */
+){
+  pParse->colNamesSet = 1;
+  sqlite3NestedParse(pParse,
+      "SELECT 1 "
+      "FROM \"%w\"." LEGACY_SCHEMA_TABLE " "
+      "WHERE name NOT LIKE 'sqliteX_%%' ESCAPE 'X'"
+      " AND sql NOT LIKE 'create virtual%%'"
+      " AND sqlite_rename_test(%Q, sql, type, name, %d, %Q, %d)=NULL ",
+      zDb,
+      zDb, bTemp, zWhen, bNoDQS
+  );
+
+  if( bTemp==0 ){
+    sqlite3NestedParse(pParse,
+        "SELECT 1 "
+        "FROM temp." LEGACY_SCHEMA_TABLE " "
+        "WHERE name NOT LIKE 'sqliteX_%%' ESCAPE 'X'"
+        " AND sql NOT LIKE 'create virtual%%'"
+        " AND sqlite_rename_test(%Q, sql, type, name, 1, %Q, %d)=NULL ",
+        zDb, zWhen, bNoDQS
+    );
+  }
+}
+
+/*
+** Generate VM code to replace any double-quoted strings (but not double-quoted
+** identifiers) within the "sql" column of the sqlite_schema table in
+** database zDb with their single-quoted equivalents. If argument bTemp is
+** not true, similarly update all SQL statements in the sqlite_schema table
+** of the temp db.
+*/
+static void renameFixQuotes(Parse *pParse, const char *zDb, int bTemp){
+  sqlite3NestedParse(pParse,
+      "UPDATE \"%w\"." LEGACY_SCHEMA_TABLE
+      " SET sql = sqlite_rename_quotefix(%Q, sql)"
+      "WHERE name NOT LIKE 'sqliteX_%%' ESCAPE 'X'"
+      " AND sql NOT LIKE 'create virtual%%'" , zDb, zDb
+  );
+  if( bTemp==0 ){
+    sqlite3NestedParse(pParse,
+      "UPDATE temp." LEGACY_SCHEMA_TABLE
+      " SET sql = sqlite_rename_quotefix('temp', sql)"
+      "WHERE name NOT LIKE 'sqliteX_%%' ESCAPE 'X'"
+      " AND sql NOT LIKE 'create virtual%%'"
+    );
+  }
+}
+
+/*
+** Generate code to reload the schema for database iDb. And, if iDb!=1, for
+** the temp database as well.
+*/
+static void renameReloadSchema(Parse *pParse, int iDb, u16 p5){
+  Vdbe *v = pParse->pVdbe;
+  if( v ){
+    sqlite3ChangeCookie(pParse, iDb);
+    sqlite3VdbeAddParseSchemaOp(pParse->pVdbe, iDb, 0, p5);
+    if( iDb!=1 ) sqlite3VdbeAddParseSchemaOp(pParse->pVdbe, 1, 0, p5);
+  }
+}
+
+/*
+** Generate code to implement the "ALTER TABLE xxx RENAME TO yyy"
+** command.
+*/
+SQLITE_PRIVATE void sqlite3AlterRenameTable(
+  Parse *pParse,            /* Parser context. */
+  SrcList *pSrc,            /* The table to rename. */
+  Token *pName              /* The new table name. */
+){
+  int iDb;                  /* Database that contains the table */
+  char *zDb;                /* Name of database iDb */
+  Table *pTab;              /* Table being renamed */
+  char *zName = 0;          /* NULL-terminated version of pName */
+  sqlite3 *db = pParse->db; /* Database connection */
+  int nTabName;             /* Number of UTF-8 characters in zTabName */
+  const char *zTabName;     /* Original name of the table */
+  Vdbe *v;
+  VTable *pVTab = 0;        /* Non-zero if this is a v-tab with an xRename() */
+
+  if( NEVER(db->mallocFailed) ) goto exit_rename_table;
+  assert( pSrc->nSrc==1 );
+  assert( sqlite3BtreeHoldsAllMutexes(pParse->db) );
+
+  pTab = sqlite3LocateTableItem(pParse, 0, &pSrc->a[0]);
+  if( !pTab ) goto exit_rename_table;
+  iDb = sqlite3SchemaToIndex(pParse->db, pTab->pSchema);
+  zDb = db->aDb[iDb].zDbSName;
+
+  /* Get a NULL terminated version of the new table name. */
+  zName = sqlite3NameFromToken(db, pName);
+  if( !zName ) goto exit_rename_table;
+
+  /* Check that a table or index named 'zName' does not already exist
+  ** in database iDb. If so, this is an error.
+  */
+  if( sqlite3FindTable(db, zName, zDb)
+   || sqlite3FindIndex(db, zName, zDb)
+   || sqlite3IsShadowTableOf(db, pTab, zName)
+  ){
+    sqlite3ErrorMsg(pParse,
+        "there is already another table or index with this name: %s", zName);
+    goto exit_rename_table;
+  }
+
+  /* Make sure it is not a system table being altered, or a reserved name
+  ** that the table is being renamed to.
+  */
+  if( SQLITE_OK!=isAlterableTable(pParse, pTab) ){
+    goto exit_rename_table;
+  }
+  if( SQLITE_OK!=sqlite3CheckObjectName(pParse,zName,"table",zName) ){
+    goto exit_rename_table;
+  }
+
+#ifndef SQLITE_OMIT_VIEW
+  if( IsView(pTab) ){
+    sqlite3ErrorMsg(pParse, "view %s may not be altered", pTab->zName);
+    goto exit_rename_table;
+  }
+#endif
+
+#ifndef SQLITE_OMIT_AUTHORIZATION
+  /* Invoke the authorization callback. */
+  if( sqlite3AuthCheck(pParse, SQLITE_ALTER_TABLE, zDb, pTab->zName, 0) ){
+    goto exit_rename_table;
+  }
+#endif
+
+#ifndef SQLITE_OMIT_VIRTUALTABLE
+  if( sqlite3ViewGetColumnNames(pParse, pTab) ){
+    goto exit_rename_table;
+  }
+  if( IsVirtual(pTab) ){
+    pVTab = sqlite3GetVTable(db, pTab);
+    if( pVTab->pVtab->pModule->
