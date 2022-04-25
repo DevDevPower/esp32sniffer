@@ -113794,4 +113794,234 @@ SQLITE_PRIVATE void sqlite3Analyze(Parse *pParse, Token *pName1, Token *pName2){
     analyzeDatabase(pParse, iDb);
   }else{
     /* Form 3: Analyze the table or index named as an argument */
-    iDb = sqlite3TwoPartName(pParse, pName1,
+    iDb = sqlite3TwoPartName(pParse, pName1, pName2, &pTableName);
+    if( iDb>=0 ){
+      zDb = pName2->n ? db->aDb[iDb].zDbSName : 0;
+      z = sqlite3NameFromToken(db, pTableName);
+      if( z ){
+        if( (pIdx = sqlite3FindIndex(db, z, zDb))!=0 ){
+          analyzeTable(pParse, pIdx->pTable, pIdx);
+        }else if( (pTab = sqlite3LocateTable(pParse, 0, z, zDb))!=0 ){
+          analyzeTable(pParse, pTab, 0);
+        }
+        sqlite3DbFree(db, z);
+      }
+    }
+  }
+  if( db->nSqlExec==0 && (v = sqlite3GetVdbe(pParse))!=0 ){
+    sqlite3VdbeAddOp0(v, OP_Expire);
+  }
+}
+
+/*
+** Used to pass information from the analyzer reader through to the
+** callback routine.
+*/
+typedef struct analysisInfo analysisInfo;
+struct analysisInfo {
+  sqlite3 *db;
+  const char *zDatabase;
+};
+
+/*
+** The first argument points to a nul-terminated string containing a
+** list of space separated integers. Read the first nOut of these into
+** the array aOut[].
+*/
+static void decodeIntArray(
+  char *zIntArray,       /* String containing int array to decode */
+  int nOut,              /* Number of slots in aOut[] */
+  tRowcnt *aOut,         /* Store integers here */
+  LogEst *aLog,          /* Or, if aOut==0, here */
+  Index *pIndex          /* Handle extra flags for this index, if not NULL */
+){
+  char *z = zIntArray;
+  int c;
+  int i;
+  tRowcnt v;
+
+#ifdef SQLITE_ENABLE_STAT4
+  if( z==0 ) z = "";
+#else
+  assert( z!=0 );
+#endif
+  for(i=0; *z && i<nOut; i++){
+    v = 0;
+    while( (c=z[0])>='0' && c<='9' ){
+      v = v*10 + c - '0';
+      z++;
+    }
+#ifdef SQLITE_ENABLE_STAT4
+    if( aOut ) aOut[i] = v;
+    if( aLog ) aLog[i] = sqlite3LogEst(v);
+#else
+    assert( aOut==0 );
+    UNUSED_PARAMETER(aOut);
+    assert( aLog!=0 );
+    aLog[i] = sqlite3LogEst(v);
+#endif
+    if( *z==' ' ) z++;
+  }
+#ifndef SQLITE_ENABLE_STAT4
+  assert( pIndex!=0 ); {
+#else
+  if( pIndex ){
+#endif
+    pIndex->bUnordered = 0;
+    pIndex->noSkipScan = 0;
+    while( z[0] ){
+      if( sqlite3_strglob("unordered*", z)==0 ){
+        pIndex->bUnordered = 1;
+      }else if( sqlite3_strglob("sz=[0-9]*", z)==0 ){
+        int sz = sqlite3Atoi(z+3);
+        if( sz<2 ) sz = 2;
+        pIndex->szIdxRow = sqlite3LogEst(sz);
+      }else if( sqlite3_strglob("noskipscan*", z)==0 ){
+        pIndex->noSkipScan = 1;
+      }
+#ifdef SQLITE_ENABLE_COSTMULT
+      else if( sqlite3_strglob("costmult=[0-9]*",z)==0 ){
+        pIndex->pTable->costMult = sqlite3LogEst(sqlite3Atoi(z+9));
+      }
+#endif
+      while( z[0]!=0 && z[0]!=' ' ) z++;
+      while( z[0]==' ' ) z++;
+    }
+  }
+}
+
+/*
+** This callback is invoked once for each index when reading the
+** sqlite_stat1 table.
+**
+**     argv[0] = name of the table
+**     argv[1] = name of the index (might be NULL)
+**     argv[2] = results of analysis - on integer for each column
+**
+** Entries for which argv[1]==NULL simply record the number of rows in
+** the table.
+*/
+static int analysisLoader(void *pData, int argc, char **argv, char **NotUsed){
+  analysisInfo *pInfo = (analysisInfo*)pData;
+  Index *pIndex;
+  Table *pTable;
+  const char *z;
+
+  assert( argc==3 );
+  UNUSED_PARAMETER2(NotUsed, argc);
+
+  if( argv==0 || argv[0]==0 || argv[2]==0 ){
+    return 0;
+  }
+  pTable = sqlite3FindTable(pInfo->db, argv[0], pInfo->zDatabase);
+  if( pTable==0 ){
+    return 0;
+  }
+  if( argv[1]==0 ){
+    pIndex = 0;
+  }else if( sqlite3_stricmp(argv[0],argv[1])==0 ){
+    pIndex = sqlite3PrimaryKeyIndex(pTable);
+  }else{
+    pIndex = sqlite3FindIndex(pInfo->db, argv[1], pInfo->zDatabase);
+  }
+  z = argv[2];
+
+  if( pIndex ){
+    tRowcnt *aiRowEst = 0;
+    int nCol = pIndex->nKeyCol+1;
+#ifdef SQLITE_ENABLE_STAT4
+    /* Index.aiRowEst may already be set here if there are duplicate
+    ** sqlite_stat1 entries for this index. In that case just clobber
+    ** the old data with the new instead of allocating a new array.  */
+    if( pIndex->aiRowEst==0 ){
+      pIndex->aiRowEst = (tRowcnt*)sqlite3MallocZero(sizeof(tRowcnt) * nCol);
+      if( pIndex->aiRowEst==0 ) sqlite3OomFault(pInfo->db);
+    }
+    aiRowEst = pIndex->aiRowEst;
+#endif
+    pIndex->bUnordered = 0;
+    decodeIntArray((char*)z, nCol, aiRowEst, pIndex->aiRowLogEst, pIndex);
+    pIndex->hasStat1 = 1;
+    if( pIndex->pPartIdxWhere==0 ){
+      pTable->nRowLogEst = pIndex->aiRowLogEst[0];
+      pTable->tabFlags |= TF_HasStat1;
+    }
+  }else{
+    Index fakeIdx;
+    fakeIdx.szIdxRow = pTable->szTabRow;
+#ifdef SQLITE_ENABLE_COSTMULT
+    fakeIdx.pTable = pTable;
+#endif
+    decodeIntArray((char*)z, 1, 0, &pTable->nRowLogEst, &fakeIdx);
+    pTable->szTabRow = fakeIdx.szIdxRow;
+    pTable->tabFlags |= TF_HasStat1;
+  }
+
+  return 0;
+}
+
+/*
+** If the Index.aSample variable is not NULL, delete the aSample[] array
+** and its contents.
+*/
+SQLITE_PRIVATE void sqlite3DeleteIndexSamples(sqlite3 *db, Index *pIdx){
+#ifdef SQLITE_ENABLE_STAT4
+  if( pIdx->aSample ){
+    int j;
+    for(j=0; j<pIdx->nSample; j++){
+      IndexSample *p = &pIdx->aSample[j];
+      sqlite3DbFree(db, p->p);
+    }
+    sqlite3DbFree(db, pIdx->aSample);
+  }
+  if( db && db->pnBytesFreed==0 ){
+    pIdx->nSample = 0;
+    pIdx->aSample = 0;
+  }
+#else
+  UNUSED_PARAMETER(db);
+  UNUSED_PARAMETER(pIdx);
+#endif /* SQLITE_ENABLE_STAT4 */
+}
+
+#ifdef SQLITE_ENABLE_STAT4
+/*
+** Populate the pIdx->aAvgEq[] array based on the samples currently
+** stored in pIdx->aSample[].
+*/
+static void initAvgEq(Index *pIdx){
+  if( pIdx ){
+    IndexSample *aSample = pIdx->aSample;
+    IndexSample *pFinal = &aSample[pIdx->nSample-1];
+    int iCol;
+    int nCol = 1;
+    if( pIdx->nSampleCol>1 ){
+      /* If this is stat4 data, then calculate aAvgEq[] values for all
+      ** sample columns except the last. The last is always set to 1, as
+      ** once the trailing PK fields are considered all index keys are
+      ** unique.  */
+      nCol = pIdx->nSampleCol-1;
+      pIdx->aAvgEq[nCol] = 1;
+    }
+    for(iCol=0; iCol<nCol; iCol++){
+      int nSample = pIdx->nSample;
+      int i;                    /* Used to iterate through samples */
+      tRowcnt sumEq = 0;        /* Sum of the nEq values */
+      tRowcnt avgEq = 0;
+      tRowcnt nRow;             /* Number of rows in index */
+      i64 nSum100 = 0;          /* Number of terms contributing to sumEq */
+      i64 nDist100;             /* Number of distinct values in index */
+
+      if( !pIdx->aiRowEst || iCol>=pIdx->nKeyCol || pIdx->aiRowEst[iCol+1]==0 ){
+        nRow = pFinal->anLt[iCol];
+        nDist100 = (i64)100 * pFinal->anDLt[iCol];
+        nSample--;
+      }else{
+        nRow = pIdx->aiRowEst[0];
+        nDist100 = ((i64)100 * pIdx->aiRowEst[0]) / pIdx->aiRowEst[iCol+1];
+      }
+      pIdx->nRowEst0 = nRow;
+
+      /* Set nSum to the number of distinct (iCol+1) field prefixes that
+      ** occur in the stat4 table for this index. Set sumEq to the sum of
+  
