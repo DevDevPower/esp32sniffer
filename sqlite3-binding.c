@@ -110475,4 +110475,206 @@ SQLITE_PRIVATE void sqlite3AlterFinishAddColumn(Parse *pParse, Token *pColDef){
     if( pDflt ){
       sqlite3_value *pVal = 0;
       int rc;
-      rc = sqlite3ValueFromExpr(db, pDflt, SQLITE_UTF
+      rc = sqlite3ValueFromExpr(db, pDflt, SQLITE_UTF8, SQLITE_AFF_BLOB, &pVal);
+      assert( rc==SQLITE_OK || rc==SQLITE_NOMEM );
+      if( rc!=SQLITE_OK ){
+        assert( db->mallocFailed == 1 );
+        return;
+      }
+      if( !pVal ){
+        sqlite3ErrorIfNotEmpty(pParse, zDb, zTab,
+           "Cannot add a column with non-constant default");
+      }
+      sqlite3ValueFree(pVal);
+    }
+  }else if( pCol->colFlags & COLFLAG_STORED ){
+    sqlite3ErrorIfNotEmpty(pParse, zDb, zTab, "cannot add a STORED column");
+  }
+
+
+  /* Modify the CREATE TABLE statement. */
+  zCol = sqlite3DbStrNDup(db, (char*)pColDef->z, pColDef->n);
+  if( zCol ){
+    char *zEnd = &zCol[pColDef->n-1];
+    while( zEnd>zCol && (*zEnd==';' || sqlite3Isspace(*zEnd)) ){
+      *zEnd-- = '\0';
+    }
+    /* substr() operations on characters, but addColOffset is in bytes. So we
+    ** have to use printf() to translate between these units: */
+    assert( IsOrdinaryTable(pTab) );
+    assert( IsOrdinaryTable(pNew) );
+    sqlite3NestedParse(pParse,
+        "UPDATE \"%w\"." LEGACY_SCHEMA_TABLE " SET "
+          "sql = printf('%%.%ds, ',sql) || %Q"
+          " || substr(sql,1+length(printf('%%.%ds',sql))) "
+        "WHERE type = 'table' AND name = %Q",
+      zDb, pNew->u.tab.addColOffset, zCol, pNew->u.tab.addColOffset,
+      zTab
+    );
+    sqlite3DbFree(db, zCol);
+  }
+
+  v = sqlite3GetVdbe(pParse);
+  if( v ){
+    /* Make sure the schema version is at least 3.  But do not upgrade
+    ** from less than 3 to 4, as that will corrupt any preexisting DESC
+    ** index.
+    */
+    r1 = sqlite3GetTempReg(pParse);
+    sqlite3VdbeAddOp3(v, OP_ReadCookie, iDb, r1, BTREE_FILE_FORMAT);
+    sqlite3VdbeUsesBtree(v, iDb);
+    sqlite3VdbeAddOp2(v, OP_AddImm, r1, -2);
+    sqlite3VdbeAddOp2(v, OP_IfPos, r1, sqlite3VdbeCurrentAddr(v)+2);
+    VdbeCoverage(v);
+    sqlite3VdbeAddOp3(v, OP_SetCookie, iDb, BTREE_FILE_FORMAT, 3);
+    sqlite3ReleaseTempReg(pParse, r1);
+
+    /* Reload the table definition */
+    renameReloadSchema(pParse, iDb, INITFLAG_AlterAdd);
+
+    /* Verify that constraints are still satisfied */
+    if( pNew->pCheck!=0
+     || (pCol->notNull && (pCol->colFlags & COLFLAG_GENERATED)!=0)
+    ){
+      sqlite3NestedParse(pParse,
+        "SELECT CASE WHEN quick_check GLOB 'CHECK*'"
+        " THEN raise(ABORT,'CHECK constraint failed')"
+        " ELSE raise(ABORT,'NOT NULL constraint failed')"
+        " END"
+        "  FROM pragma_quick_check(%Q,%Q)"
+        " WHERE quick_check GLOB 'CHECK*' OR quick_check GLOB 'NULL*'",
+        zTab, zDb
+      );
+    }
+  }
+}
+
+/*
+** This function is called by the parser after the table-name in
+** an "ALTER TABLE <table-name> ADD" statement is parsed. Argument
+** pSrc is the full-name of the table being altered.
+**
+** This routine makes a (partial) copy of the Table structure
+** for the table being altered and sets Parse.pNewTable to point
+** to it. Routines called by the parser as the column definition
+** is parsed (i.e. sqlite3AddColumn()) add the new Column data to
+** the copy. The copy of the Table structure is deleted by tokenize.c
+** after parsing is finished.
+**
+** Routine sqlite3AlterFinishAddColumn() will be called to complete
+** coding the "ALTER TABLE ... ADD" statement.
+*/
+SQLITE_PRIVATE void sqlite3AlterBeginAddColumn(Parse *pParse, SrcList *pSrc){
+  Table *pNew;
+  Table *pTab;
+  int iDb;
+  int i;
+  int nAlloc;
+  sqlite3 *db = pParse->db;
+
+  /* Look up the table being altered. */
+  assert( pParse->pNewTable==0 );
+  assert( sqlite3BtreeHoldsAllMutexes(db) );
+  if( db->mallocFailed ) goto exit_begin_add_column;
+  pTab = sqlite3LocateTableItem(pParse, 0, &pSrc->a[0]);
+  if( !pTab ) goto exit_begin_add_column;
+
+#ifndef SQLITE_OMIT_VIRTUALTABLE
+  if( IsVirtual(pTab) ){
+    sqlite3ErrorMsg(pParse, "virtual tables may not be altered");
+    goto exit_begin_add_column;
+  }
+#endif
+
+  /* Make sure this is not an attempt to ALTER a view. */
+  if( IsView(pTab) ){
+    sqlite3ErrorMsg(pParse, "Cannot add a column to a view");
+    goto exit_begin_add_column;
+  }
+  if( SQLITE_OK!=isAlterableTable(pParse, pTab) ){
+    goto exit_begin_add_column;
+  }
+
+  sqlite3MayAbort(pParse);
+  assert( IsOrdinaryTable(pTab) );
+  assert( pTab->u.tab.addColOffset>0 );
+  iDb = sqlite3SchemaToIndex(db, pTab->pSchema);
+
+  /* Put a copy of the Table struct in Parse.pNewTable for the
+  ** sqlite3AddColumn() function and friends to modify.  But modify
+  ** the name by adding an "sqlite_altertab_" prefix.  By adding this
+  ** prefix, we insure that the name will not collide with an existing
+  ** table because user table are not allowed to have the "sqlite_"
+  ** prefix on their name.
+  */
+  pNew = (Table*)sqlite3DbMallocZero(db, sizeof(Table));
+  if( !pNew ) goto exit_begin_add_column;
+  pParse->pNewTable = pNew;
+  pNew->nTabRef = 1;
+  pNew->nCol = pTab->nCol;
+  assert( pNew->nCol>0 );
+  nAlloc = (((pNew->nCol-1)/8)*8)+8;
+  assert( nAlloc>=pNew->nCol && nAlloc%8==0 && nAlloc-pNew->nCol<8 );
+  pNew->aCol = (Column*)sqlite3DbMallocZero(db, sizeof(Column)*nAlloc);
+  pNew->zName = sqlite3MPrintf(db, "sqlite_altertab_%s", pTab->zName);
+  if( !pNew->aCol || !pNew->zName ){
+    assert( db->mallocFailed );
+    goto exit_begin_add_column;
+  }
+  memcpy(pNew->aCol, pTab->aCol, sizeof(Column)*pNew->nCol);
+  for(i=0; i<pNew->nCol; i++){
+    Column *pCol = &pNew->aCol[i];
+    pCol->zCnName = sqlite3DbStrDup(db, pCol->zCnName);
+    pCol->hName = sqlite3StrIHash(pCol->zCnName);
+  }
+  assert( IsOrdinaryTable(pNew) );
+  pNew->u.tab.pDfltList = sqlite3ExprListDup(db, pTab->u.tab.pDfltList, 0);
+  pNew->pSchema = db->aDb[iDb].pSchema;
+  pNew->u.tab.addColOffset = pTab->u.tab.addColOffset;
+  pNew->nTabRef = 1;
+
+exit_begin_add_column:
+  sqlite3SrcListDelete(db, pSrc);
+  return;
+}
+
+/*
+** Parameter pTab is the subject of an ALTER TABLE ... RENAME COLUMN
+** command. This function checks if the table is a view or virtual
+** table (columns of views or virtual tables may not be renamed). If so,
+** it loads an error message into pParse and returns non-zero.
+**
+** Or, if pTab is not a view or virtual table, zero is returned.
+*/
+#if !defined(SQLITE_OMIT_VIEW) || !defined(SQLITE_OMIT_VIRTUALTABLE)
+static int isRealTable(Parse *pParse, Table *pTab, int bDrop){
+  const char *zType = 0;
+#ifndef SQLITE_OMIT_VIEW
+  if( IsView(pTab) ){
+    zType = "view";
+  }
+#endif
+#ifndef SQLITE_OMIT_VIRTUALTABLE
+  if( IsVirtual(pTab) ){
+    zType = "virtual table";
+  }
+#endif
+  if( zType ){
+    sqlite3ErrorMsg(pParse, "cannot %s %s \"%s\"",
+        (bDrop ? "drop column from" : "rename columns of"),
+        zType, pTab->zName
+    );
+    return 1;
+  }
+  return 0;
+}
+#else /* !defined(SQLITE_OMIT_VIEW) || !defined(SQLITE_OMIT_VIRTUALTABLE) */
+# define isRealTable(x,y,z) (0)
+#endif
+
+/*
+** Handles the following parser reduction:
+**
+**  cmd ::= ALTER TABLE pSrc RENAME COLUMN pOld TO pNew
+*/
+SQLITE_PRIVATE void sqlit
