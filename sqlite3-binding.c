@@ -111308,4 +111308,199 @@ static int renameEditSql(
 
   /* At this point pRename->pList contains a list of RenameToken objects
   ** corresponding to all tokens in the input SQL that must be replaced
-  ** with
+  ** with the new column name, or with single-quoted versions of themselves.
+  ** All that remains is to construct and return the edited SQL string. */
+  if( zOut ){
+    int nOut = nSql;
+    memcpy(zOut, zSql, nSql);
+    while( pRename->pList ){
+      int iOff;                   /* Offset of token to replace in zOut */
+      u32 nReplace;
+      const char *zReplace;
+      RenameToken *pBest = renameColumnTokenNext(pRename);
+
+      if( zNew ){
+        if( bQuote==0 && sqlite3IsIdChar(*pBest->t.z) ){
+          nReplace = nNew;
+          zReplace = zNew;
+        }else{
+          nReplace = nQuot;
+          zReplace = zQuot;
+          if( pBest->t.z[pBest->t.n]=='"' ) nReplace++;
+        }
+      }else{
+        /* Dequote the double-quoted token. Then requote it again, this time
+        ** using single quotes. If the character immediately following the
+        ** original token within the input SQL was a single quote ('), then
+        ** add another space after the new, single-quoted version of the
+        ** token. This is so that (SELECT "string"'alias') maps to
+        ** (SELECT 'string' 'alias'), and not (SELECT 'string''alias').  */
+        memcpy(zBuf1, pBest->t.z, pBest->t.n);
+        zBuf1[pBest->t.n] = 0;
+        sqlite3Dequote(zBuf1);
+        sqlite3_snprintf(nSql*2, zBuf2, "%Q%s", zBuf1,
+            pBest->t.z[pBest->t.n]=='\'' ? " " : ""
+        );
+        zReplace = zBuf2;
+        nReplace = sqlite3Strlen30(zReplace);
+      }
+
+      iOff = pBest->t.z - zSql;
+      if( pBest->t.n!=nReplace ){
+        memmove(&zOut[iOff + nReplace], &zOut[iOff + pBest->t.n],
+            nOut - (iOff + pBest->t.n)
+        );
+        nOut += nReplace - pBest->t.n;
+        zOut[nOut] = '\0';
+      }
+      memcpy(&zOut[iOff], zReplace, nReplace);
+      sqlite3DbFree(db, pBest);
+    }
+
+    sqlite3_result_text(pCtx, zOut, -1, SQLITE_TRANSIENT);
+    sqlite3DbFree(db, zOut);
+  }else{
+    rc = SQLITE_NOMEM;
+  }
+
+  sqlite3_free(zQuot);
+  return rc;
+}
+
+/*
+** Resolve all symbols in the trigger at pParse->pNewTrigger, assuming
+** it was read from the schema of database zDb. Return SQLITE_OK if
+** successful. Otherwise, return an SQLite error code and leave an error
+** message in the Parse object.
+*/
+static int renameResolveTrigger(Parse *pParse){
+  sqlite3 *db = pParse->db;
+  Trigger *pNew = pParse->pNewTrigger;
+  TriggerStep *pStep;
+  NameContext sNC;
+  int rc = SQLITE_OK;
+
+  memset(&sNC, 0, sizeof(sNC));
+  sNC.pParse = pParse;
+  assert( pNew->pTabSchema );
+  pParse->pTriggerTab = sqlite3FindTable(db, pNew->table,
+      db->aDb[sqlite3SchemaToIndex(db, pNew->pTabSchema)].zDbSName
+  );
+  pParse->eTriggerOp = pNew->op;
+  /* ALWAYS() because if the table of the trigger does not exist, the
+  ** error would have been hit before this point */
+  if( ALWAYS(pParse->pTriggerTab) ){
+    rc = sqlite3ViewGetColumnNames(pParse, pParse->pTriggerTab);
+  }
+
+  /* Resolve symbols in WHEN clause */
+  if( rc==SQLITE_OK && pNew->pWhen ){
+    rc = sqlite3ResolveExprNames(&sNC, pNew->pWhen);
+  }
+
+  for(pStep=pNew->step_list; rc==SQLITE_OK && pStep; pStep=pStep->pNext){
+    if( pStep->pSelect ){
+      sqlite3SelectPrep(pParse, pStep->pSelect, &sNC);
+      if( pParse->nErr ) rc = pParse->rc;
+    }
+    if( rc==SQLITE_OK && pStep->zTarget ){
+      SrcList *pSrc = sqlite3TriggerStepSrc(pParse, pStep);
+      if( pSrc ){
+        Select *pSel = sqlite3SelectNew(
+            pParse, pStep->pExprList, pSrc, 0, 0, 0, 0, 0, 0
+        );
+        if( pSel==0 ){
+          pStep->pExprList = 0;
+          pSrc = 0;
+          rc = SQLITE_NOMEM;
+        }else{
+          sqlite3SelectPrep(pParse, pSel, 0);
+          rc = pParse->nErr ? SQLITE_ERROR : SQLITE_OK;
+          assert( pStep->pExprList==0 || pStep->pExprList==pSel->pEList );
+          assert( pSrc==pSel->pSrc );
+          if( pStep->pExprList ) pSel->pEList = 0;
+          pSel->pSrc = 0;
+          sqlite3SelectDelete(db, pSel);
+        }
+        if( pStep->pFrom ){
+          int i;
+          for(i=0; i<pStep->pFrom->nSrc && rc==SQLITE_OK; i++){
+            SrcItem *p = &pStep->pFrom->a[i];
+            if( p->pSelect ){
+              sqlite3SelectPrep(pParse, p->pSelect, 0);
+            }
+          }
+        }
+
+        if(  db->mallocFailed ){
+          rc = SQLITE_NOMEM;
+        }
+        sNC.pSrcList = pSrc;
+        if( rc==SQLITE_OK && pStep->pWhere ){
+          rc = sqlite3ResolveExprNames(&sNC, pStep->pWhere);
+        }
+        if( rc==SQLITE_OK ){
+          rc = sqlite3ResolveExprListNames(&sNC, pStep->pExprList);
+        }
+        assert( !pStep->pUpsert || (!pStep->pWhere && !pStep->pExprList) );
+        if( pStep->pUpsert && rc==SQLITE_OK ){
+          Upsert *pUpsert = pStep->pUpsert;
+          pUpsert->pUpsertSrc = pSrc;
+          sNC.uNC.pUpsert = pUpsert;
+          sNC.ncFlags = NC_UUpsert;
+          rc = sqlite3ResolveExprListNames(&sNC, pUpsert->pUpsertTarget);
+          if( rc==SQLITE_OK ){
+            ExprList *pUpsertSet = pUpsert->pUpsertSet;
+            rc = sqlite3ResolveExprListNames(&sNC, pUpsertSet);
+          }
+          if( rc==SQLITE_OK ){
+            rc = sqlite3ResolveExprNames(&sNC, pUpsert->pUpsertWhere);
+          }
+          if( rc==SQLITE_OK ){
+            rc = sqlite3ResolveExprNames(&sNC, pUpsert->pUpsertTargetWhere);
+          }
+          sNC.ncFlags = 0;
+        }
+        sNC.pSrcList = 0;
+        sqlite3SrcListDelete(db, pSrc);
+      }else{
+        rc = SQLITE_NOMEM;
+      }
+    }
+  }
+  return rc;
+}
+
+/*
+** Invoke sqlite3WalkExpr() or sqlite3WalkSelect() on all Select or Expr
+** objects that are part of the trigger passed as the second argument.
+*/
+static void renameWalkTrigger(Walker *pWalker, Trigger *pTrigger){
+  TriggerStep *pStep;
+
+  /* Find tokens to edit in WHEN clause */
+  sqlite3WalkExpr(pWalker, pTrigger->pWhen);
+
+  /* Find tokens to edit in trigger steps */
+  for(pStep=pTrigger->step_list; pStep; pStep=pStep->pNext){
+    sqlite3WalkSelect(pWalker, pStep->pSelect);
+    sqlite3WalkExpr(pWalker, pStep->pWhere);
+    sqlite3WalkExprList(pWalker, pStep->pExprList);
+    if( pStep->pUpsert ){
+      Upsert *pUpsert = pStep->pUpsert;
+      sqlite3WalkExprList(pWalker, pUpsert->pUpsertTarget);
+      sqlite3WalkExprList(pWalker, pUpsert->pUpsertSet);
+      sqlite3WalkExpr(pWalker, pUpsert->pUpsertWhere);
+      sqlite3WalkExpr(pWalker, pUpsert->pUpsertTargetWhere);
+    }
+    if( pStep->pFrom ){
+      int i;
+      for(i=0; i<pStep->pFrom->nSrc; i++){
+        sqlite3WalkSelect(pWalker, pStep->pFrom->a[i].pSelect);
+      }
+    }
+  }
+}
+
+/*
+** Free the contents of Parse object (*pParse). Do not free 
