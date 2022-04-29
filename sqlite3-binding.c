@@ -114216,4 +114216,218 @@ static int loadStat4(sqlite3 *db, const char *zDb){
 ** Load the content of the sqlite_stat1 and sqlite_stat4 tables. The
 ** contents of sqlite_stat1 are used to populate the Index.aiRowEst[]
 ** arrays. The contents of sqlite_stat4 are used to populate the
-** 
+** Index.aSample[] arrays.
+**
+** If the sqlite_stat1 table is not present in the database, SQLITE_ERROR
+** is returned. In this case, even if SQLITE_ENABLE_STAT4 was defined
+** during compilation and the sqlite_stat4 table is present, no data is
+** read from it.
+**
+** If SQLITE_ENABLE_STAT4 was defined during compilation and the
+** sqlite_stat4 table is not present in the database, SQLITE_ERROR is
+** returned. However, in this case, data is read from the sqlite_stat1
+** table (if it is present) before returning.
+**
+** If an OOM error occurs, this function always sets db->mallocFailed.
+** This means if the caller does not care about other errors, the return
+** code may be ignored.
+*/
+SQLITE_PRIVATE int sqlite3AnalysisLoad(sqlite3 *db, int iDb){
+  analysisInfo sInfo;
+  HashElem *i;
+  char *zSql;
+  int rc = SQLITE_OK;
+  Schema *pSchema = db->aDb[iDb].pSchema;
+  const Table *pStat1;
+
+  assert( iDb>=0 && iDb<db->nDb );
+  assert( db->aDb[iDb].pBt!=0 );
+
+  /* Clear any prior statistics */
+  assert( sqlite3SchemaMutexHeld(db, iDb, 0) );
+  for(i=sqliteHashFirst(&pSchema->tblHash); i; i=sqliteHashNext(i)){
+    Table *pTab = sqliteHashData(i);
+    pTab->tabFlags &= ~TF_HasStat1;
+  }
+  for(i=sqliteHashFirst(&pSchema->idxHash); i; i=sqliteHashNext(i)){
+    Index *pIdx = sqliteHashData(i);
+    pIdx->hasStat1 = 0;
+#ifdef SQLITE_ENABLE_STAT4
+    sqlite3DeleteIndexSamples(db, pIdx);
+    pIdx->aSample = 0;
+#endif
+  }
+
+  /* Load new statistics out of the sqlite_stat1 table */
+  sInfo.db = db;
+  sInfo.zDatabase = db->aDb[iDb].zDbSName;
+  if( (pStat1 = sqlite3FindTable(db, "sqlite_stat1", sInfo.zDatabase))
+   && IsOrdinaryTable(pStat1)
+  ){
+    zSql = sqlite3MPrintf(db,
+        "SELECT tbl,idx,stat FROM %Q.sqlite_stat1", sInfo.zDatabase);
+    if( zSql==0 ){
+      rc = SQLITE_NOMEM_BKPT;
+    }else{
+      rc = sqlite3_exec(db, zSql, analysisLoader, &sInfo, 0);
+      sqlite3DbFree(db, zSql);
+    }
+  }
+
+  /* Set appropriate defaults on all indexes not in the sqlite_stat1 table */
+  assert( sqlite3SchemaMutexHeld(db, iDb, 0) );
+  for(i=sqliteHashFirst(&pSchema->idxHash); i; i=sqliteHashNext(i)){
+    Index *pIdx = sqliteHashData(i);
+    if( !pIdx->hasStat1 ) sqlite3DefaultRowEst(pIdx);
+  }
+
+  /* Load the statistics from the sqlite_stat4 table. */
+#ifdef SQLITE_ENABLE_STAT4
+  if( rc==SQLITE_OK ){
+    DisableLookaside;
+    rc = loadStat4(db, sInfo.zDatabase);
+    EnableLookaside;
+  }
+  for(i=sqliteHashFirst(&pSchema->idxHash); i; i=sqliteHashNext(i)){
+    Index *pIdx = sqliteHashData(i);
+    sqlite3_free(pIdx->aiRowEst);
+    pIdx->aiRowEst = 0;
+  }
+#endif
+
+  if( rc==SQLITE_NOMEM ){
+    sqlite3OomFault(db);
+  }
+  return rc;
+}
+
+
+#endif /* SQLITE_OMIT_ANALYZE */
+
+/************** End of analyze.c *********************************************/
+/************** Begin file attach.c ******************************************/
+/*
+** 2003 April 6
+**
+** The author disclaims copyright to this source code.  In place of
+** a legal notice, here is a blessing:
+**
+**    May you do good and not evil.
+**    May you find forgiveness for yourself and forgive others.
+**    May you share freely, never taking more than you give.
+**
+*************************************************************************
+** This file contains code used to implement the ATTACH and DETACH commands.
+*/
+/* #include "sqliteInt.h" */
+
+#ifndef SQLITE_OMIT_ATTACH
+/*
+** Resolve an expression that was part of an ATTACH or DETACH statement. This
+** is slightly different from resolving a normal SQL expression, because simple
+** identifiers are treated as strings, not possible column names or aliases.
+**
+** i.e. if the parser sees:
+**
+**     ATTACH DATABASE abc AS def
+**
+** it treats the two expressions as literal strings 'abc' and 'def' instead of
+** looking for columns of the same name.
+**
+** This only applies to the root node of pExpr, so the statement:
+**
+**     ATTACH DATABASE abc||def AS 'db2'
+**
+** will fail because neither abc or def can be resolved.
+*/
+static int resolveAttachExpr(NameContext *pName, Expr *pExpr)
+{
+  int rc = SQLITE_OK;
+  if( pExpr ){
+    if( pExpr->op!=TK_ID ){
+      rc = sqlite3ResolveExprNames(pName, pExpr);
+    }else{
+      pExpr->op = TK_STRING;
+    }
+  }
+  return rc;
+}
+
+/*
+** Return true if zName points to a name that may be used to refer to
+** database iDb attached to handle db.
+*/
+SQLITE_PRIVATE int sqlite3DbIsNamed(sqlite3 *db, int iDb, const char *zName){
+  return (
+      sqlite3StrICmp(db->aDb[iDb].zDbSName, zName)==0
+   || (iDb==0 && sqlite3StrICmp("main", zName)==0)
+  );
+}
+
+/*
+** An SQL user-function registered to do the work of an ATTACH statement. The
+** three arguments to the function come directly from an attach statement:
+**
+**     ATTACH DATABASE x AS y KEY z
+**
+**     SELECT sqlite_attach(x, y, z)
+**
+** If the optional "KEY z" syntax is omitted, an SQL NULL is passed as the
+** third argument.
+**
+** If the db->init.reopenMemdb flags is set, then instead of attaching a
+** new database, close the database on db->init.iDb and reopen it as an
+** empty MemDB.
+*/
+static void attachFunc(
+  sqlite3_context *context,
+  int NotUsed,
+  sqlite3_value **argv
+){
+  int i;
+  int rc = 0;
+  sqlite3 *db = sqlite3_context_db_handle(context);
+  const char *zName;
+  const char *zFile;
+  char *zPath = 0;
+  char *zErr = 0;
+  unsigned int flags;
+  Db *aNew;                 /* New array of Db pointers */
+  Db *pNew;                 /* Db object for the newly attached database */
+  char *zErrDyn = 0;
+  sqlite3_vfs *pVfs;
+
+  UNUSED_PARAMETER(NotUsed);
+  zFile = (const char *)sqlite3_value_text(argv[0]);
+  zName = (const char *)sqlite3_value_text(argv[1]);
+  if( zFile==0 ) zFile = "";
+  if( zName==0 ) zName = "";
+
+#ifndef SQLITE_OMIT_DESERIALIZE
+# define REOPEN_AS_MEMDB(db)  (db->init.reopenMemdb)
+#else
+# define REOPEN_AS_MEMDB(db)  (0)
+#endif
+
+  if( REOPEN_AS_MEMDB(db) ){
+    /* This is not a real ATTACH.  Instead, this routine is being called
+    ** from sqlite3_deserialize() to close database db->init.iDb and
+    ** reopen it as a MemDB */
+    pVfs = sqlite3_vfs_find("memdb");
+    if( pVfs==0 ) return;
+    pNew = &db->aDb[db->init.iDb];
+    if( pNew->pBt ) sqlite3BtreeClose(pNew->pBt);
+    pNew->pBt = 0;
+    pNew->pSchema = 0;
+    rc = sqlite3BtreeOpen(pVfs, "x\0", db, &pNew->pBt, 0, SQLITE_OPEN_MAIN_DB);
+  }else{
+    /* This is a real ATTACH
+    **
+    ** Check for the following errors:
+    **
+    **     * Too many attached databases,
+    **     * Transaction currently open
+    **     * Specified database name already being used.
+    */
+    if( db->nDb>=db->aLimit[SQLITE_LIMIT_ATTACHED]+2 ){
+      zErrDyn = sqlite3MPrintf(db, "too many attached databa
