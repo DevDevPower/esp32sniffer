@@ -99,4 +99,5 @@ func (c *SQLiteContext) ResultText(s string) {
 // ResultZeroblob sets the result of an SQL function.
 // See: sqlite3_result_zeroblob, http://sqlite.org/c3ref/result_blob.html
 func (c *SQLiteContext) ResultZeroblob(n int) {
-	C.sq
+	C.sqlite3_result_zeroblob((*C.sqlite3_context)(c), C.int(n))
+}
