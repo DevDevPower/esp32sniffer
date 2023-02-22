@@ -59,3 +59,5 @@ func TestLoadExtensionError(t *testing.T) {
 
 	if err.Error() == "not an error" {
 		t.Fatal("expected error from sqlite3_enable_load_extension to be returned")
+	}
+}
