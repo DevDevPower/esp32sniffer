@@ -83,4 +83,11 @@ func unlock_notify_wait(db *C.sqlite3) C.int {
 
 	argv := (*[1]uint)(pargv)
 	argv[0] = h
-	if rv := C.sqlite3_unlock_notify(db, (*[0]byte)(C.unlock_notify_callback), unsafe.Pointer(pargv));
+	if rv := C.sqlite3_unlock_notify(db, (*[0]byte)(C.unlock_notify_callback), unsafe.Pointer(pargv)); rv != C.SQLITE_OK {
+		return rv
+	}
+
+	<-c
+
+	return C.SQLITE_OK
+}
