@@ -195,4 +195,302 @@ func TestUserAuthLogin(t *testing.T) {
 	}
 	defer os.Remove(f1)
 
-	f2, db2
+	f2, db2, c2, err := connect(t, f1, "admin", "admin")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db2.Close()
+	if f1 != f2 {
+		t.Fatal("UserAuth: Database file mismatch")
+	}
+
+	// Test lower level authentication
+	err = c2.Authenticate("admin", "admin")
+	if err != nil {
+		t.Fatalf("UserAuth: *SQLiteConn.Authenticate() Failed: %s", err)
+	}
+
+	// Test Login Failed
+	_, _, _, err = connect(t, f1, "admin", "invalid")
+	if err == nil {
+		t.Fatal("Login successful while expecting to fail")
+	}
+	if err != ErrUnauthorized {
+		t.Fatal(err)
+	}
+	err = c2.Authenticate("admin", "invalid")
+	if err == nil {
+		t.Fatal("Login successful while expecting to fail")
+	}
+	if err != ErrUnauthorized {
+		t.Fatal(err)
+	}
+}
+
+func TestUserAuthAddAdmin(t *testing.T) {
+	f, db, c, err := connect(t, "", "admin", "admin")
+	if err != nil && c == nil && db == nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	defer os.Remove(f)
+
+	// Add Admin User through SQL call
+	rv, err := addUser(db, "admin2", "admin2", 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if rv != 0 {
+		t.Fatal("Failed to add user")
+	}
+
+	// Check if user was created
+	exists, err := userExists(db, "admin2")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if exists != 1 {
+		t.Fatal("UserAuth: 'admin2' does not exists")
+	}
+
+	// Check if user was created as an Administrator
+	admin, err := isAdmin(db, "admin2")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !admin {
+		t.Fatal("UserAuth: 'admin2' is not administrator")
+	}
+
+	// Test *SQLiteConn
+	err = c.AuthUserAdd("admin3", "admin3", true)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Check if user was created
+	exists, err = userExists(db, "admin2")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if exists != 1 {
+		t.Fatal("UserAuth: 'admin3' does not exists")
+	}
+
+	// Check if the user was created as an Administrator
+	admin, err = isAdmin(db, "admin3")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !admin {
+		t.Fatal("UserAuth: 'admin3' is not administrator")
+	}
+}
+
+func TestUserAuthAddUser(t *testing.T) {
+	f1, db1, c, err := connect(t, "", "admin", "admin")
+	if err != nil && c == nil && db == nil {
+		t.Fatal(err)
+	}
+	defer os.Remove(f1)
+
+	// Add user through SQL call
+	rv, err := addUser(db1, "user", "user", 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if rv != 0 {
+		t.Fatal("Failed to add user")
+	}
+
+	// Check if user was created
+	exists, err := userExists(db1, "user")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if exists != 1 {
+		t.Fatal("UserAuth: 'user' does not exists")
+	}
+
+	// Check if user was created as an Administrator
+	admin, err := isAdmin(db1, "user")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if admin {
+		t.Fatal("UserAuth: 'user' is administrator")
+	}
+
+	// Test *SQLiteConn
+	err = c.AuthUserAdd("user2", "user2", false)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Check if user was created
+	exists, err = userExists(db1, "user2")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if exists != 1 {
+		t.Fatal("UserAuth: 'user2' does not exists")
+	}
+
+	// Check if the user was created as an Administrator
+	admin, err = isAdmin(db1, "user2")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if admin {
+		t.Fatal("UserAuth: 'user2' is administrator")
+	}
+
+	// Reconnect as normal user
+	db1.Close()
+	_, db2, c2, err := connect(t, f1, "user", "user")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db2.Close()
+
+	// Try to create admin user while logged in as normal user
+	rv, err = addUser(db2, "admin2", "admin2", 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if rv != SQLITE_AUTH {
+		t.Fatal("Created admin user while not allowed")
+	}
+
+	err = c2.AuthUserAdd("admin3", "admin3", true)
+	if err != ErrAdminRequired {
+		t.Fatal("Created admin user while not allowed")
+	}
+
+	// Try to create normal user while logged in as normal user
+	rv, err = addUser(db2, "user3", "user3", 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if rv != SQLITE_AUTH {
+		t.Fatal("Created user while not allowed")
+	}
+
+	err = c2.AuthUserAdd("user4", "user4", false)
+	if err != ErrAdminRequired {
+		t.Fatal("Created user while not allowed")
+	}
+}
+
+func TestUserAuthModifyUser(t *testing.T) {
+	f1, db1, c1, err := connect(t, "", "admin", "admin")
+	if err != nil && c1 == nil && db == nil {
+		t.Fatal(err)
+	}
+	defer os.Remove(f1)
+
+	// Modify Password for current logged in admin
+	// through SQL
+	rv, err := modifyUser(db1, "admin", "admin2", 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if rv != 0 {
+		t.Fatal("Failed to modify password for admin")
+	}
+
+	// Modify password for current logged in admin
+	// through *SQLiteConn
+	err = c1.AuthUserChange("admin", "admin3", true)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Modify Administrator Flag
+	// Because we are current logged in as 'admin'
+	// Changing our own admin flag should fail.
+	rv, err = modifyUser(db1, "admin", "admin3", 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if rv != SQLITE_AUTH {
+		t.Fatal("Successfully changed admin flag while not allowed")
+	}
+
+	// Modify admin flag through (*SQLiteConn)
+	// Because we are current logged in as 'admin'
+	// Changing our own admin flag should fail.
+	err = c1.AuthUserChange("admin", "admin3", false)
+	if err != ErrAdminRequired {
+		t.Fatal("Successfully changed admin flag while not allowed")
+	}
+
+	// Add normal user
+	rv, err = addUser(db1, "user", "password", 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if rv != 0 {
+		t.Fatal("Failed to add user")
+	}
+
+	rv, err = addUser(db1, "user2", "user2", 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if rv != 0 {
+		t.Fatal("Failed to add user")
+	}
+
+	// Modify other user password and flag through SQL
+	rv, err = modifyUser(db1, "user", "pass", 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if rv != 0 {
+		t.Fatal("Failed to modify password for user")
+	}
+
+	// Modify other user password and flag through *SQLiteConn
+	err = c1.AuthUserChange("user", "newpass", false)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Disconnect database for reconnect
+	db1.Close()
+	_, db2, c2, err := connect(t, f1, "user", "newpass")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db2.Close()
+
+	// Modify other user password through SQL
+	rv, err = modifyUser(db2, "user2", "newpass", 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if rv != SQLITE_AUTH {
+		t.Fatal("Password change successful while not allowed")
+	}
+
+	// Modify other user password and flag through *SQLiteConn
+	err = c2.AuthUserChange("user2", "invalid", false)
+	if err != ErrAdminRequired {
+		t.Fatal("Password change successful while not allowed")
+	}
+}
+
+func TestUserAuthDeleteUser(t *testing.T) {
+	f1, db1, c, err := connect(t, "", "admin", "admin")
+	if err != nil && c == nil && db == nil {
+		t.Fatal(err)
+	}
+	defer os.Remove(f1)
+
+	// Add Admin User 2
+	rv, err := addUser(db1, "admin2", "admin2", 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if r
