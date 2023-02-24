@@ -493,4 +493,151 @@ func TestUserAuthDeleteUser(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if r
+	if rv != 0 {
+		t.Fatal("Failed to add user")
+	}
+
+	rv, err = addUser(db1, "admin3", "admin3", 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if rv != 0 {
+		t.Fatal("Failed to add user")
+	}
+
+	// Check if user was created
+	exists, err := userExists(db1, "admin2")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if exists != 1 {
+		t.Fatal("UserAuth: 'admin2' does not exists")
+	}
+
+	exists, err = userExists(db1, "admin3")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if exists != 1 {
+		t.Fatal("UserAuth: 'admin2' does not exists")
+	}
+
+	// Delete user through SQL
+	rv, err = deleteUser(db1, "admin2")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if rv != 0 {
+		t.Fatal("Failed to delete admin2")
+	}
+
+	// Verify user admin2 deleted
+	exists, err = userExists(db1, "admin2")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if exists != 0 {
+		t.Fatal("UserAuth: 'admin2' still exists")
+	}
+
+	// Delete user through *SQLiteConn
+	rv, err = deleteUser(db1, "admin3")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if rv != 0 {
+		t.Fatal("Failed to delete admin3")
+	}
+
+	// Verify user admin3 deleted
+	exists, err = userExists(db1, "admin3")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if exists != 0 {
+		t.Fatal("UserAuth: 'admin3' still exists")
+	}
+
+	// Add normal user for reconnect and privileges check
+	rv, err = addUser(db1, "reconnect", "reconnect", 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if rv != 0 {
+		t.Fatal("Failed to add user")
+	}
+
+	// Add normal user for deletion through SQL
+	rv, err = addUser(db1, "user", "user", 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if rv != 0 {
+		t.Fatal("Failed to add user")
+	}
+
+	rv, err = addUser(db1, "user2", "user2", 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if rv != 0 {
+		t.Fatal("Failed to add user")
+	}
+
+	// Close database for reconnect
+	db1.Close()
+
+	// Reconnect as normal user
+	_, db2, c2, err := connect(t, f1, "reconnect", "reconnect")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db2.Close()
+
+	// Delete user while logged in as normal user
+	// through SQL
+	rv, err = deleteUser(db2, "user")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if rv != SQLITE_AUTH {
+		t.Fatal("Successfully deleted user wthout proper privileges")
+	}
+
+	// Delete user while logged in as normal user
+	// through *SQLiteConn
+	err = c2.AuthUserDelete("user2")
+	if err != ErrAdminRequired {
+		t.Fatal("Successfully deleted user wthout proper privileges")
+	}
+}
+
+func TestUserAuthEncoders(t *testing.T) {
+	cases := map[string]string{
+		"sha1":    "",
+		"ssha1":   "salted",
+		"sha256":  "",
+		"ssha256": "salted",
+		"sha384":  "",
+		"ssha384": "salted",
+		"sha512":  "",
+		"ssha512": "salted",
+	}
+
+	for enc, salt := range cases {
+		f, err := createWithCrypt(t, "admin", "admin", enc, salt)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer os.Remove(f)
+
+		_, db, _, err := connectWithCrypt(t, f, "admin", "admin", enc, salt)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer db.Close()
+		if e, err := authEnabled(db); err != nil && !e {
+			t.Fatalf("UserAuth (%s) not enabled %s", enc, err)
+		}
+	}
+}
